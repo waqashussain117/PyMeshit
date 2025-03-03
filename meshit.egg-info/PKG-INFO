@@ -1,0 +1,63 @@
+Metadata-Version: 2.2
+Name: meshit
+Version: 0.1.0
+Summary: Python library for mesh generation and manipulation with C++ backend
+Home-page: https://github.com/waqashussain/meshit
+Author: Waqas Hussain
+Author-email: waqas.hussain117@gmail.com
+Project-URL: Bug Tracker, https://github.com/waqashussain/meshit/issues
+Project-URL: Documentation, https://github.com/waqashussain/meshit#readme
+Project-URL: Source Code, https://github.com/waqashussain/meshit
+Keywords: mesh triangulation geometry surface VTU paraview
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: pybind11>=2.5.0
+Dynamic: author
+Dynamic: author-email
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: project-url
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# MeshIt
+
+A Python library for mesh generation and manipulation with C++ backend.
+
+## Installation
+
+```bash
+pip install meshit
+
+Features
+Generate meshes from polylines and boundaries
+Support for different mesh algorithms (Delaunay, advancing front)
+Export to VTU format for visualization
+Vector operations and geometry utilities
+
+# Quick Start
+import meshit
+
+# Create a model
+model = meshit.MeshItModel()
+
+# Add a simple triangle
+points = [
+    [0, 0, 0],
+    [1, 0, 0],
+    [0.5, 1, 0],
+    [0, 0, 0]  # Close the loop
+]
+model.add_polyline(points)
+
+# Generate mesh
+model.set_mesh_algorithm("delaunay")
+model.set_mesh_quality(1.2)
+model.mesh()
+
+# Export result
+model.export_vtu("triangle_mesh.vtu")
