@@ -1,24 +1,27 @@
 Metadata-Version: 2.2
 Name: meshit
-Version: 0.1.0
+Version: 0.0.2
 Summary: Python library for mesh generation and manipulation with C++ backend
 Home-page: https://github.com/waqashussain/meshit
 Author: Waqas Hussain
-Author-email: waqas.hussain117@gmail.com
-Keywords: mesh triangulation geometry surface VTU paraview
+Author-email: Waqas Hussain <waqas.hussain117@gmail.com>
+Project-URL: Homepage, https://github.com/waqashussain/meshit
+Project-URL: Repository, https://github.com/waqashussain/meshit
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
 Requires-Python: >=3.7
 Description-Content-Type: text/markdown
-License-File: LICENSE
 Requires-Dist: pybind11>=2.5.0
 Dynamic: author
-Dynamic: author-email
-Dynamic: description
-Dynamic: description-content-type
 Dynamic: home-page
-Dynamic: keywords
-Dynamic: requires-dist
 Dynamic: requires-python
-Dynamic: summary
 
 # MeshIt
 

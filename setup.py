@@ -4,11 +4,16 @@ import sys
 import os
 import setuptools
 
-__version__ = '0.1.0'
+__version__ = '0.0.2'
 
-# Set environment variables for MinGW
+# Force MinGW compiler
 if sys.platform == 'win32':
     os.environ['PATH'] = 'C:\\msys64\\mingw64\\bin;' + os.environ['PATH']
+    # Force the use of MinGW compiler properly
+    def get_default_compiler(plat=None):
+        return 'mingw32'
+    import distutils.ccompiler
+    distutils.ccompiler.get_default_compiler = get_default_compiler
 
 QT_BASE_PATH = 'C:/Qt/6.8.2/mingw_64'
 QT_INCLUDE_PATH = os.path.join(QT_BASE_PATH, 'include')
@@ -60,32 +65,36 @@ ext_modules = [
 
 class BuildExt(build_ext):
     def build_extensions(self):
-        if self.compiler.compiler_type == 'mingw32':
-            for e in self.extensions:
-                e.extra_compile_args = [
-                    '-O2',
-                    '-std=c++17',
-                    '-Wall',
-                    '-DWIN32',
-                    '-D_WINDOWS',
-                    '-DQT_NO_DEBUG',
-                    '-Wno-unused-variable',  # Suppress unused variable warnings
-                    '-Wno-reorder',         # Suppress reorder warnings
-                    f'-I{QT_INCLUDE_PATH}',
-                    f'-I{os.path.join(QT_INCLUDE_PATH, "QtCore")}',
-                    f'-I{os.path.join(QT_INCLUDE_PATH, "QtGui")}',
-                    f'-I{os.path.join(QT_INCLUDE_PATH, "QtWidgets")}',
-                    f'-I{os.path.join(QT_INCLUDE_PATH, "QtOpenGLWidgets")}',
-                ]
-                e.extra_link_args = [
-                    f'-L{QT_LIB_PATH}',
-                    '-lQt6Core',
-                    '-lQt6Gui',
-                    '-lQt6Widgets',
-                    '-lQt6OpenGLWidgets',
-                    '-static-libgcc',
-                    '-static-libstdc++',
-                ]
+        opts = [
+            '-O2',
+            '-std=c++17',
+            '-Wall',
+            '-DWIN32',
+            '-D_WINDOWS',
+            '-DQT_NO_DEBUG',
+            '-Wno-unused-variable',
+            '-Wno-reorder',
+        ]
+        
+        link_opts = [
+            '-static-libgcc',
+            '-static-libstdc++',
+        ]
+
+        # Add Qt include paths
+        qt_includes = [
+            QT_INCLUDE_PATH,
+            os.path.join(QT_INCLUDE_PATH, 'QtCore'),
+            os.path.join(QT_INCLUDE_PATH, 'QtGui'),
+            os.path.join(QT_INCLUDE_PATH, 'QtWidgets'),
+            os.path.join(QT_INCLUDE_PATH, 'QtOpenGLWidgets'),
+        ]
+
+        for ext in self.extensions:
+            ext.extra_compile_args = opts
+            ext.extra_link_args = link_opts
+            for inc in qt_includes:
+                ext.extra_compile_args.append(f'-I{inc}')
 
         build_ext.build_extensions(self)
 
@@ -105,4 +114,14 @@ setup(
     cmdclass={'build_ext': BuildExt},
     zip_safe=False,
     include_package_data=True,
+    classifiers=[
+        'Development Status :: 3 - Alpha',
+        'Intended Audience :: Developers',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
+    ],
 )

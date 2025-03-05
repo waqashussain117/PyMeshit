@@ -1,8 +1,18 @@
-LICENSE
 MANIFEST.in
 README.md
 pyproject.toml
 setup.py
+include/c_vector.h
+include/commandline.h
+include/core.h
+include/exodus.h
+include/feflow.h
+include/geometry.h
+include/glwidget.h
+include/intersections.h
+include/mainwindow.h
+include/tetgen.h
+include/triangle.h
 meshit/__init__.py
 meshit.egg-info/PKG-INFO
 meshit.egg-info/SOURCES.txt
@@ -10,7 +20,6 @@ meshit.egg-info/dependency_links.txt
 meshit.egg-info/not-zip-safe
 meshit.egg-info/requires.txt
 meshit.egg-info/top_level.txt
-meshit/core/__init__.py
 src/c_vector.cpp
 src/commandline.cpp
 src/core.cpp
