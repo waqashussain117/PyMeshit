@@ -5,9 +5,6 @@ Summary: Python library for mesh generation and manipulation with C++ backend
 Home-page: https://github.com/waqashussain/meshit
 Author: Waqas Hussain
 Author-email: waqas.hussain117@gmail.com
-Project-URL: Bug Tracker, https://github.com/waqashussain/meshit/issues
-Project-URL: Documentation, https://github.com/waqashussain/meshit#readme
-Project-URL: Source Code, https://github.com/waqashussain/meshit
 Keywords: mesh triangulation geometry surface VTU paraview
 Requires-Python: >=3.7
 Description-Content-Type: text/markdown
@@ -19,7 +16,6 @@ Dynamic: description
 Dynamic: description-content-type
 Dynamic: home-page
 Dynamic: keywords
-Dynamic: project-url
 Dynamic: requires-dist
 Dynamic: requires-python
 Dynamic: summary

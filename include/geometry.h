@@ -3,7 +3,7 @@
  * Copyright (C) 2020
  *
  * Mauro Cacace (GFZ, cacace@gfz-potsdam.de),
- * Guido Blöcher (GFZ, bloech@gfz-potsdam.de),
+ * Guido Blï¿½cher (GFZ, bloech@gfz-potsdam.de),
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
@@ -32,7 +32,7 @@
 
 #include <QtCore/QtCore>
 #include <QtGui/QtGui>
-#include <QtOpenGL/QGLWidget>
+#include <QtOpenGLWidgets/QOpenGLWidget>
 
 #include <iostream>
 #include <list>
