@@ -4,7 +4,7 @@ import sys
 import os
 import setuptools
 
-__version__ = '0.0.2'
+__version__ = '0.1.1'
 
 # Force MinGW compiler
 if sys.platform == 'win32':

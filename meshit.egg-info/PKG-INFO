@@ -1,6 +1,6 @@
 Metadata-Version: 2.2
 Name: meshit
-Version: 0.0.2
+Version: 0.1.1
 Summary: Python library for mesh generation and manipulation with C++ backend
 Home-page: https://github.com/waqashussain/meshit
 Author: Waqas Hussain

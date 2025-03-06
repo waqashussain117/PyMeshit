@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meshit"
-version = "0.0.2"
+version = "0.1.1"
 description = "Python library for mesh generation and manipulation with C++ backend"
 authors = [{name = "Waqas Hussain", email = "waqas.hussain117@gmail.com"}]
 readme = "README.md"
