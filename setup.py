@@ -6,16 +6,7 @@ import setuptools
 
 __version__ = '0.1.1'
 
-# Force MinGW compiler
-if sys.platform == 'win32':
-    os.environ['PATH'] = 'C:\\msys64\\mingw64\\bin;' + os.environ['PATH']
-    # Force the use of MinGW compiler properly
-    def get_default_compiler(plat=None):
-        return 'mingw32'
-    import distutils.ccompiler
-    distutils.ccompiler.get_default_compiler = get_default_compiler
-
-QT_BASE_PATH = 'C:/Qt/6.8.2/mingw_64'
+QT_BASE_PATH = 'C:/Qt/6.8.2/msvc2022_64'
 QT_INCLUDE_PATH = os.path.join(QT_BASE_PATH, 'include')
 QT_LIB_PATH = os.path.join(QT_BASE_PATH, 'lib')
 QT_BIN_PATH = os.path.join(QT_BASE_PATH, 'bin')
@@ -59,6 +50,7 @@ ext_modules = [
             ('WIN32', '1'),
             ('NOMINMAX', '1'),
             ('NOEXODUS', '1'),
+            ('_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING', '1'),
         ],
     )
 ]
@@ -66,21 +58,23 @@ ext_modules = [
 class BuildExt(build_ext):
     def build_extensions(self):
         opts = [
-            '-O2',
-            '-std=c++17',
-            '-Wall',
-            '-DWIN32',
-            '-D_WINDOWS',
-            '-DQT_NO_DEBUG',
-            '-Wno-unused-variable',
-            '-Wno-reorder',
+            '/O2',
+            '/std:c++17',
+            '/W3',
+            '/DWIN32',
+            '/D_WINDOWS',
+            '/DQT_NO_DEBUG',
+            '/EHsc',
+            '/MD',
+            '/Zc:__cplusplus',
+            '/permissive-',
+            '/Zc:preprocessor',
+            '/Zc:externConstexpr',
+            '/Zc:throwingNew',
+            '/utf-8',
+            '/bigobj',
         ]
         
-        link_opts = [
-            '-static-libgcc',
-            '-static-libstdc++',
-        ]
-
         # Add Qt include paths
         qt_includes = [
             QT_INCLUDE_PATH,
@@ -92,9 +86,8 @@ class BuildExt(build_ext):
 
         for ext in self.extensions:
             ext.extra_compile_args = opts
-            ext.extra_link_args = link_opts
             for inc in qt_includes:
-                ext.extra_compile_args.append(f'-I{inc}')
+                ext.extra_compile_args.append(f'/I{inc}')
 
         build_ext.build_extensions(self)
 
