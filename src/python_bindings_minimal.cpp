@@ -17,6 +17,43 @@
 #include "geometry.h"
 namespace py = pybind11;
 
+// VTU file writing functions
+void write_vtu_header(std::ofstream& file) {
+    file << "<?xml version=\"1.0\"?>\n";
+    file << "<VTKFile type=\"UnstructuredGrid\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
+    file << "  <UnstructuredGrid>\n";
+    file << "    <Piece NumberOfPoints=\"0\" NumberOfCells=\"0\">\n";
+}
+
+void write_vtu_points(std::ofstream& file) {
+    file << "      <Points>\n";
+    file << "        <DataArray type=\"Float32\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+    file << "        </DataArray>\n";
+    file << "      </Points>\n";
+}
+
+void write_vtu_cells(std::ofstream& file) {
+    file << "      <Cells>\n";
+    file << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">\n";
+    file << "        </DataArray>\n";
+    file << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">\n";
+    file << "        </DataArray>\n";
+    file << "        <DataArray type=\"UInt8\" Name=\"types\" format=\"ascii\">\n";
+    file << "        </DataArray>\n";
+    file << "      </Cells>\n";
+}
+
+void write_vtu_cell_data(std::ofstream& file) {
+    file << "      <CellData>\n";
+    file << "      </CellData>\n";
+}
+
+void write_vtu_footer(std::ofstream& file) {
+    file << "    </Piece>\n";
+    file << "  </UnstructuredGrid>\n";
+    file << "</VTKFile>\n";
+}
+
 // Vector3D class with full functionality
 class Vector3D {
 public:
@@ -296,29 +333,39 @@ public:
 
 // Update your MeshItModel class with these new methods
 class MeshItModel {
-private:
-    std::vector<std::vector<Vector3D>> polylines;
-    std::vector<Triangle> triangles;
-    std::vector<Vector3D> mesh_vertices;
-    std::vector<std::vector<int>> mesh_faces;
+public:
+    std::vector<Surface> surfaces;
+    std::vector<Polyline> model_polylines;
+    std::vector<Intersection> intersections;
+    std::vector<TriplePoint> triple_points;
     double mesh_quality;
     std::string mesh_algorithm;
     bool has_constraints;
-    
-    // Add these new private variables
-    std::mutex mutex;
-    std::vector<Intersection> intersections;
-    std::vector<TriplePoint> triple_points;
 
-public:
-    // Add the existing surfaces and polylines as public members
-    std::vector<Surface> surfaces;
-    std::vector<Polyline> model_polylines;
-    
-    MeshItModel() : mesh_quality(1.0), mesh_algorithm("delaunay"), has_constraints(false) {}
+    MeshItModel() : mesh_quality(1.0), mesh_algorithm("delaunay"), has_constraints(false) {
+        // Initialize vectors
+        intersections = std::vector<Intersection>();
+        triple_points = std::vector<TriplePoint>();
+    }
+
+    void append_surface(Surface surface) {
+        surfaces.push_back(std::move(surface));
+    }
+
+    void append_polyline(Polyline polyline) {
+        model_polylines.push_back(std::move(polyline));
+    }
+
+    std::vector<Intersection>& get_intersections() {
+        return intersections;
+    }
+
+    std::vector<TriplePoint>& get_triple_points() {
+        return triple_points;
+    }
 
     void set_mesh_quality(double quality) {
-        mesh_quality = std::max(0.1, std::min(2.0, quality));
+        mesh_quality = quality;
     }
 
     void set_mesh_algorithm(const std::string& algorithm) {
@@ -415,7 +462,7 @@ public:
         std::cout << "Mesh has " << mesh_vertices.size() << " vertices and " 
                   << mesh_faces.size() << " faces" << std::endl;
     }
-// Add the pre_mesh_job method
+
     void pre_mesh_job(const std::function<void(const std::string&)>& progress_callback = nullptr) {
         // Record start time
         auto start_time = std::chrono::system_clock::now();
@@ -985,91 +1032,13 @@ public:
     }
 
 private:
-    void write_vtu_header(std::ofstream& file) {
-        file << "<?xml version=\"1.0\"?>\n";
-        file << "<VTKFile type=\"UnstructuredGrid\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
-        file << "  <UnstructuredGrid>\n";
-        file << "    <Piece NumberOfPoints=\"" << mesh_vertices.size() 
-             << "\" NumberOfCells=\"" << mesh_faces.size() << "\">\n";
-    }
+    std::vector<std::vector<Vector3D>> polylines;
+    std::vector<Triangle> triangles;
+    std::vector<Vector3D> mesh_vertices;
+    std::vector<std::vector<int>> mesh_faces;
+    std::mutex mutex;
 
-    void write_vtu_points(std::ofstream& file) {
-        file << "      <Points>\n";
-        file << "        <DataArray type=\"Float32\" NumberOfComponents=\"3\" format=\"ascii\">\n";
-        for (const auto& vertex : mesh_vertices) {
-            file << "          " << vertex.x << " " << vertex.y << " " << vertex.z << "\n";
-        }
-        file << "        </DataArray>\n";
-        file << "      </Points>\n";
-    }
-
-    void write_vtu_cells(std::ofstream& file) {
-        file << "      <Cells>\n";
-        write_vtu_connectivity(file);
-        write_vtu_offsets(file);
-        write_vtu_types(file);
-        file << "      </Cells>\n";
-    }
-
-    void write_vtu_connectivity(std::ofstream& file) {
-        file << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">\n";
-        for (const auto& face : mesh_faces) {
-            file << "          ";
-            for (int idx : face) {
-                file << idx << " ";
-            }
-            file << "\n";
-        }
-        file << "        </DataArray>\n";
-    }
-
-    void write_vtu_offsets(std::ofstream& file) {
-        file << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">\n";
-        file << "          ";
-        int offset = 0;
-        for (const auto& face : mesh_faces) {
-            offset += face.size();
-            file << offset << " ";
-        }
-        file << "\n";
-        file << "        </DataArray>\n";
-    }
-
-    void write_vtu_types(std::ofstream& file) {
-        file << "        <DataArray type=\"UInt8\" Name=\"types\" format=\"ascii\">\n";
-        file << "          ";
-        for (size_t i = 0; i < mesh_faces.size(); i++) {
-            file << "5 "; // 5 = VTK_TRIANGLE
-        }
-        file << "\n";
-        file << "        </DataArray>\n";
-    }
-
-    void write_vtu_cell_data(std::ofstream& file) {
-        file << "      <CellData>\n";
-        file << "        <DataArray type=\"Float32\" Name=\"Normals\" NumberOfComponents=\"3\" format=\"ascii\">\n";
-        for (size_t i = 0; i < mesh_faces.size(); i++) {
-            const auto& face = mesh_faces[i];
-            if (face.size() >= 3) {
-                Vector3D v1 = mesh_vertices[face[0]];
-                Vector3D v2 = mesh_vertices[face[1]];
-                Vector3D v3 = mesh_vertices[face[2]];
-                Vector3D normal = Vector3D::cross(v2 - v1, v3 - v1).normalized();
-                file << "          " << normal.x << " " << normal.y << " " << normal.z << "\n";
-            }
-            else {
-                file << "          0 0 1\n";
-            }
-        }
-        file << "        </DataArray>\n";
-        file << "      </CellData>\n";
-    }
-
-    void write_vtu_footer(std::ofstream& file) {
-        file << "    </Piece>\n";
-        file << "  </UnstructuredGrid>\n";
-        file << "</VTKFile>\n";
-    }
+    // Rest of the private methods...
 };
 
 // Replace the existing PYBIND11_MODULE section with this updated version:
@@ -1103,7 +1072,7 @@ PYBIND11_MODULE(_meshit, m) {
             }
         );
 
-    // NEW - Bind the Intersection class
+    // Bind the Intersection class
     py::class_<Intersection>(m, "Intersection")
         .def(py::init<int, int, bool>())
         .def_readwrite("id1", &Intersection::id1)
@@ -1112,14 +1081,14 @@ PYBIND11_MODULE(_meshit, m) {
         .def_readwrite("points", &Intersection::points)
         .def("add_point", &Intersection::add_point);
     
-    // NEW - Bind the TriplePoint class
+    // Bind the TriplePoint class
     py::class_<TriplePoint>(m, "TriplePoint")
         .def(py::init<Vector3D>())
         .def_readwrite("point", &TriplePoint::point)
         .def_readwrite("intersection_ids", &TriplePoint::intersection_ids)
         .def("add_intersection", &TriplePoint::add_intersection);
     
-    // NEW - Bind the Surface class
+    // Bind the Surface class
     py::class_<Surface>(m, "Surface")
         .def(py::init<>())
         .def_readwrite("name", &Surface::name)
@@ -1134,7 +1103,7 @@ PYBIND11_MODULE(_meshit, m) {
         .def("triangulate", &Surface::triangulate)
         .def("get_convex_hull", &Surface::get_convex_hull);
     
-    // NEW - Bind the Polyline class
+    // Bind the Polyline class
     py::class_<Polyline>(m, "Polyline")
         .def(py::init<>())
         .def_readwrite("name", &Polyline::name)
@@ -1156,26 +1125,26 @@ PYBIND11_MODULE(_meshit, m) {
         .def("centroid", &Triangle::centroid)
         .def("containsPoint", &Triangle::containsPoint);
 
-    // UPDATED - Bind MeshItModel class with new methods
+    // UPDATED - Bind MeshItModel class with custom vector bindings
     py::class_<MeshItModel>(m, "MeshItModel")
         .def(py::init<>())
+        .def("append_surface", &MeshItModel::append_surface)
+        .def("append_polyline", &MeshItModel::append_polyline)
         .def("set_mesh_quality", &MeshItModel::set_mesh_quality)
         .def("set_mesh_algorithm", &MeshItModel::set_mesh_algorithm)
         .def("enable_constraints", &MeshItModel::enable_constraints)
-        .def("add_polyline", &MeshItModel::add_polyline)
-        .def("add_triangle", &MeshItModel::add_triangle)
-        .def("pre_mesh", &MeshItModel::pre_mesh)
-        .def("mesh", &MeshItModel::mesh)
-        .def("export_vtu", &MeshItModel::export_vtu)
-        // NEW - Add the pre_mesh_job method
-        .def("pre_mesh_job", &MeshItModel::pre_mesh_job,
-             py::arg("progress_callback") = nullptr,
-             "Performs pre-mesh operations (convex hulls, triangulation, intersections)")
-        // NEW - Add access to model data
+        .def("pre_mesh_job", &MeshItModel::pre_mesh_job)
+        .def("get_intersections", &MeshItModel::get_intersections)
+        .def("get_triple_points", &MeshItModel::get_triple_points)
         .def_readwrite("surfaces", &MeshItModel::surfaces)
-        .def_readwrite("model_polylines", &MeshItModel::model_polylines);
+        .def_readwrite("model_polylines", &MeshItModel::model_polylines)
+        .def_readwrite("intersections", &MeshItModel::intersections)
+        .def_readwrite("triple_points", &MeshItModel::triple_points)
+        .def_readwrite("mesh_quality", &MeshItModel::mesh_quality)
+        .def_readwrite("mesh_algorithm", &MeshItModel::mesh_algorithm)
+        .def_readwrite("has_constraints", &MeshItModel::has_constraints);
     
-    // NEW - Add helper methods to create surfaces and polylines
+    // Add helper methods to create surfaces and polylines
     m.def("create_surface", [](const std::vector<std::vector<double>>& vertices,
                                const std::vector<std::vector<int>>& triangles,
                                const std::string& name = "",
