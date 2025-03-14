@@ -1,5 +1,32 @@
 import meshit
 
+# Print all available attributes in the meshit module
+print("Available attributes in meshit module:")
+for attr in dir(meshit):
+    if not attr.startswith('__'):
+        print(f"- {attr}")
+
+# Try to access the compute_convex_hull function
+try:
+    print("\nTrying to access compute_convex_hull function...")
+    if hasattr(meshit, 'compute_convex_hull'):
+        print("compute_convex_hull function is available")
+    else:
+        print("compute_convex_hull function is NOT available")
+except Exception as e:
+    print(f"Error: {e}")
+
+# Try to import the _compute_convex_hull function directly
+try:
+    print("\nTrying to access _compute_convex_hull function...")
+    from meshit.core._meshit import compute_convex_hull as _compute_convex_hull
+    print("_compute_convex_hull function is available")
+except Exception as e:
+    print(f"Error: {e}")
+
+# Print the version of the meshit module
+print(f"\nMeshIt version: {meshit.__version__}")
+
 # Create a model instance
 model = meshit.MeshItModel()
 

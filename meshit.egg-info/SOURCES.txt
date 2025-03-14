@@ -14,6 +14,7 @@ include/mainwindow.h
 include/tetgen.h
 include/triangle.h
 meshit/__init__.py
+meshit/extensions.py
 meshit.egg-info/PKG-INFO
 meshit.egg-info/SOURCES.txt
 meshit.egg-info/dependency_links.txt

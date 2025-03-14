@@ -7,8 +7,11 @@ from .core._meshit import (
     create_polyline,
     Triangle,
     Intersection,
-    TriplePoint
+    TriplePoint,
 )
+
+# Import our extensions to enhance the C++ bindings
+from . import extensions
 
 __version__ = '0.1.1'
 
@@ -60,6 +63,28 @@ def get_triple_points(model):
     except AttributeError:
         return []
 
+def compute_convex_hull(points):
+    """Compute the convex hull of a set of 3D points.
+    
+    Args:
+        points: A list of 3D points, where each point is a list of 3 coordinates [x, y, z]
+    
+    Returns:
+        A list of 3D points representing the convex hull
+    """
+    # Create a surface from the points
+    surface = create_surface(points, [], "TempSurface", "Scattered")
+    
+    # Calculate the convex hull
+    surface.calculate_convex_hull()
+    
+    # Convert the convex hull points to a list of lists
+    hull_points = []
+    for point in surface.convex_hull:
+        hull_points.append([point.x, point.y, point.z])
+    
+    return hull_points
+
 __all__ = [
     'MeshItModel',
     'Vector3D',
@@ -73,5 +98,6 @@ __all__ = [
     'add_surface_to_model',
     'add_polyline_to_model',
     'get_intersections',
-    'get_triple_points'
+    'get_triple_points',
+    'compute_convex_hull'
 ]
