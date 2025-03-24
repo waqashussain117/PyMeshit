@@ -7,14 +7,22 @@ including file loading, convex hull computation, segmentation, triangulation, an
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 import logging
 import os
 import sys
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 import time
+
+# Import PyQt5
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+                            QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QTabWidget,
+                            QFileDialog, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox,
+                            QCheckBox, QGroupBox, QRadioButton, QSlider, QLineEdit,
+                            QSplitter, QDialog, QFormLayout, QButtonGroup, QMenu, QAction)
+from PyQt5.QtCore import Qt, QSize, pyqtSignal
+from PyQt5.QtGui import QFont, QIcon
 
 # Import PyVista for 3D visualization
 try:
@@ -45,35 +53,34 @@ except ImportError as e:
     logger.error(f"Failed to import DirectTriangleWrapper: {e}")
     HAVE_DIRECT_WRAPPER = False
 
-class MeshItWorkflowGUI:
-    def __init__(self, root=None):
-        # Create root window if none provided
-        if root is None:
-            self.root = tk.Tk()
-        else:
-            self.root = root
-            
-        self.root.geometry("1200x800")
-        self.root.minsize(1000, 700)
+class MeshItWorkflowGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
         
-        # Create main frame
-        self.main_frame = ttk.Frame(self.root)
-        self.main_frame.pack(fill=tk.BOTH, expand=True)
+        # Setup main window
+        self.setWindowTitle("MeshIt Workflow GUI")
+        self.setGeometry(100, 100, 1200, 800)
+        self.setMinimumSize(1000, 700)
+        
+        # Create central widget and main layout
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QVBoxLayout(self.central_widget)
         
         # Create notebook (tabbed interface)
-        self.notebook = ttk.Notebook(self.main_frame)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.notebook = QTabWidget()
+        self.main_layout.addWidget(self.notebook)
         
         # Create tabs for each workflow step
-        self.file_tab = ttk.Frame(self.notebook)
-        self.hull_tab = ttk.Frame(self.notebook)
-        self.segment_tab = ttk.Frame(self.notebook)
-        self.triangulation_tab = ttk.Frame(self.notebook)
+        self.file_tab = QWidget()
+        self.hull_tab = QWidget()
+        self.segment_tab = QWidget()
+        self.triangulation_tab = QWidget()
         
-        self.notebook.add(self.file_tab, text="1. Load Data")
-        self.notebook.add(self.hull_tab, text="2. Convex Hull")
-        self.notebook.add(self.segment_tab, text="3. Segmentation")
-        self.notebook.add(self.triangulation_tab, text="4. Triangulation")
+        self.notebook.addTab(self.file_tab, "1. Load Data")
+        self.notebook.addTab(self.hull_tab, "2. Convex Hull")
+        self.notebook.addTab(self.segment_tab, "3. Segmentation")
+        self.notebook.addTab(self.triangulation_tab, "4. Triangulation")
         
         # Initialize data containers
         self.points = None
@@ -93,52 +100,118 @@ class MeshItWorkflowGUI:
         self._setup_triangulation_tab()
         
         # Status bar
-        self.status_var = tk.StringVar()
-        self.status_var.set("Ready")
-        self.status_bar = ttk.Label(root, textvariable=self.status_var, 
-                                   relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.statusBar().showMessage("Ready")
+        
+        # Create menu bar
+        self._create_menu_bar()
+    
+    def _create_menu_bar(self):
+        """Create the menu bar"""
+        menubar = self.menuBar()
+        
+        # File menu
+        file_menu = menubar.addMenu("File")
+        
+        load_action = QAction("Load Data", self)
+        load_action.triggered.connect(self.load_file)
+        file_menu.addAction(load_action)
+        
+        generate_action = QAction("Generate Test Data", self)
+        generate_action.triggered.connect(self.generate_test_data)
+        file_menu.addAction(generate_action)
+        
+        file_menu.addSeparator()
+        
+        export_action = QAction("Export Results", self)
+        export_action.triggered.connect(self.export_results)
+        file_menu.addAction(export_action)
+        
+        file_menu.addSeparator()
+        
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # Visualization menu
+        viz_menu = menubar.addMenu("Visualization")
+        if self.view_3d_enabled:
+            show_3d_action = QAction("Show 3D View", self)
+            show_3d_action.triggered.connect(self.show_3d_view)
+            viz_menu.addAction(show_3d_action)
+            
+            viz_menu.addSeparator()
+            
+            # 3D height factor submenu
+            height_menu = viz_menu.addMenu("3D Height Factor")
+            for height in [0.0, 0.1, 0.2, 0.5, 1.0]:
+                height_action = QAction(f"Height Factor: {height}", self)
+                height_action.triggered.connect(lambda checked, h=height: self._set_height_factor(h))
+                height_menu.addAction(height_action)
+        else:
+            disabled_action = QAction("3D Visualization Disabled", self)
+            disabled_action.setEnabled(False)
+            viz_menu.addAction(disabled_action)
+            
+            install_action = QAction("Install PyVista for 3D features", self)
+            install_action.setEnabled(False)
+            viz_menu.addAction(install_action)
+        
+        # Help menu
+        help_menu = menubar.addMenu("Help")
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
     
     def _setup_file_tab(self):
         """Sets up the file loading tab with controls and visualization area"""
-        # Create frames for controls and visualization
-        control_frame = ttk.Frame(self.file_tab)
-        control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+        # Main layout for the tab
+        tab_layout = QHBoxLayout(self.file_tab)
+        
+        # --- Control panel (left side) ---
+        control_panel = QWidget()
+        control_panel.setMaximumWidth(300)
+        control_layout = QVBoxLayout(control_panel)
         
         # -- File Loading Controls --
-        file_frame = ttk.LabelFrame(control_frame, text="Data Import")
-        file_frame.pack(fill=tk.X, padx=5, pady=5, ipady=5)
+        file_group = QGroupBox("Data Import")
+        file_layout = QVBoxLayout(file_group)
         
         # Buttons for loading files
-        load_btn = ttk.Button(file_frame, text="Load File", command=self.load_file)
-        load_btn.pack(fill=tk.X, padx=5, pady=5)
+        load_btn = QPushButton("Load File")
+        load_btn.clicked.connect(self.load_file)
+        file_layout.addWidget(load_btn)
         
         # Test data generation
-        test_btn = ttk.Button(file_frame, text="Generate Test Data", 
-                            command=self.generate_test_data)
-        test_btn.pack(fill=tk.X, padx=5, pady=5)
+        test_btn = QPushButton("Generate Test Data")
+        test_btn.clicked.connect(self.generate_test_data)
+        file_layout.addWidget(test_btn)
+        
+        control_layout.addWidget(file_group)
         
         # -- Statistics --
-        stats_frame = ttk.LabelFrame(control_frame, text="Statistics")
-        stats_frame.pack(fill=tk.X, padx=5, pady=5, ipady=5)
+        stats_group = QGroupBox("Statistics")
+        stats_layout = QVBoxLayout(stats_group)
         
         # Number of points
-        self.points_var = tk.StringVar(value="Points: 0")
-        points_label = ttk.Label(stats_frame, textvariable=self.points_var)
-        points_label.pack(fill=tk.X, padx=5, pady=2)
+        self.points_label = QLabel("Points: 0")
+        stats_layout.addWidget(self.points_label)
         
         # Bounding box info
-        self.bounds_var = tk.StringVar(value="Bounds: N/A")
-        bounds_label = ttk.Label(stats_frame, textvariable=self.bounds_var)
-        bounds_label.pack(fill=tk.X, padx=5, pady=2)
+        self.bounds_label = QLabel("Bounds: N/A")
+        stats_layout.addWidget(self.bounds_label)
         
-        # -- Visualization Area --
-        viz_frame = ttk.LabelFrame(self.file_tab, text="Point Cloud Visualization")
-        viz_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        control_layout.addWidget(stats_group)
+        control_layout.addStretch()
         
-        # Create container frame for visualization
-        self.file_viz_frame = ttk.Frame(viz_frame)
-        self.file_viz_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        tab_layout.addWidget(control_panel)
+        
+        # --- Visualization Area (right side) ---
+        viz_group = QGroupBox("Point Cloud Visualization")
+        viz_layout = QVBoxLayout(viz_group)
+        
+        # Create container for visualization
+        self.file_viz_frame = QWidget()
+        self.file_viz_layout = QVBoxLayout(self.file_viz_frame)
         
         # Initial visualization panel will show placeholder message
         if HAVE_PYVISTA:
@@ -146,59 +219,71 @@ class MeshItWorkflowGUI:
         else:
             placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nLoad data to visualize points in 2D."
             
-        self.file_viz_placeholder = ttk.Label(self.file_viz_frame, 
-                                             text=placeholder_text,
-                                             anchor="center", justify="center")
-        self.file_viz_placeholder.pack(expand=True)
+        self.file_viz_placeholder = QLabel(placeholder_text)
+        self.file_viz_placeholder.setAlignment(Qt.AlignCenter)
+        self.file_viz_layout.addWidget(self.file_viz_placeholder)
         
+        viz_layout.addWidget(self.file_viz_frame)
+        tab_layout.addWidget(viz_group, 1)  # 1 = stretch factor
+    
     def _setup_hull_tab(self):
         """Sets up the convex hull tab with controls and visualization area"""
-        # Create frames for controls and visualization
-        control_frame = ttk.Frame(self.hull_tab)
-        control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+        # Main layout for the tab
+        tab_layout = QHBoxLayout(self.hull_tab)
+        
+        # --- Control panel (left side) ---
+        control_panel = QWidget()
+        control_panel.setMaximumWidth(300)
+        control_layout = QVBoxLayout(control_panel)
         
         # -- Hull Controls --
-        hull_controls = ttk.LabelFrame(control_frame, text="Hull Controls")
-        hull_controls.pack(fill=tk.X, padx=5, pady=5, ipady=5)
+        hull_group = QGroupBox("Hull Controls")
+        hull_layout = QVBoxLayout(hull_group)
         
         # Compute hull button
-        compute_btn = ttk.Button(hull_controls, text="Compute Convex Hull", 
-                                command=self.compute_hull)
-        compute_btn.pack(fill=tk.X, padx=5, pady=5)
+        compute_btn = QPushButton("Compute Convex Hull")
+        compute_btn.clicked.connect(self.compute_hull)
+        hull_layout.addWidget(compute_btn)
+        
+        control_layout.addWidget(hull_group)
         
         # -- Statistics --
-        stats_frame = ttk.LabelFrame(control_frame, text="Hull Statistics")
-        stats_frame.pack(fill=tk.X, padx=5, pady=5, ipady=5)
+        stats_group = QGroupBox("Hull Statistics")
+        stats_layout = QVBoxLayout(stats_group)
         
         # Hull points count
-        self.hull_points_var = tk.StringVar(value="Hull vertices: 0")
-        hull_points_label = ttk.Label(stats_frame, textvariable=self.hull_points_var)
-        hull_points_label.pack(fill=tk.X, padx=5, pady=2)
+        self.hull_points_label = QLabel("Hull vertices: 0")
+        stats_layout.addWidget(self.hull_points_label)
         
         # Hull area
-        self.hull_area_var = tk.StringVar(value="Hull area: 0.0")
-        hull_area_label = ttk.Label(stats_frame, textvariable=self.hull_area_var)
-        hull_area_label.pack(fill=tk.X, padx=5, pady=2)
+        self.hull_area_label = QLabel("Hull area: 0.0")
+        stats_layout.addWidget(self.hull_area_label)
+        
+        control_layout.addWidget(stats_group)
         
         # Navigation buttons
-        nav_frame = ttk.Frame(control_frame)
-        nav_frame.pack(fill=tk.X, padx=5, pady=15)
+        nav_layout = QHBoxLayout()
         
-        prev_btn = ttk.Button(nav_frame, text="← Previous", 
-                             command=lambda: self.notebook.select(0))
-        prev_btn.pack(side=tk.LEFT)
+        prev_btn = QPushButton("← Previous")
+        prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(0))
+        nav_layout.addWidget(prev_btn)
         
-        next_btn = ttk.Button(nav_frame, text="Next →", 
-                             command=lambda: self.notebook.select(2))
-        next_btn.pack(side=tk.RIGHT)
+        next_btn = QPushButton("Next →")
+        next_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(2))
+        nav_layout.addWidget(next_btn)
         
-        # -- Visualization Area --
-        viz_frame = ttk.LabelFrame(self.hull_tab, text="Convex Hull Visualization")
-        viz_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        control_layout.addLayout(nav_layout)
+        control_layout.addStretch()
         
-        # Create container frame for visualization
-        self.hull_viz_frame = ttk.Frame(viz_frame)
-        self.hull_viz_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        tab_layout.addWidget(control_panel)
+        
+        # --- Visualization Area (right side) ---
+        viz_group = QGroupBox("Convex Hull Visualization")
+        viz_layout = QVBoxLayout(viz_group)
+        
+        # Create container for visualization
+        self.hull_viz_frame = QWidget()
+        self.hull_viz_layout = QVBoxLayout(self.hull_viz_frame)
         
         # Initial visualization panel will show placeholder message
         if HAVE_PYVISTA:
@@ -206,76 +291,88 @@ class MeshItWorkflowGUI:
         else:
             placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nCompute convex hull to visualize in 2D."
             
-        self.hull_viz_placeholder = ttk.Label(self.hull_viz_frame, 
-                                             text=placeholder_text,
-                                             anchor="center", justify="center")
-        self.hull_viz_placeholder.pack(expand=True)
+        self.hull_viz_placeholder = QLabel(placeholder_text)
+        self.hull_viz_placeholder.setAlignment(Qt.AlignCenter)
+        self.hull_viz_layout.addWidget(self.hull_viz_placeholder)
+        
+        viz_layout.addWidget(self.hull_viz_frame)
+        tab_layout.addWidget(viz_group, 1)  # 1 = stretch factor
     
     def _setup_segment_tab(self):
         """Sets up the segmentation tab with controls and visualization area"""
-        # Create frames for controls and visualization
-        control_frame = ttk.Frame(self.segment_tab)
-        control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+        # Main layout for the tab
+        tab_layout = QHBoxLayout(self.segment_tab)
+        
+        # --- Control panel (left side) ---
+        control_panel = QWidget()
+        control_panel.setMaximumWidth(300)
+        control_layout = QVBoxLayout(control_panel)
         
         # -- Segmentation Controls --
-        segment_controls = ttk.LabelFrame(control_frame, text="Segmentation Controls")
-        segment_controls.pack(fill=tk.X, padx=5, pady=5, ipady=5)
+        segment_group = QGroupBox("Segmentation Controls")
+        segment_layout = QVBoxLayout(segment_group)
         
         # Segment length control
-        length_frame = ttk.Frame(segment_controls)
-        length_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        ttk.Label(length_frame, text="Segment Length:").pack(side=tk.LEFT)
-        self.segment_length_var = tk.StringVar(value="1.0")
-        ttk.Entry(length_frame, textvariable=self.segment_length_var, width=8).pack(side=tk.RIGHT)
+        length_layout = QHBoxLayout()
+        length_layout.addWidget(QLabel("Segment Length:"))
+        self.segment_length_input = QLineEdit("1.0")
+        length_layout.addWidget(self.segment_length_input)
+        segment_layout.addLayout(length_layout)
         
         # Segment density control
-        density_frame = ttk.Frame(segment_controls)
-        density_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        ttk.Label(density_frame, text="Density:").pack(side=tk.LEFT)
-        self.segment_density_var = tk.DoubleVar(value=1.0)
-        ttk.Scale(density_frame, variable=self.segment_density_var, 
-                 from_=0.5, to=2.0, orient=tk.HORIZONTAL).pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        density_layout = QHBoxLayout()
+        density_layout.addWidget(QLabel("Density:"))
+        self.segment_density_slider = QSlider(Qt.Horizontal)
+        self.segment_density_slider.setMinimum(50)
+        self.segment_density_slider.setMaximum(200)
+        self.segment_density_slider.setValue(100)
+        density_layout.addWidget(self.segment_density_slider)
+        segment_layout.addLayout(density_layout)
         
         # Compute segments button
-        compute_btn = ttk.Button(segment_controls, text="Compute Segmentation", 
-                                command=self.compute_segments)
-        compute_btn.pack(fill=tk.X, padx=5, pady=10)
+        compute_btn = QPushButton("Compute Segmentation")
+        compute_btn.clicked.connect(self.compute_segments)
+        segment_layout.addWidget(compute_btn)
+        
+        control_layout.addWidget(segment_group)
         
         # -- Statistics --
-        stats_frame = ttk.LabelFrame(control_frame, text="Segment Statistics")
-        stats_frame.pack(fill=tk.X, padx=5, pady=5, ipady=5)
+        stats_group = QGroupBox("Segment Statistics")
+        stats_layout = QVBoxLayout(stats_group)
         
         # Number of segments
-        self.num_segments_var = tk.StringVar(value="Segments: 0")
-        segments_label = ttk.Label(stats_frame, textvariable=self.num_segments_var)
-        segments_label.pack(fill=tk.X, padx=5, pady=2)
+        self.num_segments_label = QLabel("Segments: 0")
+        stats_layout.addWidget(self.num_segments_label)
         
         # Average segment length
-        self.avg_segment_length_var = tk.StringVar(value="Avg length: 0.0")
-        avg_length_label = ttk.Label(stats_frame, textvariable=self.avg_segment_length_var)
-        avg_length_label.pack(fill=tk.X, padx=5, pady=2)
+        self.avg_segment_length_label = QLabel("Avg length: 0.0")
+        stats_layout.addWidget(self.avg_segment_length_label)
+        
+        control_layout.addWidget(stats_group)
         
         # Navigation buttons
-        nav_frame = ttk.Frame(control_frame)
-        nav_frame.pack(fill=tk.X, padx=5, pady=15)
+        nav_layout = QHBoxLayout()
         
-        prev_btn = ttk.Button(nav_frame, text="← Previous", 
-                             command=lambda: self.notebook.select(1))
-        prev_btn.pack(side=tk.LEFT)
+        prev_btn = QPushButton("← Previous")
+        prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(1))
+        nav_layout.addWidget(prev_btn)
         
-        next_btn = ttk.Button(nav_frame, text="Next →", 
-                             command=lambda: self.notebook.select(3))
-        next_btn.pack(side=tk.RIGHT)
+        next_btn = QPushButton("Next →")
+        next_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(3))
+        nav_layout.addWidget(next_btn)
         
-        # -- Visualization Area --
-        viz_frame = ttk.LabelFrame(self.segment_tab, text="Segmentation Visualization")
-        viz_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        control_layout.addLayout(nav_layout)
+        control_layout.addStretch()
         
-        # Create container frame for visualization
-        self.segment_viz_frame = ttk.Frame(viz_frame)
-        self.segment_viz_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        tab_layout.addWidget(control_panel)
+        
+        # --- Visualization Area (right side) ---
+        viz_group = QGroupBox("Segmentation Visualization")
+        viz_layout = QVBoxLayout(viz_group)
+        
+        # Create container for visualization
+        self.segment_viz_frame = QWidget()
+        self.segment_viz_layout = QVBoxLayout(self.segment_viz_frame)
         
         # Initial visualization panel will show placeholder message
         if HAVE_PYVISTA:
@@ -283,144 +380,150 @@ class MeshItWorkflowGUI:
         else:
             placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nCompute segmentation to visualize in 2D."
             
-        self.segment_viz_placeholder = ttk.Label(self.segment_viz_frame, 
-                                               text=placeholder_text,
-                                               anchor="center", justify="center")
-        self.segment_viz_placeholder.pack(expand=True)
+        self.segment_viz_placeholder = QLabel(placeholder_text)
+        self.segment_viz_placeholder.setAlignment(Qt.AlignCenter)
+        self.segment_viz_layout.addWidget(self.segment_viz_placeholder)
+        
+        viz_layout.addWidget(self.segment_viz_frame)
+        tab_layout.addWidget(viz_group, 1)  # 1 = stretch factor
     
     def _setup_triangulation_tab(self):
         """Sets up the triangulation tab with controls and visualization area"""
-        # Create frames for controls and visualization
-        control_frame = ttk.Frame(self.triangulation_tab)
-        control_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+        # Main layout for the tab
+        tab_layout = QHBoxLayout(self.triangulation_tab)
+        
+        # --- Control panel (left side) ---
+        control_panel = QWidget()
+        control_panel.setMaximumWidth(300)
+        control_layout = QVBoxLayout(control_panel)
         
         # -- Triangulation Controls --
-        tri_controls = ttk.LabelFrame(control_frame, text="Triangulation Controls")
-        tri_controls.pack(fill=tk.X, padx=5, pady=5, ipady=5)
+        tri_group = QGroupBox("Triangulation Controls")
+        tri_layout = QVBoxLayout(tri_group)
         
         # Mesh density controls
-        density_frame = ttk.Frame(tri_controls)
-        density_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        ttk.Label(density_frame, text="Mesh Density:").pack(side=tk.LEFT)
-        self.base_size_factor_var = tk.DoubleVar(value=15.0)
-        ttk.Spinbox(density_frame, from_=5.0, to=30.0, textvariable=self.base_size_factor_var,
-                   increment=1.0, width=5).pack(side=tk.RIGHT)
+        density_layout = QFormLayout()
+        self.base_size_factor_input = QDoubleSpinBox()
+        self.base_size_factor_input.setRange(5.0, 30.0)
+        self.base_size_factor_input.setValue(15.0)
+        self.base_size_factor_input.setSingleStep(1.0)
+        density_layout.addRow("Mesh Density:", self.base_size_factor_input)
+        tri_layout.addLayout(density_layout)
         
         # Mesh quality controls
-        quality_frame = ttk.LabelFrame(tri_controls, text="Quality Settings")
-        quality_frame.pack(fill=tk.X, padx=5, pady=5)
+        quality_group = QGroupBox("Quality Settings")
+        quality_layout = QFormLayout(quality_group)
         
         # Gradient
-        gradient_frame = ttk.Frame(quality_frame)
-        gradient_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(gradient_frame, text="Gradient:").pack(side=tk.LEFT)
-        self.gradient_var = tk.DoubleVar(value=1.0)
-        ttk.Spinbox(gradient_frame, from_=1.0, to=3.0, textvariable=self.gradient_var,
-                   increment=0.1, width=5).pack(side=tk.RIGHT)
+        self.gradient_input = QDoubleSpinBox()
+        self.gradient_input.setRange(1.0, 3.0)
+        self.gradient_input.setValue(1.0)
+        self.gradient_input.setSingleStep(0.1)
+        quality_layout.addRow("Gradient:", self.gradient_input)
         
         # Min angle
-        angle_frame = ttk.Frame(quality_frame)
-        angle_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(angle_frame, text="Min Angle:").pack(side=tk.LEFT)
-        self.min_angle_var = tk.DoubleVar(value=25.0)
-        ttk.Spinbox(angle_frame, from_=10.0, to=30.0, textvariable=self.min_angle_var,
-                   increment=1.0, width=5).pack(side=tk.RIGHT)
+        self.min_angle_input = QDoubleSpinBox()
+        self.min_angle_input.setRange(10.0, 30.0)
+        self.min_angle_input.setValue(25.0)
+        self.min_angle_input.setSingleStep(1.0)
+        quality_layout.addRow("Min Angle:", self.min_angle_input)
         
         # Uniform triangulation
-        uniform_frame = ttk.Frame(quality_frame)
-        uniform_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(uniform_frame, text="Uniform:").pack(side=tk.LEFT)
-        self.uniform_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(uniform_frame, variable=self.uniform_var).pack(side=tk.RIGHT)
+        self.uniform_checkbox = QCheckBox()
+        self.uniform_checkbox.setChecked(True)
+        quality_layout.addRow("Uniform:", self.uniform_checkbox)
+        
+        tri_layout.addWidget(quality_group)
         
         # Feature points controls
-        feature_frame = ttk.LabelFrame(tri_controls, text="Feature Points")
-        feature_frame.pack(fill=tk.X, padx=5, pady=5)
+        feature_group = QGroupBox("Feature Points")
+        feature_layout = QFormLayout(feature_group)
         
         # Use features
-        use_features_frame = ttk.Frame(feature_frame)
-        use_features_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(use_features_frame, text="Use Features:").pack(side=tk.LEFT)
-        self.use_feature_points_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(use_features_frame, variable=self.use_feature_points_var).pack(side=tk.RIGHT)
+        self.use_feature_points_checkbox = QCheckBox()
+        feature_layout.addRow("Use Features:", self.use_feature_points_checkbox)
         
         # Number of features
-        num_features_frame = ttk.Frame(feature_frame)
-        num_features_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(num_features_frame, text="Count:").pack(side=tk.LEFT)
-        self.num_features_var = tk.IntVar(value=3)
-        ttk.Spinbox(num_features_frame, from_=1, to=10, textvariable=self.num_features_var,
-                   width=5).pack(side=tk.RIGHT)
+        self.num_features_input = QSpinBox()
+        self.num_features_input.setRange(1, 10)
+        self.num_features_input.setValue(3)
+        feature_layout.addRow("Count:", self.num_features_input)
         
         # Feature size
-        feature_size_frame = ttk.Frame(feature_frame)
-        feature_size_frame.pack(fill=tk.X, padx=5, pady=2)
-        ttk.Label(feature_size_frame, text="Size:").pack(side=tk.LEFT)
-        self.feature_size_var = tk.DoubleVar(value=1.0)
-        ttk.Spinbox(feature_size_frame, from_=0.1, to=3.0, textvariable=self.feature_size_var,
-                   increment=0.1, width=5).pack(side=tk.RIGHT)
+        self.feature_size_input = QDoubleSpinBox()
+        self.feature_size_input.setRange(0.1, 3.0)
+        self.feature_size_input.setValue(1.0)
+        self.feature_size_input.setSingleStep(0.1)
+        feature_layout.addRow("Size:", self.feature_size_input)
+        
+        tri_layout.addWidget(feature_group)
         
         # 3D visualization settings
-        viz3d_frame = ttk.LabelFrame(tri_controls, text="3D Settings")
-        viz3d_frame.pack(fill=tk.X, padx=5, pady=5)
+        viz3d_group = QGroupBox("3D Settings")
+        viz3d_layout = QFormLayout(viz3d_group)
         
         # Height scale
-        height_frame = ttk.Frame(viz3d_frame)
-        height_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(height_frame, text="Height Scale:").pack(side=tk.LEFT)
-        self.height_factor_var = tk.DoubleVar(value=0.2)
-        scale = ttk.Scale(height_frame, variable=self.height_factor_var, from_=0.0, to=1.0,
-                         orient=tk.HORIZONTAL)
-        scale.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        self.height_factor_slider = QSlider(Qt.Horizontal)
+        self.height_factor_slider.setMinimum(0)
+        self.height_factor_slider.setMaximum(100)
+        self.height_factor_slider.setValue(20)  # 20% default
+        viz3d_layout.addRow("Height Scale:", self.height_factor_slider)
+        
+        tri_layout.addWidget(viz3d_group)
         
         # Run triangulation button
-        ttk.Button(tri_controls, text="Run Triangulation", 
-                  command=self.run_triangulation).pack(fill=tk.X, padx=5, pady=10)
+        run_btn = QPushButton("Run Triangulation")
+        run_btn.clicked.connect(self.run_triangulation)
+        tri_layout.addWidget(run_btn)
+        
+        control_layout.addWidget(tri_group)
         
         # -- Statistics --
-        stats_frame = ttk.LabelFrame(control_frame, text="Triangulation Statistics")
-        stats_frame.pack(fill=tk.X, padx=5, pady=5, ipady=5)
+        stats_group = QGroupBox("Triangulation Statistics")
+        stats_layout = QVBoxLayout(stats_group)
         
         # Number of triangles
-        self.num_triangles_var = tk.StringVar(value="Triangles: 0")
-        triangles_label = ttk.Label(stats_frame, textvariable=self.num_triangles_var)
-        triangles_label.pack(fill=tk.X, padx=5, pady=2)
+        self.num_triangles_label = QLabel("Triangles: 0")
+        stats_layout.addWidget(self.num_triangles_label)
         
         # Number of vertices
-        self.num_vertices_var = tk.StringVar(value="Vertices: 0")
-        vertices_label = ttk.Label(stats_frame, textvariable=self.num_vertices_var)
-        vertices_label.pack(fill=tk.X, padx=5, pady=2)
+        self.num_vertices_label = QLabel("Vertices: 0")
+        stats_layout.addWidget(self.num_vertices_label)
         
         # Mean edge length
-        self.mean_edge_var = tk.StringVar(value="Mean edge: 0.0")
-        edge_label = ttk.Label(stats_frame, textvariable=self.mean_edge_var)
-        edge_label.pack(fill=tk.X, padx=5, pady=2)
+        self.mean_edge_label = QLabel("Mean edge: 0.0")
+        stats_layout.addWidget(self.mean_edge_label)
         
         # Edge uniformity
-        self.uniformity_var = tk.StringVar(value="Uniformity: 0.0")
-        uniformity_label = ttk.Label(stats_frame, textvariable=self.uniformity_var)
-        uniformity_label.pack(fill=tk.X, padx=5, pady=2)
+        self.uniformity_label = QLabel("Uniformity: 0.0")
+        stats_layout.addWidget(self.uniformity_label)
+        
+        control_layout.addWidget(stats_group)
         
         # Export button
-        ttk.Button(control_frame, text="Export Results...", 
-                  command=self.export_results).pack(fill=tk.X, padx=5, pady=10)
+        export_btn = QPushButton("Export Results...")
+        export_btn.clicked.connect(self.export_results)
+        control_layout.addWidget(export_btn)
         
         # Navigation buttons
-        nav_frame = ttk.Frame(control_frame)
-        nav_frame.pack(fill=tk.X, padx=5, pady=5)
+        nav_layout = QHBoxLayout()
         
-        prev_btn = ttk.Button(nav_frame, text="← Previous", 
-                             command=lambda: self.notebook.select(2))
-        prev_btn.pack(side=tk.LEFT)
+        prev_btn = QPushButton("← Previous")
+        prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(2))
+        nav_layout.addWidget(prev_btn)
         
-        # -- Visualization Area --
-        viz_frame = ttk.LabelFrame(self.triangulation_tab, text="Triangulation Visualization")
-        viz_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        control_layout.addLayout(nav_layout)
+        control_layout.addStretch()
         
-        # Create container frame for visualization
-        self.tri_viz_frame = ttk.Frame(viz_frame)
-        self.tri_viz_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        tab_layout.addWidget(control_panel)
+        
+        # --- Visualization Area (right side) ---
+        viz_group = QGroupBox("Triangulation Visualization")
+        viz_layout = QVBoxLayout(viz_group)
+        
+        # Create container for visualization
+        self.tri_viz_frame = QWidget()
+        self.tri_viz_layout = QVBoxLayout(self.tri_viz_frame)
         
         # Initial visualization panel will show placeholder message
         if HAVE_PYVISTA:
@@ -428,33 +531,32 @@ class MeshItWorkflowGUI:
         else:
             placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nRun triangulation to visualize in 2D."
             
-        self.tri_viz_placeholder = ttk.Label(self.tri_viz_frame, 
-                                           text=placeholder_text,
-                                           anchor="center", justify="center")
-        self.tri_viz_placeholder.pack(expand=True)
-    
+        self.tri_viz_placeholder = QLabel(placeholder_text)
+        self.tri_viz_placeholder.setAlignment(Qt.AlignCenter)
+        self.tri_viz_layout.addWidget(self.tri_viz_placeholder)
+        
+        viz_layout.addWidget(self.tri_viz_frame)
+        tab_layout.addWidget(viz_group, 1)  # 1 = stretch factor
+
     # Event handlers - placeholder implementations
     def load_file(self):
         """Load data from a file"""
-        self.status_var.set("Loading file...")
+        self.statusBar().showMessage("Loading file...")
         
         # Open file dialog
-        file_path = filedialog.askopenfilename(
-            title="Select a point data file",
-            filetypes=[
-                ("Text files", "*.txt"),
-                ("Data files", "*.dat"),
-                ("CSV files", "*.csv"),
-                ("All files", "*.*")
-            ]
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select a point data file",
+            "",
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;All files (*.*)"
         )
         
         if not file_path:
-            self.status_var.set("File loading canceled")
+            self.statusBar().showMessage("File loading canceled")
             return
             
         # Update status with file path
-        self.status_var.set(f"Loading file: {os.path.basename(file_path)}...")
+        self.statusBar().showMessage(f"Loading file: {os.path.basename(file_path)}...")
         
         try:
             # Try to read the file
@@ -466,7 +568,7 @@ class MeshItWorkflowGUI:
                 # Visualize the loaded points
                 self._plot_points(points)
                 
-                self.status_var.set(f"Successfully loaded {len(points)} points")
+                self.statusBar().showMessage(f"Successfully loaded {len(points)} points")
                 
                 # Clear any previous results from later steps
                 self.hull_points = None
@@ -478,13 +580,13 @@ class MeshItWorkflowGUI:
                 self._clear_segment_plot()
                 self._clear_triangulation_plot()
             else:
-                self.status_var.set("Error: No valid points found in file")
-                messagebox.showerror("Error", "No valid points found in file")
+                self.statusBar().showMessage("Error: No valid points found in file")
+                QMessageBox.critical(self, "Error", "No valid points found in file")
         
         except Exception as e:
-            self.status_var.set(f"Error loading file: {str(e)}")
+            self.statusBar().showMessage(f"Error loading file: {str(e)}")
             logger.error(f"Error loading file: {str(e)}")
-            messagebox.showerror("Error", f"Error loading file: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error loading file: {str(e)}")
     
     def _read_point_file(self, file_path):
         """Read points from a file"""
@@ -520,49 +622,74 @@ class MeshItWorkflowGUI:
             
         except Exception as e:
             logger.error(f"Error reading file: {str(e)}")
-            messagebox.showerror("Error", f"Error reading file: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error reading file: {str(e)}")
             return None
-    
+
     def generate_test_data(self):
         """Generate test data"""
-        self.status_var.set("Generating test data...")
+        self.statusBar().showMessage("Generating test data...")
         
-        # Open a dialog to select the type of test data
-        test_data_types = {
-            "Random Points": self._generate_random_points,
-            "Circle": self._generate_circle_points,
-            "Square": self._generate_square_points,
-            "Complex Shape": self._generate_complex_shape
-        }
+        # Create a dialog to select the type of test data
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Generate Test Data")
+        dialog.setFixedSize(300, 250)
+        dialog_layout = QVBoxLayout(dialog)
         
-        # Simple dialog for data type
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Generate Test Data")
-        dialog.geometry("300x250")
-        dialog.resizable(False, False)
-        dialog.transient(self.root)
-        dialog.grab_set()
+        # Data type selection
+        dialog_layout.addWidget(QLabel("Select data type:"))
         
-        ttk.Label(dialog, text="Select data type:").pack(pady=5)
+        data_type_group = QButtonGroup(dialog)
+        data_types = ["Random Points", "Circle", "Square", "Complex Shape"]
+        data_type_buttons = {}
         
-        data_type_var = tk.StringVar(value="Random Points")
-        for data_type in test_data_types.keys():
-            ttk.Radiobutton(dialog, text=data_type, variable=data_type_var, 
-                           value=data_type).pack(anchor=tk.W, padx=20, pady=2)
+        for i, data_type in enumerate(data_types):
+            radio = QRadioButton(data_type)
+            dialog_layout.addWidget(radio)
+            data_type_group.addButton(radio, i)
+            data_type_buttons[i] = radio
+            if i == 0:  # Select the first option by default
+                radio.setChecked(True)
         
-        ttk.Label(dialog, text="Number of points:").pack(pady=5)
-        num_points_var = tk.IntVar(value=100)
-        ttk.Spinbox(dialog, from_=10, to=1000, textvariable=num_points_var, 
-                   width=5).pack(pady=5)
+        dialog_layout.addWidget(QLabel("Number of points:"))
         
-        def on_generate():
-            data_type = data_type_var.get()
-            num_points = num_points_var.get()
-            dialog.destroy()
-            
-            # Generate the selected data type
-            if data_type in test_data_types:
-                points = test_data_types[data_type](num_points)
+        num_points_input = QSpinBox()
+        num_points_input.setRange(10, 1000)
+        num_points_input.setValue(100)
+        dialog_layout.addWidget(num_points_input)
+        
+        button_layout = QHBoxLayout()
+        generate_btn = QPushButton("Generate")
+        cancel_btn = QPushButton("Cancel")
+        button_layout.addWidget(cancel_btn)
+        button_layout.addWidget(generate_btn)
+        
+        dialog_layout.addLayout(button_layout)
+        
+        # Connect signals
+        cancel_btn.clicked.connect(dialog.reject)
+        generate_btn.clicked.connect(dialog.accept)
+        
+        # Show dialog and get result
+        result = dialog.exec_()
+        
+        if result == QDialog.Accepted:
+            # Get the selected data type
+            selected_id = data_type_group.checkedId()
+            if selected_id >= 0:
+                data_type = data_types[selected_id]
+                num_points = num_points_input.value()
+                
+                # Generate the selected data type
+                if data_type == "Random Points":
+                    points = self._generate_random_points(num_points)
+                elif data_type == "Circle":
+                    points = self._generate_circle_points(num_points)
+                elif data_type == "Square":
+                    points = self._generate_square_points(num_points)
+                elif data_type == "Complex Shape":
+                    points = self._generate_complex_shape(num_points)
+                else:
+                    points = None
                 
                 if points is not None:
                     self.points = points
@@ -570,7 +697,7 @@ class MeshItWorkflowGUI:
                     # Visualize the generated points
                     self._plot_points(points)
                     
-                    self.status_var.set(f"Generated {len(points)} {data_type} points")
+                    self.statusBar().showMessage(f"Generated {len(points)} {data_type} points")
                     
                     # Clear any previous results from later steps
                     self.hull_points = None
@@ -581,18 +708,8 @@ class MeshItWorkflowGUI:
                     self._clear_hull_plot()
                     self._clear_segment_plot()
                     self._clear_triangulation_plot()
-        
-        ttk.Button(dialog, text="Generate", command=on_generate).pack(pady=10)
-        ttk.Button(dialog, text="Cancel", command=dialog.destroy).pack(pady=5)
-        
-        # Center the dialog on the parent window
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{x}+{y}")
-        
-        # Wait for the dialog to be closed
-        self.root.wait_window(dialog)
+        else:
+            self.statusBar().showMessage("Test data generation canceled")
     
     def _generate_random_points(self, num_points=100):
         """Generate random points"""
@@ -681,8 +798,79 @@ class MeshItWorkflowGUI:
                 points.append([x, y])
         
         return np.array(points)
+
+    # Visualization methods
+    def _clear_hull_plot(self):
+        """Clear the hull plot"""
+        # Clear existing visualization
+        while self.hull_viz_layout.count():
+            item = self.hull_viz_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+            
+        # Reset placeholder
+        if HAVE_PYVISTA:
+            placeholder_text = "Compute convex hull to visualize in 3D"
+        else:
+            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nCompute convex hull to visualize in 2D."
+            
+        self.hull_viz_placeholder = QLabel(placeholder_text)
+        self.hull_viz_placeholder.setAlignment(Qt.AlignCenter)
+        self.hull_viz_layout.addWidget(self.hull_viz_placeholder)
+        
+        # Reset hull info
+        self.hull_points_label.setText("Hull vertices: 0")
+        self.hull_area_label.setText("Hull area: 0.0")
     
-    # Plotting utilities
+    def _clear_segment_plot(self):
+        """Clear the segmentation plot"""
+        # Clear existing visualization
+        while self.segment_viz_layout.count():
+            item = self.segment_viz_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+            
+        # Reset placeholder
+        if HAVE_PYVISTA:
+            placeholder_text = "Compute segmentation to visualize in 3D"
+        else:
+            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nCompute segmentation to visualize in 2D."
+            
+        self.segment_viz_placeholder = QLabel(placeholder_text)
+        self.segment_viz_placeholder.setAlignment(Qt.AlignCenter)
+        self.segment_viz_layout.addWidget(self.segment_viz_placeholder)
+        
+        # Reset segment info
+        self.num_segments_label.setText("Segments: 0")
+        self.avg_segment_length_label.setText("Avg length: 0.0")
+    
+    def _clear_triangulation_plot(self):
+        """Clear the triangulation plot"""
+        # Clear existing visualization
+        while self.tri_viz_layout.count():
+            item = self.tri_viz_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+            
+        # Reset placeholder
+        if HAVE_PYVISTA:
+            placeholder_text = "Run triangulation to visualize in 3D"
+        else:
+            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nRun triangulation to visualize in 2D."
+            
+        self.tri_viz_placeholder = QLabel(placeholder_text)
+        self.tri_viz_placeholder.setAlignment(Qt.AlignCenter)
+        self.tri_viz_layout.addWidget(self.tri_viz_placeholder)
+        
+        # Reset triangulation info
+        self.num_triangles_label.setText("Triangles: 0")
+        self.num_vertices_label.setText("Vertices: 0")
+        self.mean_edge_label.setText("Mean edge: 0.0")
+        self.uniformity_label.setText("Uniformity: 0.0")
+    
     def _plot_points(self, points):
         """Visualize the loaded points using 3D visualization instead of matplotlib
         
@@ -693,16 +881,19 @@ class MeshItWorkflowGUI:
             return
             
         # Update statistics
-        self.points_var.set(f"Points: {len(points)}")
+        self.points_label.setText(f"Points: {len(points)}")
         
         # Calculate bounds
         min_x, min_y = np.min(points, axis=0)
         max_x, max_y = np.max(points, axis=0)
-        self.bounds_var.set(f"Bounds: X[{min_x:.2f},{max_x:.2f}] Y[{min_y:.2f},{max_y:.2f}]")
+        self.bounds_label.setText(f"Bounds: X[{min_x:.2f},{max_x:.2f}] Y[{min_y:.2f},{max_y:.2f}]")
         
         # Clear existing visualization
-        for widget in self.file_viz_frame.winfo_children():
-            widget.destroy()
+        while self.file_viz_layout.count():
+            item = self.file_viz_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
             
         # Create 3D visualization
         if self.view_3d_enabled:
@@ -729,88 +920,20 @@ class MeshItWorkflowGUI:
             ax.set_ylim(min_y - padding, max_y + padding)
             
             # Create canvas
-            canvas = FigureCanvasTkAgg(fig, master=self.file_viz_frame)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            canvas = FigureCanvas(fig)
+            self.file_viz_layout.addWidget(canvas)
             
             # Add toolbar
-            toolbar_frame = ttk.Frame(self.file_viz_frame)
-            toolbar_frame.pack(fill=tk.X)
-            toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
-            toolbar.update()
-    
-    def _clear_hull_plot(self):
-        """Clear the hull plot"""
-        # Clear existing visualization
-        for widget in self.hull_viz_frame.winfo_children():
-            widget.destroy()
-            
-        # Reset placeholder
-        if HAVE_PYVISTA:
-            placeholder_text = "Compute convex hull to visualize in 3D"
-        else:
-            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nCompute convex hull to visualize in 2D."
-            
-        self.hull_viz_placeholder = ttk.Label(self.hull_viz_frame, 
-                                             text=placeholder_text,
-                                             anchor="center", justify="center")
-        self.hull_viz_placeholder.pack(expand=True)
-        
-        # Reset hull info
-        self.hull_points_var.set("Hull vertices: 0")
-        self.hull_area_var.set("Hull area: 0.0")
-    
-    def _clear_segment_plot(self):
-        """Clear the segmentation plot"""
-        # Clear existing visualization
-        for widget in self.segment_viz_frame.winfo_children():
-            widget.destroy()
-            
-        # Reset placeholder
-        if HAVE_PYVISTA:
-            placeholder_text = "Compute segmentation to visualize in 3D"
-        else:
-            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nCompute segmentation to visualize in 2D."
-            
-        self.segment_viz_placeholder = ttk.Label(self.segment_viz_frame, 
-                                               text=placeholder_text,
-                                               anchor="center", justify="center")
-        self.segment_viz_placeholder.pack(expand=True)
-        
-        # Reset segment info
-        self.num_segments_var.set("Segments: 0")
-        self.avg_segment_length_var.set("Avg length: 0.0")
-    
-    def _clear_triangulation_plot(self):
-        """Clear the triangulation plot"""
-        # Clear existing visualization
-        for widget in self.tri_viz_frame.winfo_children():
-            widget.destroy()
-            
-        # Reset placeholder
-        if HAVE_PYVISTA:
-            placeholder_text = "Run triangulation to visualize in 3D"
-        else:
-            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nRun triangulation to visualize in 2D."
-            
-        self.tri_viz_placeholder = ttk.Label(self.tri_viz_frame, 
-                                           text=placeholder_text,
-                                           anchor="center", justify="center")
-        self.tri_viz_placeholder.pack(expand=True)
-        
-        # Reset triangulation info
-        self.num_triangles_var.set("Triangles: 0")
-        self.num_vertices_var.set("Vertices: 0")
-        self.mean_edge_var.set("Mean edge: 0.0")
-        self.uniformity_var.set("Uniformity: 0.0")
-    
+            toolbar = NavigationToolbar(canvas, self.file_viz_frame)
+            self.file_viz_layout.addWidget(toolbar)
+
     def compute_hull(self):
         """Compute the convex hull of the loaded points"""
-        self.status_var.set("Computing convex hull...")
+        self.statusBar().showMessage("Computing convex hull...")
         
         if self.points is None or len(self.points) < 3:
-            self.status_var.set("Error: Need at least 3 points to compute hull")
-            messagebox.showerror("Error", "Need at least 3 points to compute hull")
+            self.statusBar().showMessage("Error: Need at least 3 points to compute hull")
+            QMessageBox.critical(self, "Error", "Need at least 3 points to compute hull")
             return
         
         try:
@@ -826,13 +949,13 @@ class MeshItWorkflowGUI:
             hull_area = hull.volume  # In 2D, volume means area
             
             # Update hull info
-            self.hull_points_var.set(f"Hull vertices: {len(hull.vertices)}")
-            self.hull_area_var.set(f"Hull area: {hull_area:.2f}")
+            self.hull_points_label.setText(f"Hull vertices: {len(hull.vertices)}")
+            self.hull_area_label.setText(f"Hull area: {hull_area:.2f}")
             
             # Visualize the hull
             self._plot_hull(self.points, self.hull_points)
             
-            self.status_var.set(f"Computed convex hull with {len(hull.vertices)} vertices")
+            self.statusBar().showMessage(f"Computed convex hull with {len(hull.vertices)} vertices")
             
             # Clear any previous results from later steps
             self.segments = None
@@ -843,12 +966,12 @@ class MeshItWorkflowGUI:
             self._clear_triangulation_plot()
             
             # Auto-switch to the hull tab
-            self.notebook.select(1)  # Select hull tab (index 1)
+            self.notebook.setCurrentIndex(1)  # Select hull tab (index 1)
             
         except Exception as e:
-            self.status_var.set(f"Error computing hull: {str(e)}")
+            self.statusBar().showMessage(f"Error computing hull: {str(e)}")
             logger.error(f"Error computing hull: {str(e)}")
-            messagebox.showerror("Error", f"Error computing hull: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error computing hull: {str(e)}")
     
     def _plot_hull(self, points, hull_points):
         """Visualize the hull using 3D visualization instead of matplotlib
@@ -861,7 +984,7 @@ class MeshItWorkflowGUI:
             return
             
         # Update statistics
-        self.hull_points_var.set(f"Hull vertices: {len(hull_points)-1}")  # -1 for the closing point
+        self.hull_points_label.setText(f"Hull vertices: {len(hull_points)-1}")  # -1 for the closing point
         
         # Calculate hull area (approximate)
         area = 0.0
@@ -870,11 +993,14 @@ class MeshItWorkflowGUI:
             x2, y2 = hull_points[i+1]
             area += x1*y2 - x2*y1
         area = abs(area) / 2.0
-        self.hull_area_var.set(f"Hull area: {area:.2f}")
+        self.hull_area_label.setText(f"Hull area: {area:.2f}")
         
         # Clear existing visualization
-        for widget in self.hull_viz_frame.winfo_children():
-            widget.destroy()
+        while self.hull_viz_layout.count():
+            item = self.hull_viz_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
             
         # Create 3D visualization
         if self.view_3d_enabled:
@@ -935,34 +1061,295 @@ class MeshItWorkflowGUI:
             ax.set_ylim(min_coords[1] - margin, max_coords[1] + margin)
             
             # Create canvas
-            canvas = FigureCanvasTkAgg(fig, master=self.hull_viz_frame)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            canvas = FigureCanvas(fig)
+            self.hull_viz_layout.addWidget(canvas)
             
             # Add toolbar
-            toolbar_frame = ttk.Frame(self.segment_viz_frame)
-            toolbar_frame.pack(fill=tk.X)
-            toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
-            toolbar.update()
+            toolbar = NavigationToolbar(canvas, self.hull_viz_frame)
+            self.hull_viz_layout.addWidget(toolbar)
     
+    def _create_3d_visualization(self, parent_frame, points, title="3D Visualization", 
+                               point_colors=None, lines=None, triangles=None, feature_points=None):
+        """Create a visualization of the data in 3D using PyVista
+        
+        Args:
+            parent_frame: Frame to contain the visualization
+            points: Points to visualize (Nx2 or Nx3 array)
+            title: Title for the visualization
+            point_colors: Optional colors for points
+            lines: Optional line segments to draw
+            triangles: Optional triangles to draw
+            feature_points: Optional feature points to highlight
+            
+        Returns:
+            Frame containing the visualization
+        """
+        if not HAVE_PYVISTA:
+            # Create a message if PyVista is not available
+            msg_widget = QWidget()
+            msg_layout = QVBoxLayout(msg_widget)
+            
+            msg = QLabel("PyVista not installed.\nPlease install PyVista for 3D visualization.")
+            msg.setAlignment(Qt.AlignCenter)
+            msg_layout.addWidget(msg)
+            
+            parent_frame.layout().addWidget(msg_widget)
+            return msg_widget
+        
+        # Create a frame for the visualization
+        vis_widget = QWidget()
+        vis_layout = QVBoxLayout(vis_widget)
+        
+        # Close previous plotter if it exists
+        if self.current_plotter is not None:
+            try:
+                self.current_plotter.close()
+            except:
+                pass
+        
+        # Add button to open a separate interactive window
+        open_3d_btn = QPushButton("Open 3D Interactive View")
+        open_3d_btn.clicked.connect(lambda: self._show_interactive_3d(
+            points=points, 
+            point_colors=point_colors, 
+            lines=lines, 
+            triangles=triangles, 
+            title=title
+        ))
+        vis_layout.addWidget(open_3d_btn)
+        
+        # Create a placeholder for the 3D visualization
+        preview_group = QGroupBox("3D Preview")
+        preview_layout = QVBoxLayout(preview_group)
+        
+        # Add a label with info about the visualization
+        vis_info = f"{title}\n"
+        vis_info += f"Points: {len(points)}\n"
+        if lines is not None and len(lines) > 0:
+            vis_info += f"Lines: {len(lines)}\n"
+        if triangles is not None and len(triangles) > 0:
+            vis_info += f"Triangles: {len(triangles)}\n"
+            
+        info_label = QLabel(vis_info)
+        info_label.setAlignment(Qt.AlignCenter)
+        preview_layout.addWidget(info_label)
+        
+        note_label = QLabel("Click 'Open 3D Interactive View' for full 3D visualization")
+        note_label.setAlignment(Qt.AlignCenter)
+        font = note_label.font()
+        font.setItalic(True)
+        note_label.setFont(font)
+        preview_layout.addWidget(note_label)
+        
+        vis_layout.addWidget(preview_group)
+        parent_frame.layout().addWidget(vis_widget)
+        
+        return vis_widget
+    
+    def _show_interactive_3d(self, points, point_colors=None, lines=None, triangles=None,
+                           feature_points=None, title="MeshIt 3D View"):
+        """Open an interactive 3D visualization window"""
+        if not self.view_3d_enabled:
+            QMessageBox.information(self, "PyVista Not Available", 
+                                 "PyVista is not available. Please install PyVista for 3D visualization.")
+            return
+            
+        if points is None or len(points) == 0:
+            QMessageBox.information(self, "No Data", 
+                                 "No data available to visualize.")
+            return
+        
+        # Close previous plotter if it exists
+        if hasattr(self, 'pv_plotter') and self.pv_plotter is not None:
+            try:
+                self.pv_plotter.close()
+            except:
+                pass
+        
+        # Create a new plotter
+        self.pv_plotter = pv.Plotter(window_size=[800, 600], title=title)
+        self.pv_plotter.set_background("#383F51")  # Dark blue background
+        
+        # Ensure points are 3D
+        if points.shape[1] == 2:
+            # Convert 2D points to 3D
+            points_3d = np.zeros((len(points), 3))
+            points_3d[:, 0] = points[:, 0]
+            points_3d[:, 1] = points[:, 1]
+            
+            # Add Z values with a nice pattern
+            x_scale = 0.05
+            y_scale = 0.05
+            z_scale = 20.0 * self.height_factor
+            
+            for i in range(len(points)):
+                x, y = points[i]
+                z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
+                points_3d[i, 2] = z
+        else:
+            points_3d = points.copy()
+        
+        # Create a point cloud
+        if point_colors is None:
+            point_colors = np.full(len(points_3d), 'blue')
+        
+        # Create a PolyData with points
+        point_cloud = pv.PolyData(points_3d)
+        if isinstance(point_colors, np.ndarray) and point_colors.shape == (len(points_3d),):
+            point_cloud["colors"] = point_colors
+            self.pv_plotter.add_mesh(point_cloud, render_points_as_spheres=True, 
+                                  point_size=10, scalar_bar_args={'title': 'Colors'})
+        else:
+            self.pv_plotter.add_mesh(point_cloud, color='blue', render_points_as_spheres=True, 
+                                  point_size=10)
+        
+        # Add lines if provided
+        if lines is not None and len(lines) > 0:
+            try:
+                for i, line in enumerate(lines):
+                    # Create 3D line points
+                    line_points = np.zeros((2, 3))
+                    line_points[0, 0] = line[0][0]
+                    line_points[0, 1] = line[0][1]
+                    line_points[1, 0] = line[1][0]
+                    line_points[1, 1] = line[1][1]
+                    
+                    # Set Z values
+                    x1, y1 = line[0]
+                    x2, y2 = line[1]
+                    line_points[0, 2] = np.sin(x1 * x_scale) * np.cos(y1 * y_scale) * z_scale
+                    line_points[1, 2] = np.sin(x2 * x_scale) * np.cos(y2 * y_scale) * z_scale
+                    
+                    # Create line
+                    line_obj = pv.Line(line_points[0], line_points[1])
+                    self.pv_plotter.add_mesh(line_obj, color='green', line_width=3)
+            except Exception as e:
+                print(f"Error adding lines: {str(e)}")
+        
+        # Add triangles if provided
+        if triangles is not None and len(triangles) > 0:
+            try:
+                # Create cells array
+                cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
+                surface = pv.PolyData(points_3d, cells)
+                self.pv_plotter.add_mesh(surface, color='#70D6FF', show_edges=True, 
+                                      line_width=1, edge_color='#00CCFF', 
+                                      specular=0.5, smooth_shading=True)
+            except Exception as e:
+                print(f"Error adding triangles: {str(e)}")
+        
+        # Add feature points if provided
+        if feature_points is not None and len(feature_points) > 0:
+            try:
+                # Convert feature points to 3D
+                fp_3d = np.zeros((len(feature_points), 3))
+                fp_3d[:, 0] = feature_points[:, 0]
+                fp_3d[:, 1] = feature_points[:, 1]
+                
+                # Add Z values
+                for i in range(len(feature_points)):
+                    x, y = feature_points[i]
+                    z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
+                    fp_3d[i, 2] = z
+                
+                # Create point cloud for feature points
+                fp_cloud = pv.PolyData(fp_3d)
+                self.pv_plotter.add_mesh(fp_cloud, color='red', render_points_as_spheres=True, 
+                                      point_size=15)
+            except Exception as e:
+                print(f"Error adding feature points: {str(e)}")
+        
+        # Add axes for reference
+        self.pv_plotter.add_axes()
+        
+        # Add title with statistics
+        if title:
+            self.pv_plotter.add_text(title, font_size=12, position='upper_edge')
+        
+        # Show the plotter in a separate window
+        self.pv_plotter.show()
+        
+    def show_3d_view(self):
+        """Show 3D view of the triangulation in a separate window"""
+        if not self.view_3d_enabled:
+            QMessageBox.information(self, "PyVista Not Available", 
+                                 "PyVista is not available. Please install PyVista for 3D visualization.")
+            return
+            
+        if not hasattr(self, 'triangulation_result') or self.triangulation_result is None:
+            QMessageBox.information(self, "No Triangulation", 
+                                 "Please run triangulation first before showing 3D view.")
+            return
+            
+        # Get triangulation data
+        vertices = self.triangulation_result['vertices']
+        triangles = self.triangulation_result['triangles']
+        hull_points = self.hull_points if hasattr(self, 'hull_points') else None
+        
+        # Create hull lines if available
+        hull_lines = None
+        if hull_points is not None and len(hull_points) > 2:
+            hull_lines = []
+            for i in range(len(hull_points)-1):
+                start = hull_points[i]
+                end = hull_points[i+1]
+                hull_lines.append([start, end])
+        
+        # Show in interactive window
+        title = f"MeshIt 3D View - {len(triangles)} triangles"
+        self._show_interactive_3d(
+            points=vertices, 
+            lines=hull_lines,
+            triangles=triangles,
+            title=title
+        )
+        
+    def _set_height_factor(self, height):
+        """Set the height factor for 3D visualization"""
+        self.height_factor = height
+        self.height_factor_slider.setValue(int(height * 100))
+        
+        # Update existing visualization if any
+        if hasattr(self, 'triangulation_result') and self.triangulation_result is not None:
+            vertices = self.triangulation_result['vertices']
+            triangles = self.triangulation_result['triangles']
+            self._plot_triangulation(vertices, triangles, self.hull_points)
+    
+    def _show_about(self):
+        """Show about dialog"""
+        about_text = """
+MeshIt Workflow GUI
+
+A graphical interface for the complete MeshIt workflow,
+including file loading, convex hull computation, 
+segmentation, triangulation, and visualization.
+
+3D Visualization: {status}
+"""
+        
+        status = "Enabled" if self.view_3d_enabled else "Disabled (Install PyVista)"
+        about_text = about_text.format(status=status)
+        
+        QMessageBox.information(self, "About MeshIt Workflow GUI", about_text)
+
     def compute_segments(self):
         """Compute the segmentation of the convex hull"""
-        self.status_var.set("Computing segments...")
+        self.statusBar().showMessage("Computing segments...")
         
         if self.hull_points is None or len(self.hull_points) < 4:  # 3 vertices + 1 closing point
-            self.status_var.set("Error: Compute convex hull first")
-            messagebox.showerror("Error", "Please compute the convex hull first")
+            self.statusBar().showMessage("Error: Compute convex hull first")
+            QMessageBox.critical(self, "Error", "Please compute the convex hull first")
             return
         
         # Get the segmentation parameters from the UI
         try:
-            segment_length = float(self.segment_length_var.get())
+            segment_length = float(self.segment_length_input.text())
             if segment_length <= 0:
                 segment_length = 1.0
-                self.segment_length_var.set("1.0")
+                self.segment_length_input.setText("1.0")
         except ValueError:
             segment_length = 1.0
-            self.segment_length_var.set("1.0")
+            self.segment_length_input.setText("1.0")
         
         try:
             # Extract the hull boundary (excluding the closing point)
@@ -985,7 +1372,11 @@ class MeshItWorkflowGUI:
             if segment_length > optimal_segment_length * 3 or segment_length < optimal_segment_length * 0.3:
                 logger.info(f"Adjusting segment length from {segment_length} to {optimal_segment_length}")
                 segment_length = optimal_segment_length
-                self.segment_length_var.set(f"{segment_length:.2f}")
+                self.segment_length_input.setText(f"{segment_length:.2f}")
+            
+            # Density factor from slider (0.5 to 2.0 range)
+            density_factor = self.segment_density_slider.value() / 100.0
+            segment_length /= density_factor
             
             # Generate segments along the hull boundary with uniform distribution
             segments = []
@@ -1018,13 +1409,13 @@ class MeshItWorkflowGUI:
             avg_segment_length = np.mean(segment_lengths)
             
             # Update segment info
-            self.num_segments_var.set(f"Segments: {len(segments)}")
-            self.avg_segment_length_var.set(f"Avg length: {avg_segment_length:.2f}")
+            self.num_segments_label.setText(f"Segments: {len(segments)}")
+            self.avg_segment_length_label.setText(f"Avg length: {avg_segment_length:.2f}")
             
             # Visualize the segments
             self._plot_segments(self.points, self.hull_points, self.segments)
             
-            self.status_var.set(f"Computed {len(segments)} segments, avg length: {avg_segment_length:.2f}")
+            self.statusBar().showMessage(f"Computed {len(segments)} segments, avg length: {avg_segment_length:.2f}")
             
             # Clear any previous results from later steps
             self.triangulation_result = None
@@ -1033,12 +1424,12 @@ class MeshItWorkflowGUI:
             self._clear_triangulation_plot()
             
             # Auto-switch to the segments tab
-            self.notebook.select(2)  # Select segments tab (index 2)
+            self.notebook.setCurrentIndex(2)  # Select segments tab (index 2)
             
         except Exception as e:
-            self.status_var.set(f"Error computing segments: {str(e)}")
+            self.statusBar().showMessage(f"Error computing segments: {str(e)}")
             logger.error(f"Error computing segments: {str(e)}")
-            messagebox.showerror("Error", f"Error computing segments: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error computing segments: {str(e)}")
             
     def _plot_segments(self, points, hull_points, segments):
         """Visualize the segments using 3D visualization instead of matplotlib
@@ -1052,16 +1443,19 @@ class MeshItWorkflowGUI:
             return
             
         # Update statistics
-        self.num_segments_var.set(f"Segments: {len(segments)}")
+        self.num_segments_label.setText(f"Segments: {len(segments)}")
         
         # Calculate average segment length
         segment_lengths = [np.linalg.norm(segment[1] - segment[0]) for segment in segments]
         avg_length = np.mean(segment_lengths)
-        self.avg_segment_length_var.set(f"Avg length: {avg_length:.2f}")
+        self.avg_segment_length_label.setText(f"Avg length: {avg_length:.2f}")
         
         # Clear existing visualization
-        for widget in self.segment_viz_frame.winfo_children():
-            widget.destroy()
+        while self.segment_viz_layout.count():
+            item = self.segment_viz_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
             
         # Create 3D visualization
         if self.view_3d_enabled:
@@ -1132,31 +1526,28 @@ class MeshItWorkflowGUI:
             ax.set_ylim(min_coords[1] - margin, max_coords[1] + margin)
             
             # Create canvas
-            canvas = FigureCanvasTkAgg(fig, master=self.segment_viz_frame)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            canvas = FigureCanvas(fig)
+            self.segment_viz_layout.addWidget(canvas)
             
             # Add toolbar
-            toolbar_frame = ttk.Frame(self.segment_viz_frame)
-            toolbar_frame.pack(fill=tk.X)
-            toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
-            toolbar.update()
-    
+            toolbar = NavigationToolbar(canvas, self.segment_viz_frame)
+            self.segment_viz_layout.addWidget(toolbar)
+
     def run_triangulation(self):
         """Run triangulation on the segments and points"""
-        self.status_var.set("Running triangulation...")
+        self.statusBar().showMessage("Running triangulation...")
         
         if self.segments is None or len(self.segments) < 3:
-            self.status_var.set("Error: Compute segments first")
-            messagebox.showerror("Error", "Please compute segments first")
+            self.statusBar().showMessage("Error: Compute segments first")
+            QMessageBox.critical(self, "Error", "Please compute segments first")
             return
         
         # Get triangulation parameters from UI
-        gradient = self.gradient_var.get()
-        min_angle = self.min_angle_var.get()
-        base_size_factor = self.base_size_factor_var.get()
-        uniform = self.uniform_var.get()
-        use_feature_points = self.use_feature_points_var.get()
+        gradient = self.gradient_input.value()
+        min_angle = self.min_angle_input.value()
+        base_size_factor = self.base_size_factor_input.value()
+        uniform = self.uniform_checkbox.isChecked()
+        use_feature_points = self.use_feature_points_checkbox.isChecked()
         
         try:
             start_time = time.time()
@@ -1227,7 +1618,7 @@ class MeshItWorkflowGUI:
             triangulator.set_triangle_options(triangle_options)
             
             # Run triangulation
-            self.status_var.set(f"Running triangulation with base size {base_size:.2f}...")
+            self.statusBar().showMessage(f"Running triangulation with base size {base_size:.2f}...")
             
             triangulation_result = triangulator.triangulate(
                 points=all_points,
@@ -1256,15 +1647,15 @@ class MeshItWorkflowGUI:
             # Calculate elapsed time
             elapsed_time = time.time() - start_time
             
-            self.status_var.set(f"Completed triangulation: {len(triangles)} triangles, {len(vertices)} vertices in {elapsed_time:.2f}s")
+            self.statusBar().showMessage(f"Completed triangulation: {len(triangles)} triangles, {len(vertices)} vertices in {elapsed_time:.2f}s")
             
             # Auto-switch to the triangulation tab
-            self.notebook.select(3)  # Select triangulation tab (index 3)
+            self.notebook.setCurrentIndex(3)  # Select triangulation tab (index 3)
             
         except Exception as e:
-            self.status_var.set(f"Error in triangulation: {str(e)}")
+            self.statusBar().showMessage(f"Error in triangulation: {str(e)}")
             logger.error(f"Error during triangulation: {str(e)}")
-            messagebox.showerror("Error", f"Error in triangulation: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error in triangulation: {str(e)}")
     
     def _plot_triangulation(self, vertices, triangles, hull_points=None):
         """Plot the triangulation using 3D visualization
@@ -1278,8 +1669,8 @@ class MeshItWorkflowGUI:
             return
             
         # Update statistics
-        self.num_triangles_var.set(f"Triangles: {len(triangles)}")
-        self.num_vertices_var.set(f"Vertices: {len(vertices)}")
+        self.num_triangles_label.setText(f"Triangles: {len(triangles)}")
+        self.num_vertices_label.setText(f"Vertices: {len(vertices)}")
         
         # Calculate edge lengths and statistics
         edge_lengths = []
@@ -1297,12 +1688,15 @@ class MeshItWorkflowGUI:
         edge_std = np.std(edge_lengths)
         uniformity = edge_std / mean_edge if mean_edge > 0 else 0
         
-        self.mean_edge_var.set(f"Mean edge: {mean_edge:.4f}")
-        self.uniformity_var.set(f"Uniformity: {uniformity:.4f}")
+        self.mean_edge_label.setText(f"Mean edge: {mean_edge:.4f}")
+        self.uniformity_label.setText(f"Uniformity: {uniformity:.4f}")
         
         # Clear existing visualization
-        for widget in self.tri_viz_frame.winfo_children():
-            widget.destroy()
+        while self.tri_viz_layout.count():
+            item = self.tri_viz_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
 
         # Create lines from hull points if available
         hull_lines = None
@@ -1358,311 +1752,122 @@ class MeshItWorkflowGUI:
             ax.set_ylim(min_coords[1] - margin, max_coords[1] + margin)
             
             # Create canvas
-            canvas = FigureCanvasTkAgg(fig, master=self.tri_viz_frame)
-            canvas.draw()
-            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            canvas = FigureCanvas(fig)
+            self.tri_viz_layout.addWidget(canvas)
             
             # Add toolbar
-            toolbar_frame = ttk.Frame(self.tri_viz_frame)
-            toolbar_frame.pack(fill=tk.X)
-            toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
-            toolbar.update()
+            toolbar = NavigationToolbar(canvas, self.tri_viz_frame)
+            self.tri_viz_layout.addWidget(toolbar)
     
-    def _create_3d_visualization(self, parent_frame, points, title="3D Visualization", 
-                                point_colors=None, lines=None, triangles=None, feature_points=None):
-        """Create a visualization of the data in 3D using PyVista
-        
-        Args:
-            parent_frame: Frame to contain the visualization
-            points: Points to visualize (Nx2 or Nx3 array)
-            title: Title for the visualization
-            point_colors: Optional colors for points
-            lines: Optional line segments to draw
-            triangles: Optional triangles to draw
-            feature_points: Optional feature points to highlight
-            
-        Returns:
-            Frame containing the visualization
-        """
-        if not HAVE_PYVISTA:
-            # Create a message if PyVista is not available
-            msg_frame = ttk.Frame(parent_frame)
-            msg_frame.pack(fill=tk.BOTH, expand=True)
-            
-            msg = ttk.Label(msg_frame, text="PyVista not installed.\n"
-                           "Please install PyVista for 3D visualization.")
-            msg.pack(expand=True)
-            return msg_frame
-        
-        # Create a frame for the visualization
-        vis_frame = ttk.Frame(parent_frame)
-        vis_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Close previous plotter if it exists
-        if self.current_plotter is not None:
-            try:
-                self.current_plotter.close()
-            except:
-                pass
-        
-        # Add button to open a separate interactive window
-        ttk.Button(vis_frame, text="Open 3D Interactive View", 
-                  command=lambda: self._show_interactive_3d(
-                      points=points, 
-                      point_colors=point_colors, 
-                      lines=lines, 
-                      triangles=triangles, 
-                      title=title
-                  )).pack(pady=5)
-        
-        # Create a placeholder for the 3D visualization
-        preview_frame = ttk.LabelFrame(vis_frame, text="3D Preview")
-        preview_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Add a label with info about the visualization
-        vis_info = f"{title}\n"
-        vis_info += f"Points: {len(points)}\n"
-        if lines is not None and len(lines) > 0:
-            vis_info += f"Lines: {len(lines)}\n"
-        if triangles is not None and len(triangles) > 0:
-            vis_info += f"Triangles: {len(triangles)}\n"
-            
-        info_label = ttk.Label(preview_frame, text=vis_info, justify="center")
-        info_label.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
-        note_label = ttk.Label(preview_frame, 
-                             text="Click 'Open 3D Interactive View' for full 3D visualization",
-                             justify="center", font=("Arial", 10, "italic"))
-        note_label.pack(fill=tk.X, pady=10)
-        
-        return vis_frame
-    
-    def show_3d_view(self):
-        """Show 3D view of the triangulation in a separate window"""
-        if not self.view_3d_enabled:
-            messagebox.showinfo("PyVista Not Available", 
-                             "PyVista is not available. Please install PyVista for 3D visualization.")
-            return
-            
-        if not hasattr(self, 'triangulation_result') or self.triangulation_result is None:
-            messagebox.showinfo("No Triangulation", 
-                             "Please run triangulation first before showing 3D view.")
-            return
-            
-        # Get triangulation data
-        vertices = self.triangulation_result['vertices']
-        triangles = self.triangulation_result['triangles']
-        hull_points = self.hull_points if hasattr(self, 'hull_points') else None
-        
-        # Create hull lines if available
-        hull_lines = None
-        if hull_points is not None and len(hull_points) > 2:
-            hull_lines = []
-            for i in range(len(hull_points)-1):
-                start = hull_points[i]
-                end = hull_points[i+1]
-                hull_lines.append([start, end])
-        
-        # Show in interactive window
-        title = f"MeshIt 3D View - {len(triangles)} triangles"
-        self._show_interactive_3d(
-            points=vertices, 
-            lines=hull_lines,
-            triangles=triangles,
-            title=title
-        )
-    
-    def _show_interactive_3d(self, points, point_colors=None, lines=None, triangles=None,
-                           feature_points=None, title="MeshIt 3D View"):
-        """Open an interactive 3D visualization window"""
-        if not self.view_3d_enabled:
-            messagebox.showinfo("PyVista Not Available", 
-                               "PyVista is not available. Please install PyVista for 3D visualization.")
-            return
-            
-        if points is None or len(points) == 0:
-            messagebox.showinfo("No Data", 
-                               "No data available to visualize.")
-            return
-        
-        # Close previous plotter if it exists
-        if hasattr(self, 'pv_plotter') and self.pv_plotter is not None:
-            try:
-                self.pv_plotter.close()
-            except:
-                pass
-        
-        # Create a new plotter
-        self.pv_plotter = pv.Plotter(window_size=[800, 600], title=title)
-        self.pv_plotter.set_background("#383F51")  # Dark blue background
-        
-        # Ensure points are 3D
-        if points.shape[1] == 2:
-            # Convert 2D points to 3D
-            points_3d = np.zeros((len(points), 3))
-            points_3d[:, 0] = points[:, 0]
-            points_3d[:, 1] = points[:, 1]
-            
-            # Add Z values with a nice pattern
-            x_scale = 0.05
-            y_scale = 0.05
-            z_scale = 20.0 * self.height_factor
-            
-            for i in range(len(points)):
-                x, y = points[i]
-                z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
-                points_3d[i, 2] = z
-        else:
-            points_3d = points.copy()
-        
-        # Create a point cloud
-        if point_colors is None:
-            point_colors = np.full(len(points_3d), 'blue')
-        
-        # Create a PolyData with points
-        point_cloud = pv.PolyData(points_3d)
-        if isinstance(point_colors, np.ndarray) and point_colors.shape == (len(points_3d),):
-            point_cloud["colors"] = point_colors
-            self.pv_plotter.add_mesh(point_cloud, render_points_as_spheres=True, 
-                                   point_size=10, scalar_bar_args={'title': 'Colors'})
-        else:
-            self.pv_plotter.add_mesh(point_cloud, color='blue', render_points_as_spheres=True, 
-                                   point_size=10)
-        
-        # Add lines if provided
-        if lines is not None and len(lines) > 0:
-            try:
-                for i, line in enumerate(lines):
-                    # Create 3D line points
-                    line_points = np.zeros((2, 3))
-                    line_points[0, 0] = line[0][0]
-                    line_points[0, 1] = line[0][1]
-                    line_points[1, 0] = line[1][0]
-                    line_points[1, 1] = line[1][1]
-                    
-                    # Set Z values
-                    x1, y1 = line[0]
-                    x2, y2 = line[1]
-                    line_points[0, 2] = np.sin(x1 * x_scale) * np.cos(y1 * y_scale) * z_scale
-                    line_points[1, 2] = np.sin(x2 * x_scale) * np.cos(y2 * y_scale) * z_scale
-                    
-                    # Create line
-                    line_obj = pv.Line(line_points[0], line_points[1])
-                    self.pv_plotter.add_mesh(line_obj, color='green', line_width=3)
-            except Exception as e:
-                print(f"Error adding lines: {str(e)}")
-        
-        # Add triangles if provided
-        if triangles is not None and len(triangles) > 0:
-            try:
-                # Create cells array
-                cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
-                surface = pv.PolyData(points_3d, cells)
-                self.pv_plotter.add_mesh(surface, color='#70D6FF', show_edges=True, 
-                                      line_width=1, edge_color='#00CCFF', 
-                                      specular=0.5, smooth_shading=True)
-            except Exception as e:
-                print(f"Error adding triangles: {str(e)}")
-        
-        # Add feature points if provided
-        if feature_points is not None and len(feature_points) > 0:
-            try:
-                # Convert feature points to 3D
-                fp_3d = np.zeros((len(feature_points), 3))
-                fp_3d[:, 0] = feature_points[:, 0]
-                fp_3d[:, 1] = feature_points[:, 1]
-                
-                # Add Z values
-                for i in range(len(feature_points)):
-                    x, y = feature_points[i]
-                    z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
-                    fp_3d[i, 2] = z
-                
-                # Create point cloud for feature points
-                fp_cloud = pv.PolyData(fp_3d)
-                self.pv_plotter.add_mesh(fp_cloud, color='red', render_points_as_spheres=True, 
-                                      point_size=15)
-            except Exception as e:
-                print(f"Error adding feature points: {str(e)}")
-        
-        # Add axes for reference
-        self.pv_plotter.add_axes()
-        
-        # Add title with statistics
-        if title:
-            self.pv_plotter.add_text(title, font_size=12, position='upper_edge')
-        
-        # Show the plotter in a separate window
-        self.pv_plotter.show()
-        
     def export_results(self):
         """Export the triangulation results to a file"""
-        self.status_var.set("Exporting results...")
+        self.statusBar().showMessage("Exporting results...")
         
         if self.triangulation_result is None:
-            self.status_var.set("Error: No triangulation results to export")
-            messagebox.showerror("Error", "No triangulation results to export")
+            self.statusBar().showMessage("Error: No triangulation results to export")
+            QMessageBox.critical(self, "Error", "No triangulation results to export")
             return
         
         # Create export options dialog
-        export_dialog = tk.Toplevel(self.root)
-        export_dialog.title("Export Options")
-        export_dialog.geometry("400x300")
-        export_dialog.transient(self.root)
-        export_dialog.grab_set()
+        export_dialog = QDialog(self)
+        export_dialog.setWindowTitle("Export Options")
+        export_dialog.setMinimumWidth(400)
+        dialog_layout = QVBoxLayout(export_dialog)
         
         # Export format frame
-        format_frame = ttk.LabelFrame(export_dialog, text="Export Format")
-        format_frame.pack(fill=tk.X, expand=False, padx=10, pady=10)
+        format_group = QGroupBox("Export Format")
+        format_layout = QVBoxLayout(format_group)
         
-        format_var = tk.StringVar(value="obj")
-        ttk.Radiobutton(format_frame, text="OBJ Format (3D objects)", 
-                       variable=format_var, value="obj").grid(row=0, column=0, sticky=tk.W, pady=2)
-        ttk.Radiobutton(format_frame, text="PLY Format (3D mesh)", 
-                       variable=format_var, value="ply").grid(row=1, column=0, sticky=tk.W, pady=2)
-        ttk.Radiobutton(format_frame, text="STL Format (3D printing)", 
-                       variable=format_var, value="stl").grid(row=2, column=0, sticky=tk.W, pady=2)
-        ttk.Radiobutton(format_frame, text="CSV Format (raw data)", 
-                       variable=format_var, value="csv").grid(row=3, column=0, sticky=tk.W, pady=2)
+        format_radio_group = QButtonGroup(export_dialog)
+        
+        obj_radio = QRadioButton("OBJ Format (3D objects)")
+        ply_radio = QRadioButton("PLY Format (3D mesh)")
+        stl_radio = QRadioButton("STL Format (3D printing)")
+        csv_radio = QRadioButton("CSV Format (raw data)")
+        
+        format_radio_group.addButton(obj_radio, 0)
+        format_radio_group.addButton(ply_radio, 1)
+        format_radio_group.addButton(stl_radio, 2)
+        format_radio_group.addButton(csv_radio, 3)
+        
+        obj_radio.setChecked(True)  # Default selection
+        
+        format_layout.addWidget(obj_radio)
+        format_layout.addWidget(ply_radio)
+        format_layout.addWidget(stl_radio)
+        format_layout.addWidget(csv_radio)
+        
+        dialog_layout.addWidget(format_group)
         
         # 3D export options (enabled only if PyVista is available)
-        options_frame = ttk.LabelFrame(export_dialog, text="3D Export Options")
-        options_frame.pack(fill=tk.X, expand=False, padx=10, pady=10)
+        options_group = QGroupBox("3D Export Options")
+        options_layout = QGridLayout(options_group)
         
-        export_3d_var = tk.BooleanVar(value=HAVE_PYVISTA)
-        ttk.Checkbutton(options_frame, text="Export as 3D Surface", 
-                       variable=export_3d_var,
-                       state=tk.NORMAL if HAVE_PYVISTA else tk.DISABLED).grid(row=0, column=0, 
-                                                                          sticky=tk.W, pady=2)
+        export_3d_checkbox = QCheckBox("Export as 3D Surface")
+        export_3d_checkbox.setChecked(HAVE_PYVISTA)
+        export_3d_checkbox.setEnabled(HAVE_PYVISTA)
+        options_layout.addWidget(export_3d_checkbox, 0, 0, 1, 2)
         
-        ttk.Label(options_frame, text="Height Scale:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        height_scale_var = tk.DoubleVar(value=self.height_factor_var.get())
-        ttk.Scale(options_frame, variable=height_scale_var, from_=0.0, to=1.0, 
-                 orient=tk.HORIZONTAL).grid(row=1, column=1, sticky=tk.W + tk.E, pady=2)
+        options_layout.addWidget(QLabel("Height Scale:"), 1, 0)
+        height_scale_slider = QSlider(Qt.Horizontal)
+        height_scale_slider.setMinimum(0)
+        height_scale_slider.setMaximum(100)
+        height_scale_slider.setValue(int(self.height_factor * 100))
+        options_layout.addWidget(height_scale_slider, 1, 1)
+        
+        dialog_layout.addWidget(options_group)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        export_btn = QPushButton("Export")
+        
+        button_layout.addWidget(cancel_btn)
+        button_layout.addWidget(export_btn)
+        
+        dialog_layout.addLayout(button_layout)
+        
+        # Connect signals
+        cancel_btn.clicked.connect(export_dialog.reject)
+        export_btn.clicked.connect(export_dialog.accept)
+        
+        # Show dialog and get result
+        result = export_dialog.exec_()
+        
+        if result == QDialog.Accepted:
+            # Get selected format
+            format_id = format_radio_group.checkedId()
+            formats = ["obj", "ply", "stl", "csv"]
+            if format_id >= 0 and format_id < len(formats):
+                export_format = formats[format_id]
+            else:
+                export_format = "obj"  # Default
                 
-        # Export function
-        def do_export():
-            # Get export format and 3D options
-            export_format = format_var.get()
-            export_3d = export_3d_var.get() and HAVE_PYVISTA
-            height_scale = height_scale_var.get()
+            # Get 3D options
+            export_3d = export_3d_checkbox.isChecked() and HAVE_PYVISTA
+            height_scale = height_scale_slider.value() / 100.0
             
             # Create a file save dialog
-            file_path = filedialog.asksaveasfilename(
-                title="Save triangulation results",
-                filetypes=[
-                    ("OBJ files", "*.obj"),
-                    ("PLY files", "*.ply"),
-                    ("STL files", "*.stl"),
-                    ("CSV files", "*.csv"),
-                    ("All files", "*.*")
-                ],
-                defaultextension=f".{export_format}"
+            file_filter = ""
+            if export_format == "obj":
+                file_filter = "OBJ files (*.obj);;All files (*.*)"
+            elif export_format == "ply":
+                file_filter = "PLY files (*.ply);;All files (*.*)"
+            elif export_format == "stl":
+                file_filter = "STL files (*.stl);;All files (*.*)"
+            elif export_format == "csv":
+                file_filter = "CSV files (*.csv);;All files (*.*)"
+                
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save triangulation results",
+                "",
+                file_filter,
+                options=QFileDialog.Options()
             )
             
             if not file_path:
-                export_dialog.destroy()
-                self.status_var.set("Export canceled")
+                self.statusBar().showMessage("Export canceled")
                 return
             
             try:
@@ -1694,58 +1899,42 @@ class MeshItWorkflowGUI:
                         # Save based on format
                         if export_format == "obj":
                             mesh.save(file_path)
-                            self.status_var.set(f"Exported 3D OBJ file to {file_path}")
+                            self.statusBar().showMessage(f"Exported 3D OBJ file to {file_path}")
                         elif export_format == "ply":
                             mesh.save(file_path)
-                            self.status_var.set(f"Exported 3D PLY file to {file_path}")
+                            self.statusBar().showMessage(f"Exported 3D PLY file to {file_path}")
                         elif export_format == "stl":
                             mesh.save(file_path)
-                            self.status_var.set(f"Exported 3D STL file to {file_path}")
+                            self.statusBar().showMessage(f"Exported 3D STL file to {file_path}")
                         elif export_format == "csv":
                             # For CSV, fall back to standard CSV export
                             self._export_csv(file_path, points_3d, triangles)
-                            self.status_var.set(f"Exported 3D CSV file to {file_path}")
+                            self.statusBar().showMessage(f"Exported 3D CSV file to {file_path}")
                     except Exception as e:
-                        self.status_var.set(f"Error creating 3D export: {str(e)}")
+                        self.statusBar().showMessage(f"Error creating 3D export: {str(e)}")
                         logger.error(f"Error creating 3D export: {str(e)}")
-                        messagebox.showerror("Export Error", f"Error creating 3D export: {str(e)}")
+                        QMessageBox.critical(self, "Export Error", f"Error creating 3D export: {str(e)}")
                 else:
                     # Standard 2D format exports
                     if export_format == "obj":
                         self._export_obj(file_path, vertices, triangles)
-                        self.status_var.set(f"Exported 2D OBJ file to {file_path}")
+                        self.statusBar().showMessage(f"Exported 2D OBJ file to {file_path}")
                     elif export_format == "ply":
                         self._export_ply(file_path, vertices, triangles)
-                        self.status_var.set(f"Exported 2D PLY file to {file_path}")
+                        self.statusBar().showMessage(f"Exported 2D PLY file to {file_path}")
                     elif export_format == "stl":
                         self._export_stl(file_path, vertices, triangles)
-                        self.status_var.set(f"Exported 2D STL file to {file_path}")
+                        self.statusBar().showMessage(f"Exported 2D STL file to {file_path}")
                     elif export_format == "csv":
                         self._export_csv(file_path, vertices, triangles)
-                        self.status_var.set(f"Exported 2D CSV file to {file_path}")
-                
-                export_dialog.destroy()
+                        self.statusBar().showMessage(f"Exported 2D CSV file to {file_path}")
                 
             except Exception as e:
-                self.status_var.set(f"Error exporting results: {str(e)}")
+                self.statusBar().showMessage(f"Error exporting results: {str(e)}")
                 logger.error(f"Error exporting results: {str(e)}")
-                messagebox.showerror("Error", f"Error exporting results: {str(e)}")
-                export_dialog.destroy()
-        
-        # Buttons
-        button_frame = ttk.Frame(export_dialog)
-        button_frame.pack(fill=tk.X, expand=False, padx=10, pady=10)
-        
-        ttk.Button(button_frame, text="Export", command=do_export).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(button_frame, text="Cancel", command=export_dialog.destroy).pack(side=tk.RIGHT, padx=5)
-        
-        # Center dialog on parent
-        export_dialog.update_idletasks()
-        width = export_dialog.winfo_width()
-        height = export_dialog.winfo_height()
-        x = self.root.winfo_x() + (self.root.winfo_width() - width) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - height) // 2
-        export_dialog.geometry(f"+{x}+{y}")
+                QMessageBox.critical(self, "Error", f"Error exporting results: {str(e)}")
+        else:
+            self.statusBar().showMessage("Export canceled")
     
     def _export_obj(self, file_path, vertices, triangles):
         """Export to OBJ format"""
@@ -1836,89 +2025,9 @@ class MeshItWorkflowGUI:
             for triangle in triangles:
                 f.write(f"{triangle[0]},{triangle[1]},{triangle[2]}\n")
 
-    def run(self):
-        """Run the application"""
-        # Set window title to include 3D visualization status
-        if self.view_3d_enabled:
-            title = "MeshIt Workflow GUI - 3D Visualization Enabled"
-        else:
-            title = "MeshIt Workflow GUI - 3D Visualization Disabled (Install PyVista for 3D)"
-            
-        self.root.title(title)
-        
-        # Create a menu bar
-        menubar = tk.Menu(self.root)
-        
-        # File menu
-        filemenu = tk.Menu(menubar, tearoff=0)
-        filemenu.add_command(label="Load Data", command=self.load_file)
-        filemenu.add_command(label="Generate Test Data", command=self.generate_test_data)
-        filemenu.add_separator()
-        filemenu.add_command(label="Export Results", command=self.export_results)
-        filemenu.add_separator()
-        filemenu.add_command(label="Exit", command=self.root.quit)
-        menubar.add_cascade(label="File", menu=filemenu)
-        
-        # Visualization menu
-        vizmenu = tk.Menu(menubar, tearoff=0)
-        if self.view_3d_enabled:
-            vizmenu.add_command(label="Show 3D View", command=self.show_3d_view)
-            vizmenu.add_separator()
-            
-            # 3D height factor submenu
-            heightmenu = tk.Menu(vizmenu, tearoff=0)
-            for height in [0.0, 0.1, 0.2, 0.5, 1.0]:
-                heightmenu.add_command(
-                    label=f"Height Factor: {height}", 
-                    command=lambda h=height: self._set_height_factor(h)
-                )
-            vizmenu.add_cascade(label="3D Height Factor", menu=heightmenu)
-        else:
-            vizmenu.add_command(label="3D Visualization Disabled", state=tk.DISABLED)
-            vizmenu.add_command(label="Install PyVista for 3D features", state=tk.DISABLED)
-        
-        menubar.add_cascade(label="Visualization", menu=vizmenu)
-        
-        # Help menu
-        helpmenu = tk.Menu(menubar, tearoff=0)
-        helpmenu.add_command(label="About", command=self._show_about)
-        menubar.add_cascade(label="Help", menu=helpmenu)
-        
-        # Set the menu bar
-        self.root.config(menu=menubar)
-        
-        # Start the application
-        self.root.mainloop()
-        
-    def _set_height_factor(self, height):
-        """Set the height factor for 3D visualization"""
-        self.height_factor = height
-        self.height_factor_var.set(height)
-        
-        # Update existing visualization if any
-        if hasattr(self, 'triangulation_result') and self.triangulation_result is not None:
-            vertices = self.triangulation_result['vertices']
-            triangles = self.triangulation_result['triangles']
-            self._plot_triangulation(vertices, triangles, self.hull_points)
-        
-    def _show_about(self):
-        """Show about dialog"""
-        about_text = """
-        MeshIt Workflow GUI
-        
-        A graphical interface for the complete MeshIt workflow,
-        including file loading, convex hull computation, 
-        segmentation, triangulation, and visualization.
-        
-        3D Visualization: {status}
-        """
-        
-        status = "Enabled" if self.view_3d_enabled else "Disabled (Install PyVista)"
-        about_text = about_text.format(status=status)
-        
-        messagebox.showinfo("About MeshIt Workflow GUI", about_text)
-
 # Main entry point
 if __name__ == "__main__":
-    app = MeshItWorkflowGUI()
-    app.run() 
+    app = QApplication(sys.argv)
+    window = MeshItWorkflowGUI()
+    window.show()
+    sys.exit(app.exec_()) 
