@@ -1096,55 +1096,196 @@ class MeshItWorkflowGUI(QMainWindow):
             parent_frame.layout().addWidget(msg_widget)
             return msg_widget
         
-        # Create a frame for the visualization
-        vis_widget = QWidget()
-        vis_layout = QVBoxLayout(vis_widget)
-        
         # Close previous plotter if it exists
         if self.current_plotter is not None:
             try:
                 self.current_plotter.close()
             except:
                 pass
-        
-        # Add button to open a separate interactive window
-        open_3d_btn = QPushButton("Open 3D Interactive View")
-        open_3d_btn.clicked.connect(lambda: self._show_interactive_3d(
-            points=points, 
-            point_colors=point_colors, 
-            lines=lines, 
-            triangles=triangles, 
-            title=title
-        ))
-        vis_layout.addWidget(open_3d_btn)
-        
-        # Create a placeholder for the 3D visualization
-        preview_group = QGroupBox("3D Preview")
-        preview_layout = QVBoxLayout(preview_group)
-        
-        # Add a label with info about the visualization
-        vis_info = f"{title}\n"
-        vis_info += f"Points: {len(points)}\n"
-        if lines is not None and len(lines) > 0:
-            vis_info += f"Lines: {len(lines)}\n"
-        if triangles is not None and len(triangles) > 0:
-            vis_info += f"Triangles: {len(triangles)}\n"
             
-        info_label = QLabel(vis_info)
+        # Create a frame for the visualization
+        vis_widget = QWidget()
+        vis_layout = QVBoxLayout(vis_widget)
+        
+        # Add visualization info header
+        info_label = QLabel(title)
         info_label.setAlignment(Qt.AlignCenter)
-        preview_layout.addWidget(info_label)
+        vis_layout.addWidget(info_label)
         
-        note_label = QLabel("Click 'Open 3D Interactive View' for full 3D visualization")
-        note_label.setAlignment(Qt.AlignCenter)
-        font = note_label.font()
-        font.setItalic(True)
-        note_label.setFont(font)
-        preview_layout.addWidget(note_label)
+        # Convert 2D points to 3D with height variation
+        if points.shape[1] == 2:
+            # Convert 2D points to 3D
+            points_3d = np.zeros((len(points), 3))
+            points_3d[:, 0] = points[:, 0]
+            points_3d[:, 1] = points[:, 1]
+            
+            # Add Z values with a nice pattern
+            x_scale = 0.05
+            y_scale = 0.05
+            z_scale = 20.0 * self.height_factor
+            
+            for i in range(len(points)):
+                x, y = points[i]
+                z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
+                points_3d[i, 2] = z
+        else:
+            points_3d = points.copy()
+            
+        try:
+            # Create PyVista plotter widget
+            from pyvistaqt import QtInteractor
+            
+            # Create the QVTKRenderWindowInteractor
+            viz_frame = QFrame()
+            viz_layout = QVBoxLayout(viz_frame)
+            
+            # Create the interactor
+            self.current_plotter = QtInteractor(viz_frame)
+            viz_layout.addWidget(self.current_plotter)
+            
+            # Set background color and size
+            self.current_plotter.set_background("#383F51")
+            
+            # Add point cloud
+            if point_colors is None:
+                point_colors = np.full(len(points_3d), 'blue')
+            
+            # Create point cloud
+            point_cloud = pv.PolyData(points_3d)
+            
+            # Add points with colors
+            if isinstance(point_colors, np.ndarray) and point_colors.shape == (len(points_3d),):
+                point_cloud["colors"] = point_colors
+                self.current_plotter.add_mesh(point_cloud, render_points_as_spheres=True, 
+                                         point_size=10, scalar_bar_args={'title': 'Colors'})
+            else:
+                self.current_plotter.add_mesh(point_cloud, color='blue', render_points_as_spheres=True, 
+                                         point_size=10)
+            
+            # Add lines if provided
+            if lines is not None and len(lines) > 0:
+                try:
+                    for i, line in enumerate(lines):
+                        # Create 3D line points
+                        line_points = np.zeros((2, 3))
+                        line_points[0, 0] = line[0][0]
+                        line_points[0, 1] = line[0][1]
+                        line_points[1, 0] = line[1][0]
+                        line_points[1, 1] = line[1][1]
+                        
+                        # Set Z values
+                        x1, y1 = line[0]
+                        x2, y2 = line[1]
+                        line_points[0, 2] = np.sin(x1 * x_scale) * np.cos(y1 * y_scale) * z_scale
+                        line_points[1, 2] = np.sin(x2 * x_scale) * np.cos(y2 * y_scale) * z_scale
+                        
+                        # Create line
+                        line_obj = pv.Line(line_points[0], line_points[1])
+                        self.current_plotter.add_mesh(line_obj, color='green', line_width=3)
+                except Exception as e:
+                    print(f"Error adding lines: {str(e)}")
+            
+            # Add triangles if provided
+            if triangles is not None and len(triangles) > 0:
+                try:
+                    # Create cells array
+                    cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
+                    surface = pv.PolyData(points_3d, cells)
+                    self.current_plotter.add_mesh(surface, color='#70D6FF', show_edges=True, 
+                                              line_width=1, edge_color='#00CCFF', 
+                                              specular=0.5, smooth_shading=True)
+                except Exception as e:
+                    print(f"Error adding triangles: {str(e)}")
+            
+            # Add feature points if provided
+            if feature_points is not None and len(feature_points) > 0:
+                try:
+                    # Convert feature points to 3D
+                    fp_3d = np.zeros((len(feature_points), 3))
+                    fp_3d[:, 0] = feature_points[:, 0]
+                    fp_3d[:, 1] = feature_points[:, 1]
+                    
+                    # Add Z values
+                    for i in range(len(feature_points)):
+                        x, y = feature_points[i]
+                        z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
+                        fp_3d[i, 2] = z
+                    
+                    # Create point cloud for feature points
+                    fp_cloud = pv.PolyData(fp_3d)
+                    self.current_plotter.add_mesh(fp_cloud, color='red', render_points_as_spheres=True, 
+                                              point_size=15)
+                except Exception as e:
+                    print(f"Error adding feature points: {str(e)}")
+            
+            # Add axes
+            self.current_plotter.add_axes()
+            
+            # Reset camera to show all objects
+            self.current_plotter.reset_camera()
+            
+            # Add controls for adjustment
+            controls_layout = QHBoxLayout()
+            
+            # Height adjustment slider
+            controls_layout.addWidget(QLabel("Height:"))
+            height_slider = QSlider(Qt.Horizontal)
+            height_slider.setMinimum(0)
+            height_slider.setMaximum(100)
+            height_slider.setValue(int(self.height_factor * 100))
+            height_slider.valueChanged.connect(lambda v: self._update_height_in_plotter(v/100.0))
+            controls_layout.addWidget(height_slider)
+            
+            # Add zoom controls
+            controls_layout.addWidget(QLabel("Zoom:"))
+            zoom_in_btn = QPushButton("+")
+            zoom_in_btn.setMaximumWidth(30)
+            zoom_in_btn.clicked.connect(lambda: self.current_plotter.camera.zoom(1.5))
+            controls_layout.addWidget(zoom_in_btn)
+            
+            zoom_out_btn = QPushButton("-")
+            zoom_out_btn.setMaximumWidth(30)
+            zoom_out_btn.clicked.connect(lambda: self.current_plotter.camera.zoom(0.75))
+            controls_layout.addWidget(zoom_out_btn)
+            
+            # Reset view button
+            reset_btn = QPushButton("Reset View")
+            reset_btn.clicked.connect(lambda: self.current_plotter.reset_camera())
+            controls_layout.addWidget(reset_btn)
+            
+            vis_layout.addLayout(controls_layout)
+            vis_layout.addWidget(viz_frame)
+            
+        except Exception as e:
+            # Fallback if QtInteractor fails
+            error_msg = QLabel(f"Error creating 3D view: {str(e)}\nTry using the 'Show 3D View' option in the Visualization menu.")
+            error_msg.setAlignment(Qt.AlignCenter)
+            vis_layout.addWidget(error_msg)
+            logger.error(f"Error creating embedded 3D view: {str(e)}")
         
-        vis_layout.addWidget(preview_group)
         parent_frame.layout().addWidget(vis_widget)
-        
         return vis_widget
+        
+    def _update_height_in_plotter(self, height_factor):
+        """Update the height factor in the current plotter"""
+        self.height_factor = height_factor
+        
+        # If we have a current plotter, update it
+        if hasattr(self, 'current_plotter') and self.current_plotter is not None:
+            try:
+                # Get the current visualization data
+                if self.triangulation_result is not None:
+                    vertices = self.triangulation_result['vertices']
+                    triangles = self.triangulation_result['triangles']
+                    self._plot_triangulation(vertices, triangles, self.hull_points)
+                elif self.segments is not None:
+                    self._plot_segments(self.points, self.hull_points, self.segments)
+                elif self.hull_points is not None:
+                    self._plot_hull(self.points, self.hull_points)
+                elif self.points is not None:
+                    self._plot_points(self.points)
+            except Exception as e:
+                logger.error(f"Error updating 3D height: {str(e)}")
     
     def _show_interactive_3d(self, points, point_colors=None, lines=None, triangles=None,
                            feature_points=None, title="MeshIt 3D View"):
@@ -1268,7 +1409,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
         # Show the plotter in a separate window
         self.pv_plotter.show()
-        
+    
     def show_3d_view(self):
         """Show 3D view of the triangulation in a separate window"""
         if not self.view_3d_enabled:
