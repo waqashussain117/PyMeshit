@@ -38,6 +38,7 @@ class DirectTriangleWrapper:
         self.feature_points = None
         self.feature_sizes = None
         self.logger = logging.getLogger("DirectTriangleWrapper")
+        self.triangle_opts = None  # Will store custom triangle options if set
         
     def set_feature_points(self, points: np.ndarray, sizes: np.ndarray):
         """
@@ -509,3 +510,16 @@ class DirectTriangleWrapper:
     def __del__(self):
         """Clean up C++ resources when the wrapper is destroyed."""
         # No explicit cleanup needed, the Python-C++ binding handles this 
+
+    def set_triangle_options(self, options: str):
+        """
+        Set custom options for the Triangle library.
+        
+        This allows direct control over Triangle's behavior by passing specific
+        options string that will override the default options generated.
+        
+        Args:
+            options: String with Triangle options (e.g., 'pzq30a40')
+        """
+        self.triangle_opts = options
+        self.logger.info(f"Setting custom Triangle options: {options}") 
