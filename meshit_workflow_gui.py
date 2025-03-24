@@ -20,9 +20,10 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushBu
                             QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QTabWidget,
                             QFileDialog, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox,
                             QCheckBox, QGroupBox, QRadioButton, QSlider, QLineEdit,
-                            QSplitter, QDialog, QFormLayout, QButtonGroup, QMenu, QAction)
+                            QSplitter, QDialog, QFormLayout, QButtonGroup, QMenu, QAction,
+                            QListWidget, QColorDialog, QListWidgetItem)
 from PyQt5.QtCore import Qt, QSize, pyqtSignal
-from PyQt5.QtGui import QFont, QIcon
+from PyQt5.QtGui import QFont, QIcon, QColor
 
 # Import PyVista for 3D visualization
 try:
@@ -55,112 +56,140 @@ except ImportError as e:
 
 class MeshItWorkflowGUI(QMainWindow):
     def __init__(self):
+        """Initialize the GUI"""
         super().__init__()
         
-        # Setup main window
+        # Set window properties
         self.setWindowTitle("MeshIt Workflow GUI")
         self.setGeometry(100, 100, 1200, 800)
-        self.setMinimumSize(1000, 700)
         
-        # Create central widget and main layout
+        # Initialize data structures for multiple datasets
+        self.datasets = []
+        self.active_dataset_index = -1
+        
+        # Define a color palette for datasets
+        self.color_palette = [
+            "#1f77b4", # blue
+            "#ff7f0e", # orange
+            "#2ca02c", # green
+            "#d62728", # red
+            "#9467bd", # purple
+            "#8c564b", # brown
+            "#e377c2", # pink
+            "#7f7f7f", # gray
+            "#bcbd22", # olive
+            "#17becf"  # cyan
+        ]
+        
+        # Initialize optional variables that could be used for 3D visualization
+        self.view_3d_enabled = HAVE_PYVISTA
+        self.height_factor = 1.0
+        self.current_plotter = None
+        self.pv_plotter = None
+        
+        # Initialize legend widgets
+        self.file_legend_widget = None
+        self.hull_legend_widget = None
+        self.segment_legend_widget = None
+        self.tri_legend_widget = None
+        
+        # Create layout
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
+        
         self.main_layout = QVBoxLayout(self.central_widget)
         
-        # Create notebook (tabbed interface)
+        # Create notebook with multiple tabs
         self.notebook = QTabWidget()
         self.main_layout.addWidget(self.notebook)
         
-        # Create tabs for each workflow step
+        # Setup file tab
         self.file_tab = QWidget()
-        self.hull_tab = QWidget()
-        self.segment_tab = QWidget()
-        self.triangulation_tab = QWidget()
-        
         self.notebook.addTab(self.file_tab, "1. Load Data")
-        self.notebook.addTab(self.hull_tab, "2. Convex Hull")
-        self.notebook.addTab(self.segment_tab, "3. Segmentation")
-        self.notebook.addTab(self.triangulation_tab, "4. Triangulation")
-        
-        # Initialize data containers
-        self.points = None
-        self.hull_points = None
-        self.segments = None
-        self.triangulation_result = None
-        
-        # Initialize PyVista 3D visualization
-        self.view_3d_enabled = HAVE_PYVISTA
-        self.current_plotter = None
-        self.height_factor = 0.2
-        
-        # Set up tabs
         self._setup_file_tab()
-        self._setup_hull_tab()
-        self._setup_segment_tab()
-        self._setup_triangulation_tab()
         
-        # Status bar
-        self.statusBar().showMessage("Ready")
+        # Setup hull tab
+        self.hull_tab = QWidget()
+        self.notebook.addTab(self.hull_tab, "2. Convex Hull")
+        self._setup_hull_tab()
+        
+        # Setup segment tab
+        self.segment_tab = QWidget()
+        self.notebook.addTab(self.segment_tab, "3. Segmentation")
+        self._setup_segment_tab()
+        
+        # Setup triangulation tab
+        self.triangulation_tab = QWidget()
+        self.notebook.addTab(self.triangulation_tab, "4. Triangulation")
+        self._setup_triangulation_tab()
         
         # Create menu bar
         self._create_menu_bar()
+        
+        # Create status bar
+        self.statusBar().showMessage("Ready")
+        
+        # Connect signals
+        self.notebook.currentChanged.connect(self._on_tab_changed)
+        
+        # Show ready message
+        self.statusBar().showMessage("MeshIt GUI Ready")
     
     def _create_menu_bar(self):
         """Create the menu bar"""
-        menubar = self.menuBar()
+        # Create menu bar
+        menu_bar = self.menuBar()
         
         # File menu
-        file_menu = menubar.addMenu("File")
+        file_menu = menu_bar.addMenu("File")
+        load_file_action = file_menu.addAction("Load File")
+        load_file_action.triggered.connect(self.load_file)
         
-        load_action = QAction("Load Data", self)
-        load_action.triggered.connect(self.load_file)
-        file_menu.addAction(load_action)
+        load_multiple_action = file_menu.addAction("Load Multiple Files")
+        load_multiple_action.triggered.connect(self.load_multiple_files)
         
-        generate_action = QAction("Generate Test Data", self)
-        generate_action.triggered.connect(self.generate_test_data)
-        file_menu.addAction(generate_action)
+        generate_test_action = file_menu.addAction("Generate Test Data")
+        generate_test_action.triggered.connect(self.generate_test_data)
         
         file_menu.addSeparator()
-        
-        export_action = QAction("Export Results", self)
+        export_action = file_menu.addAction("Export Results")
         export_action.triggered.connect(self.export_results)
-        file_menu.addAction(export_action)
         
         file_menu.addSeparator()
-        
-        exit_action = QAction("Exit", self)
+        exit_action = file_menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
+        
+        # Dataset menu
+        dataset_menu = menu_bar.addMenu("Datasets")
+        clear_all_action = dataset_menu.addAction("Clear All Datasets")
+        clear_all_action.triggered.connect(self.clear_all_datasets)
+        
+        remove_active_action = dataset_menu.addAction("Remove Active Dataset")
+        remove_active_action.triggered.connect(self.remove_active_dataset)
+        
+        dataset_menu.addSeparator()
+        process_all_action = dataset_menu.addAction("Process All Datasets")
+        process_all_action.triggered.connect(self.process_all_datasets)
         
         # Visualization menu
-        viz_menu = menubar.addMenu("Visualization")
-        if self.view_3d_enabled:
-            show_3d_action = QAction("Show 3D View", self)
-            show_3d_action.triggered.connect(self.show_3d_view)
-            viz_menu.addAction(show_3d_action)
-            
-            viz_menu.addSeparator()
-            
-            # 3D height factor submenu
-            height_menu = viz_menu.addMenu("3D Height Factor")
-            for height in [0.0, 0.1, 0.2, 0.5, 1.0]:
-                height_action = QAction(f"Height Factor: {height}", self)
-                height_action.triggered.connect(lambda checked, h=height: self._set_height_factor(h))
-                height_menu.addAction(height_action)
-        else:
-            disabled_action = QAction("3D Visualization Disabled", self)
-            disabled_action.setEnabled(False)
-            viz_menu.addAction(disabled_action)
-            
-            install_action = QAction("Install PyVista for 3D features", self)
-            install_action.setEnabled(False)
-            viz_menu.addAction(install_action)
+        viz_menu = menu_bar.addMenu("Visualization")
+        view_3d_action = viz_menu.addAction("Show 3D View")
+        view_3d_action.triggered.connect(self.show_3d_view)
+        
+        viz_menu.addSeparator()
+        
+        # Height factor submenu
+        height_menu = viz_menu.addMenu("Height Factor")
+        height_factors = [0.1, 0.5, 1.0, 2.0, 5.0]
+        
+        for factor in height_factors:
+            height_action = height_menu.addAction(f"{factor:.1f}x")
+            height_action.triggered.connect(lambda checked, f=factor: self._set_height_factor(f))
         
         # Help menu
-        help_menu = menubar.addMenu("Help")
-        about_action = QAction("About", self)
+        help_menu = menu_bar.addMenu("Help")
+        about_action = help_menu.addAction("About")
         about_action.triggered.connect(self._show_about)
-        help_menu.addAction(about_action)
     
     def _setup_file_tab(self):
         """Sets up the file loading tab with controls and visualization area"""
@@ -181,6 +210,11 @@ class MeshItWorkflowGUI(QMainWindow):
         load_btn.clicked.connect(self.load_file)
         file_layout.addWidget(load_btn)
         
+        # Button for loading multiple files
+        load_multiple_btn = QPushButton("Load Multiple Files")
+        load_multiple_btn.clicked.connect(self.load_multiple_files)
+        file_layout.addWidget(load_multiple_btn)
+        
         # Test data generation
         test_btn = QPushButton("Generate Test Data")
         test_btn.clicked.connect(self.generate_test_data)
@@ -188,9 +222,26 @@ class MeshItWorkflowGUI(QMainWindow):
         
         control_layout.addWidget(file_group)
         
+        # -- Dataset List --
+        datasets_group = QGroupBox("Loaded Datasets")
+        datasets_layout = QVBoxLayout(datasets_group)
+        
+        self.dataset_list = QListWidget()
+        self.dataset_list.setSelectionMode(QListWidget.SingleSelection)
+        self.dataset_list.itemSelectionChanged.connect(self._on_dataset_selection_changed)
+        self.dataset_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.dataset_list.customContextMenuRequested.connect(self._show_dataset_context_menu)
+        datasets_layout.addWidget(self.dataset_list)
+        
+        control_layout.addWidget(datasets_group)
+        
         # -- Statistics --
         stats_group = QGroupBox("Statistics")
         stats_layout = QVBoxLayout(stats_group)
+        
+        # Number of datasets
+        self.num_datasets_label = QLabel("Datasets: 0")
+        stats_layout.addWidget(self.num_datasets_label)
         
         # Number of points
         self.points_label = QLabel("Points: 0")
@@ -926,12 +977,21 @@ class MeshItWorkflowGUI(QMainWindow):
             # Add toolbar
             toolbar = NavigationToolbar(canvas, self.file_viz_frame)
             self.file_viz_layout.addWidget(toolbar)
-
+    
     def compute_hull(self):
-        """Compute the convex hull of the loaded points"""
+        """Compute the convex hull of the loaded points for the active dataset"""
         self.statusBar().showMessage("Computing convex hull...")
         
-        if self.points is None or len(self.points) < 3:
+        # Check if we have an active dataset
+        if self.active_dataset_index < 0 or self.active_dataset_index >= len(self.datasets):
+            self.statusBar().showMessage("Error: No active dataset selected")
+            QMessageBox.critical(self, "Error", "No active dataset selected")
+            return
+        
+        # Get active dataset
+        dataset = self.datasets[self.active_dataset_index]
+        
+        if dataset.get('points') is None or len(dataset['points']) < 3:
             self.statusBar().showMessage("Error: Need at least 3 points to compute hull")
             QMessageBox.critical(self, "Error", "Need at least 3 points to compute hull")
             return
@@ -939,31 +999,32 @@ class MeshItWorkflowGUI(QMainWindow):
         try:
             # Compute convex hull using scipy
             from scipy.spatial import ConvexHull
-            hull = ConvexHull(self.points)
+            hull = ConvexHull(dataset['points'])
             
             # Extract hull points
-            self.hull_points = self.points[hull.vertices]
-            self.hull_points = np.append(self.hull_points, [self.hull_points[0]], axis=0)  # Close the hull
+            hull_points = dataset['points'][hull.vertices]
+            hull_points = np.append(hull_points, [hull_points[0]], axis=0)  # Close the hull
             
             # Calculate hull area
             hull_area = hull.volume  # In 2D, volume means area
             
-            # Update hull info
-            self.hull_points_label.setText(f"Hull vertices: {len(hull.vertices)}")
-            self.hull_area_label.setText(f"Hull area: {hull_area:.2f}")
+            # Store in dataset
+            dataset['hull_points'] = hull_points
             
-            # Visualize the hull
-            self._plot_hull(self.points, self.hull_points)
+            # Update statistics
+            self._update_statistics()
+            
+            # Visualize all visible hulls (not just the active one)
+            self._visualize_all_hulls()
             
             self.statusBar().showMessage(f"Computed convex hull with {len(hull.vertices)} vertices")
             
-            # Clear any previous results from later steps
-            self.segments = None
-            self.triangulation_result = None
+            # Clear any previous results from later steps for this dataset
+            dataset.pop('segments', None)
+            dataset.pop('triangulation_result', None)
             
             # Update other views
-            self._clear_segment_plot()
-            self._clear_triangulation_plot()
+            self._update_visualization()
             
             # Auto-switch to the hull tab
             self.notebook.setCurrentIndex(1)  # Select hull tab (index 1)
@@ -1411,40 +1472,93 @@ class MeshItWorkflowGUI(QMainWindow):
         self.pv_plotter.show()
     
     def show_3d_view(self):
-        """Show 3D view of the triangulation in a separate window"""
+        """Show 3D view of all triangulations in a separate window"""
         if not self.view_3d_enabled:
             QMessageBox.information(self, "PyVista Not Available", 
                                  "PyVista is not available. Please install PyVista for 3D visualization.")
             return
             
-        if not hasattr(self, 'triangulation_result') or self.triangulation_result is None:
+        # Check if we have any triangulation results
+        visible_datasets = [d for d in self.datasets if d.get('visible', True) and d.get('triangulation_result') is not None]
+        
+        if not visible_datasets:
             QMessageBox.information(self, "No Triangulation", 
-                                 "Please run triangulation first before showing 3D view.")
+                                 "No triangulation results available. Please run triangulation first.")
             return
             
-        # Get triangulation data
-        vertices = self.triangulation_result['vertices']
-        triangles = self.triangulation_result['triangles']
-        hull_points = self.hull_points if hasattr(self, 'hull_points') else None
+        # Close previous plotter if it exists
+        if hasattr(self, 'pv_plotter') and self.pv_plotter is not None:
+            try:
+                self.pv_plotter.close()
+            except:
+                pass
         
-        # Create hull lines if available
-        hull_lines = None
-        if hull_points is not None and len(hull_points) > 2:
-            hull_lines = []
-            for i in range(len(hull_points)-1):
-                start = hull_points[i]
-                end = hull_points[i+1]
-                hull_lines.append([start, end])
+        # Create a new plotter
+        self.pv_plotter = pv.Plotter(window_size=[800, 600], title="MeshIt 3D Visualization")
+        self.pv_plotter.set_background("#383F51")  # Dark blue background
         
-        # Show in interactive window
-        title = f"MeshIt 3D View - {len(triangles)} triangles"
-        self._show_interactive_3d(
-            points=vertices, 
-            lines=hull_lines,
-            triangles=triangles,
-            title=title
-        )
+        # Show each dataset
+        for dataset in visible_datasets:
+            color = dataset.get('color', '#000000')
+            name = dataset.get('name', 'Unnamed')
+            
+            triangulation_result = dataset['triangulation_result']
+            vertices = triangulation_result['vertices']
+            triangles = triangulation_result['triangles']
+            
+            # Convert 2D vertices to 3D
+            vertices_3d = np.zeros((len(vertices), 3))
+            vertices_3d[:, 0] = vertices[:, 0]
+            vertices_3d[:, 1] = vertices[:, 1]
+            
+            # Add Z values with a nice pattern
+            x_scale = 0.05
+            y_scale = 0.05
+            z_scale = 20.0 * self.height_factor
+            
+            for i in range(len(vertices)):
+                x, y = vertices[i]
+                z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
+                vertices_3d[i, 2] = z
+            
+            # Create a mesh
+            cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
+            mesh = pv.PolyData(vertices_3d, cells)
+            
+            # Add mesh to plotter
+            self.pv_plotter.add_mesh(mesh, color=color, opacity=0.8, 
+                                  show_edges=True, edge_color=color, 
+                                  line_width=1, label=name,
+                                  specular=0.5, smooth_shading=True)
+            
+            # Add hull if available
+            hull_points = dataset.get('hull_points')
+            if hull_points is not None and len(hull_points) > 3:
+                # Convert hull points to 3D
+                hull_3d = np.zeros((len(hull_points), 3))
+                hull_3d[:, 0] = hull_points[:, 0]
+                hull_3d[:, 1] = hull_points[:, 1]
+                
+                # Add Z values
+                for i in range(len(hull_points)):
+                    x, y = hull_points[i]
+                    z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
+                    hull_3d[i, 2] = z
+                
+                # Create lines for hull
+                for i in range(len(hull_3d)-1):
+                    line = pv.Line(hull_3d[i], hull_3d[i+1])
+                    self.pv_plotter.add_mesh(line, color=color, line_width=3)
         
+        # Add axes for reference
+        self.pv_plotter.add_axes()
+        
+        # Add legend
+        self.pv_plotter.add_legend()
+        
+        # Show the plotter in a separate window
+        self.pv_plotter.show()
+    
     def _set_height_factor(self, height):
         """Set the height factor for 3D visualization"""
         self.height_factor = height
@@ -1474,10 +1588,19 @@ segmentation, triangulation, and visualization.
         QMessageBox.information(self, "About MeshIt Workflow GUI", about_text)
 
     def compute_segments(self):
-        """Compute the segmentation of the convex hull"""
+        """Compute the segmentation of the convex hull for the active dataset"""
         self.statusBar().showMessage("Computing segments...")
         
-        if self.hull_points is None or len(self.hull_points) < 4:  # 3 vertices + 1 closing point
+        # Check if we have an active dataset
+        if self.active_dataset_index < 0 or self.active_dataset_index >= len(self.datasets):
+            self.statusBar().showMessage("Error: No active dataset selected")
+            QMessageBox.critical(self, "Error", "No active dataset selected")
+            return
+        
+        # Get active dataset
+        dataset = self.datasets[self.active_dataset_index]
+        
+        if dataset.get('hull_points') is None or len(dataset['hull_points']) < 4:  # 3 vertices + 1 closing point
             self.statusBar().showMessage("Error: Compute convex hull first")
             QMessageBox.critical(self, "Error", "Please compute the convex hull first")
             return
@@ -1494,7 +1617,7 @@ segmentation, triangulation, and visualization.
         
         try:
             # Extract the hull boundary (excluding the closing point)
-            hull_boundary = self.hull_points[:-1]
+            hull_boundary = dataset['hull_points'][:-1]
             
             # Calculate hull perimeter to determine a good segment size
             # If user-provided segment length is too large/small relative to the hull,
@@ -1543,26 +1666,25 @@ segmentation, triangulation, and visualization.
                     segments.append([segment_start, segment_end])
                     segment_lengths.append(np.linalg.norm(segment_end - segment_start))
             
-            # Store the segments
-            self.segments = np.array(segments)
+            # Store the segments in the dataset
+            dataset['segments'] = np.array(segments)
+            
+            # Update statistics
+            self._update_statistics()
+            
+            # Visualize all visible segments (not just the active one)
+            self._visualize_all_segments()
             
             # Calculate average segment length
             avg_segment_length = np.mean(segment_lengths)
             
-            # Update segment info
-            self.num_segments_label.setText(f"Segments: {len(segments)}")
-            self.avg_segment_length_label.setText(f"Avg length: {avg_segment_length:.2f}")
-            
-            # Visualize the segments
-            self._plot_segments(self.points, self.hull_points, self.segments)
-            
             self.statusBar().showMessage(f"Computed {len(segments)} segments, avg length: {avg_segment_length:.2f}")
             
-            # Clear any previous results from later steps
-            self.triangulation_result = None
+            # Clear any previous results from later steps for this dataset
+            dataset.pop('triangulation_result', None)
             
-            # Update other views
-            self._clear_triangulation_plot()
+            # Update other views 
+            self._update_visualization()
             
             # Auto-switch to the segments tab
             self.notebook.setCurrentIndex(2)  # Select segments tab (index 2)
@@ -1571,7 +1693,7 @@ segmentation, triangulation, and visualization.
             self.statusBar().showMessage(f"Error computing segments: {str(e)}")
             logger.error(f"Error computing segments: {str(e)}")
             QMessageBox.critical(self, "Error", f"Error computing segments: {str(e)}")
-            
+    
     def _plot_segments(self, points, hull_points, segments):
         """Visualize the segments using 3D visualization instead of matplotlib
         
@@ -1673,12 +1795,21 @@ segmentation, triangulation, and visualization.
             # Add toolbar
             toolbar = NavigationToolbar(canvas, self.segment_viz_frame)
             self.segment_viz_layout.addWidget(toolbar)
-
+    
     def run_triangulation(self):
-        """Run triangulation on the segments and points"""
+        """Run triangulation on the segments and points of the active dataset"""
         self.statusBar().showMessage("Running triangulation...")
         
-        if self.segments is None or len(self.segments) < 3:
+        # Check if we have an active dataset
+        if self.active_dataset_index < 0 or self.active_dataset_index >= len(self.datasets):
+            self.statusBar().showMessage("Error: No active dataset selected")
+            QMessageBox.critical(self, "Error", "No active dataset selected")
+            return
+        
+        # Get active dataset
+        dataset = self.datasets[self.active_dataset_index]
+        
+        if dataset.get('segments') is None or len(dataset['segments']) < 3:
             self.statusBar().showMessage("Error: Compute segments first")
             QMessageBox.critical(self, "Error", "Please compute segments first")
             return
@@ -1694,7 +1825,7 @@ segmentation, triangulation, and visualization.
             start_time = time.time()
             
             # Create a boundary from the hull points (excluding the closing point)
-            boundary_points = self.hull_points[:-1]
+            boundary_points = dataset['hull_points'][:-1]
             
             # Calculate the domain size (bounding box diagonal)
             min_coords = np.min(boundary_points, axis=0)
@@ -1771,8 +1902,8 @@ segmentation, triangulation, and visualization.
             vertices = triangulation_result['vertices']
             triangles = triangulation_result['triangles']
             
-            # Store triangulation results
-            self.triangulation_result = {
+            # Store triangulation results in the dataset
+            dataset['triangulation_result'] = {
                 'vertices': vertices,
                 'triangles': triangles,
                 'uniform': uniform,
@@ -1782,8 +1913,11 @@ segmentation, triangulation, and visualization.
                 'grid_points': grid_points if grid_points is not None else np.empty((0, 2))
             }
             
-            # Update visualization
-            self._plot_triangulation(vertices, triangles, self.hull_points)
+            # Update statistics
+            self._update_statistics()
+            
+            # Visualize all triangulations (not just the active one)
+            self._visualize_all_triangulations()
             
             # Calculate elapsed time
             elapsed_time = time.time() - start_time
@@ -1901,10 +2035,19 @@ segmentation, triangulation, and visualization.
             self.tri_viz_layout.addWidget(toolbar)
     
     def export_results(self):
-        """Export the triangulation results to a file"""
+        """Export the triangulation results to a file for the active dataset"""
         self.statusBar().showMessage("Exporting results...")
         
-        if self.triangulation_result is None:
+        # Check if we have an active dataset
+        if self.active_dataset_index < 0 or self.active_dataset_index >= len(self.datasets):
+            self.statusBar().showMessage("Error: No active dataset selected")
+            QMessageBox.critical(self, "Error", "No active dataset selected")
+            return
+        
+        # Get active dataset
+        dataset = self.datasets[self.active_dataset_index]
+        
+        if dataset.get('triangulation_result') is None:
             self.statusBar().showMessage("Error: No triangulation results to export")
             QMessageBox.critical(self, "Error", "No triangulation results to export")
             return
@@ -2012,8 +2155,8 @@ segmentation, triangulation, and visualization.
                 return
             
             try:
-                vertices = self.triangulation_result['vertices']
-                triangles = self.triangulation_result['triangles']
+                vertices = dataset['triangulation_result']['vertices']
+                triangles = dataset['triangulation_result']['triangles']
                 
                 # If 3D export is selected and PyVista is available
                 if export_3d and HAVE_PYVISTA:
@@ -2165,6 +2308,1363 @@ segmentation, triangulation, and visualization.
             # Write triangles
             for triangle in triangles:
                 f.write(f"{triangle[0]},{triangle[1]},{triangle[2]}\n")
+
+    def _show_dataset_context_menu(self, position):
+        """Show context menu for dataset list items"""
+        if self.dataset_list.count() == 0:
+            return
+            
+        # Get selected item
+        selected_items = self.dataset_list.selectedItems()
+        if not selected_items:
+            return
+            
+        # Create context menu
+        menu = QMenu()
+        rename_action = menu.addAction("Rename")
+        toggle_action = menu.addAction("Toggle Visibility")
+        change_color_action = menu.addAction("Change Color")
+        menu.addSeparator()
+        
+        # Add processing actions
+        process_menu = menu.addMenu("Process")
+        compute_hull_action = process_menu.addAction("Compute Hull")
+        compute_segments_action = process_menu.addAction("Compute Segments")
+        compute_triangulation_action = process_menu.addAction("Compute Triangulation")
+        process_all_action = process_menu.addAction("Process All Steps")
+        
+        menu.addSeparator()
+        remove_action = menu.addAction("Remove")
+        
+        # Show menu at position
+        action = menu.exec_(self.dataset_list.mapToGlobal(position))
+        
+        # Handle action
+        if not action:
+            return
+            
+        # Get selected dataset index
+        selected_index = self.dataset_list.row(selected_items[0])
+        
+        if action == rename_action:
+            self._rename_dataset(selected_index)
+        elif action == toggle_action:
+            self._toggle_dataset_visibility(selected_index)
+        elif action == change_color_action:
+            self._change_dataset_color(selected_index)
+        elif action == remove_action:
+            self._remove_dataset(selected_index)
+        elif action == compute_hull_action:
+            self.active_dataset_index = selected_index
+            self.compute_hull()
+        elif action == compute_segments_action:
+            self.active_dataset_index = selected_index
+            self.compute_segments()
+        elif action == compute_triangulation_action:
+            self.active_dataset_index = selected_index
+            self.run_triangulation()
+        elif action == process_all_action:
+            self.active_dataset_index = selected_index
+            self._process_all_steps(selected_index)
+    
+    def _process_all_steps(self, dataset_index):
+        """Process all steps (hull, segments, triangulation) for a dataset"""
+        if not (0 <= dataset_index < len(self.datasets)):
+            return
+            
+        # Set as active dataset
+        self.active_dataset_index = dataset_index
+        
+        # Display processing message
+        dataset_name = self.datasets[dataset_index]['name']
+        self.statusBar().showMessage(f"Processing all steps for {dataset_name}...")
+        
+        try:
+            # Step 1: Compute hull
+            self.compute_hull()
+            
+            # Step 2: Compute segments
+            self.compute_segments()
+            
+            # Step 3: Run triangulation
+            self.run_triangulation()
+            
+            self.statusBar().showMessage(f"Completed all processing steps for {dataset_name}")
+        except Exception as e:
+            self.statusBar().showMessage(f"Error processing dataset: {str(e)}")
+            logger.error(f"Error during dataset processing: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error processing dataset: {str(e)}")
+    
+    def process_all_datasets(self):
+        """Process all steps for all datasets"""
+        if not self.datasets:
+            QMessageBox.information(self, "No Datasets", "No datasets available to process.")
+            return
+            
+        num_processed = 0
+        total_datasets = len(self.datasets)
+        
+        self.statusBar().showMessage(f"Processing all steps for {total_datasets} datasets...")
+        
+        try:
+            # Process each dataset
+            for i in range(total_datasets):
+                dataset_name = self.datasets[i]['name']
+                self.statusBar().showMessage(f"Processing {dataset_name} ({i+1}/{total_datasets})...")
+                
+                # Set as active
+                self.active_dataset_index = i
+                
+                # Compute hull if needed
+                if self.datasets[i].get('hull_points') is None:
+                    # Call compute hull but catch any exceptions to continue with other datasets
+                    try:
+                        self.compute_hull()
+                    except Exception as e:
+                        logger.error(f"Error computing hull for {dataset_name}: {str(e)}")
+                        continue
+                
+                # Compute segments if needed
+                if self.datasets[i].get('segments') is None:
+                    try:
+                        self.compute_segments()
+                    except Exception as e:
+                        logger.error(f"Error computing segments for {dataset_name}: {str(e)}")
+                        continue
+                
+                # Run triangulation if needed
+                if self.datasets[i].get('triangulation_result') is None:
+                    try:
+                        self.run_triangulation()
+                    except Exception as e:
+                        logger.error(f"Error triangulating {dataset_name}: {str(e)}")
+                        continue
+                
+                num_processed += 1
+            
+            # Show completion message
+            self.statusBar().showMessage(f"Successfully processed {num_processed} out of {total_datasets} datasets")
+            
+            # Update visualizations for all
+            self._update_visualization()
+            
+        except Exception as e:
+            self.statusBar().showMessage(f"Error in batch processing: {str(e)}")
+            logger.error(f"Error during batch processing: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error in batch processing: {str(e)}")
+    
+    def _on_dataset_selection_changed(self):
+        """Handle dataset selection change"""
+        selected_items = self.dataset_list.selectedItems()
+        if not selected_items:
+            return
+            
+        # Get selected dataset index
+        selected_index = self.dataset_list.row(selected_items[0])
+        
+        # Set as active dataset
+        self.active_dataset_index = selected_index
+        
+        # Update statistics and visualization for the selected dataset
+        self._update_statistics()
+        self._update_visualization()
+        
+    def _update_statistics(self):
+        """Update statistics labels based on loaded datasets"""
+        num_datasets = len(self.datasets)
+        self.num_datasets_label.setText(f"Datasets: {num_datasets}")
+        
+        if num_datasets == 0:
+            self.points_label.setText("Points: 0")
+            self.bounds_label.setText("Bounds: N/A")
+            self.hull_points_label.setText("Hull vertices: 0")
+            self.hull_area_label.setText("Hull area: 0.0")
+            self.num_segments_label.setText("Segments: 0")
+            self.avg_segment_length_label.setText("Avg length: 0.0")
+            self.num_triangles_label.setText("Triangles: 0")
+            self.num_vertices_label.setText("Vertices: 0")
+            self.mean_edge_label.setText("Mean edge: 0.0")
+            self.uniformity_label.setText("Uniformity: 0.0")
+            return
+        
+        # Update statistics for the active dataset
+        if 0 <= self.active_dataset_index < num_datasets:
+            dataset = self.datasets[self.active_dataset_index]
+            
+            # Points statistics
+            if dataset['points'] is not None:
+                self.points_label.setText(f"Points: {len(dataset['points'])}")
+                
+                # Calculate bounds
+                min_x, min_y = np.min(dataset['points'], axis=0)
+                max_x, max_y = np.max(dataset['points'], axis=0)
+                self.bounds_label.setText(f"Bounds: X[{min_x:.2f},{max_x:.2f}] Y[{min_y:.2f},{max_y:.2f}]")
+            else:
+                self.points_label.setText("Points: 0")
+                self.bounds_label.setText("Bounds: N/A")
+            
+            # Hull statistics
+            if dataset.get('hull_points') is not None:
+                hull_points = dataset['hull_points']
+                self.hull_points_label.setText(f"Hull vertices: {len(hull_points)-1}")  # -1 for the closing point
+                
+                # Calculate hull area (approximate)
+                area = 0.0
+                for i in range(len(hull_points)-1):
+                    x1, y1 = hull_points[i]
+                    x2, y2 = hull_points[i+1]
+                    area += x1*y2 - x2*y1
+                area = abs(area) / 2.0
+                self.hull_area_label.setText(f"Hull area: {area:.2f}")
+            else:
+                self.hull_points_label.setText("Hull vertices: 0")
+                self.hull_area_label.setText("Hull area: 0.0")
+            
+            # Segment statistics
+            if dataset.get('segments') is not None:
+                segments = dataset['segments']
+                self.num_segments_label.setText(f"Segments: {len(segments)}")
+                
+                # Calculate average segment length
+                segment_lengths = [np.linalg.norm(segment[1] - segment[0]) for segment in segments]
+                avg_length = np.mean(segment_lengths)
+                self.avg_segment_length_label.setText(f"Avg length: {avg_length:.2f}")
+            else:
+                self.num_segments_label.setText("Segments: 0")
+                self.avg_segment_length_label.setText("Avg length: 0.0")
+            
+            # Triangulation statistics
+            if dataset.get('triangulation_result') is not None:
+                triangulation = dataset['triangulation_result']
+                vertices = triangulation['vertices']
+                triangles = triangulation['triangles']
+                
+                self.num_triangles_label.setText(f"Triangles: {len(triangles)}")
+                self.num_vertices_label.setText(f"Vertices: {len(vertices)}")
+                
+                # Calculate edge lengths and statistics
+                edge_lengths = []
+                for tri in triangles:
+                    v1, v2, v3 = tri
+                    p1, p2, p3 = vertices[v1], vertices[v2], vertices[v3]
+                    
+                    edge_lengths.extend([
+                        np.linalg.norm(p2 - p1),
+                        np.linalg.norm(p3 - p2),
+                        np.linalg.norm(p1 - p3)
+                    ])
+                
+                if edge_lengths:
+                    mean_edge = np.mean(edge_lengths)
+                    edge_std = np.std(edge_lengths)
+                    uniformity = edge_std / mean_edge if mean_edge > 0 else 0
+                    
+                    self.mean_edge_label.setText(f"Mean edge: {mean_edge:.4f}")
+                    self.uniformity_label.setText(f"Uniformity: {uniformity:.4f}")
+                else:
+                    self.mean_edge_label.setText("Mean edge: 0.0")
+                    self.uniformity_label.setText("Uniformity: 0.0")
+            else:
+                self.num_triangles_label.setText("Triangles: 0")
+                self.num_vertices_label.setText("Vertices: 0")
+                self.mean_edge_label.setText("Mean edge: 0.0")
+                self.uniformity_label.setText("Uniformity: 0.0")
+    
+    def _update_dataset_list(self):
+        """Update the dataset list widget"""
+        # Save current selection
+        current_index = self.active_dataset_index
+        
+        # Clear list
+        self.dataset_list.clear()
+        
+        # Add datasets to list
+        for dataset in self.datasets:
+            visibility = "✓" if dataset.get('visible', True) else "✗"
+            color_square = "■ "
+            item_text = f"{color_square}{visibility} {dataset['name']}"
+            
+            item = QListWidgetItem(item_text)
+            
+            # Set item color based on dataset color
+            color = dataset.get('color', '#000000')
+            item.setForeground(QColor(color))
+            
+            self.dataset_list.addItem(item)
+        
+        # Restore selection if possible
+        if 0 <= current_index < self.dataset_list.count():
+            self.dataset_list.setCurrentRow(current_index)
+        elif self.dataset_list.count() > 0:
+            self.dataset_list.setCurrentRow(0)
+            self.active_dataset_index = 0
+        else:
+            self.active_dataset_index = -1
+    
+    def _rename_dataset(self, dataset_index):
+        """Rename a dataset"""
+        if not (0 <= dataset_index < len(self.datasets)):
+            return
+            
+        dataset = self.datasets[dataset_index]
+        old_name = dataset['name']
+        
+        # Create dialog for renaming
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Rename Dataset")
+        dialog.setFixedSize(300, 100)
+        dialog_layout = QVBoxLayout(dialog)
+        
+        # Add name input
+        dialog_layout.addWidget(QLabel("Dataset Name:"))
+        name_input = QLineEdit(old_name)
+        dialog_layout.addWidget(name_input)
+        
+        # Add buttons
+        button_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        ok_btn = QPushButton("OK")
+        button_layout.addWidget(cancel_btn)
+        button_layout.addWidget(ok_btn)
+        dialog_layout.addLayout(button_layout)
+        
+        # Connect signals
+        cancel_btn.clicked.connect(dialog.reject)
+        ok_btn.clicked.connect(dialog.accept)
+        
+        # Show dialog and get result
+        result = dialog.exec_()
+        
+        if result == QDialog.Accepted:
+            new_name = name_input.text().strip()
+            if new_name:
+                # Update dataset name
+                dataset['name'] = new_name
+                
+                # Update list
+                self._update_dataset_list()
+    
+    def _toggle_dataset_visibility(self, dataset_index):
+        """Toggle visibility of a dataset"""
+        if not (0 <= dataset_index < len(self.datasets)):
+            return
+            
+        dataset = self.datasets[dataset_index]
+        dataset['visible'] = not dataset.get('visible', True)
+        
+        # Update list
+        self._update_dataset_list()
+        
+        # Update visualization
+        self._update_visualization()
+    
+    def _change_dataset_color(self, dataset_index):
+        """Change color of a dataset"""
+        if not (0 <= dataset_index < len(self.datasets)):
+            return
+            
+        dataset = self.datasets[dataset_index]
+        old_color = dataset.get('color', '#000000')
+        
+        # Get new color using color dialog
+        new_color = QColorDialog.getColor(QColor(old_color), self, "Select Dataset Color")
+        
+        if new_color.isValid():
+            # Update dataset color
+            dataset['color'] = new_color.name()
+            
+            # Update list
+            self._update_dataset_list()
+            
+            # Update visualization
+            self._update_visualization()
+    
+    def _remove_dataset(self, dataset_index):
+        """Remove a dataset"""
+        if not (0 <= dataset_index < len(self.datasets)):
+            return
+            
+        # Confirm deletion
+        confirm = QMessageBox.question(
+            self, 
+            "Remove Dataset", 
+            f"Are you sure you want to remove dataset '{self.datasets[dataset_index]['name']}'?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if confirm == QMessageBox.Yes:
+            # Remove dataset
+            self.datasets.pop(dataset_index)
+            
+            # Update dataset list
+            self._update_dataset_list()
+            
+            # Update statistics and visualization
+            self._update_statistics()
+            self._update_visualization()
+    
+    def clear_all_datasets(self):
+        """Clear all loaded datasets"""
+        if not self.datasets:
+            return
+            
+        # Confirm deletion
+        confirm = QMessageBox.question(
+            self, 
+            "Clear All Datasets", 
+            f"Are you sure you want to remove all {len(self.datasets)} datasets?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if confirm == QMessageBox.Yes:
+            # Clear datasets
+            self.datasets = []
+            self.active_dataset_index = -1
+            
+            # Update UI
+            self._update_dataset_list()
+            self._update_statistics()
+            
+            # Clear visualizations
+            self._clear_visualizations()
+            
+            self.statusBar().showMessage("All datasets cleared")
+    
+    def remove_active_dataset(self):
+        """Remove the active dataset"""
+        if 0 <= self.active_dataset_index < len(self.datasets):
+            self._remove_dataset(self.active_dataset_index)
+    
+    def _clear_visualizations(self):
+        """Clear all visualizations"""
+        self._clear_hull_plot()
+        self._clear_segment_plot()
+        self._clear_triangulation_plot()
+        
+        # Clear points visualization
+        while self.file_viz_layout.count():
+            item = self.file_viz_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        
+        # Reset placeholder
+        if HAVE_PYVISTA:
+            placeholder_text = "Load data to visualize points in 3D"
+        else:
+            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nLoad data to visualize points in 2D."
+            
+        self.file_viz_placeholder = QLabel(placeholder_text)
+        self.file_viz_placeholder.setAlignment(Qt.AlignCenter)
+        self.file_viz_layout.addWidget(self.file_viz_placeholder)
+    
+    def _update_visualization(self):
+        """Update all visualizations based on loaded datasets"""
+        # Check if we have any datasets
+        if not self.datasets:
+            self._clear_visualizations()
+            return
+        
+        # Get visible datasets
+        visible_datasets = [d for d in self.datasets if d.get('visible', True)]
+        
+        if not visible_datasets:
+            self._clear_visualizations()
+            return
+        
+        # Update points visualization
+        self._visualize_all_points()
+        
+        # Update hull visualization if we have any hulls
+        hulls_exist = any(d.get('hull_points') is not None for d in visible_datasets)
+        if hulls_exist:
+            self._visualize_all_hulls()
+        
+        # Update segments visualization if we have any segments
+        segments_exist = any(d.get('segments') is not None for d in visible_datasets)
+        if segments_exist:
+            self._visualize_all_segments()
+        
+        # Update triangulation visualization if we have any triangulations
+        triangulations_exist = any(d.get('triangulation_result') is not None for d in visible_datasets)
+        if triangulations_exist:
+            self._visualize_all_triangulations()
+    
+    def load_file(self):
+        """Load a single data file"""
+        self.statusBar().showMessage("Loading file...")
+        
+        # Open file dialog
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select a point data file",
+            "",
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;All files (*.*)"
+        )
+        
+        if not file_path:
+            self.statusBar().showMessage("File loading canceled")
+            return
+            
+        # Update status with file path
+        self.statusBar().showMessage(f"Loading file: {os.path.basename(file_path)}...")
+        
+        try:
+            # Try to read the file
+            points = self._read_point_file(file_path)
+            
+            if points is not None and len(points) > 0:
+                # Create a new dataset
+                filename = os.path.basename(file_path)
+                dataset = {
+                    'name': filename,
+                    'points': points,
+                    'visible': True,
+                    'color': self._get_next_color()
+                }
+                
+                # Add to datasets
+                self.datasets.append(dataset)
+                self.active_dataset_index = len(self.datasets) - 1
+                
+                # Update UI
+                self._update_dataset_list()
+                self._update_statistics()
+                self._visualize_all_points()
+                
+                self.statusBar().showMessage(f"Successfully loaded {len(points)} points from {filename}")
+            else:
+                self.statusBar().showMessage("Error: No valid points found in file")
+                QMessageBox.critical(self, "Error", "No valid points found in file")
+        
+        except Exception as e:
+            self.statusBar().showMessage(f"Error loading file: {str(e)}")
+            logger.error(f"Error loading file: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error loading file: {str(e)}")
+    
+    def load_multiple_files(self):
+        """Load multiple data files"""
+        self.statusBar().showMessage("Loading multiple files...")
+        
+        # Open file dialog
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select point data files",
+            "",
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;All files (*.*)"
+        )
+        
+        if not file_paths:
+            self.statusBar().showMessage("File loading canceled")
+            return
+        
+        successful_loads = 0
+        
+        for file_path in file_paths:
+            try:
+                # Update status with file path
+                filename = os.path.basename(file_path)
+                self.statusBar().showMessage(f"Loading file: {filename}...")
+                
+                # Try to read the file
+                points = self._read_point_file(file_path)
+                
+                if points is not None and len(points) > 0:
+                    # Create a new dataset
+                    dataset = {
+                        'name': filename,
+                        'points': points,
+                        'visible': True,
+                        'color': self._get_next_color()
+                    }
+                    
+                    # Add to datasets
+                    self.datasets.append(dataset)
+                    self.active_dataset_index = len(self.datasets) - 1
+                    successful_loads += 1
+                else:
+                    logger.warning(f"No valid points found in file: {filename}")
+            except Exception as e:
+                logger.error(f"Error loading file {filename}: {str(e)}")
+        
+        if successful_loads > 0:
+            # Update UI
+            self._update_dataset_list()
+            self._update_statistics()
+            self._visualize_all_points()
+            
+            self.statusBar().showMessage(f"Successfully loaded {successful_loads} out of {len(file_paths)} files")
+        else:
+            self.statusBar().showMessage("Error: No valid points found in any file")
+            QMessageBox.critical(self, "Error", "No valid points found in any file")
+            
+    def _get_next_color(self):
+        """Get next color from palette for a new dataset"""
+        if not self.datasets:
+            return self.color_palette[0]
+        
+        # Count existing colors
+        used_colors = {}
+        for dataset in self.datasets:
+            color = dataset.get('color')
+            if color:
+                used_colors[color] = used_colors.get(color, 0) + 1
+        
+        # Find first least used color
+        for color in self.color_palette:
+            if color not in used_colors:
+                return color
+        
+        # If all colors are used, use the least used one
+        min_used = min(used_colors.values())
+        least_used_colors = [c for c, count in used_colors.items() if count == min_used]
+        
+        # Return the first one from palette order
+        for color in self.color_palette:
+            if color in least_used_colors:
+                return color
+        
+        # If all else fails, return a random color
+        return self.color_palette[np.random.randint(0, len(self.color_palette))]
+
+    def _visualize_all_points(self):
+        """Visualize all visible datasets' points"""
+        # Get visible datasets
+        visible_datasets = [d for d in self.datasets if d.get('visible', True)]
+        
+        if not visible_datasets:
+            self._clear_hull_plot()
+            return
+        
+        # Clear existing visualization
+        while self.file_viz_layout.count():
+            item = self.file_viz_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        
+        # Calculate global bounds for all visible datasets
+        all_points = np.vstack([d['points'] for d in visible_datasets if d['points'] is not None])
+        if len(all_points) == 0:
+            return
+            
+        min_x, min_y = np.min(all_points, axis=0)
+        max_x, max_y = np.max(all_points, axis=0)
+        
+        # Use 3D visualization if enabled
+        if self.view_3d_enabled:
+            # Create 3D visualization
+            self._create_multi_dataset_3d_visualization(
+                self.file_viz_frame,
+                visible_datasets,
+                "Points Visualization",
+                view_type="points"
+            )
+        else:
+            # Fall back to matplotlib if PyVista is not available
+            fig = Figure(figsize=(6, 4), dpi=100)
+            ax = fig.add_subplot(111)
+            
+            # Plot each dataset with its color
+            for dataset in visible_datasets:
+                points = dataset['points']
+                if points is not None and len(points) > 0:
+                    color = dataset.get('color', 'blue')
+                    name = dataset.get('name', 'Unnamed')
+                    ax.scatter(points[:, 0], points[:, 1], s=5, c=color, alpha=0.7, label=name)
+            
+            ax.set_aspect('equal')
+            ax.set_title("Point Clouds")
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            ax.legend()
+            
+            # Add grid and set limits with some padding
+            ax.grid(True, linestyle='--', alpha=0.6)
+            padding = max((max_x - min_x), (max_y - min_y)) * 0.05
+            ax.set_xlim(min_x - padding, max_x + padding)
+            ax.set_ylim(min_y - padding, max_y + padding)
+            
+            # Create canvas
+            canvas = FigureCanvas(fig)
+            self.file_viz_layout.addWidget(canvas)
+            
+            # Add toolbar
+            toolbar = NavigationToolbar(canvas, self.file_viz_frame)
+            self.file_viz_layout.addWidget(toolbar)
+    
+    def _visualize_all_hulls(self):
+        """Visualize all visible datasets' hulls"""
+        # Get visible datasets with hulls
+        visible_datasets = [d for d in self.datasets if d.get('visible', True) and d.get('hull_points') is not None]
+        
+        if not visible_datasets:
+            self._clear_hull_plot()
+            return
+        
+        # Clear existing visualization
+        while self.hull_viz_layout.count():
+            item = self.hull_viz_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        
+        # Calculate global bounds for all visible datasets
+        all_points = np.vstack([d['points'] for d in visible_datasets if d['points'] is not None])
+        if len(all_points) == 0:
+            return
+            
+        min_x, min_y = np.min(all_points, axis=0)
+        max_x, max_y = np.max(all_points, axis=0)
+        
+        # Use 3D visualization if enabled
+        if self.view_3d_enabled:
+            # Create 3D visualization
+            self._create_multi_dataset_3d_visualization(
+                self.hull_viz_frame,
+                visible_datasets,
+                "Convex Hull Visualization",
+                view_type="hulls"
+            )
+        else:
+            # Fall back to matplotlib if PyVista is not available
+            fig = Figure(figsize=(6, 4), dpi=100)
+            ax = fig.add_subplot(111)
+            
+            # Plot each dataset with its color
+            for dataset in visible_datasets:
+                points = dataset['points']
+                hull_points = dataset['hull_points']
+                
+                if points is not None and len(points) > 0 and hull_points is not None and len(hull_points) > 0:
+                    color = dataset.get('color', 'blue')
+                    name = dataset.get('name', 'Unnamed')
+                    
+                    # Plot points
+                    ax.scatter(points[:, 0], points[:, 1], s=5, c=color, alpha=0.3)
+                    
+                    # Plot hull
+                    ax.plot(hull_points[:, 0], hull_points[:, 1], 
+                          color=color, linewidth=2, label=f"{name} Hull")
+                    
+                    # Plot hull vertices
+                    ax.scatter(hull_points[:-1, 0], hull_points[:-1, 1], 
+                             s=30, c=color, edgecolor='black')
+            
+            ax.set_aspect('equal')
+            ax.set_title("Convex Hulls")
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            ax.legend()
+            
+            # Add grid and set limits with some padding
+            ax.grid(True, linestyle='--', alpha=0.6)
+            padding = max((max_x - min_x), (max_y - min_y)) * 0.05
+            ax.set_xlim(min_x - padding, max_x + padding)
+            ax.set_ylim(min_y - padding, max_y + padding)
+            
+            # Create canvas
+            canvas = FigureCanvas(fig)
+            self.hull_viz_layout.addWidget(canvas)
+            
+            # Add toolbar
+            toolbar = NavigationToolbar(canvas, self.hull_viz_frame)
+            self.hull_viz_layout.addWidget(toolbar)
+        
+        # Update the hull legend to show all visible datasets
+        legend_layout = QHBoxLayout()
+        for dataset in visible_datasets:
+            color = dataset.get('color', '#000000')
+            name = dataset.get('name', 'Unnamed')
+            
+            legend_item = QWidget()
+            legend_item_layout = QHBoxLayout(legend_item)
+            legend_item_layout.setContentsMargins(0, 0, 0, 0)
+            
+            # Color box
+            color_box = QLabel("■")
+            color_box.setStyleSheet(f"color: {color}; font-size: 16px;")
+            legend_item_layout.addWidget(color_box)
+            
+            # Dataset name
+            name_label = QLabel(name)
+            legend_item_layout.addWidget(name_label)
+            
+            legend_layout.addWidget(legend_item)
+        
+        # Add spacer to push items to the left
+        legend_layout.addStretch()
+        
+        # Remove previous legend if it exists
+        if hasattr(self, 'hull_legend_widget') and self.hull_legend_widget is not None:
+            self.hull_legend_widget.deleteLater()
+        
+        # Create a widget for the legend
+        self.hull_legend_widget = QWidget()
+        self.hull_legend_widget.setLayout(legend_layout)
+        
+        # Add it to the top of the layout
+        self.hull_viz_layout.insertWidget(0, self.hull_legend_widget)
+    
+    def _visualize_all_segments(self):
+        """Visualize all visible datasets' segments"""
+        # Get visible datasets with segments
+        visible_datasets = [d for d in self.datasets if d.get('visible', True) and d.get('segments') is not None]
+        
+        if not visible_datasets:
+            self._clear_segment_plot()
+            return
+        
+        # Clear existing visualization
+        while self.segment_viz_layout.count():
+            item = self.segment_viz_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        
+        # Calculate global bounds for all visible datasets
+        all_points = np.vstack([d['points'] for d in visible_datasets if d['points'] is not None])
+        if len(all_points) == 0:
+            return
+            
+        min_x, min_y = np.min(all_points, axis=0)
+        max_x, max_y = np.max(all_points, axis=0)
+        
+        # Use 3D visualization if enabled
+        if self.view_3d_enabled:
+            # Create 3D visualization
+            self._create_multi_dataset_3d_visualization(
+                self.segment_viz_frame,
+                visible_datasets,
+                "Segmentation Visualization",
+                view_type="segments"
+            )
+        else:
+            # Fall back to matplotlib if PyVista is not available
+            fig = Figure(figsize=(6, 4), dpi=100)
+            ax = fig.add_subplot(111)
+            
+            # Plot each dataset with its color
+            for dataset in visible_datasets:
+                points = dataset['points']
+                hull_points = dataset.get('hull_points')
+                segments = dataset['segments']
+                
+                if points is not None and len(points) > 0 and segments is not None and len(segments) > 0:
+                    color = dataset.get('color', 'blue')
+                    name = dataset.get('name', 'Unnamed')
+                    
+                    # Plot points
+                    ax.scatter(points[:, 0], points[:, 1], s=5, c=color, alpha=0.3)
+                    
+                    # Plot hull if available
+                    if hull_points is not None and len(hull_points) > 0:
+                        ax.plot(hull_points[:, 0], hull_points[:, 1], 
+                              color=color, linewidth=1, alpha=0.5)
+                    
+                    # Plot segments
+                    for segment in segments:
+                        ax.plot([segment[0][0], segment[1][0]], [segment[0][1], segment[1][1]], 
+                              color=color, linewidth=1.5, alpha=0.8)
+                    
+                    # Plot segment endpoints
+                    all_endpoints = np.vstack([segment[0] for segment in segments] + 
+                                            [segment[1] for segment in segments])
+                    unique_endpoints = np.unique(all_endpoints, axis=0)
+                    ax.scatter(unique_endpoints[:, 0], unique_endpoints[:, 1], 
+                             s=15, c=color, edgecolor='black', label=f"{name} Segments")
+            
+            ax.set_aspect('equal')
+            ax.set_title("Segmentations")
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            ax.legend()
+            
+            # Add grid and set limits with some padding
+            ax.grid(True, linestyle='--', alpha=0.6)
+            padding = max((max_x - min_x), (max_y - min_y)) * 0.05
+            ax.set_xlim(min_x - padding, max_x + padding)
+            ax.set_ylim(min_y - padding, max_y + padding)
+            
+            # Create canvas
+            canvas = FigureCanvas(fig)
+            self.segment_viz_layout.addWidget(canvas)
+            
+            # Add toolbar
+            toolbar = NavigationToolbar(canvas, self.segment_viz_frame)
+            self.segment_viz_layout.addWidget(toolbar)
+        
+        # Update the segments legend to show all visible datasets
+        legend_layout = QHBoxLayout()
+        for dataset in visible_datasets:
+            color = dataset.get('color', '#000000')
+            name = dataset.get('name', 'Unnamed')
+            
+            legend_item = QWidget()
+            legend_item_layout = QHBoxLayout(legend_item)
+            legend_item_layout.setContentsMargins(0, 0, 0, 0)
+            
+            # Color box
+            color_box = QLabel("■")
+            color_box.setStyleSheet(f"color: {color}; font-size: 16px;")
+            legend_item_layout.addWidget(color_box)
+            
+            # Dataset name
+            name_label = QLabel(name)
+            legend_item_layout.addWidget(name_label)
+            
+            legend_layout.addWidget(legend_item)
+        
+        # Add spacer to push items to the left
+        legend_layout.addStretch()
+        
+        # Remove previous legend if it exists
+        if hasattr(self, 'segment_legend_widget') and self.segment_legend_widget is not None:
+            self.segment_legend_widget.deleteLater()
+        
+        # Create a widget for the legend
+        self.segment_legend_widget = QWidget()
+        self.segment_legend_widget.setLayout(legend_layout)
+        
+        # Add it to the top of the layout
+        self.segment_viz_layout.insertWidget(0, self.segment_legend_widget)
+    
+    def _visualize_all_triangulations(self):
+        """Visualize all visible datasets' triangulations"""
+        # Get visible datasets with triangulations
+        visible_datasets = [d for d in self.datasets if d.get('visible', True) and d.get('triangulation_result') is not None]
+        
+        if not visible_datasets:
+            self._clear_triangulation_plot()
+            return
+        
+        # Clear existing visualization
+        while self.tri_viz_layout.count():
+            item = self.tri_viz_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        
+        # Calculate global bounds for all visible datasets
+        all_vertices = []
+        for dataset in visible_datasets:
+            if dataset.get('triangulation_result') is not None:
+                vertices = dataset['triangulation_result']['vertices']
+                if vertices is not None and len(vertices) > 0:
+                    all_vertices.append(vertices)
+        
+        if not all_vertices:
+            return
+            
+        all_vertices = np.vstack(all_vertices)
+        min_x, min_y = np.min(all_vertices, axis=0)
+        max_x, max_y = np.max(all_vertices, axis=0)
+        
+        # Use 3D visualization if enabled
+        if self.view_3d_enabled:
+            # Create 3D visualization
+            self._create_multi_dataset_3d_visualization(
+                self.tri_viz_frame,
+                visible_datasets,
+                "Triangulation Visualization",
+                view_type="triangulation"
+            )
+        else:
+            # Fall back to matplotlib if PyVista is not available
+            fig = Figure(figsize=(6, 4), dpi=100)
+            ax = fig.add_subplot(111)
+            
+            # Plot each dataset with its color
+            for dataset in visible_datasets:
+                triangulation_result = dataset['triangulation_result']
+                hull_points = dataset.get('hull_points')
+                
+                if triangulation_result is not None:
+                    vertices = triangulation_result['vertices']
+                    triangles = triangulation_result['triangles']
+                    
+                    if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
+                        color = dataset.get('color', 'blue')
+                        name = dataset.get('name', 'Unnamed')
+                        
+                        # Plot triangulation using triplot
+                        from matplotlib.tri import Triangulation
+                        tri = Triangulation(vertices[:, 0], vertices[:, 1], triangles)
+                        ax.triplot(tri, color=color, lw=0.5, alpha=0.7, label=f"{name} Mesh")
+                        
+                        # Plot hull boundary if available
+                        if hull_points is not None and len(hull_points) > 3:
+                            ax.plot(hull_points[:, 0], hull_points[:, 1], color=color, linewidth=1.5)
+            
+            ax.set_aspect('equal')
+            ax.set_title("Triangulations")
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            ax.legend()
+            
+            # Add grid and set limits with some padding
+            ax.grid(True, linestyle='--', alpha=0.6)
+            padding = max((max_x - min_x), (max_y - min_y)) * 0.05
+            ax.set_xlim(min_x - padding, max_x + padding)
+            ax.set_ylim(min_y - padding, max_y + padding)
+            
+            # Create canvas
+            canvas = FigureCanvas(fig)
+            self.tri_viz_layout.addWidget(canvas)
+            
+            # Add toolbar
+            toolbar = NavigationToolbar(canvas, self.tri_viz_frame)
+            self.tri_viz_layout.addWidget(toolbar)
+        
+        # Update the triangulation legend to show all visible datasets
+        legend_layout = QHBoxLayout()
+        for dataset in visible_datasets:
+            color = dataset.get('color', '#000000')
+            name = dataset.get('name', 'Unnamed')
+            
+            legend_item = QWidget()
+            legend_item_layout = QHBoxLayout(legend_item)
+            legend_item_layout.setContentsMargins(0, 0, 0, 0)
+            
+            # Color box
+            color_box = QLabel("■")
+            color_box.setStyleSheet(f"color: {color}; font-size: 16px;")
+            legend_item_layout.addWidget(color_box)
+            
+            # Dataset name
+            name_label = QLabel(name)
+            legend_item_layout.addWidget(name_label)
+            
+            legend_layout.addWidget(legend_item)
+        
+        # Add spacer to push items to the left
+        legend_layout.addStretch()
+        
+        # Remove previous legend if it exists
+        if hasattr(self, 'tri_legend_widget') and self.tri_legend_widget is not None:
+            self.tri_legend_widget.deleteLater()
+        
+        # Create a widget for the legend
+        self.tri_legend_widget = QWidget()
+        self.tri_legend_widget.setLayout(legend_layout)
+        
+        # Add it to the top of the layout
+        self.tri_viz_layout.insertWidget(0, self.tri_legend_widget)
+    
+    def _create_multi_dataset_3d_visualization(self, parent_frame, datasets, title, view_type="points"):
+        """Create a 3D visualization of multiple datasets
+        
+        Args:
+            parent_frame: Frame to contain the visualization
+            datasets: List of datasets to visualize
+            title: Title for the visualization
+            view_type: Type of visualization: "points", "hulls", "segments", or "triangulation"
+        """
+        if not HAVE_PYVISTA:
+            # Create a message if PyVista is not available
+            msg_widget = QWidget()
+            msg_layout = QVBoxLayout(msg_widget)
+            
+            msg = QLabel("PyVista not installed.\nPlease install PyVista for 3D visualization.")
+            msg.setAlignment(Qt.AlignCenter)
+            msg_layout.addWidget(msg)
+            
+            parent_frame.layout().addWidget(msg_widget)
+            return msg_widget
+        
+        # Close previous plotter if it exists
+        if self.current_plotter is not None:
+            try:
+                self.current_plotter.close()
+            except:
+                pass
+            
+        # Create a frame for the visualization
+        vis_widget = QWidget()
+        vis_layout = QVBoxLayout(vis_widget)
+        
+        # Add visualization info header
+        if view_type == "points":
+            info_title = "Point Cloud Visualization"
+        elif view_type == "hulls":
+            info_title = "Convex Hull Visualization"
+        elif view_type == "segments":
+            info_title = "Segmentation Visualization"
+        elif view_type == "triangulation":
+            info_title = "Triangulation Visualization"
+        else:
+            info_title = title
+            
+        info_label = QLabel(info_title)
+        info_label.setAlignment(Qt.AlignCenter)
+        vis_layout.addWidget(info_label)
+        
+        # Create legend with colored boxes for each dataset
+        legend_layout = QHBoxLayout()
+        for dataset in datasets:
+            if not dataset.get('visible', True):
+                continue
+                
+            color = dataset.get('color', '#000000')
+            name = dataset.get('name', 'Unnamed')
+            
+            legend_item = QWidget()
+            legend_item_layout = QHBoxLayout(legend_item)
+            legend_item_layout.setContentsMargins(0, 0, 0, 0)
+            
+            # Color box
+            color_box = QLabel("■")
+            color_box.setStyleSheet(f"color: {color}; font-size: 16px;")
+            legend_item_layout.addWidget(color_box)
+            
+            # Dataset name
+            name_label = QLabel(name)
+            legend_item_layout.addWidget(name_label)
+            
+            legend_layout.addWidget(legend_item)
+            
+        # Add spacer to push items to the left
+        legend_layout.addStretch()
+        vis_layout.addLayout(legend_layout)
+        
+        try:
+            # Create PyVista plotter widget
+            from pyvistaqt import QtInteractor
+            
+            # Create frame
+            viz_frame = QFrame()
+            viz_layout = QVBoxLayout(viz_frame)
+            
+            # Create the interactor
+            self.current_plotter = QtInteractor(viz_frame)
+            viz_layout.addWidget(self.current_plotter)
+            
+            # Set background color
+            self.current_plotter.set_background("#383F51")
+            
+            # Determine dataset vertical spacing
+            # This is crucial to distinguish multiple datasets by giving them unique Z positions
+            # Calculate global bounding box of all points
+            all_points = []
+            for dataset in datasets:
+                if dataset.get('visible', True) and dataset.get('points') is not None:
+                    all_points.append(dataset['points'])
+            
+            # Set Z-position variables
+            z_base = 0           # Base Z position for the first dataset
+            z_spacing = 20.0     # Spacing between datasets
+            
+            # Calculate dataset extents if we have points
+            if all_points:
+                all_points_np = np.vstack(all_points)
+                x_min, y_min = np.min(all_points_np, axis=0)
+                x_max, y_max = np.max(all_points_np, axis=0)
+                xy_range = max(x_max - x_min, y_max - y_min)
+                z_spacing = xy_range * 0.5  # Adjust spacing based on dataset size
+            
+            # Variables for pattern-based Z offset
+            x_scale = 0.05
+            y_scale = 0.05
+            
+            # Process datasets based on visualization type
+            for i, dataset in enumerate(datasets):
+                if not dataset.get('visible', True):
+                    continue
+                    
+                # Get dataset properties
+                points = dataset.get('points')
+                color = dataset.get('color', '#000000')
+                name = dataset.get('name', 'Unnamed')
+                
+                if points is None or len(points) == 0:
+                    continue
+                
+                # Calculate vertical position for this dataset
+                # Each dataset gets a unique z_offset to stack in 3D space
+                z_offset = z_base + (i * z_spacing)
+                
+                # Convert 2D points to 3D with height variation
+                if points.shape[1] == 2:
+                    # Convert 2D points to 3D
+                    points_3d = np.zeros((len(points), 3))
+                    points_3d[:, 0] = points[:, 0]
+                    points_3d[:, 1] = points[:, 1]
+                    
+                    # Check if the filename suggests this is a top or bottom part
+                    lower_name = name.lower()
+                    if "top" in lower_name:
+                        # Top parts get extra elevation
+                        z_offset += z_spacing
+                    elif "bottom" in lower_name:
+                        # Bottom parts stay at base level
+                        pass
+                    
+                    # Add Z values with a nice pattern + the dataset offset
+                    z_pattern_scale = 5.0 * self.height_factor
+                    
+                    for j in range(len(points)):
+                        x, y = points[j]
+                        # Pattern-based height variation
+                        z_pattern = np.sin(x * x_scale) * np.cos(y * y_scale) * z_pattern_scale
+                        # Add dataset offset
+                        points_3d[j, 2] = z_pattern + z_offset
+                else:
+                    points_3d = points.copy()
+                    # If already 3D, still apply the offset
+                    points_3d[:, 2] += z_offset
+                
+                # Add visualization based on type
+                if view_type == "points" or view_type == "all":
+                    # Create point cloud
+                    point_cloud = pv.PolyData(points_3d)
+                    self.current_plotter.add_mesh(point_cloud, color=color, render_points_as_spheres=True, 
+                                         point_size=8, label=name)
+                
+                if view_type == "hulls" or view_type == "segments" or view_type == "triangulation" or view_type == "all":
+                    hull_points = dataset.get('hull_points')
+                    if hull_points is not None and len(hull_points) > 3:
+                        # Convert hull points to 3D
+                        hull_3d = np.zeros((len(hull_points), 3))
+                        hull_3d[:, 0] = hull_points[:, 0]
+                        hull_3d[:, 1] = hull_points[:, 1]
+                        
+                        # Add Z values with offset
+                        for j in range(len(hull_points)):
+                            x, y = hull_points[j]
+                            z_pattern = np.sin(x * x_scale) * np.cos(y * y_scale) * z_pattern_scale
+                            hull_3d[j, 2] = z_pattern + z_offset
+                        
+                        # Create lines for hull
+                        for j in range(len(hull_3d)-1):
+                            line = pv.Line(hull_3d[j], hull_3d[j+1])
+                            self.current_plotter.add_mesh(line, color=color, line_width=3)
+                
+                if view_type == "segments" or view_type == "all":
+                    segments = dataset.get('segments')
+                    if segments is not None and len(segments) > 0:
+                        # Create 3D lines for segments
+                        for segment in segments:
+                            # Create 3D line points
+                            line_points = np.zeros((2, 3))
+                            line_points[0, 0] = segment[0][0]
+                            line_points[0, 1] = segment[0][1]
+                            line_points[1, 0] = segment[1][0]
+                            line_points[1, 1] = segment[1][1]
+                            
+                            # Set Z values with offset
+                            x1, y1 = segment[0]
+                            x2, y2 = segment[1]
+                            z1 = np.sin(x1 * x_scale) * np.cos(y1 * y_scale) * z_pattern_scale
+                            z2 = np.sin(x2 * x_scale) * np.cos(y2 * y_scale) * z_pattern_scale
+                            line_points[0, 2] = z1 + z_offset
+                            line_points[1, 2] = z2 + z_offset
+                            
+                            # Create line
+                            line_obj = pv.Line(line_points[0], line_points[1])
+                            self.current_plotter.add_mesh(line_obj, color=color, line_width=2)
+                
+                if view_type == "triangulation" or view_type == "all":
+                    triangulation_result = dataset.get('triangulation_result')
+                    if triangulation_result is not None:
+                        vertices = triangulation_result.get('vertices')
+                        triangles = triangulation_result.get('triangles')
+                        
+                        if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
+                            # Convert vertices to 3D
+                            vertices_3d = np.zeros((len(vertices), 3))
+                            vertices_3d[:, 0] = vertices[:, 0]
+                            vertices_3d[:, 1] = vertices[:, 1]
+                            
+                            # Add Z values with offset
+                            for j in range(len(vertices)):
+                                x, y = vertices[j]
+                                z_pattern = np.sin(x * x_scale) * np.cos(y * y_scale) * z_pattern_scale
+                                vertices_3d[j, 2] = z_pattern + z_offset
+                            
+                            # Create a mesh from vertices and triangles
+                            cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
+                            mesh = pv.PolyData(vertices_3d, cells)
+                            
+                            # Add mesh to plotter
+                            self.current_plotter.add_mesh(mesh, color=color, opacity=0.7, 
+                                                      show_edges=True, edge_color=color, 
+                                                      line_width=1, specular=0.5)
+            
+            # Add axes
+            self.current_plotter.add_axes()
+            
+            # Reset camera
+            self.current_plotter.reset_camera()
+            
+            # Add controls for adjustment
+            controls_layout = QHBoxLayout()
+            
+            # Height adjustment slider
+            controls_layout.addWidget(QLabel("Height:"))
+            height_slider = QSlider(Qt.Horizontal)
+            height_slider.setMinimum(0)
+            height_slider.setMaximum(100)
+            height_slider.setValue(int(self.height_factor * 100))
+            height_slider.valueChanged.connect(lambda v: self._update_height_in_plotter(v/100.0))
+            controls_layout.addWidget(height_slider)
+            
+            # Add zoom controls
+            controls_layout.addWidget(QLabel("Zoom:"))
+            zoom_in_btn = QPushButton("+")
+            zoom_in_btn.setMaximumWidth(30)
+            zoom_in_btn.clicked.connect(lambda: self.current_plotter.camera.zoom(1.5))
+            controls_layout.addWidget(zoom_in_btn)
+            
+            zoom_out_btn = QPushButton("-")
+            zoom_out_btn.setMaximumWidth(30)
+            zoom_out_btn.clicked.connect(lambda: self.current_plotter.camera.zoom(0.75))
+            controls_layout.addWidget(zoom_out_btn)
+            
+            # Reset view button
+            reset_btn = QPushButton("Reset View")
+            reset_btn.clicked.connect(lambda: self.current_plotter.reset_camera())
+            controls_layout.addWidget(reset_btn)
+            
+            vis_layout.addLayout(controls_layout)
+            vis_layout.addWidget(viz_frame)
+        
+        except Exception as e:
+            # Fallback if 3D visualization fails
+            error_msg = QLabel(f"Error creating 3D view: {str(e)}\nTry using the 'Show 3D View' option in the Visualization menu.")
+            error_msg.setAlignment(Qt.AlignCenter)
+            vis_layout.addWidget(error_msg)
+            logger.error(f"Error creating embedded 3D view: {str(e)}")
+        
+        parent_frame.layout().addWidget(vis_widget)
+        return vis_widget
+
+    def _on_tab_changed(self, index):
+        """Handle tab changes to update visualizations as needed"""
+        # Update visualization based on the selected tab
+        if index == 0:  # File tab
+            # Update points visualization
+            self._visualize_all_points()
+        elif index == 1:  # Hull tab
+            # Update hull visualization
+            visible_with_hulls = [d for d in self.datasets if d.get('visible', True) and d.get('hull_points') is not None]
+            if visible_with_hulls:
+                self._visualize_all_hulls()
+            else:
+                self.statusBar().showMessage("No hulls computed yet. Use 'Compute Convex Hull' or right-click a dataset.")
+        elif index == 2:  # Segment tab
+            # Update segment visualization
+            visible_with_segments = [d for d in self.datasets if d.get('visible', True) and d.get('segments') is not None]
+            if visible_with_segments:
+                self._visualize_all_segments()
+            else:
+                self.statusBar().showMessage("No segments computed yet. Use 'Compute Segments' after computing hulls.")
+        elif index == 3:  # Triangulation tab
+            # Update triangulation visualization
+            visible_with_tri = [d for d in self.datasets if d.get('visible', True) and d.get('triangulation_result') is not None]
+            if visible_with_tri:
+                self._visualize_all_triangulations()
+            else:
+                self.statusBar().showMessage("No triangulations computed yet. Complete previous steps first.")
 
 # Main entry point
 if __name__ == "__main__":
