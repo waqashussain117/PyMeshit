@@ -1,0 +1,32 @@
+Triangulation Comparison Summary
+===============================
+
+Number of points: 100
+Number of feature points: 3
+Point type: grid
+
+Results by gradient value:
+
+Gradient = 2.0
+--------------------------------------------------
+Standard: 162 triangles in 0.0010s
+Custom:   1160 triangles in 0.0913s
+          Difference: +616.05% triangles
+MeshIt:   738 triangles in 0.0669s
+          Difference from standard: +355.56% triangles
+
+Gradient = 3.0
+--------------------------------------------------
+Standard: 162 triangles in 0.0000s
+Custom:   1779 triangles in 0.1161s
+          Difference: +998.15% triangles
+MeshIt:   1154 triangles in 0.1020s
+          Difference from standard: +612.35% triangles
+
+Gradient = 4.0
+--------------------------------------------------
+Standard: 162 triangles in 0.0000s
+Custom:   2210 triangles in 0.1502s
+          Difference: +1264.20% triangles
+MeshIt:   1466 triangles in 0.1080s
+          Difference from standard: +804.94% triangles

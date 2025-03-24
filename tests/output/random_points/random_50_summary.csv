@@ -1,0 +1,5 @@
+Gradient,Triangle Count,Processing Time,Change from Baseline
+0.5,287,0.13s,+56.0%
+1.0,184,1.3ms,+0.0%
+2.0,84,0.9ms,-54.3%
+3.0,85,0.0ms,-53.8%

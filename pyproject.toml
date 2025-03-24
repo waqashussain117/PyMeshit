@@ -1,30 +1,42 @@
 [build-system]
-requires = ["setuptools>=42", "wheel", "pybind11>=2.5.0"]
+requires = [
+    "setuptools>=42",
+    "wheel",
+    "pybind11>=2.5.0",
+    "numpy>=1.20.0",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "meshit"
 version = "0.1.1"
+authors = [
+    {name = "Waqas Hussain", email = "waqas.hussain117@gmail.com"},
+]
 description = "Python library for mesh generation and manipulation with C++ backend"
-authors = [{name = "Waqas Hussain", email = "waqas.hussain117@gmail.com"}]
 readme = "README.md"
 requires-python = ">=3.7"
-dependencies = ["pybind11>=2.5.0"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3.7",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
 ]
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "triangle>=1.0.9",
+    "matplotlib>=3.3.0",
+    "pybind11>=2.5.0",
+]
 
 [project.urls]
-Homepage = "https://github.com/waqashussain/meshit"
-Repository = "https://github.com/waqashussain/meshit"
+"Homepage" = "https://github.com/waqashussain/meshit"
+"Bug Tracker" = "https://github.com/waqashussain/meshit/issues"
 
 [tool.setuptools]
 packages = ["meshit"]

@@ -1,0 +1,15 @@
+Results Summary:
+--------------------------------------------------
+Number of points: 64
+Point type: grid
+Noise level: 0.0
+Base size: 0.1
+Refinesize: 0.2
+Feature points: 3
+Feature size: 0.05
+--------------------------------------------------
+Gradient Results:
+--------------------------------------------------
+Gradient 0.50: 294 triangles, 0.0610s
+Gradient 1.00: 294 triangles, 0.0489s
+Gradient 2.00: 294 triangles, 0.0597s

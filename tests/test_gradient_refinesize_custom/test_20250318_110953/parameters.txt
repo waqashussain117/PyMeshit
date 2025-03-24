@@ -1,0 +1,19 @@
+Test Parameters:
+Date/Time: 20250318_110953
+Number of points: 100
+Point type: grid
+Noise level: 0.0
+Gradient value: 2.0
+Base size: 0.188562
+Feature points: 3
+Feature size: 0.056569
+
+Feature Point Locations:
+  1: (0.5556, 0.7778, 0.0000)
+  2: (-1.0000, 0.5556, 0.0000)
+  3: (-1.0000, 0.1111, 0.0000)
+
+Refinesize Test Values:
+  0.1000
+  0.3000
+  0.5000

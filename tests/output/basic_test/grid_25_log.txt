@@ -1,0 +1,28 @@
+Triangulation Test Log - 20250318_102002
+Point type: grid
+Number of points: 25
+Noise level: 0.0
+
+Feature points:
+  Point 1: (-1.0000, -1.0000, 0.0000)
+  Point 2: (-1.0000, 1.0000, 0.0000)
+  Point 3: (1.0000, -1.0000, 0.0000)
+  Point 4: (1.0000, 1.0000, 0.0000)
+
+Triangulation results:
+
+Gradient: 0.5
+  Triangle count: 232
+  Processing time: 0.14s
+
+Gradient: 1.0
+  Triangle count: 132
+  Processing time: 0.0ms
+
+Gradient: 2.0
+  Triangle count: 28
+  Processing time: 0.0ms
+
+Gradient: 3.0
+  Triangle count: 32
+  Processing time: 0.0ms

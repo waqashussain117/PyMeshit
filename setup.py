@@ -3,6 +3,7 @@ from setuptools.command.build_ext import build_ext
 import sys
 import os
 import setuptools
+import numpy as np
 
 __version__ = '0.1.1'
 
@@ -52,6 +53,25 @@ ext_modules = [
             ('NOEXODUS', '1'),
             ('_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING', '1'),
         ],
+    ),
+    # New extension module for triangle callback
+    Extension(
+        'meshit.triangle_callback',
+        sources=['meshit/triangle_callback.cpp'],
+        include_dirs=[
+            'src',
+            'include',
+            # NumPy include directory
+            np.get_include(),
+        ],
+        language='c++',
+        define_macros=[
+            ('VERSION_INFO', __version__),
+            ('WIN32', '1'),
+            ('NOMINMAX', '1'),
+            ('NPY_NO_DEPRECATED_API', 'NPY_1_7_API_VERSION'),
+            ('_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING', '1'),
+        ],
     )
 ]
 
@@ -86,8 +106,10 @@ class BuildExt(build_ext):
 
         for ext in self.extensions:
             ext.extra_compile_args = opts
-            for inc in qt_includes:
-                ext.extra_compile_args.append(f'/I{inc}')
+            # Only add Qt includes for the main extension, not for triangle_callback
+            if ext.name == 'meshit.core._meshit':
+                for inc in qt_includes:
+                    ext.extra_compile_args.append(f'/I{inc}')
 
         build_ext.build_extensions(self)
 
@@ -102,7 +124,17 @@ setup(
     url='https://github.com/waqashussain/meshit',
     packages=find_packages(),
     ext_modules=ext_modules,
-    install_requires=['pybind11>=2.5.0'],
+    install_requires=[
+        'pybind11>=2.5.0', 
+        'numpy>=1.20.0',
+        'scipy>=1.7.0',
+        'triangle>=1.0.9',
+        'matplotlib>=3.3.0'
+    ],
+    setup_requires=[
+        'numpy>=1.20.0',
+        'pybind11>=2.5.0',
+    ],
     python_requires='>=3.7',
     cmdclass={'build_ext': BuildExt},
     zip_safe=False,

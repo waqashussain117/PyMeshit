@@ -1,0 +1,25 @@
+Triangulation Test Log - 20250318_102010
+Point type: random
+Number of points: 50
+Noise level: 0.0
+
+Feature points:
+  None defined
+
+Triangulation results:
+
+Gradient: 0.5
+  Triangle count: 287
+  Processing time: 0.13s
+
+Gradient: 1.0
+  Triangle count: 184
+  Processing time: 1.3ms
+
+Gradient: 2.0
+  Triangle count: 84
+  Processing time: 0.9ms
+
+Gradient: 3.0
+  Triangle count: 85
+  Processing time: 0.0ms

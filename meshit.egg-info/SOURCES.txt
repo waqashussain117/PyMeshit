@@ -15,6 +15,11 @@ include/tetgen.h
 include/triangle.h
 meshit/__init__.py
 meshit/extensions.py
+meshit/intersection_utils.py
+meshit/triangle_callback.cpp
+meshit/triangle_direct.py
+meshit/triangle_wrapper.py
+meshit/workflow.py
 meshit.egg-info/PKG-INFO
 meshit.egg-info/SOURCES.txt
 meshit.egg-info/dependency_links.txt
@@ -31,3 +36,11 @@ src/glwidget.cpp
 src/main.cpp
 src/mainwindow.cpp
 src/python_bindings_minimal.cpp
+tests/test_coarse_triangulation.py
+tests/test_coarse_triangulation_simplified.py
+tests/test_custom_refinement.py
+tests/test_enhanced_triangulation.py
+tests/test_gradient_refinement.py
+tests/test_meshit_paper.py
+tests/test_meshit_triangle.py
+tests/test_workflow_simple.py
