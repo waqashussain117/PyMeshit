@@ -278,7 +278,7 @@ class MeshItWorkflowGUI(QMainWindow):
     def _create_menu_bar(self):
         """Create the menu bar"""
         menu_bar = self.menuBar()
-
+        
         # --- File Menu ---
         file_menu = menu_bar.addMenu("&File")
 
@@ -296,14 +296,14 @@ class MeshItWorkflowGUI(QMainWindow):
         generate_action.setStatusTip("Generate sample point data for testing")
         generate_action.triggered.connect(self.generate_test_data)
         file_menu.addAction(generate_action)
-
+        
         file_menu.addSeparator()
 
         export_action = QAction("&Export Active Result...", self)
         export_action.setStatusTip("Export the triangulation result of the active dataset")
         export_action.triggered.connect(self.export_results)
         file_menu.addAction(export_action)
-
+        
         file_menu.addSeparator()
 
         exit_action = QAction("E&xit", self)
@@ -317,7 +317,7 @@ class MeshItWorkflowGUI(QMainWindow):
         process_all_action = dataset_menu.addAction("&Process All Datasets")
         process_all_action.setStatusTip("Run all steps (hull, segments, triangulation) for all datasets")
         process_all_action.triggered.connect(self.process_all_datasets)
-
+        
         dataset_menu.addSeparator()
 
         remove_active_action = dataset_menu.addAction("&Remove Active Dataset")
@@ -336,9 +336,9 @@ class MeshItWorkflowGUI(QMainWindow):
         view_3d_action.setStatusTip("Open a separate interactive 3D view (requires PyVista)")
         view_3d_action.triggered.connect(self.show_3d_view)
         view_3d_action.setEnabled(HAVE_PYVISTA) # Disable if PyVista not available
-
+        
         viz_menu.addSeparator()
-
+        
         # --- Height Factor Submenu ---
         height_menu = viz_menu.addMenu("Height Factor (3D)")
         height_group = QActionGroup(self) # Use QActionGroup for radio-button like behavior
@@ -845,9 +845,15 @@ class MeshItWorkflowGUI(QMainWindow):
             # Check if the file has 2D or 3D points
             if points.shape[1] < 2:
                 raise ValueError("File must contain at least 2D points (x, y)")
-                
-            # Use only first 2 dimensions for now
-            return points[:, 0:2]
+            
+            # If data has only 2 columns (X, Y), add a Z column with zeros
+            if points.shape[1] == 2:
+                points_3d = np.zeros((len(points), 3))
+                points_3d[:, 0:2] = points
+                return points_3d
+            
+            # If data has 3 or more columns, use the first 3 as X, Y, Z
+            return points[:, 0:3]
             
         except Exception as e:
             logger.error(f"Error reading file: {str(e)}")
@@ -1104,7 +1110,7 @@ class MeshItWorkflowGUI(QMainWindow):
         """Visualize the loaded points using 3D visualization instead of matplotlib
         
         Args:
-            points: 2D points to visualize
+            points: 2D or 3D points to visualize
         """
         if points is None or len(points) == 0:
             return
@@ -1112,10 +1118,18 @@ class MeshItWorkflowGUI(QMainWindow):
         # Update statistics
         self.points_label.setText(f"Points: {len(points)}")
         
-        # Calculate bounds
-        min_x, min_y = np.min(points, axis=0)
-        max_x, max_y = np.max(points, axis=0)
-        self.bounds_label.setText(f"Bounds: X[{min_x:.2f},{max_x:.2f}] Y[{min_y:.2f},{max_y:.2f}]")
+        # Calculate bounds, correctly handling 3D coordinates
+        min_coords = np.min(points, axis=0)
+        max_coords = np.max(points, axis=0)
+        min_x, min_y = min_coords[0], min_coords[1]
+        max_x, max_y = max_coords[0], max_coords[1]
+        
+        # If 3D data is available, also show Z range
+        if points.shape[1] >= 3:
+            min_z, max_z = min_coords[2], max_coords[2]
+            self.bounds_label.setText(f"Bounds: X[{min_x:.2f},{max_x:.2f}] Y[{min_y:.2f},{max_y:.2f}] Z[{min_z:.2f},{max_z:.2f}]")
+        else:
+            self.bounds_label.setText(f"Bounds: X[{min_x:.2f},{max_x:.2f}] Y[{min_y:.2f},{max_y:.2f}]")
         
         # Clear existing visualization
         while self.file_viz_layout.count():
@@ -1166,31 +1180,84 @@ class MeshItWorkflowGUI(QMainWindow):
         dataset = self.datasets[dataset_index]
         dataset_name = dataset.get('name', f"Dataset {dataset_index}")
         # self.statusBar().showMessage(f"Computing hull for {dataset_name}...") # Remove status update
-
+        
         if dataset.get('points') is None or len(dataset['points']) < 3:
             self.statusBar().showMessage(f"Error: Need at least 3 points for hull in {dataset_name}")
             logger.warning(f"Skipping hull for {dataset_name}: needs >= 3 points.")
             return False # Indicate error or skip
-
+        
         try:
-            # Compute convex hull using scipy
-            from scipy.spatial import ConvexHull
-            hull = ConvexHull(dataset['points'])
-
-            # Extract hull points
-            hull_points = dataset['points'][hull.vertices]
-            hull_points = np.append(hull_points, [hull_points[0]], axis=0)  # Close the hull
-
+            # Get points
+            points = dataset['points']
+            
+            # For 3D computations, we need to handle the hull differently
+            if points.shape[1] >= 3:
+                # Check if points are roughly planar (most real-world datasets are)
+                # 1. Center points
+                centroid = np.mean(points, axis=0)
+                centered = points - centroid
+                
+                # 2. Get dominant plane using PCA/SVD
+                u, s, vh = np.linalg.svd(centered, full_matrices=False)
+                # The smallest singular value/component tells us how planar the data is
+                normal = vh[2]  # This is the approximate normal to the best-fitting plane
+                
+                # For highly planar data (ratio of smallest to second smallest singular value is small)
+                if s[2] / s[1] < 0.2:  # Threshold can be adjusted
+                    logger.debug(f"Points in {dataset_name} are mostly planar, using projected hull")
+                    # Project points onto a plane defined by first two principal components
+                    projected = np.dot(centered, vh[:2].T)
+                    
+                    # Compute 2D convex hull on projected points
+                    from scipy.spatial import ConvexHull
+                    hull_2d = ConvexHull(projected)
+                    
+                    # Map hull vertices back to 3D
+                    hull_indices = hull_2d.vertices
+                    hull_points = points[hull_indices]
+                    
+                    # Ensure the hull is closed
+                    if not np.array_equal(hull_points[0], hull_points[-1]):
+                        hull_points = np.vstack([hull_points, hull_points[0]])
+                else:
+                    # For truly 3D point clouds, use 3D convex hull
+                    logger.debug(f"Points in {dataset_name} are 3D, using 3D convex hull")
+                    from scipy.spatial import ConvexHull
+                    hull_3d = ConvexHull(points)
+                    
+                    # Extract unique vertices from the hull
+                    # 3D hulls use triangular faces, so we need to get unique vertices
+                    hull_indices = []
+                    for simplex in hull_3d.simplices:
+                        for idx in simplex:
+                            if idx not in hull_indices:
+                                hull_indices.append(idx)
+                    
+                    # Extract hull points in original order
+                    hull_points = points[hull_indices]
+                    
+                    # For visualization purposes, we'll close the hull by adding the first point again
+                    hull_points = np.vstack([hull_points, hull_points[0]])
+            else:
+                # Standard 2D hull computation
+                from scipy.spatial import ConvexHull
+                hull = ConvexHull(points)
+                
+                # Extract hull points
+                hull_points = points[hull.vertices]
+                
+                # Close the hull
+                hull_points = np.append(hull_points, [hull_points[0]], axis=0)
+            
             # Store in dataset
             dataset['hull_points'] = hull_points
-
+            
             # Clear any previous results from later steps for this dataset
             dataset.pop('segments', None)
             dataset.pop('triangulation_result', None)
-
-            # self.statusBar().showMessage(f"Computed hull for {dataset_name}") # Remove status update
+            
             return True # Indicate success
-
+            
         except Exception as e:
             # self.statusBar().showMessage(f"Error computing hull for {dataset_name}: {str(e)}") # Remove status update
             logger.error(f"Error computing hull for {dataset_name}: {str(e)}")
@@ -1223,7 +1290,7 @@ class MeshItWorkflowGUI(QMainWindow):
             QMessageBox.information(self, "No Data", "No datasets loaded to compute hulls.")
             return
         self._run_batch_computation("hulls", len(self.datasets))
-
+    
     def _plot_hull(self, points, hull_points):
         """Visualize the hull using 3D visualization instead of matplotlib
         
@@ -1240,8 +1307,9 @@ class MeshItWorkflowGUI(QMainWindow):
         # Calculate hull area (approximate)
         area = 0.0
         for i in range(len(hull_points)-1):
-            x1, y1 = hull_points[i]
-            x2, y2 = hull_points[i+1]
+            # Extract x,y coordinates only
+            x1, y1 = hull_points[i][0], hull_points[i][1]
+            x2, y2 = hull_points[i+1][0], hull_points[i+1][1]
             area += x1*y2 - x2*y1
         area = abs(area) / 2.0
         self.hull_area_label.setText(f"Hull area: {area:.2f}")
@@ -1363,22 +1431,12 @@ class MeshItWorkflowGUI(QMainWindow):
         info_label.setAlignment(Qt.AlignCenter)
         vis_layout.addWidget(info_label)
         
-        # Convert 2D points to 3D with height variation
+        # Ensure points are in 3D format
         if points.shape[1] == 2:
-            # Convert 2D points to 3D
+            # Convert 2D points to 3D with Z=0
             points_3d = np.zeros((len(points), 3))
             points_3d[:, 0] = points[:, 0]
             points_3d[:, 1] = points[:, 1]
-            
-            # Add Z values with a nice pattern
-            x_scale = 0.05
-            y_scale = 0.05
-            z_scale = 20.0 * self.height_factor
-            
-            for i in range(len(points)):
-                x, y = points[i]
-                z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
-                points_3d[i, 2] = z
         else:
             points_3d = points.copy()
             
@@ -1419,16 +1477,16 @@ class MeshItWorkflowGUI(QMainWindow):
                     for i, line in enumerate(lines):
                         # Create 3D line points
                         line_points = np.zeros((2, 3))
-                        line_points[0, 0] = line[0][0]
-                        line_points[0, 1] = line[0][1]
-                        line_points[1, 0] = line[1][0]
-                        line_points[1, 1] = line[1][1]
+                        line_points[0, 0:2] = line[0]
+                        line_points[1, 0:2] = line[1]
                         
-                        # Set Z values
-                        x1, y1 = line[0]
-                        x2, y2 = line[1]
-                        line_points[0, 2] = np.sin(x1 * x_scale) * np.cos(y1 * y_scale) * z_scale
-                        line_points[1, 2] = np.sin(x2 * x_scale) * np.cos(y2 * y_scale) * z_scale
+                        # Set Z values from the original points if possible
+                        # Find closest point in the points array for each line endpoint
+                        for j in range(2):
+                            # Find the point in the dataset closest to this line endpoint
+                            distances = np.sum((points_3d[:, 0:2] - line[j])**2, axis=1)
+                            closest_idx = np.argmin(distances)
+                            line_points[j, 2] = points_3d[closest_idx, 2]
                         
                         # Create line
                         line_obj = pv.Line(line_points[0], line_points[1])
@@ -1451,16 +1509,19 @@ class MeshItWorkflowGUI(QMainWindow):
             # Add feature points if provided
             if feature_points is not None and len(feature_points) > 0:
                 try:
-                    # Convert feature points to 3D
-                    fp_3d = np.zeros((len(feature_points), 3))
-                    fp_3d[:, 0] = feature_points[:, 0]
-                    fp_3d[:, 1] = feature_points[:, 1]
-                    
-                    # Add Z values
-                    for i in range(len(feature_points)):
-                        x, y = feature_points[i]
-                        z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
-                        fp_3d[i, 2] = z
+                    # Convert feature points to 3D if needed
+                    if feature_points.shape[1] == 2:
+                        fp_3d = np.zeros((len(feature_points), 3))
+                        fp_3d[:, 0:2] = feature_points
+                        
+                        # Set Z values from closest points in the main point cloud
+                        for i in range(len(feature_points)):
+                            point_2d = feature_points[i]
+                            distances = np.sum((points_3d[:, 0:2] - point_2d)**2, axis=1)
+                            closest_idx = np.argmin(distances)
+                            fp_3d[i, 2] = points_3d[closest_idx, 2]
+                    else:
+                        fp_3d = feature_points.copy()
                     
                     # Create point cloud for feature points
                     fp_cloud = pv.PolyData(fp_3d)
@@ -1519,24 +1580,19 @@ class MeshItWorkflowGUI(QMainWindow):
         
     def _update_height_in_plotter(self, height_factor):
         """Update the height factor in the current plotter"""
+        # Store the new height factor
         self.height_factor = height_factor
         
+        # The height factor is used to exaggerate the Z dimension for better visualization
         # If we have a current plotter, update it
         if hasattr(self, 'current_plotter') and self.current_plotter is not None:
             try:
-                # Get the current visualization data
-                if self.triangulation_result is not None:
-                    vertices = self.triangulation_result['vertices']
-                    triangles = self.triangulation_result['triangles']
-                    self._plot_triangulation(vertices, triangles, self.hull_points)
-                elif self.segments is not None:
-                    self._plot_segments(self.points, self.hull_points, self.segments)
-                elif self.hull_points is not None:
-                    self._plot_hull(self.points, self.hull_points)
-                elif self.points is not None:
-                    self._plot_points(self.points)
+                # Scale the Z dimension using plotter's scale feature
+                # This adjusts how the 3D scene appears without modifying the actual coordinates
+                self.current_plotter.set_scale(zscale=height_factor)
+                self.current_plotter.reset_camera()
             except Exception as e:
-                logger.error(f"Error updating 3D height: {str(e)}")
+                logger.error(f"Error updating 3D Z exaggeration: {str(e)}")
     
     def _show_interactive_3d(self, points, point_colors=None, lines=None, triangles=None,
                            feature_points=None, title="MeshIt 3D View"):
@@ -1564,20 +1620,10 @@ class MeshItWorkflowGUI(QMainWindow):
         
         # Ensure points are 3D
         if points.shape[1] == 2:
-            # Convert 2D points to 3D
+            # Convert 2D points to 3D with Z=0
             points_3d = np.zeros((len(points), 3))
             points_3d[:, 0] = points[:, 0]
             points_3d[:, 1] = points[:, 1]
-            
-            # Add Z values with a nice pattern
-            x_scale = 0.05
-            y_scale = 0.05
-            z_scale = 20.0 * self.height_factor
-            
-            for i in range(len(points)):
-                x, y = points[i]
-                z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
-                points_3d[i, 2] = z
         else:
             points_3d = points.copy()
         
@@ -1601,16 +1647,15 @@ class MeshItWorkflowGUI(QMainWindow):
                 for i, line in enumerate(lines):
                     # Create 3D line points
                     line_points = np.zeros((2, 3))
-                    line_points[0, 0] = line[0][0]
-                    line_points[0, 1] = line[0][1]
-                    line_points[1, 0] = line[1][0]
-                    line_points[1, 1] = line[1][1]
+                    line_points[0, 0:2] = line[0]
+                    line_points[1, 0:2] = line[1]
                     
-                    # Set Z values
-                    x1, y1 = line[0]
-                    x2, y2 = line[1]
-                    line_points[0, 2] = np.sin(x1 * x_scale) * np.cos(y1 * y_scale) * z_scale
-                    line_points[1, 2] = np.sin(x2 * x_scale) * np.cos(y2 * y_scale) * z_scale
+                    # Set Z values from the original points if possible
+                    for j in range(2):
+                        # Find the point in the dataset closest to this line endpoint
+                        distances = np.sum((points_3d[:, 0:2] - line[j])**2, axis=1)
+                        closest_idx = np.argmin(distances)
+                        line_points[j, 2] = points_3d[closest_idx, 2]
                     
                     # Create line
                     line_obj = pv.Line(line_points[0], line_points[1])
@@ -1633,16 +1678,19 @@ class MeshItWorkflowGUI(QMainWindow):
         # Add feature points if provided
         if feature_points is not None and len(feature_points) > 0:
             try:
-                # Convert feature points to 3D
-                fp_3d = np.zeros((len(feature_points), 3))
-                fp_3d[:, 0] = feature_points[:, 0]
-                fp_3d[:, 1] = feature_points[:, 1]
-                
-                # Add Z values
-                for i in range(len(feature_points)):
-                    x, y = feature_points[i]
-                    z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
-                    fp_3d[i, 2] = z
+                # Convert feature points to 3D if needed
+                if feature_points.shape[1] == 2:
+                    fp_3d = np.zeros((len(feature_points), 3))
+                    fp_3d[:, 0:2] = feature_points
+                    
+                    # Set Z values from closest points in the main point cloud
+                    for i in range(len(feature_points)):
+                        point_2d = feature_points[i]
+                        distances = np.sum((points_3d[:, 0:2] - point_2d)**2, axis=1)
+                        closest_idx = np.argmin(distances)
+                        fp_3d[i, 2] = points_3d[closest_idx, 2]
+                else:
+                    fp_3d = feature_points.copy()
                 
                 # Create point cloud for feature points
                 fp_cloud = pv.PolyData(fp_3d)
@@ -1696,20 +1744,24 @@ class MeshItWorkflowGUI(QMainWindow):
             vertices = triangulation_result['vertices']
             triangles = triangulation_result['triangles']
             
-            # Convert 2D vertices to 3D
+            # Ensure vertices are 3D
             vertices_3d = np.zeros((len(vertices), 3))
-            vertices_3d[:, 0] = vertices[:, 0]
-            vertices_3d[:, 1] = vertices[:, 1]
-            
-            # Add Z values with a nice pattern
-            x_scale = 0.05
-            y_scale = 0.05
-            z_scale = 20.0 * self.height_factor
-            
-            for i in range(len(vertices)):
-                x, y = vertices[i]
-                z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
-                vertices_3d[i, 2] = z
+            if vertices.shape[1] == 2:
+                # If 2D vertices, try to get Z from original points
+                vertices_3d[:, 0:2] = vertices
+                
+                # If the dataset has 3D points, use them to set Z values based on XY proximity
+                original_points = dataset.get('points')
+                if original_points is not None and original_points.shape[1] >= 3:
+                    for i in range(len(vertices)):
+                        vertex_2d = vertices[i]
+                        # Find the closest original point
+                        distances = np.sum((original_points[:, 0:2] - vertex_2d)**2, axis=1)
+                        closest_idx = np.argmin(distances)
+                        vertices_3d[i, 2] = original_points[closest_idx, 2]
+            else:
+                # If vertices already have Z, use them directly
+                vertices_3d = vertices.copy()
             
             # Create a mesh
             cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
@@ -1718,33 +1770,41 @@ class MeshItWorkflowGUI(QMainWindow):
             # Add mesh to plotter
             self.pv_plotter.add_mesh(mesh, color=color, opacity=0.8, 
                                   show_edges=True, edge_color=color, 
-                                  line_width=1, label=name,
-                                  specular=0.5, smooth_shading=True)
-            
-            # Add hull if available
-            hull_points = dataset.get('hull_points')
-            if hull_points is not None and len(hull_points) > 3:
-                # Convert hull points to 3D
-                hull_3d = np.zeros((len(hull_points), 3))
-                hull_3d[:, 0] = hull_points[:, 0]
-                hull_3d[:, 1] = hull_points[:, 1]
-                
-                # Add Z values
-                for i in range(len(hull_points)):
-                    x, y = hull_points[i]
-                    z = np.sin(x * x_scale) * np.cos(y * y_scale) * z_scale
-                    hull_3d[i, 2] = z
-                
-                # Create lines for hull
-                for i in range(len(hull_3d)-1):
-                    line = pv.Line(hull_3d[i], hull_3d[i+1])
-                    self.pv_plotter.add_mesh(line, color=color, line_width=3)
+                                  specular=0.5, smooth_shading=True,
+                                  name=name)  # Add name to identify in plotter
         
+        # Add text with dataset information
+        text_lines = []
+        for i, dataset in enumerate(visible_datasets):
+            name = dataset.get('name', 'Unnamed')
+            num_vertices = len(dataset['triangulation_result']['vertices'])
+            num_triangles = len(dataset['triangulation_result']['triangles'])
+            text_lines.append(f"{i+1}. {name}: {num_vertices} vertices, {num_triangles} triangles")
+        
+        if text_lines:
+            info_text = '\n'.join(text_lines)
+            self.pv_plotter.add_text(info_text, font_size=10, position='upper_left')
+        
+        # Add UI controls for adjusting display
+        self.pv_plotter.add_checkbox_button_widget(
+            lambda state: [self.pv_plotter.add_axes() if state else self.pv_plotter.remove_axes()],
+            value=True,
+            position=(10, 180),
+            size=30,
+            border_size=1,
+            color_on='white',
+            color_off='grey',
+            background_color='darkblue'
+        )
+        self.pv_plotter.add_text("Axes", position=(50, 180), font_size=10, color='white')
+        
+        # Add scale slider for height
+        def update_height(value):
+            self._set_height_factor(value)
+            self.show_3d_view()  # Refresh the view
+            
         # Add axes for reference
         self.pv_plotter.add_axes()
-        
-        # Add legend
-        self.pv_plotter.add_legend()
         
         # Show the plotter in a separate window
         self.pv_plotter.show()
@@ -1786,8 +1846,7 @@ segmentation, triangulation, and visualization.
 
         dataset = self.datasets[dataset_index]
         dataset_name = dataset.get('name', f"Dataset {dataset_index}")
-        # self.statusBar().showMessage(f"Computing segments for {dataset_name}...") # Remove status update
-
+        
         if dataset.get('hull_points') is None or len(dataset['hull_points']) < 4:  # 3 vertices + 1 closing point
             self.statusBar().showMessage(f"Skipping segments for {dataset_name}: Compute convex hull first")
             logger.warning(f"Skipping segments for {dataset_name}: hull not computed.")
@@ -1798,46 +1857,67 @@ segmentation, triangulation, and visualization.
             segment_length = float(self.segment_length_input.text())
             if segment_length <= 0:
                 segment_length = 1.0
-                # Don't update UI text during batch processing, maybe adjust later or just use default
         except ValueError:
             segment_length = 1.0
 
         density_factor = self.segment_density_slider.value() / 100.0
         effective_segment_length = segment_length / density_factor
-
+        
         try:
             # Extract the hull boundary (excluding the closing point)
             hull_boundary = dataset['hull_points'][:-1]
-
-            # Generate segments along the hull boundary with uniform distribution
-            segments = []
-            segment_lengths = []
-
-            for i in range(len(hull_boundary)):
+            hull_size = len(hull_boundary)
+            
+            # Performance optimization: Limit the number of segments per edge to prevent excessive calculations
+            MAX_SEGMENTS_PER_EDGE = 20
+            
+            # Estimate average edge length to determine a reasonable minimum segment length
+            total_perimeter = 0
+            for i in range(hull_size):
                 p1 = hull_boundary[i]
-                p2 = hull_boundary[(i + 1) % len(hull_boundary)]
+                p2 = hull_boundary[(i + 1) % hull_size]
+                total_perimeter += np.linalg.norm(p2 - p1)
+            
+            avg_edge_length = total_perimeter / hull_size
+            min_segment_length = avg_edge_length / MAX_SEGMENTS_PER_EDGE
+            
+            # Use the larger of calculated min_segment_length and effective_segment_length
+            effective_segment_length = max(effective_segment_length, min_segment_length)
+            
+            # Pre-allocate segments list with reasonable capacity
+            estimated_segments = int(total_perimeter / effective_segment_length) + hull_size
+            segments = []
+            
+            # Generate segments along the hull boundary with uniform distribution
+            for i in range(hull_size):
+                p1 = hull_boundary[i]
+                p2 = hull_boundary[(i + 1) % hull_size]
+                
+                # Compute edge length
                 dist = np.linalg.norm(p2 - p1)
-                num_segments = max(1, int(np.ceil(dist / effective_segment_length)))
-
+                
+                # Limit number of segments per edge
+                num_segments = min(max(1, int(np.ceil(dist / effective_segment_length))), MAX_SEGMENTS_PER_EDGE)
+                
+                # Vectorized segment creation for this edge
+                t_values = np.linspace(0, 1, num_segments + 1)
+                edge_segments = []
+                
                 for j in range(num_segments):
-                    t1 = j / num_segments
-                    t2 = (j + 1) / num_segments
+                    t1, t2 = t_values[j], t_values[j+1]
                     segment_start = p1 + t1 * (p2 - p1)
                     segment_end = p1 + t2 * (p2 - p1)
                     segments.append([segment_start, segment_end])
-                    segment_lengths.append(np.linalg.norm(segment_end - segment_start))
-
-            # Store the segments in the dataset
-            dataset['segments'] = np.array(segments)
-
+            
+            # Store the segments in the dataset - using a normal list for better performance
+            dataset['segments'] = segments
+            
             # Clear any previous results from later steps for this dataset
             dataset.pop('triangulation_result', None)
 
-            # self.statusBar().showMessage(f"Computed segments for {dataset_name}") # Remove status update
             return True # Indicate success
 
         except Exception as e:
-            # self.statusBar().showMessage(f"Error computing segments for {dataset_name}: {str(e)}") # Remove status update
             logger.error(f"Error computing segments for {dataset_name}: {str(e)}")
             return False # Indicate error
 
@@ -1867,7 +1947,7 @@ segmentation, triangulation, and visualization.
             QMessageBox.information(self, "No Hulls", "No datasets have computed hulls. Please compute hulls first.")
             return
         self._run_batch_computation("segments", len(datasets_with_hulls_indices))
-
+    
     def _plot_segments(self, points, hull_points, segments):
         """Visualize the segments using 3D visualization instead of matplotlib
         
@@ -1883,7 +1963,19 @@ segmentation, triangulation, and visualization.
         self.num_segments_label.setText(f"Segments: {len(segments)}")
         
         # Calculate average segment length
-        segment_lengths = [np.linalg.norm(segment[1] - segment[0]) for segment in segments]
+        segment_lengths = []
+        for segment in segments:
+            # Get segment endpoints correctly for either format
+            if hasattr(segment[0], 'shape'):
+                # NumPy array format
+                p1, p2 = segment[0], segment[1]
+            else:
+                # List format
+                p1 = np.array(segment[0])
+                p2 = np.array(segment[1])
+            
+            segment_lengths.append(np.linalg.norm(p2 - p1))
+            
         avg_length = np.mean(segment_lengths)
         self.avg_segment_length_label.setText(f"Avg length: {avg_length:.2f}")
         
@@ -1896,9 +1988,20 @@ segmentation, triangulation, and visualization.
             
         # Create 3D visualization
         if self.view_3d_enabled:
-            # Extract segment endpoints for visualization
-            segment_points = np.vstack([segment[0] for segment in segments] + 
-                                      [segment[1] for segment in segments])
+            # Convert segments to consistent format for visualization
+            segment_points = []
+            for segment in segments:
+                if hasattr(segment[0], 'shape'):
+                    # NumPy array format
+                    segment_points.append(segment[0])
+                    segment_points.append(segment[1])
+                else:
+                    # List format
+                    segment_points.append(np.array(segment[0]))
+                    segment_points.append(np.array(segment[1]))
+            
+            # Convert to numpy array for processing
+            segment_points = np.vstack(segment_points)
             
             # Create unique points for visualization to avoid duplicates
             unique_points, indices = np.unique(segment_points, axis=0, return_inverse=True)
@@ -1979,8 +2082,7 @@ segmentation, triangulation, and visualization.
 
         dataset = self.datasets[dataset_index]
         dataset_name = dataset.get('name', f"Dataset {dataset_index}")
-        # self.statusBar().showMessage(f"Running triangulation for {dataset_name}...") # Remove status update
-
+        
         if dataset.get('segments') is None or len(dataset['segments']) < 3:
             self.statusBar().showMessage(f"Skipping triangulation for {dataset_name}: Compute segments first")
             logger.warning(f"Skipping triangulation for {dataset_name}: segments not computed.")
@@ -1991,12 +2093,72 @@ segmentation, triangulation, and visualization.
         min_angle = self.min_angle_input.value()
         base_size_factor = self.base_size_factor_input.value()
         uniform = self.uniform_checkbox.isChecked()
-
+        
         try:
             start_time = time.time()
-
+            
             # Create boundary from hull points
-            boundary_points = dataset['hull_points'][:-1]
+            boundary_points = dataset['hull_points'][:-1]  # Exclude closing point
+            
+            # For 3D points, we need to project to a plane for triangulation
+            if boundary_points.shape[1] > 2:
+                logger.info(f"Projecting 3D points to best-fit plane for triangulation for {dataset_name}")
+                
+                # Find best-fitting plane using PCA/SVD
+                # 1. Center points
+                centroid = np.mean(boundary_points, axis=0)
+                centered = boundary_points - centroid
+                
+                # 2. Get dominant plane using PCA/SVD
+                u, s, vh = np.linalg.svd(centered, full_matrices=False)
+                
+                # 3. Use first two principal components as projection basis
+                projection_basis = vh[:2]
+                
+                # 4. Project points to 2D plane
+                points_2d = np.dot(centered, projection_basis.T)
+                
+                # Store original points and projection info for reconstruction
+                original_boundary_points = boundary_points.copy()
+                boundary_points = points_2d
+                
+                # Do the same for all segments to ensure consistency
+                segments_2d = []
+                for segment in dataset['segments']:
+                    if hasattr(segment[0], 'shape') and segment[0].shape[0] > 2:
+                        # For numpy arrays
+                        start_centered = segment[0] - centroid
+                        end_centered = segment[1] - centroid
+                        
+                        start_2d = np.dot(start_centered, projection_basis.T)
+                        end_2d = np.dot(end_centered, projection_basis.T)
+                        
+                        segments_2d.append([start_2d, end_2d])
+                    elif len(segment[0]) > 2:
+                        # For list based points
+                        start_centered = np.array(segment[0]) - centroid
+                        end_centered = np.array(segment[1]) - centroid
+                        
+                        start_2d = np.dot(start_centered, projection_basis.T)
+                        end_2d = np.dot(end_centered, projection_basis.T)
+                        
+                        segments_2d.append([start_2d, end_2d])
+                    else:
+                        # Already 2D
+                        segments_2d.append(segment)
+                
+                dataset['segments_2d'] = segments_2d
+                
+                # Store projection parameters for reconstruction
+                dataset['projection_params'] = {
+                    'centroid': centroid,
+                    'basis': projection_basis
+                }
+            else:
+                # Store info showing no projection was needed
+                dataset['projection_params'] = None
+            
+            # Calculate diagonal for base size
             min_coords = np.min(boundary_points, axis=0)
             max_coords = np.max(boundary_points, axis=0)
             diagonal = np.sqrt(np.sum((max_coords - min_coords) ** 2))
@@ -2007,7 +2169,7 @@ segmentation, triangulation, and visualization.
 
             # Combine boundary points (we don't need grid points if using hull segments)
             all_points = boundary_points
-
+            
             # Use DirectTriangleWrapper
             from meshit.triangle_direct import DirectTriangleWrapper
             triangulator = DirectTriangleWrapper(
@@ -2015,34 +2177,84 @@ segmentation, triangulation, and visualization.
                 min_angle=min_angle,
                 base_size=base_size
             )
-
+            
             # Set Triangle options
             triangle_options = f"pzq{min_angle}a{base_size*base_size*0.5}"
             triangulator.set_triangle_options(triangle_options)
-
+            
             # Run triangulation
             triangulation_result = triangulator.triangulate(
                 points=all_points,
                 segments=boundary_segments_indices,
                 uniform=True # Force uniform for consistency
             )
+            
+            # Get vertices and triangles
+            vertices = triangulation_result['vertices']
+            triangles = triangulation_result['triangles']
+            
+            # Project vertices back to 3D if needed
+            if dataset['projection_params'] is not None:
+                projection_params = dataset['projection_params']
+                centroid = projection_params['centroid']
+                basis = projection_params['basis']
+                
+                # Get original points with Z values
+                original_points = dataset['points']
+                original_boundary = dataset['hull_points'][:-1]  # Exclude closing point
+                
+                # Convert 2D triangulation vertices back to 3D
+                vertices_3d = np.zeros((len(vertices), 3))
+                
+                for i, vertex_2d in enumerate(vertices):
+                    # First check if this is exactly one of the boundary points
+                    is_boundary_point = False
+                    for j, bp_2d in enumerate(boundary_points):
+                        if np.allclose(vertex_2d, bp_2d, atol=1e-10):
+                            # Use original boundary point Z-value
+                            vertices_3d[i] = original_boundary[j]
+                            is_boundary_point = True
+                            break
+                    
+                    if not is_boundary_point:
+                        # Project back to 3D using the projection basis
+                        vertex_3d = centroid.copy()  # Start with centroid
+                        
+                        # Add contributions from each basis vector
+                        for j in range(2):  # 2D coordinates
+                            vertex_3d += vertex_2d[j] * basis[j]  # basis[j] is a 3D vector
+                        
+                        # For interior points, find the closest original point 
+                        # and use its Z value to better preserve 3D structure
+                        vertex_3d_xy = vertex_3d[:2]  # Just X,Y for distance computation
+                        
+                        # Get distances to all original points (using just X,Y)
+                        distances = np.sum((original_points[:, :2] - vertex_3d_xy)**2, axis=1)
+                        
+                        # Find nearest original point
+                        closest_idx = np.argmin(distances)
+                        
+                        # Use Z from closest original point but X,Y from projection
+                        vertex_3d[2] = original_points[closest_idx, 2]
+                        
+                        vertices_3d[i] = vertex_3d
+                
+                # Replace vertices with 3D version
+                vertices = vertices_3d
 
             # Store results
             dataset['triangulation_result'] = {
-                'vertices': triangulation_result['vertices'],
-                'triangles': triangulation_result['triangles'],
+                'vertices': vertices,
+                'triangles': triangles,
                 'uniform': uniform,
                 'gradient': gradient,
                 'min_angle': min_angle,
                 'base_size': base_size,
             }
 
-            # elapsed_time = time.time() - start_time # No need to calculate here
-            # self.statusBar().showMessage(f"Triangulated {dataset_name} in {elapsed_time:.2f}s") # Remove status update
             return True # Indicate success
 
         except Exception as e:
-            # self.statusBar().showMessage(f"Error triangulating {dataset_name}: {str(e)}") # Remove status update
             logger.error(f"Error triangulating {dataset_name}: {str(e)}")
             return False # Indicate error
 
@@ -2072,7 +2284,7 @@ segmentation, triangulation, and visualization.
             QMessageBox.information(self, "No Segments", "No datasets have computed segments. Please compute segments first.")
             return
         self._run_batch_computation("triangulations", len(datasets_with_segments_indices))
-
+    
     def _plot_triangulation(self, vertices, triangles, hull_points=None):
         """Plot the triangulation using 3D visualization
         
@@ -2371,8 +2583,12 @@ segmentation, triangulation, and visualization.
             
             # Write vertices
             for vertex in vertices:
-                # OBJ indices start from 1, not 0
-                f.write(f"v {vertex[0]} {vertex[1]} 0.0\n")
+                # Check if vertex has Z coordinate
+                if vertex.shape[0] >= 3:
+                    f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
+                else:
+                    # If only 2D, use 0 for Z
+                    f.write(f"v {vertex[0]} {vertex[1]} 0.0\n")
             
             # Write triangles
             for triangle in triangles:
@@ -2395,7 +2611,12 @@ segmentation, triangulation, and visualization.
             
             # Write vertices
             for vertex in vertices:
-                f.write(f"{vertex[0]} {vertex[1]} 0.0\n")
+                # Check if vertex has Z coordinate
+                if vertex.shape[0] >= 3:
+                    f.write(f"{vertex[0]} {vertex[1]} {vertex[2]}\n")
+                else:
+                    # If only 2D, use 0 for Z
+                    f.write(f"{vertex[0]} {vertex[1]} 0.0\n")
             
             # Write triangles
             for triangle in triangles:
@@ -2414,13 +2635,31 @@ segmentation, triangulation, and visualization.
                 v2 = vertices[triangle[1]]
                 v3 = vertices[triangle[2]]
                 
+                # Get Z coordinates or default to 0
+                z1 = v1[2] if v1.shape[0] >= 3 else 0.0
+                z2 = v2[2] if v2.shape[0] >= 3 else 0.0
+                z3 = v3[2] if v3.shape[0] >= 3 else 0.0
+                
                 # Calculate normal (cross product of two sides)
-                # For a flat mesh, all normals will be (0,0,1)
-                f.write(f"  facet normal 0.0 0.0 1.0\n")
+                # For a non-flat mesh, calculate actual normal
+                if v1.shape[0] >= 3 and v2.shape[0] >= 3 and v3.shape[0] >= 3:
+                    # Simple normal calculation
+                    side1 = np.array([v2[0]-v1[0], v2[1]-v1[1], v2[2]-v1[2]])
+                    side2 = np.array([v3[0]-v1[0], v3[1]-v1[1], v3[2]-v1[2]])
+                    normal = np.cross(side1, side2)
+                    # Normalize
+                    norm = np.linalg.norm(normal)
+                    if norm > 0:
+                        normal = normal / norm
+                    f.write(f"  facet normal {normal[0]} {normal[1]} {normal[2]}\n")
+                else:
+                    # Default normal for flat mesh
+                    f.write(f"  facet normal 0.0 0.0 1.0\n")
+                
                 f.write(f"    outer loop\n")
-                f.write(f"      vertex {v1[0]} {v1[1]} 0.0\n")
-                f.write(f"      vertex {v2[0]} {v2[1]} 0.0\n")
-                f.write(f"      vertex {v3[0]} {v3[1]} 0.0\n")
+                f.write(f"      vertex {v1[0]} {v1[1]} {z1}\n")
+                f.write(f"      vertex {v2[0]} {v2[1]} {z2}\n")
+                f.write(f"      vertex {v3[0]} {v3[1]} {z3}\n")
                 f.write(f"    endloop\n")
                 f.write(f"  endfacet\n")
             
@@ -2636,10 +2875,18 @@ segmentation, triangulation, and visualization.
             if dataset['points'] is not None:
                 self.points_label.setText(f"Points: {len(dataset['points'])}")
                 
-                # Calculate bounds
-                min_x, min_y = np.min(dataset['points'], axis=0)
-                max_x, max_y = np.max(dataset['points'], axis=0)
-                self.bounds_label.setText(f"Bounds: X[{min_x:.2f},{max_x:.2f}] Y[{min_y:.2f},{max_y:.2f}]")
+                # Calculate bounds - only use X and Y for display
+                min_coords = np.min(dataset['points'], axis=0)
+                max_coords = np.max(dataset['points'], axis=0)
+                min_x, min_y = min_coords[0], min_coords[1]
+                max_x, max_y = max_coords[0], max_coords[1]
+                
+                # If 3D data is available, also show Z range
+                if dataset['points'].shape[1] >= 3:
+                    min_z, max_z = min_coords[2], max_coords[2]
+                    self.bounds_label.setText(f"Bounds: X[{min_x:.2f},{max_x:.2f}] Y[{min_y:.2f},{max_y:.2f}] Z[{min_z:.2f},{max_z:.2f}]")
+                else:
+                    self.bounds_label.setText(f"Bounds: X[{min_x:.2f},{max_x:.2f}] Y[{min_y:.2f},{max_y:.2f}]")
             else:
                 self.points_label.setText("Points: 0")
                 self.bounds_label.setText("Bounds: N/A")
@@ -2652,8 +2899,9 @@ segmentation, triangulation, and visualization.
                 # Calculate hull area (approximate)
                 area = 0.0
                 for i in range(len(hull_points)-1):
-                    x1, y1 = hull_points[i]
-                    x2, y2 = hull_points[i+1]
+                    # Extract x,y coordinates only
+                    x1, y1 = hull_points[i][0], hull_points[i][1]
+                    x2, y2 = hull_points[i+1][0], hull_points[i+1][1]
                     area += x1*y2 - x2*y1
                 area = abs(area) / 2.0
                 self.hull_area_label.setText(f"Hull area: {area:.2f}")
@@ -3089,8 +3337,11 @@ segmentation, triangulation, and visualization.
         if len(all_points) == 0:
             return
             
-        min_x, min_y = np.min(all_points, axis=0)
-        max_x, max_y = np.max(all_points, axis=0)
+        # Calculate bounds, correctly handling 3D coordinates
+        min_coords = np.min(all_points, axis=0)
+        max_coords = np.max(all_points, axis=0)
+        min_x, min_y = min_coords[0], min_coords[1]
+        max_x, max_y = max_coords[0], max_coords[1]
         
         # Use 3D visualization if enabled
         if self.view_3d_enabled:
@@ -3135,117 +3386,91 @@ segmentation, triangulation, and visualization.
             self.file_viz_layout.addWidget(toolbar)
     
     def _visualize_all_hulls(self):
-        """Visualize all visible datasets' hulls"""
-        # Get visible datasets with hulls
-        visible_datasets = [d for d in self.datasets if d.get('visible', True) and d.get('hull_points') is not None]
-        
-        if not visible_datasets:
+        """Visualize all visible hulls"""
+        # Get datasets with hulls
+        datasets_with_hull = []
+        for dataset in self.datasets:
+            if dataset.get('visible', True) and dataset.get('hull_points') is not None:
+                datasets_with_hull.append(dataset)
+                
+        # Clear previous visualization if no datasets with hull
+        if not datasets_with_hull:
             self._clear_hull_plot()
             return
+            
+        # Use 3D visualization or PyVista
+        if self.view_3d_enabled:
+            self._create_multi_dataset_3d_visualization(
+                self.hull_viz_frame, 
+                datasets_with_hull,
+                "Convex Hull Visualization",
+                view_type="hulls"
+            )
+            return
         
-        # Clear existing visualization
+        # Clear previous visualization
         while self.hull_viz_layout.count():
             item = self.hull_viz_layout.takeAt(0)
             widget = item.widget()
             if widget:
                 widget.deleteLater()
+                
+        # Create a matplotlib visualization
+        fig = Figure(figsize=(6, 4), dpi=100)
+        ax = fig.add_subplot(111)
         
-        # Calculate global bounds for all visible datasets
-        all_points = np.vstack([d['points'] for d in visible_datasets if d['points'] is not None])
-        if len(all_points) == 0:
+        # Find global limits for all datasets
+        all_points = []
+        for dataset in datasets_with_hull:
+            points = dataset.get('points')
+            if points is not None and len(points) > 0:
+                all_points.append(points)
+                
+        if not all_points:
             return
             
-        min_x, min_y = np.min(all_points, axis=0)
-        max_x, max_y = np.max(all_points, axis=0)
+        all_points_np = np.vstack(all_points)
+        min_x, min_y = np.min(all_points_np[:, 0:2], axis=0)
+        max_x, max_y = np.max(all_points_np[:, 0:2], axis=0)
         
-        # Use 3D visualization if enabled
-        if self.view_3d_enabled:
-            # Create 3D visualization
-            self._create_multi_dataset_3d_visualization(
-                self.hull_viz_frame,
-                visible_datasets,
-                "Convex Hull Visualization",
-                view_type="hulls"
-            )
-        else:
-            # Fall back to matplotlib if PyVista is not available
-            fig = Figure(figsize=(6, 4), dpi=100)
-            ax = fig.add_subplot(111)
-            
-            # Plot each dataset with its color
-            for dataset in visible_datasets:
-                points = dataset['points']
-                hull_points = dataset['hull_points']
-                
-                if points is not None and len(points) > 0 and hull_points is not None and len(hull_points) > 0:
-                    color = dataset.get('color', 'blue')
-                    name = dataset.get('name', 'Unnamed')
-                    
-                    # Plot points
-                    ax.scatter(points[:, 0], points[:, 1], s=5, c=color, alpha=0.3)
-                    
-                    # Plot hull
-                    ax.plot(hull_points[:, 0], hull_points[:, 1], 
-                          color=color, linewidth=2, label=f"{name} Hull")
-                    
-                    # Plot hull vertices
-                    ax.scatter(hull_points[:-1, 0], hull_points[:-1, 1], 
-                             s=30, c=color, edgecolor='black')
-            
-            ax.set_aspect('equal')
-            ax.set_title("Convex Hulls")
-            ax.set_xlabel("X")
-            ax.set_ylabel("Y")
-            ax.legend()
-            
-            # Add grid and set limits with some padding
-            ax.grid(True, linestyle='--', alpha=0.6)
-            padding = max((max_x - min_x), (max_y - min_y)) * 0.05
-            ax.set_xlim(min_x - padding, max_x + padding)
-            ax.set_ylim(min_y - padding, max_y + padding)
-            
-            # Create canvas
-            canvas = FigureCanvas(fig)
-            self.hull_viz_layout.addWidget(canvas)
-            
-            # Add toolbar
-            toolbar = NavigationToolbar(canvas, self.hull_viz_frame)
-            self.hull_viz_layout.addWidget(toolbar)
+        # Add some margin to the plot
+        margin_x = 0.1 * (max_x - min_x)
+        margin_y = 0.1 * (max_y - min_y)
         
-        # Update the hull legend to show all visible datasets
-        legend_layout = QHBoxLayout()
-        for dataset in visible_datasets:
+        # Plot each dataset
+        for dataset in datasets_with_hull:
+            points = dataset.get('points')
+            hull_points = dataset.get('hull_points')
             color = dataset.get('color', '#000000')
             name = dataset.get('name', 'Unnamed')
             
-            legend_item = QWidget()
-            legend_item_layout = QHBoxLayout(legend_item)
-            legend_item_layout.setContentsMargins(0, 0, 0, 0)
+            if points is None or len(points) == 0 or hull_points is None or len(hull_points) == 0:
+                continue
             
-            # Color box
-            color_box = QLabel("■")
-            color_box.setStyleSheet(f"color: {color}; font-size: 16px;")
-            legend_item_layout.addWidget(color_box)
+            # Plot points (with reduced alpha for better visualization)
+            ax.scatter(points[:, 0], points[:, 1], s=5, c=color, alpha=0.3)
             
-            # Dataset name
-            name_label = QLabel(name)
-            legend_item_layout.addWidget(name_label)
+            # Plot hull (using first 2 dimensions)
+            ax.plot(hull_points[:, 0], hull_points[:, 1], c=color, linewidth=2, label=name)
             
-            legend_layout.addWidget(legend_item)
+        ax.set_aspect('equal')
+        ax.set_title(f"Hull Visualization: {len(datasets_with_hull)} datasets")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.grid(True, linestyle='--', alpha=0.6)
+        ax.legend(loc='best')
         
-        # Add spacer to push items to the left
-        legend_layout.addStretch()
+        # Set limits with margin
+        ax.set_xlim(min_x - margin_x, max_x + margin_x)
+        ax.set_ylim(min_y - margin_y, max_y + margin_y)
         
-        # Remove previous legend if it exists
-        if hasattr(self, 'hull_legend_widget') and self.hull_legend_widget is not None:
-            self.hull_legend_widget.deleteLater()
+        # Create canvas
+        canvas = FigureCanvas(fig)
+        self.hull_viz_layout.addWidget(canvas)
         
-        # Create a widget for the legend
-        self.hull_legend_widget = QWidget()
-        self.hull_legend_widget.setLayout(legend_layout)
-        
-        # Add it to the top of the layout
-        self.hull_viz_layout.insertWidget(0, self.hull_legend_widget)
+        # Add toolbar
+        toolbar = NavigationToolbar(canvas, self.hull_viz_frame)
+        self.hull_viz_layout.addWidget(toolbar)
     
     def _visualize_all_segments(self):
         """Visualize all visible datasets' segments"""
@@ -3268,8 +3493,11 @@ segmentation, triangulation, and visualization.
         if len(all_points) == 0:
             return
             
-        min_x, min_y = np.min(all_points, axis=0)
-        max_x, max_y = np.max(all_points, axis=0)
+        # Handle 3D coordinates properly
+        min_coords = np.min(all_points, axis=0)
+        max_coords = np.max(all_points, axis=0)
+        min_x, min_y = min_coords[0], min_coords[1]
+        max_x, max_y = max_coords[0], max_coords[1]
         
         # Use 3D visualization if enabled
         if self.view_3d_enabled:
@@ -3284,20 +3512,20 @@ segmentation, triangulation, and visualization.
             # Fall back to matplotlib if PyVista is not available
             fig = Figure(figsize=(6, 4), dpi=100)
             ax = fig.add_subplot(111)
-
+            
             # Plot each dataset with its color
             for dataset in visible_datasets:
                 points = dataset['points']
                 # hull_points = dataset.get('hull_points') # No longer needed for plotting here
                 segments = dataset['segments']
-
+                
                 if points is not None and len(points) > 0 and segments is not None and len(segments) > 0:
                     color = dataset.get('color', 'blue')
                     name = dataset.get('name', 'Unnamed')
-
+                    
                     # Plot points
                     ax.scatter(points[:, 0], points[:, 1], s=5, c=color, alpha=0.3)
-
+                    
                     # # Plot hull if available - REMOVED to show segment boundary instead
                     # if hull_points is not None and len(hull_points) > 0:
                     #     ax.plot(hull_points[:, 0], hull_points[:, 1],
@@ -3305,37 +3533,37 @@ segmentation, triangulation, and visualization.
 
                     # Plot segments - make them slightly more prominent
                     for segment in segments:
-                        ax.plot([segment[0][0], segment[1][0]], [segment[0][1], segment[1][1]],
+                        ax.plot([segment[0][0], segment[1][0]], [segment[0][1], segment[1][1]], 
                               color=color, linewidth=1.8, alpha=0.9) # Increased linewidth/alpha
-
+                    
                     # Plot segment endpoints
-                    all_endpoints = np.vstack([segment[0] for segment in segments] +
+                    all_endpoints = np.vstack([segment[0] for segment in segments] + 
                                             [segment[1] for segment in segments])
                     unique_endpoints = np.unique(all_endpoints, axis=0)
-                    ax.scatter(unique_endpoints[:, 0], unique_endpoints[:, 1],
+                    ax.scatter(unique_endpoints[:, 0], unique_endpoints[:, 1], 
                              s=20, c=color, edgecolor='black', label=f"{name} Boundary Points") # Adjusted label
-
+            
             ax.set_aspect('equal')
             ax.set_title("Segmentations (Boundary Defined by Segments)") # Updated title
             # ... rest of matplotlib setup (labels, legend, grid, limits) ...
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
             ax.legend()
-
+            
             # Add grid and set limits with some padding
             ax.grid(True, linestyle='--', alpha=0.6)
             padding = max((max_x - min_x), (max_y - min_y)) * 0.05
             ax.set_xlim(min_x - padding, max_x + padding)
             ax.set_ylim(min_y - padding, max_y + padding)
-
+            
             # Create canvas
             canvas = FigureCanvas(fig)
             self.segment_viz_layout.addWidget(canvas)
-
+            
             # Add toolbar
             toolbar = NavigationToolbar(canvas, self.segment_viz_frame)
             self.segment_viz_layout.addWidget(toolbar)
-
+        
         # Update the segments legend (remains the same)
         # ... existing legend update code ...
     
@@ -3367,8 +3595,11 @@ segmentation, triangulation, and visualization.
             return
             
         all_vertices = np.vstack(all_vertices)
-        min_x, min_y = np.min(all_vertices, axis=0)
-        max_x, max_y = np.max(all_vertices, axis=0)
+        # Handle 3D coordinates properly
+        min_coords = np.min(all_vertices, axis=0)
+        max_coords = np.max(all_vertices, axis=0)
+        min_x, min_y = min_coords[0], min_coords[1]
+        max_x, max_y = max_coords[0], max_coords[1]
         
         # Use 3D visualization if enabled
         if self.view_3d_enabled:
@@ -3384,25 +3615,25 @@ segmentation, triangulation, and visualization.
             # Fall back to matplotlib if PyVista is not available
             fig = Figure(figsize=(6, 4), dpi=100)
             ax = fig.add_subplot(111)
-
+            
             # Plot each dataset with its color
             for dataset in visible_datasets:
                 triangulation_result = dataset['triangulation_result']
                 # hull_points = dataset.get('hull_points') # Don't use original hull
-
+                
                 if triangulation_result is not None:
                     vertices = triangulation_result.get('vertices')
                     triangles = triangulation_result.get('triangles')
-
+                    
                     if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
                         color = dataset.get('color', 'blue')
                         name = dataset.get('name', 'Unnamed')
-
+                        
                         # Plot triangulation using triplot
                         from matplotlib.tri import Triangulation
                         tri = Triangulation(vertices[:, 0], vertices[:, 1], triangles)
                         ax.triplot(tri, color=color, lw=0.5, alpha=0.7, label=f"{name} Mesh")
-
+                        
                         # --- Plot actual boundary edges ---
                         boundary_edges_indices = self._get_boundary_edges(triangles)
                         if boundary_edges_indices:
@@ -3416,7 +3647,7 @@ segmentation, triangulation, and visualization.
                         # # Plot hull boundary if available - REMOVED
                         # if hull_points is not None and len(hull_points) > 3:
                         #     ax.plot(hull_points[:, 0], hull_points[:, 1], color=color, linewidth=1.5)
-
+            
             ax.set_aspect('equal')
             ax.set_title("Triangulations (Actual Boundary)") # Updated title
             # ... rest of matplotlib setup (labels, legend, grid, limits) ...
@@ -3426,27 +3657,27 @@ segmentation, triangulation, and visualization.
             handles, labels = ax.get_legend_handles_labels()
             by_label = dict(zip(labels, handles)) # Remove duplicate labels
             ax.legend(by_label.values(), by_label.keys())
-
+            
             # Add grid and set limits with some padding
             ax.grid(True, linestyle='--', alpha=0.6)
             padding = max((max_x - min_x), (max_y - min_y)) * 0.05
             ax.set_xlim(min_x - padding, max_x + padding)
             ax.set_ylim(min_y - padding, max_y + padding)
-
+            
             # Create canvas
             canvas = FigureCanvas(fig)
             self.tri_viz_layout.addWidget(canvas)
-
+            
             # Add toolbar
             toolbar = NavigationToolbar(canvas, self.tri_viz_frame)
             self.tri_viz_layout.addWidget(toolbar)
-
+        
         # Update the triangulation legend (remains the same)
         # ... existing legend update code ...
     
     def _create_multi_dataset_3d_visualization(self, parent_frame, datasets, title, view_type="points"):
         """Create a 3D visualization of multiple datasets
-
+        
         Args:
             parent_frame: Frame to contain the visualization
             datasets: List of datasets to visualize
@@ -3473,14 +3704,14 @@ segmentation, triangulation, and visualization.
             msg_layout.addWidget(msg)
             parent_frame.layout().addWidget(msg_widget)
             return msg_widget # Return the message widget
-
+        
         # Close previous plotter if it exists
         if hasattr(self, 'current_plotter') and self.current_plotter is not None:
             try:
                 # Explicitly close and maybe delete the plotter resources
                 self.current_plotter.close()
             except Exception as e:
-                 logger.warning(f"Error closing previous plotter: {e}")
+                logger.warning(f"Error closing previous plotter: {e}")
             self.current_plotter = None # Ensure reference is cleared
 
         # Clear previous content from parent frame layout first
@@ -3496,10 +3727,10 @@ segmentation, triangulation, and visualization.
             if widget:
                 # Critical: Ensure the plotter widget is properly deleted
                 if isinstance(widget, QFrame) and hasattr(widget, 'interactor'): # Check if it's a plotter frame
-                     try:
-                         widget.interactor.close() # Try closing interactor too
-                     except Exception as e:
-                         logger.debug(f"Minor issue closing interactor: {e}")
+                    try:
+                        widget.interactor.close() # Try closing interactor too
+                    except Exception as e:
+                        logger.debug(f"Minor issue closing interactor: {e}")
                 widget.deleteLater()
 
 
@@ -3519,11 +3750,11 @@ segmentation, triangulation, and visualization.
             info_title = "Triangulation Visualization"
         else:
             info_title = title # Fallback to provided title
-
+            
         info_label = QLabel(info_title)
         info_label.setAlignment(Qt.AlignCenter)
         vis_container_layout.addWidget(info_label) # Add title to the main container
-
+        
         # Create legend with colored boxes for each dataset
         legend_widget = QWidget() # Widget to hold the legend layout
         legend_layout = QHBoxLayout(legend_widget)
@@ -3533,210 +3764,227 @@ segmentation, triangulation, and visualization.
         for dataset in visible_datasets_in_list:
             color = dataset.get('color', '#000000')
             name = dataset.get('name', 'Unnamed')
-
+            
             legend_item = QWidget()
             legend_item_layout = QHBoxLayout(legend_item)
             legend_item_layout.setContentsMargins(0, 0, 5, 0) # Spacing between legend items
-
+            
             # Color box
             color_box = QLabel("■")
             color_box.setStyleSheet(f"color: {color}; font-size: 16px;")
             legend_item_layout.addWidget(color_box)
-
+            
             # Dataset name
             name_label = QLabel(name)
             legend_item_layout.addWidget(name_label)
-
+            
             legend_layout.addWidget(legend_item)
-
+            
         # Add spacer to push items to the left
         legend_layout.addStretch()
         vis_container_layout.addWidget(legend_widget) # Add legend widget to the main container
-
+        
         try:
             # Create PyVista plotter widget using QtInteractor
             from pyvistaqt import QtInteractor
-
+            
             # *** Visualization Fix: Create plotter without intermediate frame ***
             # QtInteractor itself is a QFrame, so we can add it directly
             # parent=vis_container_widget makes it live inside the main container
             self.current_plotter = QtInteractor(parent=vis_container_widget)
             vis_container_layout.addWidget(self.current_plotter) # Add the plotter QFrame
-
+            
             # Set background color
             self.current_plotter.set_background("#383F51")
-
-            # Determine dataset vertical spacing
+            
+            # Collect all points for global bounds
             all_points = []
             for dataset in datasets:
                 if dataset.get('visible', True) and dataset.get('points') is not None:
                     all_points.append(dataset['points'])
-
-            # Set Z-position variables
-            z_base = 0           # Base Z position for the first dataset
-            z_spacing = 20.0     # Default spacing
-
-            # Calculate dataset extents if we have points
+            
+            # Calculate dataset extents if we have points - for informational purposes only
             if all_points:
                 all_points_np = np.vstack(all_points)
                 if len(all_points_np) > 0:
-                    min_coords = np.min(all_points_np, axis=0)
-                    max_coords = np.max(all_points_np, axis=0)
-                    xy_range = max(max_coords[0] - min_coords[0], max_coords[1] - min_coords[1], 1.0) # Avoid zero range
-                    z_spacing = xy_range * 0.5  # Adjust spacing based on dataset size
+                    logger.debug(f"Visualizing {len(all_points_np)} points across {len(all_points)} datasets")
                 else:
-                     logger.warning("No points found in visible datasets to calculate range.")
+                    logger.warning("No points found in visible datasets to calculate range.")
             else:
-                 logger.warning("No visible datasets with points found.")
-
-
-            # Variables for pattern-based Z offset
-            x_scale = 0.05
-            y_scale = 0.05
-            z_pattern_scale = 5.0 * self.height_factor # Use instance height factor
-
+                logger.warning("No visible datasets with points found.")
+            
             # Process datasets based on visualization type
             plotter_has_geometry = False # Flag to check if anything was added
             for i, dataset in enumerate(datasets):
                 if not dataset.get('visible', True):
                     continue
-
+                    
                 # Get dataset properties
                 points = dataset.get('points')
                 color = dataset.get('color', '#000000')
                 name = dataset.get('name', 'Unnamed')
-
+                
                 if points is None or len(points) == 0:
                     continue
-
-                # Calculate vertical position for this dataset
-                z_offset = z_base + (i * z_spacing)
-
+                
                 # Convert 2D points to 3D with height variation
                 if points.shape[1] == 2:
                     points_3d = np.zeros((len(points), 3))
                     points_3d[:, 0] = points[:, 0]
                     points_3d[:, 1] = points[:, 1]
-
-                    # Add Z values with a pattern + the dataset offset
-                    for j in range(len(points)):
-                        x, y = points[j]
-                        z_pattern = np.sin(x * x_scale) * np.cos(y * y_scale) * z_pattern_scale
-                        points_3d[j, 2] = z_pattern + z_offset
-                elif points.shape[1] == 3:
-                     points_3d = points.copy()
-                     points_3d[:, 2] += z_offset # Apply offset if already 3D
+                    # Z coordinate is left as 0 for 2D points
+                elif points.shape[1] >= 3:
+                    # Use actual Z coordinates from the data
+                    points_3d = points.copy()[:, 0:3]  # Use the first 3 dimensions only
                 else:
-                     logger.warning(f"Dataset '{name}' has unexpected point dimensions: {points.shape[1]}. Skipping.")
-                     continue
+                    logger.warning(f"Dataset '{name}' has unexpected point dimensions: {points.shape[1]}. Skipping.")
+                    continue
 
-
+                
                 # Add visualization based on type
                 if view_type == "points":
                     point_cloud = pv.PolyData(points_3d)
-                    self.current_plotter.add_mesh(point_cloud, color=color, render_points_as_spheres=True,
+                    self.current_plotter.add_mesh(point_cloud, color=color, render_points_as_spheres=True, 
                                          point_size=8, label=name)
                     plotter_has_geometry = True
-
+                
                 elif view_type == "hulls":
                     hull_points = dataset.get('hull_points')
                     if hull_points is not None and len(hull_points) > 3:
-                        hull_3d = np.zeros((len(hull_points), 3))
-                        hull_3d[:, 0] = hull_points[:, 0]
-                        hull_3d[:, 1] = hull_points[:, 1]
-
-                        for j in range(len(hull_points)):
-                            x, y = hull_points[j]
-                            z_pattern = np.sin(x * x_scale) * np.cos(y * y_scale) * z_pattern_scale
-                            hull_3d[j, 2] = z_pattern + z_offset
-
+                        # Use hull points directly - they should already have proper 3D coordinates
+                        hull_3d = hull_points
+                        
+                        # Create lines for the hull
                         for j in range(len(hull_3d)-1):
                             line = pv.Line(hull_3d[j], hull_3d[j+1])
                             self.current_plotter.add_mesh(line, color=color, line_width=3)
+                            
+                        # Add the original points with reduced opacity for context
+                        point_cloud = pv.PolyData(points_3d)
+                        self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.3, 
+                                           render_points_as_spheres=True, point_size=5)
                         plotter_has_geometry = True
-                     # Optionally add points too for context
+                    # Optionally add points too for context
                     point_cloud = pv.PolyData(points_3d)
                     self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.3, render_points_as_spheres=True,
                                      point_size=5)
-
+                
 
                 elif view_type == "segments":
                     segments = dataset.get('segments')
                     if segments is not None and len(segments) > 0:
-                         # Add points for context
+                        # Add points for context
                         point_cloud = pv.PolyData(points_3d)
                         self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.3, render_points_as_spheres=True,
                                          point_size=5)
 
-                        # Create 3D lines for segments
+                        # Create 3D lines for segments - handle both list and numpy array formats
                         for segment in segments:
                             line_points = np.zeros((2, 3))
-                            line_points[0, 0] = segment[0][0]
-                            line_points[0, 1] = segment[0][1]
-                            line_points[1, 0] = segment[1][0]
-                            line_points[1, 1] = segment[1][1]
-
-                            x1, y1 = segment[0]
-                            x2, y2 = segment[1]
-                            z1 = np.sin(x1 * x_scale) * np.cos(y1 * y_scale) * z_pattern_scale
-                            z2 = np.sin(x2 * x_scale) * np.cos(y2 * y_scale) * z_pattern_scale
-                            line_points[0, 2] = z1 + z_offset
-                            line_points[1, 2] = z2 + z_offset
-
+                            
+                            # Handle both 2D and 3D segment points
+                            if hasattr(segment[0], 'shape'):
+                                # For numpy arrays
+                                if segment[0].shape[0] == 2:
+                                    # For 2D segments, copy X,Y and find Z from closest point
+                                    line_points[0, 0:2] = segment[0]
+                                    line_points[1, 0:2] = segment[1]
+                                    
+                                    # Set Z values based on closest original points
+                                    for j in range(2):
+                                        point_2d = segment[j]
+                                        # Find closest point in original dataset for Z value
+                                        distances = np.sum((points_3d[:, 0:2] - point_2d)**2, axis=1)
+                                        closest_idx = np.argmin(distances)
+                                        line_points[j, 2] = points_3d[closest_idx, 2]
+                                else:
+                                    # For 3D segments, use all dimensions directly
+                                    line_points[0] = segment[0]
+                                    line_points[1] = segment[1]
+                            else:
+                                # For list-based points
+                                if len(segment[0]) == 2:
+                                    # For 2D segments, copy X,Y and find Z from closest point
+                                    line_points[0, 0] = segment[0][0]
+                                    line_points[0, 1] = segment[0][1]
+                                    line_points[1, 0] = segment[1][0]
+                                    line_points[1, 1] = segment[1][1]
+                                    
+                                    # Set Z values based on closest original points
+                                    for j in range(2):
+                                        point_2d = np.array([segment[j][0], segment[j][1]])
+                                        # Find closest point in original dataset for Z value
+                                        distances = np.sum((points_3d[:, 0:2] - point_2d)**2, axis=1)
+                                        closest_idx = np.argmin(distances)
+                                        line_points[j, 2] = points_3d[closest_idx, 2]
+                                else:
+                                    # For 3D segments, use all dimensions directly
+                                    line_points[0, 0] = segment[0][0]
+                                    line_points[0, 1] = segment[0][1]
+                                    line_points[0, 2] = segment[0][2]
+                                    line_points[1, 0] = segment[1][0]
+                                    line_points[1, 1] = segment[1][1]
+                                    line_points[1, 2] = segment[1][2]
+                            
                             line_obj = pv.Line(line_points[0], line_points[1])
                             self.current_plotter.add_mesh(line_obj, color=color, line_width=2.5)
                         plotter_has_geometry = True
-
 
                 elif view_type == "triangulation":
                     triangulation_result = dataset.get('triangulation_result')
                     if triangulation_result is not None:
                         vertices = triangulation_result.get('vertices')
                         triangles = triangulation_result.get('triangles')
-
+                        
                         if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
-                            vertices_3d = np.zeros((len(vertices), 3))
-                            vertices_3d[:, 0] = vertices[:, 0]
-                            vertices_3d[:, 1] = vertices[:, 1]
-
-                            for j in range(len(vertices)):
-                                x, y = vertices[j]
-                                z_pattern = np.sin(x * x_scale) * np.cos(y * y_scale) * z_pattern_scale
-                                vertices_3d[j, 2] = z_pattern + z_offset
-
+                            # Convert vertices to 3D, respecting Z coordinates 
+                            if vertices.shape[1] == 2:
+                                vertices_3d = np.zeros((len(vertices), 3))
+                                vertices_3d[:, 0:2] = vertices
+                                
+                                # Try to map Z values from original points
+                                for j in range(len(vertices)):
+                                    vertex_2d = vertices[j]
+                                    # Find closest point in original dataset for Z value
+                                    distances = np.sum((points_3d[:, 0:2] - vertex_2d)**2, axis=1)
+                                    closest_idx = np.argmin(distances)
+                                    vertices_3d[j, 2] = points_3d[closest_idx, 2]
+                            else:
+                                # Use Z values if they're already present
+                                vertices_3d = vertices.copy()[:, 0:3]
+                            
                             cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
                             mesh = pv.PolyData(vertices_3d, cells)
-
-                            self.current_plotter.add_mesh(mesh, color=color, opacity=0.7,
-                                                      show_edges=True, edge_color=color,
+                            
+                            self.current_plotter.add_mesh(mesh, color=color, opacity=0.7, 
+                                                      show_edges=True, edge_color=color, 
                                                       line_width=1, specular=0.5, label=name)
                             plotter_has_geometry = True
-
-
+            
+            
             # Add axes and reset camera only if something was plotted
             if plotter_has_geometry:
                 self.current_plotter.add_axes()
                 self.current_plotter.reset_camera()
             else:
-                 logger.warning("No geometry added to the plotter for the current view.")
-
+                logger.warning("No geometry added to the plotter for the current view.")
+            
             # Add controls for adjustment
             controls_widget = QWidget() # Widget to hold controls
             controls_layout = QHBoxLayout(controls_widget)
             controls_layout.setContentsMargins(5, 2, 5, 2) # Small margins
-
-            # Height adjustment slider - Only makes sense if height pattern was used
-            if any(d['points'].shape[1] == 2 for d in datasets if d.get('points') is not None):
-                controls_layout.addWidget(QLabel("Height:"))
-                height_slider = QSlider(Qt.Horizontal)
-                height_slider.setMinimum(0)
-                height_slider.setMaximum(100)
-                # Reflect current height factor in slider position
-                height_slider.setValue(int(self.height_factor / 5.0 * 100)) # Scale to slider range
-                # Update height factor and re-trigger the visualization update for the current tab
-                height_slider.valueChanged.connect(lambda v: self._set_height_factor_and_update(v / 20.0)) # Scale back from slider range
-                controls_layout.addWidget(height_slider)
-
+            
+            # Height adjustment slider - for Z axis exaggeration
+            controls_layout.addWidget(QLabel("Z Exaggeration:"))
+            height_slider = QSlider(Qt.Horizontal)
+            height_slider.setMinimum(1)
+            height_slider.setMaximum(100)
+            # Reflect current height factor in slider position
+            height_slider.setValue(int(self.height_factor * 20)) # Scale to slider range
+            # Update height factor and re-trigger the visualization update for the current tab
+            height_slider.valueChanged.connect(lambda v: self._set_height_factor_and_update(v / 20.0)) # Scale back from slider range
+            controls_layout.addWidget(height_slider)
+            
             # Add zoom controls
             controls_layout.addStretch(1) # Push zoom controls to the right
             controls_layout.addWidget(QLabel("Zoom:"))
@@ -3744,25 +3992,25 @@ segmentation, triangulation, and visualization.
             zoom_in_btn.setMaximumWidth(30)
             zoom_in_btn.clicked.connect(lambda: self.current_plotter.camera.zoom(1.2))
             controls_layout.addWidget(zoom_in_btn)
-
+            
             zoom_out_btn = QPushButton("-")
             zoom_out_btn.setMaximumWidth(30)
             zoom_out_btn.clicked.connect(lambda: self.current_plotter.camera.zoom(1/1.2))
             controls_layout.addWidget(zoom_out_btn)
-
+            
             # Reset view button
             reset_btn = QPushButton("Reset View")
             reset_btn.clicked.connect(lambda: self.current_plotter.reset_camera())
             controls_layout.addWidget(reset_btn)
-
+            
             vis_container_layout.addWidget(controls_widget) # Add controls below the plotter
 
         except ImportError:
-             # This case should be caught by HAVE_PYVISTA check at the top
-             logger.error("PyVistaQt import failed unexpectedly.")
-             error_msg = QLabel("Error: Failed to load PyVistaQt.")
-             error_msg.setAlignment(Qt.AlignCenter)
-             vis_container_layout.addWidget(error_msg)
+            # This case should be caught by HAVE_PYVISTA check at the top
+            logger.error("PyVistaQt import failed unexpectedly.")
+            error_msg = QLabel("Error: Failed to load PyVistaQt.")
+            error_msg.setAlignment(Qt.AlignCenter)
+            vis_container_layout.addWidget(error_msg)
         except Exception as e:
             # Fallback if QtInteractor fails
             error_msg_text = f"Error creating 3D view: {str(e)}\nCheck logs for details."
@@ -3809,9 +4057,9 @@ segmentation, triangulation, and visualization.
             if visible_with_hulls:
                 self._visualize_all_hulls()
             else:
-                 # Clear the specific plot for this tab if no relevant data exists
-                 self._clear_hull_plot()
-                 self.statusBar().showMessage("No hulls computed yet. Use 'Compute Convex Hull' or right-click a dataset.")
+                # Clear the specific plot for this tab if no relevant data exists
+                self._clear_hull_plot()
+                self.statusBar().showMessage("No hulls computed yet. Use 'Compute Convex Hull' or right-click a dataset.")
         elif index == 2:  # Segment tab
             visible_with_segments = any(d.get('visible', True) and d.get('segments') is not None for d in self.datasets)
             if visible_with_segments:
@@ -3824,8 +4072,8 @@ segmentation, triangulation, and visualization.
             if visible_with_tri:
                 self._visualize_all_triangulations()
             else:
-                 self._clear_triangulation_plot()
-                 self.statusBar().showMessage("No triangulations computed yet. Complete previous steps first.")
+                self._clear_triangulation_plot()
+                self.statusBar().showMessage("No triangulations computed yet. Complete previous steps first.")
 
     # ... rest of the class methods (_get_next_color, _create_main_layout, etc.) ...
 
@@ -4076,4 +4324,4 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MeshItWorkflowGUI()
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec_()) 
