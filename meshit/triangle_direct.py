@@ -321,35 +321,18 @@ class DirectTriangleWrapper:
 
         # For uniform triangulation (default and simpler approach)
         if uniform:
-            # Simple approach: Use quality and area constraints for uniform meshes
-            effective_min_angle = 25.0  # Higher angle for better quality
-            area_constraint = self.base_size * self.base_size * 0.5
+            # Simple approach: Use quality and area constraints derived from GUI/init params
+            effective_min_angle = self.min_angle # *** USE self.min_angle FROM GUI ***
+            area_constraint = self.base_size * self.base_size * 0.5 # Use calculated base_size
             
-            # Simple Triangle options for uniform meshes - no feature points needed
-            # p = PSLG (use segments)
-            # z = Number vertices from zero
-            # q = Quality constraint (higher min angle)
-            # a = Area constraint for uniform size
-            # Y = Prohibits Steiner points on the boundary
-            tri_options = f'pzYq{effective_min_angle}a{area_constraint}'
-            self.logger.info(f"Using simple uniform Triangle options: '{tri_options}'")
+            # Triangle options: pzqa (respect GUI angle and density/base_size)
+            # We avoid 'Y' to allow boundary refinement if needed for quality.
+            tri_options = f'pzq{effective_min_angle:.1f}a{area_constraint:.8f}'
+            self.logger.info(f"Using options derived from GUI for uniform request: '{tri_options}'")
             
-            # Feature points are only used if explicitly requested
-            if create_feature_points and self.feature_points is not None and len(self.feature_points) > 0:
-                # Use feature points with uniform sizing
-                combined_feature_points = self.feature_points
-                combined_feature_sizes = np.ones(len(self.feature_points)) * self.base_size
-                
-                # Initialize C++ callback
-                self.logger.info(f"Using C++ callback with uniform sizing for {len(combined_feature_points)} feature points")
-                triangle_callback.initialize_gradient_control(
-                    1.0,  # Use gradient=1.0 for uniform sizing
-                    self.base_size * self.base_size,
-                    combined_feature_points,
-                    combined_feature_sizes
-                )
-                # Add 'u' option to use the callback
-                tri_options += 'u'
+            # NOTE: We are intentionally NOT using the C++ callback path for uniform=True,
+            # as the goal is consistent triangulation based on angle/area constraints.
+            # Feature points are effectively ignored in this mode for simplicity.
         
         # For gradient-based refinement (more complex, non-default approach)
         else:
