@@ -15,6 +15,7 @@ import os
 import sys
 import time
 from matplotlib.colors import ListedColormap, to_rgba
+import re
 
 # Import PyQt5
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
@@ -820,8 +821,35 @@ class MeshItWorkflowGUI(QMainWindow):
     def _read_point_file(self, file_path):
         """Read points from a file"""
         try:
+            # First check file content to see if it might be a fault file format
+            try:
+                with open(file_path, 'r') as f:
+                    first_lines = [f.readline().strip() for _ in range(5)]
+                    has_mixed_delimiters = any(('\t' in line and (',' in line or ';' in line)) for line in first_lines if line)
+                    
+                if has_mixed_delimiters or any(line.startswith("Bounds:") for line in first_lines if line):
+                    # Likely a fault file with mixed delimiters, use custom parser
+                    points = self._parse_fault_file(file_path)
+                    if points is not None and len(points) > 0:
+                        logger.info(f"Successfully parsed file as fault format: {len(points)} points")
+                        return points
+            except Exception as e:
+                # If preview fails, continue with standard import
+                logger.debug(f"File preview check failed: {str(e)}")
+                
             # Try different formats based on file extension
             ext = os.path.splitext(file_path)[1].lower()
+            
+            # Check if this might be a fault file with mixed delimiters
+            if ext in ['.fault', '.txt', '.dat', '']:
+                try:
+                    # Custom parsing for fault files with mixed delimiters
+                    points = self._parse_fault_file(file_path)
+                    if points is not None and len(points) > 0:
+                        return points
+                except Exception as e:
+                    logger.debug(f"Fault file parsing failed, trying standard formats: {str(e)}")
+                    # Continue with standard formats if fault parsing fails
             
             if ext == '.csv':
                 # CSV format - try comma, tab, and space separators
@@ -859,6 +887,177 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.error(f"Error reading file: {str(e)}")
             QMessageBox.critical(self, "Error", f"Error reading file: {str(e)}")
             return None
+            
+    def _extract_all_values_from_line(self, line):
+        """
+        Extract all numeric values from a line with mixed delimiters
+        
+        Args:
+            line: String line to parse
+            
+        Returns:
+            List of numeric values
+        """
+        # First, replace tabs with spaces to ensure they're proper separators
+        line = line.replace('\t', ' ')
+        
+        # Replace '+' with ' +' and '-' with ' -' to ensure they're separated
+        # But don't add spaces if they're after digits (like in 1.5e-3)
+        line = re.sub(r'(?<!\d)(\+|-)', r' \1', line)
+        
+        # Replace all common delimiters with spaces
+        for delimiter in [',', ';']:
+            line = line.replace(delimiter, ' ')
+        
+        # Remove extra spaces
+        line = re.sub(r'\s+', ' ', line).strip()
+        
+        # Split by whitespace
+        parts = line.split()
+        
+        # Convert to float
+        values = []
+        for part in parts:
+            try:
+                # Remove '+' sign prefix if present
+                if part.startswith('+'):
+                    part = part[1:]
+                values.append(float(part))
+            except ValueError:
+                logger.debug(f"Could not convert '{part}' to float in line: '{line}'")
+                continue
+        
+        # Debug output
+        logger.debug(f"Extracted values {values} from line: '{line}'")
+        return values
+    
+    def _parse_fault_file(self, file_path):
+        """
+        Parse a fault file with mixed delimiters 
+        
+        Args:
+            file_path: Path to the fault file
+            
+        Returns:
+            numpy array of points (Nx3) or None if parsing failed
+        """
+        points = []
+        
+        try:
+            with open(file_path, 'r') as f:
+                for line_num, line in enumerate(f):
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue  # Skip empty lines and comments
+                    
+                    # Check if this is a bounds format line: "Bounds: X[min,max] Y[min,max] Z[min,max]"
+                    if line.startswith("Bounds:"):
+                        bounds_points = self._parse_bounds_format(line)
+                        if bounds_points is not None and len(bounds_points) > 0:
+                            points.extend(bounds_points)
+                        continue
+                    
+                    # Parse each line as a single (x,y,z) coordinate
+                    try:
+                        # Extract all numbers from the line
+                        all_values = self._extract_all_values_from_line(line)
+                        
+                        # We need at least 2 values for a valid point
+                        if len(all_values) >= 2:
+                            x = all_values[0]
+                            y = all_values[1]
+                            # Use third value as z if available, otherwise default to 0
+                            z = all_values[2] if len(all_values) >= 3 else 0.0
+                            points.append([x, y, z])
+                            logger.debug(f"Parsed point: ({x}, {y}, {z})")
+                    except Exception as e:
+                        logger.debug(f"Error parsing line {line_num+1}: {str(e)}")
+            
+            if len(points) == 0:
+                return None
+                
+            return np.array(points)
+        except Exception as e:
+            logger.debug(f"Error in fault file parsing: {str(e)}")
+            return None
+    
+    def _parse_bounds_format(self, line):
+        """
+        Parse bounds format line: "Bounds: X[min,max] Y[min,max] Z[min,max]"
+        
+        Args:
+            line: String line in bounds format
+            
+        Returns:
+            List of points representing the bounds
+        """
+        try:
+            # Extract X, Y, Z ranges
+            x_range = re.search(r'X\[([-+]?\d+\.?\d*),([-+]?\d+\.?\d*)\]', line)
+            y_range = re.search(r'Y\[([-+]?\d+\.?\d*),([-+]?\d+\.?\d*)\]', line)
+            z_range = re.search(r'Z\[([-+]?\d+\.?\d*),([-+]?\d+\.?\d*)\]', line)
+            
+            if not x_range or not y_range:
+                logger.debug("Could not find X or Y ranges in bounds line")
+                return None
+                
+            # Extract min/max values for each dimension
+            x_min, x_max = float(x_range.group(1)), float(x_range.group(2))
+            y_min, y_max = float(y_range.group(1)), float(y_range.group(2))
+            
+            # For Z, use found values or default to 0
+            if z_range:
+                z_min, z_max = float(z_range.group(1)), float(z_range.group(2))
+            else:
+                z_min, z_max = 0.0, 0.0
+                
+            # Create corner points only (not the full bounding box)
+            # For a fault file, we typically just want the 4 corners of the rectangular region
+            bounds_points = [
+                [x_min, y_min, 0.0],  # Bottom-left
+                [x_max, y_min, 0.0],  # Bottom-right
+                [x_max, y_max, 0.0],  # Top-right
+                [x_min, y_max, 0.0]   # Top-left
+            ]
+            
+            # Log the extracted points for debugging
+            logger.info(f"Parsed bounds points: {bounds_points}")
+            
+            return bounds_points
+        except Exception as e:
+            logger.debug(f"Error parsing bounds format: {str(e)}")
+            return None
+    
+    def _extract_values(self, part):
+        """
+        Extract numeric values from a string that might contain multiple delimiters
+        
+        Args:
+            part: String part potentially containing multiple values
+            
+        Returns:
+            List of numeric values
+        """
+        values = []
+        
+        # Replace '+' at the beginning of numbers with nothing
+        part = re.sub(r'(?<!\d)\+', '', part)
+        
+        # First try comma
+        comma_parts = part.split(',')
+        for cp in comma_parts:
+            # Then try semicolon
+            semicolon_parts = cp.split(';')
+            for sp in semicolon_parts:
+                # Clean and convert to float
+                sp = sp.strip()
+                if sp:
+                    try:
+                        values.append(float(sp))
+                    except ValueError:
+                        logger.debug(f"Could not convert '{sp}' to float")
+        
+        return values
 
     def generate_test_data(self):
         """Generate test data"""
