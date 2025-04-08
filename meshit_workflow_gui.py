@@ -819,168 +819,104 @@ class MeshItWorkflowGUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Error loading file: {str(e)}")
     
     def _read_point_file(self, file_path):
-        """Read points from a file"""
-        try:
-            # First check file content to see if it might be a fault file format
-            try:
-                with open(file_path, 'r') as f:
-                    first_lines = [f.readline().strip() for _ in range(5)]
-                    has_mixed_delimiters = any(('\t' in line and (',' in line or ';' in line)) for line in first_lines if line)
-                    
-                if has_mixed_delimiters or any(line.startswith("Bounds:") for line in first_lines if line):
-                    # Likely a fault file with mixed delimiters, use custom parser
-                    points = self._parse_fault_file(file_path)
-                    if points is not None and len(points) > 0:
-                        logger.info(f"Successfully parsed file as fault format: {len(points)} points")
-                        return points
-            except Exception as e:
-                # If preview fails, continue with standard import
-                logger.debug(f"File preview check failed: {str(e)}")
-                
-            # Try different formats based on file extension
-            ext = os.path.splitext(file_path)[1].lower()
-            
-            # Check if this might be a fault file with mixed delimiters
-            if ext in ['.fault', '.txt', '.dat', '']:
-                try:
-                    # Custom parsing for fault files with mixed delimiters
-                    points = self._parse_fault_file(file_path)
-                    if points is not None and len(points) > 0:
-                        return points
-                except Exception as e:
-                    logger.debug(f"Fault file parsing failed, trying standard formats: {str(e)}")
-                    # Continue with standard formats if fault parsing fails
-            
-            if ext == '.csv':
-                # CSV format - try comma, tab, and space separators
-                try:
-                    points = np.loadtxt(file_path, delimiter=',')
-                except:
-                    try:
-                        points = np.loadtxt(file_path, delimiter='\t')
-                    except:
-                        points = np.loadtxt(file_path, delimiter=' ')
-            else:
-                # Default format - space or tab separated
-                try:
-                    points = np.loadtxt(file_path)
-                except:
-                    try:
-                        points = np.loadtxt(file_path, delimiter='\t')
-                    except:
-                        points = np.loadtxt(file_path, delimiter=',')
-            
-            # Check if the file has 2D or 3D points
-            if points.shape[1] < 2:
-                raise ValueError("File must contain at least 2D points (x, y)")
-            
-            # If data has only 2 columns (X, Y), add a Z column with zeros
-            if points.shape[1] == 2:
-                points_3d = np.zeros((len(points), 3))
-                points_3d[:, 0:2] = points
-                return points_3d
-            
-            # If data has 3 or more columns, use the first 3 as X, Y, Z
-            return points[:, 0:3]
-            
-        except Exception as e:
-            logger.error(f"Error reading file: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Error reading file: {str(e)}")
-            return None
-            
-    def _extract_all_values_from_line(self, line):
-        """
-        Extract all numeric values from a line with mixed delimiters
-        
-        Args:
-            line: String line to parse
-            
-        Returns:
-            List of numeric values
-        """
-        # First, replace tabs with spaces to ensure they're proper separators
-        line = line.replace('\t', ' ')
-        
-        # Replace '+' with ' +' and '-' with ' -' to ensure they're separated
-        # But don't add spaces if they're after digits (like in 1.5e-3)
-        line = re.sub(r'(?<!\d)(\+|-)', r' \1', line)
-        
-        # Replace all common delimiters with spaces
-        for delimiter in [',', ';']:
-            line = line.replace(delimiter, ' ')
-        
-        # Remove extra spaces
-        line = re.sub(r'\s+', ' ', line).strip()
-        
-        # Split by whitespace
-        parts = line.split()
-        
-        # Convert to float
-        values = []
-        for part in parts:
-            try:
-                # Remove '+' sign prefix if present
-                if part.startswith('+'):
-                    part = part[1:]
-                values.append(float(part))
-            except ValueError:
-                logger.debug(f"Could not convert '{part}' to float in line: '{line}'")
-                continue
-        
-        # Debug output
-        logger.debug(f"Extracted values {values} from line: '{line}'")
-        return values
-    
-    def _parse_fault_file(self, file_path):
-        """
-        Parse a fault file with mixed delimiters 
-        
-        Args:
-            file_path: Path to the fault file
-            
-        Returns:
-            numpy array of points (Nx3) or None if parsing failed
-        """
+        """Read points from a file, handling various delimiters and formats."""
         points = []
-        
         try:
+            # --- Primary Method: Line-by-line parsing for robustness --- 
             with open(file_path, 'r') as f:
                 for line_num, line in enumerate(f):
                     line = line.strip()
                     if not line or line.startswith('#'):
-                        continue  # Skip empty lines and comments
-                    
-                    # Check if this is a bounds format line: "Bounds: X[min,max] Y[min,max] Z[min,max]"
+                        continue # Skip comments and empty lines
+
+                    # Check for Bounds format first
                     if line.startswith("Bounds:"):
                         bounds_points = self._parse_bounds_format(line)
-                        if bounds_points is not None and len(bounds_points) > 0:
+                        if bounds_points:
                             points.extend(bounds_points)
                         continue
-                    
-                    # Parse each line as a single (x,y,z) coordinate
-                    try:
-                        # Extract all numbers from the line
-                        all_values = self._extract_all_values_from_line(line)
                         
-                        # We need at least 2 values for a valid point
-                        if len(all_values) >= 2:
-                            x = all_values[0]
-                            y = all_values[1]
-                            # Use third value as z if available, otherwise default to 0
-                            z = all_values[2] if len(all_values) >= 3 else 0.0
+                    # Clean the line: replace delimiters, handle signs
+                    cleaned_line = line.replace('\t', ' ').replace(',', ' ').replace(';', ' ')
+                    # Handle potential + signs before numbers
+                    cleaned_line = re.sub(r'(?<![eE\d.-])\+', '', cleaned_line) # Remove + if not part of scientific notation or preceded by digit/.
+                    # Ensure space around minus signs not part of scientific notation
+                    cleaned_line = re.sub(r'(?<![eE\d.-])-', ' -', cleaned_line) 
+                    # Remove extra whitespace
+                    cleaned_line = ' '.join(cleaned_line.split())
+
+                    parts = cleaned_line.split()
+                    try:
+                        if len(parts) >= 2:
+                            x = float(parts[0])
+                            y = float(parts[1])
+                            z = float(parts[2]) if len(parts) >= 3 else 0.0
                             points.append([x, y, z])
-                            logger.debug(f"Parsed point: ({x}, {y}, {z})")
-                    except Exception as e:
-                        logger.debug(f"Error parsing line {line_num+1}: {str(e)}")
+                        else:
+                            logger.warning(f"Skipping line {line_num+1}: Not enough values found in '{line}'")
+                    except ValueError as ve:
+                        logger.warning(f"Skipping line {line_num+1} due to value error: {ve} in '{line}'")
+                        continue # Skip lines with non-numeric data after cleaning
             
-            if len(points) == 0:
-                return None
+            if points:
+                logger.info(f"Read {len(points)} points using line-by-line parsing.")
+                points_arr = np.array(points)
+                # Ensure 3D format even if Z was missing
+                if points_arr.shape[1] == 2:
+                     points_3d = np.zeros((len(points_arr), 3))
+                     points_3d[:, 0:2] = points_arr
+                     return points_3d
+                return points_arr[:, :3] # Return first 3 columns if more exist
+            else:
+                 logger.info("Line-by-line parsing yielded no points, trying np.loadtxt.")
+
+            # --- Fallback Method: np.loadtxt --- 
+            points = None # Reset points if primary method failed
+            ext = os.path.splitext(file_path)[1].lower()
+            delimiters_to_try = [None, '\t', ',', ' '] # None tries whitespace
+            if ext == '.csv': # Prioritize comma for csv
+                delimiters_to_try = [',', '\t', ' ', None]
                 
-            return np.array(points)
+            for delim in delimiters_to_try:
+                try:
+                    # Try loading, skip comment lines
+                    loaded_points = np.loadtxt(file_path, delimiter=delim, comments='#')
+                    # Check shape after loading
+                    if loaded_points.ndim == 1: # Handle case where only one line is read
+                        if loaded_points.shape[0] >= 2:
+                           points = loaded_points.reshape(1, -1)
+                    elif loaded_points.ndim == 2 and loaded_points.shape[1] >= 2:
+                         points = loaded_points
+                         
+                    if points is not None:
+                         logger.info(f"Successfully read data using np.loadtxt with delimiter: '{delim if delim else 'whitespace'}'")
+                         break # Stop trying delimiters if successful
+                except Exception as np_err:
+                    logger.debug(f"np.loadtxt failed with delimiter '{delim if delim else 'whitespace'}': {np_err}")
+                    continue
+            
+            if points is None:
+                 logger.error("Failed to read valid points using all methods.")
+                 raise ValueError("Could not read valid point data from file.")
+
+            # --- Final Processing (applies to np.loadtxt result) --- 
+            if points.shape[1] < 2:
+                raise ValueError("File must contain at least 2D points (x, y)")
+            
+            if points.shape[1] == 2:
+                points_3d = np.zeros((len(points), 3))
+                points_3d[:, 0:2] = points
+                logger.info(f"Converted {len(points)} 2D points to 3D.")
+                return points_3d
+            
+            logger.info(f"Read {len(points)} points using np.loadtxt.")
+            return points[:, 0:3]
+            
         except Exception as e:
-            logger.debug(f"Error in fault file parsing: {str(e)}")
+            logger.error(f"Error reading file '{file_path}': {str(e)}")
+            QMessageBox.critical(self, "Error Reading File", f"Failed to read points from file:\n{os.path.basename(file_path)}\n\nError: {str(e)}")
             return None
-    
+            
     def _parse_bounds_format(self, line):
         """
         Parse bounds format line: "Bounds: X[min,max] Y[min,max] Z[min,max]"
@@ -989,7 +925,7 @@ class MeshItWorkflowGUI(QMainWindow):
             line: String line in bounds format
             
         Returns:
-            List of points representing the bounds
+            List of points representing the bounds corners (4 points, Z=0)
         """
         try:
             # Extract X, Y, Z ranges
@@ -1005,60 +941,30 @@ class MeshItWorkflowGUI(QMainWindow):
             x_min, x_max = float(x_range.group(1)), float(x_range.group(2))
             y_min, y_max = float(y_range.group(1)), float(y_range.group(2))
             
-            # For Z, use found values or default to 0
+            # Use Z from bounds if present for 3D bounds
             if z_range:
-                z_min, z_max = float(z_range.group(1)), float(z_range.group(2))
+                 z_min, z_max = float(z_range.group(1)), float(z_range.group(2))
             else:
-                z_min, z_max = 0.0, 0.0
-                
-            # Create corner points only (not the full bounding box)
-            # For a fault file, we typically just want the 4 corners of the rectangular region
+                 z_min, z_max = 0.0, 0.0 # Default Z to 0 if not found
+                 
+            # Return 8 corners of the 3D bounding box
             bounds_points = [
-                [x_min, y_min, 0.0],  # Bottom-left
-                [x_max, y_min, 0.0],  # Bottom-right
-                [x_max, y_max, 0.0],  # Top-right
-                [x_min, y_max, 0.0]   # Top-left
+                [x_min, y_min, z_min],
+                [x_max, y_min, z_min],
+                [x_max, y_max, z_min],
+                [x_min, y_max, z_min],
+                [x_min, y_min, z_max],
+                [x_max, y_min, z_max],
+                [x_max, y_max, z_max],
+                [x_min, y_max, z_max]
             ]
             
-            # Log the extracted points for debugging
-            logger.info(f"Parsed bounds points: {bounds_points}")
-            
+            logger.info(f"Parsed bounds line into 8 corner points.")
             return bounds_points
         except Exception as e:
             logger.debug(f"Error parsing bounds format: {str(e)}")
             return None
-    
-    def _extract_values(self, part):
-        """
-        Extract numeric values from a string that might contain multiple delimiters
-        
-        Args:
-            part: String part potentially containing multiple values
             
-        Returns:
-            List of numeric values
-        """
-        values = []
-        
-        # Replace '+' at the beginning of numbers with nothing
-        part = re.sub(r'(?<!\d)\+', '', part)
-        
-        # First try comma
-        comma_parts = part.split(',')
-        for cp in comma_parts:
-            # Then try semicolon
-            semicolon_parts = cp.split(';')
-            for sp in semicolon_parts:
-                # Clean and convert to float
-                sp = sp.strip()
-                if sp:
-                    try:
-                        values.append(float(sp))
-                    except ValueError:
-                        logger.debug(f"Could not convert '{sp}' to float")
-        
-        return values
-
     def generate_test_data(self):
         """Generate test data"""
         self.statusBar().showMessage("Generating test data...")
@@ -2282,7 +2188,8 @@ segmentation, triangulation, and visualization.
         dataset = self.datasets[dataset_index]
         dataset_name = dataset.get('name', f"Dataset {dataset_index}")
         
-        if dataset.get('segments') is None or len(dataset['segments']) < 3:
+        segments_data = dataset.get('segments')
+        if segments_data is None or len(segments_data) < 3:
             self.statusBar().showMessage(f"Skipping triangulation for {dataset_name}: Compute segments first")
             logger.warning(f"Skipping triangulation for {dataset_name}: segments not computed.")
             return False # Indicate error or skip
@@ -2296,167 +2203,230 @@ segmentation, triangulation, and visualization.
         try:
             start_time = time.time()
             
-            # Create boundary from hull points
-            boundary_points = dataset['hull_points'][:-1]  # Exclude closing point
+            # --- Use points and segments from the segmentation step --- 
+            # Extract unique points from the segments
+            segment_points = []
+            for segment in segments_data:
+                segment_points.append(segment[0])
+                segment_points.append(segment[1])
+            
+            # Use unique points, preserving order as much as possible
+            # Using np.unique might reorder points, so we build manually
+            unique_points_list = []
+            point_to_index = {}
+            segment_indices = []
+            
+            current_index = 0
+            for segment in segments_data:
+                start_pt, end_pt = segment[0], segment[1]
+                start_tuple = tuple(start_pt)
+                end_tuple = tuple(end_pt)
+                
+                if start_tuple not in point_to_index:
+                    point_to_index[start_tuple] = current_index
+                    unique_points_list.append(start_pt)
+                    start_idx = current_index
+                    current_index += 1
+                else:
+                    start_idx = point_to_index[start_tuple]
+                    
+                if end_tuple not in point_to_index:
+                    point_to_index[end_tuple] = current_index
+                    unique_points_list.append(end_pt)
+                    end_idx = current_index
+                    current_index += 1
+                else:
+                    end_idx = point_to_index[end_tuple]
+                    
+                segment_indices.append([start_idx, end_idx])
+
+            all_boundary_points = np.array(unique_points_list)
+            boundary_segments_indices = np.array(segment_indices)
+            logger.info(f"Using {len(all_boundary_points)} unique points and {len(boundary_segments_indices)} segments from segmentation step for triangulation.")
+            # --- End using points/segments from segmentation --- 
+            
+            # Make a working copy for potential projection
+            projected_boundary_points = all_boundary_points.copy()
             
             # For 3D points, we need to project to a plane for triangulation
-            if boundary_points.shape[1] > 2:
+            plane_normal = None # Initialize plane_normal
+            if projected_boundary_points.shape[1] > 2:
                 logger.info(f"Projecting 3D points to best-fit plane for triangulation for {dataset_name}")
                 
                 # Find best-fitting plane using PCA/SVD
-                # 1. Center points
-                centroid = np.mean(boundary_points, axis=0)
-                centered = boundary_points - centroid
-                
-                # 2. Get dominant plane using PCA/SVD
+                centroid = np.mean(projected_boundary_points, axis=0)
+                centered = projected_boundary_points - centroid
                 u, s, vh = np.linalg.svd(centered, full_matrices=False)
-                
-                # 3. Use first two principal components as projection basis
                 projection_basis = vh[:2]
-                
-                # 4. Project points to 2D plane
+                plane_normal = vh[2] # *** STORE THE NORMAL VECTOR ***
                 points_2d = np.dot(centered, projection_basis.T)
                 
                 # Store original points and projection info for reconstruction
-                original_boundary_points = boundary_points.copy()
-                boundary_points = points_2d
-                
-                # Do the same for all segments to ensure consistency
-                segments_2d = []
-                for segment in dataset['segments']:
-                    if hasattr(segment[0], 'shape') and segment[0].shape[0] > 2:
-                        # For numpy arrays
-                        start_centered = segment[0] - centroid
-                        end_centered = segment[1] - centroid
-                        
-                        start_2d = np.dot(start_centered, projection_basis.T)
-                        end_2d = np.dot(end_centered, projection_basis.T)
-                        
-                        segments_2d.append([start_2d, end_2d])
-                    elif len(segment[0]) > 2:
-                        # For list based points
-                        start_centered = np.array(segment[0]) - centroid
-                        end_centered = np.array(segment[1]) - centroid
-                        
-                        start_2d = np.dot(start_centered, projection_basis.T)
-                        end_2d = np.dot(end_centered, projection_basis.T)
-                        
-                        segments_2d.append([start_2d, end_2d])
-                    else:
-                        # Already 2D
-                        segments_2d.append(segment)
-                
-                dataset['segments_2d'] = segments_2d
+                original_boundary_points_for_recon = all_boundary_points.copy() 
+                projected_boundary_points = points_2d 
                 
                 # Store projection parameters for reconstruction
                 dataset['projection_params'] = {
                     'centroid': centroid,
-                    'basis': projection_basis
+                    'basis': projection_basis,
+                    'normal': plane_normal, # *** STORE IT HERE ***
+                    'original_points': original_boundary_points_for_recon 
                 }
             else:
                 # Store info showing no projection was needed
                 dataset['projection_params'] = None
             
-            # Calculate diagonal for base size
-            min_coords = np.min(boundary_points, axis=0)
-            max_coords = np.max(boundary_points, axis=0)
-            diagonal = np.sqrt(np.sum((max_coords - min_coords) ** 2))
-            base_size = diagonal / (base_size_factor * 2.0)
-
-            # Create boundary segments indices
-            boundary_segments_indices = np.array([[i, (i + 1) % len(boundary_points)] for i in range(len(boundary_points))])
-
-            # Combine boundary points (we don't need grid points if using hull segments)
-            all_points = boundary_points
+            # Calculate diagonal for base size using the projected points
+            # min_coords = np.min(projected_boundary_points, axis=0)
+            # max_coords = np.max(projected_boundary_points, axis=0)
+            # diagonal = np.sqrt(np.sum((max_coords - min_coords) ** 2))
+            # Ensure base_size_factor is positive to avoid division by zero or negative base_size
+            # density_factor_val = max(0.1, self.base_size_factor_input.value()) # Ensure positive factor
+            # base_size = diagonal / (density_factor_val * 2.0)
+            # Add a safeguard for extremely small diagonals or factors
+            # if base_size < 1e-9:
+            #      logger.warning(f"Calculated base_size {base_size:.2e} is extremely small. Using a fallback minimum.")
+            #      base_size = max(1e-6, diagonal * 0.01) # Fallback based on diagonal
             
-            # Use DirectTriangleWrapper
-            from meshit.triangle_direct import DirectTriangleWrapper
+            # Calculate bounding box of projected points
+            min_coords = np.min(projected_boundary_points, axis=0)
+            max_coords = np.max(projected_boundary_points, axis=0)
+            width = max_coords[0] - min_coords[0]
+            height = max_coords[1] - min_coords[1]
+            # Use minimum dimension for characteristic length (ensure non-zero)
+            characteristic_length = max(1e-9, min(width, height))
+            density_factor_val = max(0.1, self.base_size_factor_input.value()) # Ensure positive factor
+            base_size = characteristic_length / (density_factor_val * 2.0)
+            # Safeguard for base_size
+            if base_size < 1e-9:
+                 logger.warning(f"Calculated base_size {base_size:.2e} is extremely small. Using fallback.")
+                 diag = np.sqrt(width**2 + height**2) if width > 0 or height > 0 else 1.0
+                 base_size = max(1e-6, diag * 0.01) # Fallback based on diagonal
+            logger.info(f"Dataset {dataset_name}: Projected W={width:.2f}, H={height:.2f}. Char. Length={characteristic_length:.2f}. Base Size={base_size:.4f}")
+
+            # --- Unified Path for ALL Datasets using DirectTriangleWrapper --- 
+            logger.info(f"Using DirectTriangleWrapper for: {dataset_name}")
+            if not HAVE_DIRECT_WRAPPER:
+                 logger.error("DirectTriangleWrapper not available!")
+                 raise ImportError("DirectTriangleWrapper failed to import.")
+
+            # Get parameters from GUI
+            gradient = self.gradient_input.value()
+            min_angle = self.min_angle_input.value()
+            uniform = self.uniform_checkbox.isChecked()
+
             triangulator = DirectTriangleWrapper(
                 gradient=gradient,
                 min_angle=min_angle,
-                base_size=base_size
+                base_size=base_size # Pass the calculated base_size
             )
             
-            # Set Triangle options
-            triangle_options = f"pzq{min_angle}a{base_size*base_size*0.5}"
-            triangulator.set_triangle_options(triangle_options)
-            
-            # Run triangulation
+            # Wrapper internally sets options based on params, but can be overridden:
+            # triangle_options = f"pzq{min_angle}a{base_size*base_size*0.5}"
+            # triangulator.set_triangle_options(triangle_options)
+
+            # Run triangulation using the wrapper
+            logger.debug(f"Running triangulation with {len(projected_boundary_points)} points, {len(boundary_segments_indices)} segments, base_size={base_size:.4f}, uniform={uniform}")
             triangulation_result = triangulator.triangulate(
-                points=all_points,
+                points=projected_boundary_points, 
                 segments=boundary_segments_indices,
-                uniform=True # Force uniform for consistency
+                uniform=uniform # Pass uniform flag from GUI
             )
-            
+            # --- End Unified Path --- 
+
+            # --- Process the result --- 
+            if triangulation_result is None or 'vertices' not in triangulation_result or 'triangles' not in triangulation_result:
+                raise ValueError("Triangulation failed to produce valid output.")
+                
             # Get vertices and triangles
-            vertices = triangulation_result['vertices']
+            vertices_2d = triangulation_result['vertices'] 
             triangles = triangulation_result['triangles']
             
-            # Project vertices back to 3D if needed
+            logger.info(f"Triangulation produced {len(vertices_2d)} vertices and {len(triangles)} triangles")
+
+            # --- Reconstruction logic - MODIFIED --- 
             if dataset['projection_params'] is not None:
                 projection_params = dataset['projection_params']
                 centroid = projection_params['centroid']
                 basis = projection_params['basis']
+                normal = projection_params.get('normal') # *** GET THE NORMAL ***
+                original_points_for_recon = projection_params['original_points']
                 
-                # Get original points with Z values
-                original_points = dataset['points']
-                original_boundary = dataset['hull_points'][:-1]  # Exclude closing point
+                # Check if normal vector is valid for plane equation
+                if normal is None:
+                    logger.error("Plane normal not found in projection parameters. Cannot reconstruct planar Z.")
+                    # Fallback: Use nearest neighbor Z (original flawed approach)
+                    normal = np.array([0, 0, 1]) # Assume XY plane
+                    can_calculate_planar_z = False
+                else:
+                     can_calculate_planar_z = abs(normal[2]) > 1e-9 # Check for non-horizontal plane
                 
                 # Convert 2D triangulation vertices back to 3D
-                vertices_3d = np.zeros((len(vertices), 3))
+                final_vertices_3d = np.zeros((len(vertices_2d), 3))
                 
-                for i, vertex_2d in enumerate(vertices):
-                    # First check if this is exactly one of the boundary points
+                for i, vertex_2d in enumerate(vertices_2d):
                     is_boundary_point = False
-                    for j, bp_2d in enumerate(boundary_points):
+                    # Check if vertex_2d matches any projected_boundary_points (original unique segment points after projection)
+                    for j, bp_2d in enumerate(projected_boundary_points):
                         if np.allclose(vertex_2d, bp_2d, atol=1e-10):
-                            # Use original boundary point Z-value
-                            vertices_3d[i] = original_boundary[j]
-                            is_boundary_point = True
-                            break
+                             # If it matches a projected boundary point, use its original 3D coordinate
+                            if j < len(original_points_for_recon):
+                                final_vertices_3d[i] = original_points_for_recon[j] # Use original 3D pt
+                                is_boundary_point = True
+                                break
+                            else: 
+                                logger.warning(f"Index mismatch when mapping boundary point {j}")
+                                break # Avoid potential error, treat as interior
                     
                     if not is_boundary_point:
-                        # Project back to 3D using the projection basis
-                        vertex_3d = centroid.copy()  # Start with centroid
+                        # --- Calculate Planar Z for Interior Points --- 
+                        # Project 2D point back to its 3D XY location on the plane
+                        vertex_3d_on_plane = centroid.copy()
+                        vertex_3d_on_plane += vertex_2d[0] * basis[0]
+                        vertex_3d_on_plane += vertex_2d[1] * basis[1]
                         
-                        # Add contributions from each basis vector
-                        for j in range(2):  # 2D coordinates
-                            vertex_3d += vertex_2d[j] * basis[j]  # basis[j] is a 3D vector
-                        
-                        # For interior points, find the closest original point 
-                        # and use its Z value to better preserve 3D structure
-                        vertex_3d_xy = vertex_3d[:2]  # Just X,Y for distance computation
-                        
-                        # Get distances to all original points (using just X,Y)
-                        distances = np.sum((original_points[:, :2] - vertex_3d_xy)**2, axis=1)
-                        
-                        # Find nearest original point
-                        closest_idx = np.argmin(distances)
-                        
-                        # Use Z from closest original point but X,Y from projection
-                        vertex_3d[2] = original_points[closest_idx, 2]
-                        
-                        vertices_3d[i] = vertex_3d
+                        if can_calculate_planar_z:
+                            # Use plane equation: normal . (point - centroid) = 0
+                            # z = cz - (normal[0]*(x-cx) + normal[1]*(y-cy)) / normal[2]
+                            z_planar = centroid[2] - (normal[0]*(vertex_3d_on_plane[0] - centroid[0]) + normal[1]*(vertex_3d_on_plane[1] - centroid[1])) / normal[2]
+                            vertex_3d_on_plane[2] = z_planar
+                        else:
+                            # Fallback for horizontal plane (or if normal was missing)
+                            logger.warning(f"Plane normal is nearly horizontal ({normal}). Using centroid Z for interior point {i}.")
+                            vertex_3d_on_plane[2] = centroid[2] 
+                            
+                        final_vertices_3d[i] = vertex_3d_on_plane
+                        # --- End Planar Z Calculation --- 
                 
-                # Replace vertices with 3D version
-                vertices = vertices_3d
+                # Use the reconstructed 3D vertices
+                final_vertices = final_vertices_3d
+            else:
+                # No projection was done, vertices are already correct (2D or 3D)
+                 if vertices_2d.shape[1] == 2:
+                      # If input was 2D, ensure output is 3D with Z=0
+                      final_vertices = np.zeros((len(vertices_2d), 3))
+                      final_vertices[:, :2] = vertices_2d
+                 else:
+                      final_vertices = vertices_2d # Already 3D
 
-            # Store results
+            # --- Store results logic remains the same --- 
             dataset['triangulation_result'] = {
-                'vertices': vertices,
+                'vertices': final_vertices,
                 'triangles': triangles,
-                'uniform': uniform,
+                'uniform': uniform, # Store parameters used
                 'gradient': gradient,
                 'min_angle': min_angle,
                 'base_size': base_size,
             }
-
+            logger.info(f"Triangulation for {dataset_name} completed. Vertices: {len(final_vertices)}, Triangles: {len(triangles)}")
             return True # Indicate success
 
         except Exception as e:
             logger.error(f"Error triangulating {dataset_name}: {str(e)}")
+            import traceback
+            logger.debug(f"Triangulation error traceback: {traceback.format_exc()}")
             return False # Indicate error
-
+            
     def run_triangulation(self):
         """Run triangulation on the segments and points of the *active* dataset (primarily for context menu)"""
         # Check if we have an active dataset
