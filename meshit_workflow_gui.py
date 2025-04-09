@@ -4406,8 +4406,16 @@ segmentation, triangulation, and visualization.
     def closeEvent(self, event):
         """Handle closing the application, especially if a thread is running."""
         logger.debug("Close event triggered.")
-        # Check if a worker thread is running
-        if hasattr(self, 'thread') and self.thread and self.thread.isRunning():
+        thread_running = False
+        try:
+            # Check if a worker thread is running, handle potential AttributeError
+            if hasattr(self, 'thread') and self.thread is not None and self.thread.isRunning():
+                thread_running = True
+        except AttributeError:
+            logger.warning("AttributeError accessing thread.isRunning() during closeEvent. Assuming not running.")
+            thread_running = False
+
+        if thread_running:
             logger.info("Close event while worker thread is running.")
             reply = QMessageBox.question(self, 'Confirm Exit',
                                        "A computation is running. Stop and exit?",
