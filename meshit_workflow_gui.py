@@ -5105,10 +5105,10 @@ segmentation, triangulation, and visualization.
         # Add involved dataset meshes (dim others slightly)
         plotter_has_content = False
         for index, dataset in enumerate(self.datasets):
-            if index not in involved_dataset_ids: continue # Skip uninvolved datasets for simplicity, or dim them:
-            # is_involved = index in involved_dataset_ids
-            # opacity = 0.6 if is_involved else 0.2
-            opacity = 0.6 # Keep involved ones clearly visible
+            # Determine opacity: Highlight involved, dim others (or keep all same)
+            is_involved = index in involved_dataset_ids
+            opacity = 0.7 # Use consistent opacity like triangulation step
+            # opacity = 0.7 if is_involved else 0.2 # Alternative: Dim uninvolved
 
             tri_result = dataset.get('triangulation_result')
             if tri_result:
@@ -5126,12 +5126,15 @@ segmentation, triangulation, and visualization.
                         triangles = np.array(triangles)
                         cells = np.hstack([np.full((len(triangles), 1), 3, dtype=triangles.dtype), triangles])
                         surface_mesh = pv.PolyData(vertices, faces=cells)
-                        plotter.add_mesh(surface_mesh, color=color, opacity=opacity, show_edges=False, label=name)
+                        # --- Apply Triangulation Style --- 
+                        plotter.add_mesh(surface_mesh, color=color, opacity=opacity, 
+                                         show_edges=True, edge_color=color, 
+                                         line_width=1, specular=0.5, label=name)
                         plotter_has_content = True
                     except Exception as e:
                          logger.error(f"Error creating mesh for dataset {index} ('{name}') during selection view: {e}")
 
-        # Add the selected intersection line prominently
+        # Add the selected intersection line prominently (keep distinct style)
         if selected_intersection['points'] and len(selected_intersection['points']) >= 2:
             line_points = np.array(selected_intersection['points'])
             try:
@@ -5168,22 +5171,23 @@ segmentation, triangulation, and visualization.
                       logger.warning(f"Could not adjust camera for selected intersection: {e}")
             logger.info("Updated embedded view for selected intersection.")
         else:
-            plotter.add_text("Could not display selected intersection.", position='upper_edge', color='orange')
+            plotter.add_text("Could not display selected intersection.", position='upper_edge', color='white')
             logger.warning("No content added when visualizing selected intersection.")
 
     def _visualize_intersections(self):
-        """Visualize all intersections in the embedded PyVista plotter."""
+        """Visualize all intersections in the embedded PyVista plotter, matching triangulation style."""
         if not hasattr(self, 'intersection_plotter') or not self.intersection_plotter:
             logger.warning("Intersection plotter not available for visualization.")
             return
             
         plotter = self.intersection_plotter
         plotter.clear() # Start fresh
-        plotter.set_background("white")
+        # --- Use MeshIt Background --- 
+        plotter.set_background([0.318, 0.341, 0.431]) 
         
         # Check if data exists
         if not hasattr(self, 'datasets_intersections') or not self.datasets_intersections:
-            plotter.add_text("No intersections computed yet.", position='upper_edge', color='gray')
+            plotter.add_text("No intersections computed yet.", position='upper_edge', color='white')
             plotter.reset_camera()
             return
 
@@ -5219,7 +5223,8 @@ segmentation, triangulation, and visualization.
                 if tri_result:
                     vertices = tri_result.get('vertices')
                     triangles = tri_result.get('triangles')
-                    color = dataset.get('color', self.DEFAULT_COLORS[index % len(self.DEFAULT_COLORS)])
+                    # Use a consistent surface color unless dataset has one
+                    mesh_color = dataset.get('color', '#CCCCCC') # Default light grey
                     name = dataset.get('name', f'Dataset {index+1}')
 
                     if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
@@ -5236,24 +5241,26 @@ segmentation, triangulation, and visualization.
                             cells = np.hstack([np.full((len(triangles), 1), 3, dtype=triangles.dtype), triangles])
                             
                             surface_mesh = pv.PolyData(vertices, faces=cells)
-                            plotter.add_mesh(surface_mesh, color=color, opacity=0.5, 
-                                             show_edges=False, label=name)
+                            # --- Apply Style similar to test_intersections.py --- 
+                            plotter.add_mesh(surface_mesh, color=mesh_color, opacity=0.7, 
+                                             show_edges=True, edge_color='black', 
+                                             line_width=1, label=name)
                             plotter_has_content = True
                         except Exception as e:
                              logger.error(f"Error creating mesh for dataset {index} ('{name}') in embedded view: {e}")
 
-        # Add intersection lines
+        # Add intersection lines (Keep style distinct: red, thicker line)
         if all_intersection_lines:
             for line_points in all_intersection_lines:
                 try:
                      for i in range(len(line_points) - 1):
                          segment = pv.Line(line_points[i], line_points[i+1])
-                         plotter.add_mesh(segment, color='red', line_width=4) # Slightly thinner than standalone
+                         plotter.add_mesh(segment, color='red', line_width=4) # Keep intersection lines distinct
                      plotter_has_content = True
                 except Exception as e:
                      logger.error(f"Error adding intersection line segment in embedded view: {e}")
 
-        # Add triple points
+        # Add triple points (Keep style distinct: black spheres)
         if all_triple_points_coords:
             try:
                 triple_points_poly = pv.PolyData(np.array(all_triple_points_coords))
@@ -5264,13 +5271,104 @@ segmentation, triangulation, and visualization.
                 logger.error(f"Error adding triple points in embedded view: {e}")
 
         if plotter_has_content:
+            # Use white text for legend on dark background
             plotter.add_legend(bcolor=None, face='circle', border=False, size=(0.15, 0.15))
             plotter.add_axes()
             plotter.reset_camera()
             logger.info("Updated embedded intersection view.")
         else:
-            plotter.add_text("No valid intersection data to display.", position='upper_edge', color='gray')
+            plotter.add_text("No valid intersection data to display.", position='upper_edge', color='white')
             logger.info("Embedded intersection view updated, but no content added.")
+
+    def _visualize_selected_intersection(self, dataset_index, intersection_index):
+        """Visualize a specific intersection by highlighting it in the embedded plotter, matching triangulation style."""
+        if not hasattr(self, 'intersection_plotter') or not self.intersection_plotter:
+            logger.warning("Intersection plotter not available for selection visualization.")
+            return
+
+        plotter = self.intersection_plotter
+        plotter.clear()
+        # --- Use MeshIt Background --- 
+        plotter.set_background([0.318, 0.341, 0.431])
+        
+        if dataset_index not in self.datasets_intersections or intersection_index >= len(self.datasets_intersections[dataset_index]):
+            logger.warning("Selected intersection data not found.")
+            plotter.add_text("Selected intersection not found.", position='upper_edge', color='red')
+            return
+            
+        selected_intersection = self.datasets_intersections[dataset_index][intersection_index]
+        involved_dataset_ids = {selected_intersection['dataset_id1'], selected_intersection['dataset_id2']}
+        
+        # Add involved dataset meshes
+        plotter_has_content = False
+        for index, dataset in enumerate(self.datasets):
+            if index not in involved_dataset_ids: continue # Only show involved datasets
+            
+            opacity = 0.7 # Keep involved ones clearly visible
+
+            tri_result = dataset.get('triangulation_result')
+            if tri_result:
+                vertices = tri_result.get('vertices')
+                triangles = tri_result.get('triangles')
+                mesh_color = dataset.get('color', '#CCCCCC') # Use dataset color or default grey
+                name = dataset.get('name', f'Dataset {index+1}')
+
+                if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
+                    try:
+                        vertices = np.array(vertices)
+                        if vertices.shape[1] == 2: 
+                             temp_vertices = np.zeros((vertices.shape[0], 3)); temp_vertices[:,:2] = vertices; vertices = temp_vertices
+                        elif vertices.shape[1] > 3: vertices = vertices[:, :3]
+                        triangles = np.array(triangles)
+                        cells = np.hstack([np.full((len(triangles), 1), 3, dtype=triangles.dtype), triangles])
+                        surface_mesh = pv.PolyData(vertices, faces=cells)
+                        # --- Apply Style similar to test_intersections.py --- 
+                        plotter.add_mesh(surface_mesh, color=mesh_color, opacity=opacity, 
+                                         show_edges=True, edge_color='black', 
+                                         line_width=1, label=name)
+                        plotter_has_content = True
+                    except Exception as e:
+                         logger.error(f"Error creating mesh for dataset {index} ('{name}') during selection view: {e}")
+
+        # Add the selected intersection line prominently (keep distinct style)
+        if selected_intersection['points'] and len(selected_intersection['points']) >= 2:
+            line_points = np.array(selected_intersection['points'])
+            try:
+                 for i in range(len(line_points) - 1):
+                     segment = pv.Line(line_points[i], line_points[i+1])
+                     # Highlight: thicker and brighter red
+                     plotter.add_mesh(segment, color='#FF0000', line_width=6) 
+                 plotter_has_content = True
+            except Exception as e:
+                 logger.error(f"Error adding selected intersection line segment: {e}")
+
+        # Add triple points (keep distinct style)
+        if hasattr(self, 'triple_points') and self.triple_points:
+            all_triple_points_coords = [tp['point'] for tp in self.triple_points]
+            if all_triple_points_coords:
+                try:
+                    triple_points_poly = pv.PolyData(np.array(all_triple_points_coords))
+                    plotter.add_points(triple_points_poly, color='black', point_size=8, render_points_as_spheres=True)
+                    plotter_has_content = True
+                except Exception as e:
+                     logger.error(f"Error adding triple points during selection view: {e}")
+
+        if plotter_has_content:
+            # Use white text for legend on dark background
+            plotter.add_legend(bcolor=None, face='circle', border=False, size=(0.15, 0.15))
+            plotter.add_axes()
+            plotter.reset_camera()
+            # Zoom slightly on the selected intersection line (optional)
+            if selected_intersection['points'] and len(selected_intersection['points']) >= 2:
+                 try:
+                      plotter.camera.focal_point = np.mean(line_points, axis=0)
+                      # plotter.camera.zoom(1.5) # Adjust zoom factor as needed
+                 except Exception as e:
+                      logger.warning(f"Could not adjust camera for selected intersection: {e}")
+            logger.info("Updated embedded view for selected intersection.")
+        else:
+            plotter.add_text("Could not display selected intersection.", position='upper_edge', color='white')
+            logger.warning("No content added when visualizing selected intersection.")
 
     def show_intersections_3d_view(self):
         """Show a 3D view of the datasets involved in intersections and the intersection lines/points."""
