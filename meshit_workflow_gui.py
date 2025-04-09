@@ -16,6 +16,8 @@ import sys
 import time
 from matplotlib.colors import ListedColormap, to_rgba
 import re
+# import QAbsractItemView
+from PyQt5.QtWidgets import QAbstractItemView
 
 # Import PyQt5
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
@@ -24,9 +26,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushBu
                             QCheckBox, QGroupBox, QRadioButton, QSlider, QLineEdit,
                             QSplitter, QDialog, QFormLayout, QButtonGroup, QMenu, QAction,
                             QListWidget, QColorDialog, QListWidgetItem, QProgressDialog,
-                            QActionGroup)
-from PyQt5.QtCore import Qt, QSize, pyqtSignal, QObject, QThread, QTimer # Add QTimer
-from PyQt5.QtGui import QFont, QIcon, QColor
+                            QActionGroup, QSpacerItem)
+from PyQt5.QtCore import Qt, QSize, pyqtSignal, QObject, QThread, QTimer, QSettings # Add QTimer and QSettings
+from PyQt5.QtGui import QFont, QIcon, QColor, QPalette, QPixmap
 
 # Import PyVista for 3D visualization
 try:
@@ -178,6 +180,34 @@ class ComputationWorker(QObject):
         self.batch_finished.emit(success_count, total_eligible, elapsed)
         # self._is_running = False
 
+    def compute_global_intersections_task(self):
+        """Worker task to trigger global intersection computation on the GUI instance."""
+        logger.info("Worker: Starting global intersection computation task.")
+        if not hasattr(self, 'gui') or self.gui is None:
+            self.error_occurred.emit("GUI instance not available for intersection computation.")
+            self.batch_finished.emit(0, 0, 0) # Indicate failure
+            return
+
+        start_time = time.time()
+        success = False
+        try:
+            # Call the GUI's method to perform the actual computation
+            # We expect this method to handle its own data preparation and error reporting
+            # and return True/False for overall success.
+            success = self.gui._compute_global_intersections()
+            logger.info(f"Worker: GUI's global intersection computation returned: {success}")
+        except Exception as e:
+            error_msg = f"Unhandled error during global intersection computation: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            self.error_occurred.emit(error_msg)
+            success = False # Ensure failure is recorded
+
+        elapsed_time = time.time() - start_time
+        # Emit batch finished: 1 success if calculation succeeded, 0 otherwise.
+        # Total eligible is conceptually 1 (the single global task).
+        self.batch_finished.emit(1 if success else 0, 1, elapsed_time)
+        logger.info(f"Worker: Global intersection task finished. Success: {success}. Elapsed: {elapsed_time:.2f}s.")
+
 
 class MeshItWorkflowGUI(QMainWindow):
     # Define a color cycle for datasets
@@ -247,6 +277,9 @@ class MeshItWorkflowGUI(QMainWindow):
         self.triangulation_tab = QWidget()
         self.notebook.addTab(self.triangulation_tab, "4. Triangulation")
         self._setup_triangulation_tab()
+        
+        # Add to __init__ after other tabs are created
+        self._setup_intersection_tab()
         
         # Create menu bar
         self._create_menu_bar()
@@ -754,6 +787,124 @@ class MeshItWorkflowGUI(QMainWindow):
         self.tri_viz_layout.addWidget(self.tri_viz_placeholder) # Added for completeness
         viz_layout.addWidget(self.tri_viz_frame) # Added for completeness
         tab_layout.addWidget(viz_group, 1)  # 1 = stretch factor # Added for completeness
+
+    def _setup_intersection_tab(self):
+        """Create the intersection tab and its components with embedded PyVista view."""
+        self.intersection_tab = QWidget()
+        self.notebook.addTab(self.intersection_tab, "5. Intersections")
+
+        # Set up the layout
+        layout = QVBoxLayout(self.intersection_tab)
+        
+        # Add information label
+        info_label = QLabel("Compute intersections between surfaces and polylines:")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("font-size: 12px; color: #555;")
+        layout.addWidget(info_label)
+        
+        # Horizontal layout for controls
+        controls_layout = QHBoxLayout()
+        
+        # Create compute buttons
+        self.compute_intersections_btn = QPushButton("Compute Intersections")
+        self.compute_intersections_btn.setObjectName("compute_intersections_btn")
+        self.compute_intersections_btn.setIcon(QIcon.fromTheme("system-run", QIcon()))
+        self.compute_intersections_btn.clicked.connect(self.compute_intersections)
+        controls_layout.addWidget(self.compute_intersections_btn)
+        
+        self.compute_all_intersections_btn = QPushButton("Compute All")
+        self.compute_all_intersections_btn.setIcon(QIcon.fromTheme("system-run", QIcon()))
+        self.compute_all_intersections_btn.clicked.connect(self.compute_all_intersections)
+        controls_layout.addWidget(self.compute_all_intersections_btn)
+        
+        self.clear_intersections_btn = QPushButton("Clear Results")
+        self.clear_intersections_btn.setIcon(QIcon.fromTheme("edit-clear", QIcon()))
+        self.clear_intersections_btn.clicked.connect(self._clear_intersection_results)
+        controls_layout.addWidget(self.clear_intersections_btn)
+        
+        controls_layout.addStretch()
+        layout.addLayout(controls_layout)
+        
+        # Create a splitter for the main interface
+        splitter = QSplitter(Qt.Horizontal)
+        layout.addWidget(splitter, 1)  # Add the splitter with stretch
+        
+        # Left panel for intersection list and details
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        
+        # Statistics group
+        stats_group = QGroupBox("Intersection Statistics")
+        stats_layout = QVBoxLayout(stats_group)
+        
+        self.surface_intersection_count_label = QLabel("Surface-Surface: 0")
+        stats_layout.addWidget(self.surface_intersection_count_label)
+        
+        self.polyline_intersection_count_label = QLabel("Polyline-Surface: 0")
+        stats_layout.addWidget(self.polyline_intersection_count_label)
+        
+        self.triple_point_count_label = QLabel("Triple Points: 0")
+        stats_layout.addWidget(self.triple_point_count_label)
+        
+        left_layout.addWidget(stats_group)
+        
+        # List of intersections
+        intersection_group = QGroupBox("Intersections")
+        intersection_layout = QVBoxLayout(intersection_group)
+        
+        self.intersection_list = QListWidget()
+        self.intersection_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        # Defer connecting selection change until plotter is ready
+        # self.intersection_list.itemSelectionChanged.connect(self._on_intersection_selection_changed)
+        intersection_layout.addWidget(self.intersection_list)
+        
+        left_layout.addWidget(intersection_group, 1)  # Add stretch
+        
+        # Right panel for visualization
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # --- Embed PyVista Plotter --- 
+        self.intersection_view_frame = QFrame()
+        self.intersection_view_frame.setFrameShape(QFrame.StyledPanel)
+        self.intersection_view_frame.setMinimumSize(400, 300)
+        self.intersection_plot_layout = QVBoxLayout(self.intersection_view_frame)
+        self.intersection_plot_layout.setContentsMargins(0, 0, 0, 0)
+        
+        if HAVE_PYVISTA:
+            from pyvistaqt import QtInteractor
+            self.intersection_plotter = QtInteractor(self.intersection_view_frame)
+            self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
+            self.intersection_plotter.set_background('white')
+            # Connect selection change now that plotter exists
+            self.intersection_list.itemSelectionChanged.connect(self._on_intersection_selection_changed)
+        else:
+            # Placeholder if PyVista is not available
+            placeholder = QLabel("PyVista is required for 3D intersection visualization.")
+            placeholder.setAlignment(Qt.AlignCenter)
+            self.intersection_plot_layout.addWidget(placeholder)
+            self.intersection_plotter = None # Ensure plotter is None
+        
+        right_layout.addWidget(self.intersection_view_frame, 1)  # Add frame with stretch
+        # --- End PyVista Embedding ---
+        
+        # Remove the separate 3D view button
+        # self.intersection_3d_view_btn = QPushButton("Show 3D View")
+        # self.intersection_3d_view_btn.clicked.connect(self.show_intersections_3d_view)
+        # right_layout.addWidget(self.intersection_3d_view_btn)
+        
+        # Add panels to splitter
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setSizes([250, 550])  # Adjust initial sizes
+        
+        # Store references to intersection data (remains the same)
+        if not hasattr(self, 'datasets_intersections'):
+            self.datasets_intersections = {}
+        
+        if not hasattr(self, 'triple_points'):
+            self.triple_points = []
 
     # Event handlers - placeholder implementations
     def load_file(self):
@@ -2973,6 +3124,53 @@ segmentation, triangulation, and visualization.
         num_datasets = len(self.datasets)
         self.num_datasets_label.setText(f"Datasets: {num_datasets}")
         
+        # Count datasets with each processing step completed
+        datasets_with_hull = sum(1 for d in self.datasets if d.get('hull_points') is not None)
+        datasets_with_segments = sum(1 for d in self.datasets if d.get('segments') is not None)
+        datasets_with_triangulation = sum(1 for d in self.datasets if d.get('triangulation_result') is not None)
+        
+        # Count intersections
+        surface_intersections = 0
+        polyline_intersections = 0
+        
+        if hasattr(self, 'datasets_intersections'):
+            for intersections in self.datasets_intersections.values():
+                for intersection in intersections:
+                    if intersection['is_polyline_mesh']:
+                        polyline_intersections += 1
+                    else:
+                        surface_intersections += 1
+        
+        # Due to double-counting (each intersection is stored for both datasets),
+        # we divide surface-surface intersections count by 2
+        unique_surface_intersections = surface_intersections // 2
+        triple_point_count = len(self.triple_points) if hasattr(self, 'triple_points') else 0
+        
+        # Update the status bar with processing statistics
+        if hasattr(self, 'status_hulls_label'):
+            self.status_hulls_label.setText(f"Hulls: {datasets_with_hull}")
+        else:
+            self.status_hulls_label = QLabel(f"Hulls: {datasets_with_hull}")
+            self.statusBar().addPermanentWidget(self.status_hulls_label)
+            
+        if hasattr(self, 'status_segments_label'):
+            self.status_segments_label.setText(f"Segments: {datasets_with_segments}")
+        else:
+            self.status_segments_label = QLabel(f"Segments: {datasets_with_segments}")
+            self.statusBar().addPermanentWidget(self.status_segments_label)
+            
+        if hasattr(self, 'status_triangulations_label'):
+            self.status_triangulations_label.setText(f"Triangulations: {datasets_with_triangulation}")
+        else:
+            self.status_triangulations_label = QLabel(f"Triangulations: {datasets_with_triangulation}")
+            self.statusBar().addPermanentWidget(self.status_triangulations_label)
+            
+        if hasattr(self, 'status_intersections_label'):
+            self.status_intersections_label.setText(f"Intersections: {unique_surface_intersections + polyline_intersections}")
+        else:
+            self.status_intersections_label = QLabel(f"Intersections: {unique_surface_intersections + polyline_intersections}")
+            self.statusBar().addPermanentWidget(self.status_intersections_label)
+        
         if num_datasets == 0:
             self.points_label.setText("Points: 0")
             self.bounds_label.setText("Bounds: N/A")
@@ -2984,6 +3182,14 @@ segmentation, triangulation, and visualization.
             self.num_vertices_label.setText("Vertices: 0")
             self.mean_edge_label.setText("Mean edge: 0.0")
             self.uniformity_label.setText("Uniformity: 0.0")
+            
+            # Update intersection statistics if they exist
+            if hasattr(self, 'surface_intersection_count_label'):
+                self.surface_intersection_count_label.setText("Surface-Surface: 0")
+            if hasattr(self, 'polyline_intersection_count_label'):
+                self.polyline_intersection_count_label.setText("Polyline-Surface: 0")
+            if hasattr(self, 'triple_point_count_label'):
+                self.triple_point_count_label.setText("Triple Points: 0")
             return
         
         # Update statistics for the active dataset
@@ -3077,6 +3283,24 @@ segmentation, triangulation, and visualization.
                 self.num_vertices_label.setText("Vertices: 0")
                 self.mean_edge_label.setText("Mean edge: 0.0")
                 self.uniformity_label.setText("Uniformity: 0.0")
+            
+            # Intersection statistics
+            if hasattr(self, 'surface_intersection_count_label'):
+                # Count dataset-specific intersections
+                dataset_surface_intersections = 0
+                dataset_polyline_intersections = 0
+                
+                if hasattr(self, 'datasets_intersections') and self.current_dataset_index in self.datasets_intersections:
+                    for intersection in self.datasets_intersections[self.current_dataset_index]:
+                        if intersection['is_polyline_mesh']:
+                            dataset_polyline_intersections += 1
+                        else:
+                            dataset_surface_intersections += 1
+                
+                # Update UI with dataset-specific intersection counts
+                self.surface_intersection_count_label.setText(f"Surface-Surface: {dataset_surface_intersections}")
+                self.polyline_intersection_count_label.setText(f"Polyline-Surface: {dataset_polyline_intersections}")
+                self.triple_point_count_label.setText(f"Triple Points: {triple_point_count}")
     
     def _update_dataset_list(self):
         """Update the dataset list widget"""
@@ -3248,6 +3472,7 @@ segmentation, triangulation, and visualization.
         self._clear_hull_plot()
         self._clear_segment_plot()
         self._clear_triangulation_plot()
+        self._clear_intersection_plot()
         
         # Clear points visualization
         while self.file_viz_layout.count():
@@ -3297,6 +3522,11 @@ segmentation, triangulation, and visualization.
         triangulations_exist = any(d.get('triangulation_result') is not None for d in visible_datasets)
         if triangulations_exist:
             self._visualize_all_triangulations()
+        
+        # Update intersection visualization if we have any intersections
+        intersections_exist = hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections)
+        if intersections_exist:
+            self._visualize_intersections()
     
     def load_file(self):
         """Load a single data file"""
@@ -4155,44 +4385,52 @@ segmentation, triangulation, and visualization.
 
     def _on_tab_changed(self, index):
         """Handle tab changes to update visualizations as needed"""
-        # Update visualization based on the selected tab
         logger.debug(f"Tab changed to index {index}")
         # Check if datasets exist before trying to visualize
         if not self.datasets:
              logger.debug("No datasets loaded, clearing visualizations.")
              self._clear_visualizations() # Clear plots if no data
-             # Optionally show a status message in the relevant placeholder
-             if index == 0: pass # File tab is fine
+             if index == 0: pass
              elif index == 1: self._clear_hull_plot()
              elif index == 2: self._clear_segment_plot()
              elif index == 3: self._clear_triangulation_plot()
-             return # Nothing more to do if no datasets
+             elif index == 4: self._clear_intersection_plot() # Clear plotter when tab is selected with no data
+             return
 
-        # Datasets exist, proceed with updating the view for the new tab
+        # Logic to update visualization based on the selected tab
         if index == 0:  # File tab
             self._visualize_all_points()
         elif index == 1:  # Hull tab
-            visible_with_hulls = any(d.get('visible', True) and d.get('hull_points') is not None for d in self.datasets)
-            if visible_with_hulls:
+            # Check visibility and data existence
+            needs_update = any(d.get('visible', True) and d.get('hull_points') is not None for d in self.datasets)
+            if needs_update:
                 self._visualize_all_hulls()
             else:
-                # Clear the specific plot for this tab if no relevant data exists
                 self._clear_hull_plot()
-                self.statusBar().showMessage("No hulls computed yet. Use 'Compute Convex Hull' or right-click a dataset.")
+                self.statusBar().showMessage("No visible hulls computed.")
         elif index == 2:  # Segment tab
-            visible_with_segments = any(d.get('visible', True) and d.get('segments') is not None for d in self.datasets)
-            if visible_with_segments:
+            needs_update = any(d.get('visible', True) and d.get('segments') is not None for d in self.datasets)
+            if needs_update:
                 self._visualize_all_segments()
             else:
                 self._clear_segment_plot()
-                self.statusBar().showMessage("No segments computed yet. Use 'Compute Segments' after computing hulls.")
+                self.statusBar().showMessage("No visible segments computed.")
         elif index == 3:  # Triangulation tab
-            visible_with_tri = any(d.get('visible', True) and d.get('triangulation_result') is not None for d in self.datasets)
-            if visible_with_tri:
+            needs_update = any(d.get('visible', True) and d.get('triangulation_result') is not None for d in self.datasets)
+            if needs_update:
                 self._visualize_all_triangulations()
             else:
                 self._clear_triangulation_plot()
-                self.statusBar().showMessage("No triangulations computed yet. Complete previous steps first.")
+                self.statusBar().showMessage("No visible triangulations computed.")
+        elif index == 4:  # Intersection tab
+            # Trigger visualization update for the embedded plotter when tab becomes active
+            # Check if intersection data exists before visualizing
+            has_intersections = hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections)
+            if has_intersections:
+                 self._visualize_intersections() 
+            else:
+                 self._clear_intersection_plot() # Ensure plotter is cleared if no data
+                 self.statusBar().showMessage("No intersections computed yet.")
 
     # ... rest of the class methods (_get_next_color, _create_main_layout, etc.) ...
 
@@ -4248,7 +4486,9 @@ segmentation, triangulation, and visualization.
         self._disable_compute_buttons() # Disable buttons first
 
         # Setup progress dialog
-        self.progress_dialog = QProgressDialog(f"Computing {compute_type}...", "Cancel", 0, total_items, self)
+        # For global intersection, total_items is conceptually 1 (the whole task)
+        progress_max = 1 if compute_type == "intersections" else total_items
+        self.progress_dialog = QProgressDialog(f"Computing {compute_type}...", "Cancel", 0, progress_max, self)
         self.progress_dialog.setWindowTitle(f"Processing {compute_type.capitalize()}")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.setAutoClose(False) # We will close it manually
@@ -4263,10 +4503,19 @@ segmentation, triangulation, and visualization.
         self.worker.moveToThread(self.thread)
 
         # Connect signals
-        self.worker.dataset_finished.connect(self.handle_dataset_finished)
-        self.worker.batch_finished.connect(self.handle_batch_finished)
-        self.worker.error_occurred.connect(self.handle_computation_error)
-        self.thread.started.connect(getattr(self.worker, f"compute_{compute_type}_batch")) # e.g., compute_hulls_batch
+        if compute_type == "intersections":
+            # Global intersection has only batch_finished and error signals
+            self.worker.batch_finished.connect(self.handle_batch_finished)
+            self.worker.error_occurred.connect(self.handle_computation_error)
+            self.thread.started.connect(self.worker.compute_global_intersections_task)
+        else:
+            # Other types have per-dataset signals
+            self.worker.dataset_finished.connect(self.handle_dataset_finished)
+            self.worker.batch_finished.connect(self.handle_batch_finished)
+            self.worker.error_occurred.connect(self.handle_computation_error)
+            self.thread.started.connect(getattr(self.worker, f"compute_{compute_type}_batch")) # e.g., compute_hulls_batch
+        
+        # Common signals for thread management
         self.worker.batch_finished.connect(self.thread.quit) # Quit thread when batch finishes
         self.worker.error_occurred.connect(self.thread.quit) # Also quit on error
         self.thread.finished.connect(self.worker.deleteLater) # Schedule worker deletion
@@ -4278,27 +4527,44 @@ segmentation, triangulation, and visualization.
 
     def handle_dataset_finished(self, index, name, success):
         """Handles the completion of computation for a single dataset."""
-        logger.debug(f"Dataset finished: Index={index}, Name='{name}', Success={success}")
-        if hasattr(self, 'progress_dialog') and self.progress_dialog:
+        # This is not used for global intersections, but check progress dialog exists
+        if hasattr(self, 'progress_dialog') and self.progress_dialog and self.progress_dialog.maximum() > 1:
+            logger.debug(f"Dataset finished: Index={index}, Name='{name}', Success={success}")
             current_value = self.progress_dialog.value()
             self.progress_dialog.setValue(current_value + 1)
             self.progress_dialog.setLabelText(f"Processed: {name} ({'OK' if success else 'Fail'})")
-        QApplication.processEvents() # Keep UI responsive
+            QApplication.processEvents() # Keep UI responsive
+        else:
+            logger.debug(f"Dataset finished signal received but not updating progress (Index={index}, Name='{name}', Success={success})")
 
     def handle_batch_finished(self, success_count, total_eligible, elapsed_time):
         """Handles the completion of a batch computation."""
-        logger.info(f"Batch computation finished. Success: {success_count}/{total_eligible}. Time: {elapsed_time:.2f}s")
-        # Fix: Use self.statusBar() instead of self.status_bar
-        self.statusBar().showMessage(f"Batch finished: {success_count}/{total_eligible} succeeded in {elapsed_time:.2f}s.", 10000)
+        # Determine if this was the global intersection task
+        is_intersection_task = (total_eligible == 1 and hasattr(self.worker, 'compute_global_intersections_task'))
+        
+        if is_intersection_task:
+            task_name = "Global Intersection"
+            success_status = "succeeded" if success_count == 1 else "failed"
+            logger.info(f"Batch computation finished for {task_name}. Status: {success_status}. Time: {elapsed_time:.2f}s")
+            self.statusBar().showMessage(f"{task_name} {success_status} in {elapsed_time:.2f}s.", 10000)
+        else:
+            task_name = "Batch computation"
+            logger.info(f"{task_name} finished. Success: {success_count}/{total_eligible}. Time: {elapsed_time:.2f}s")
+            self.statusBar().showMessage(f"Batch finished: {success_count}/{total_eligible} succeeded in {elapsed_time:.2f}s.", 10000)
 
-        if self.progress_dialog:
+        # Close progress dialog if it exists
+        if hasattr(self, 'progress_dialog') and self.progress_dialog:
+            # If it was the global intersection task, set value to max to show completion
+            if is_intersection_task:
+                self.progress_dialog.setValue(self.progress_dialog.maximum())
             self.progress_dialog.close()
             self.progress_dialog = None
             logger.debug("Progress dialog closed.")
 
-        if self.thread and self.thread.isRunning():
+        # Thread cleanup (moved thread check inside)
+        if hasattr(self, 'thread') and self.thread and self.thread.isRunning():
             logger.info("Signaling worker thread to stop and quit.")
-            if self.worker:
+            if hasattr(self, 'worker') and self.worker:
                 self.worker.stop() # Signal the worker loop to exit
             self.thread.quit() # Ask the thread's event loop to exit
 
@@ -4317,8 +4583,14 @@ segmentation, triangulation, and visualization.
         logger.debug("Thread and worker references cleared.")
 
         self._enable_compute_buttons()
-        self._update_visualization() # Update visualization after batch completion
-        self._update_statistics()
+        # Update visualization and stats - This happens via QTimer in _compute_global_intersections for intersections
+        if not is_intersection_task:
+            self._update_visualization() 
+            self._update_statistics()
+        else:
+            # For intersections, the updates are already scheduled via QTimer.singleShot
+            # but we can ensure stats are updated one last time here just in case.
+            self._update_statistics()
 
     def handle_computation_error(self, error_message):
         """Handles errors reported by the worker thread."""
@@ -4371,7 +4643,7 @@ segmentation, triangulation, and visualization.
         tabs_and_buttons = [
             (self.hull_tab, "compute_btn"),
             (self.segment_tab, "compute_btn"),
-            (self.triangulation_tab, "run_btn")
+            (self.triangulation_tab, "run_btn"),
         ]
         for tab_widget, button_name in tabs_and_buttons:
             if tab_widget: # Check if tab exists
@@ -4382,6 +4654,14 @@ segmentation, triangulation, and visualization.
                     logger.warning(f"Could not find button '{button_name}' in tab {tab_widget.objectName()} to disable.")
             else:
                  logger.warning(f"Tab widget not found when trying to disable button '{button_name}'.")
+        
+        # Handle intersection buttons directly
+        if hasattr(self, 'compute_intersections_btn'):
+            self.compute_intersections_btn.setEnabled(False)
+        
+        # Also disable compute all button for intersections if it exists
+        if hasattr(self, 'compute_all_intersections_btn'):
+            self.compute_all_intersections_btn.setEnabled(False)
 
 
     def _enable_compute_buttons(self):
@@ -4390,7 +4670,7 @@ segmentation, triangulation, and visualization.
         tabs_and_buttons = [
             (self.hull_tab, "compute_btn"),
             (self.segment_tab, "compute_btn"),
-            (self.triangulation_tab, "run_btn")
+            (self.triangulation_tab, "run_btn"),
         ]
         for tab_widget, button_name in tabs_and_buttons:
              if tab_widget: # Check if tab exists
@@ -4401,6 +4681,14 @@ segmentation, triangulation, and visualization.
                       logger.warning(f"Could not find button '{button_name}' in tab {tab_widget.objectName()} to enable.")
              else:
                  logger.warning(f"Tab widget not found when trying to enable button '{button_name}'.")
+        
+        # Handle intersection buttons directly
+        if hasattr(self, 'compute_intersections_btn'):
+            self.compute_intersections_btn.setEnabled(True)
+        
+        # Also enable compute all button for intersections if it exists
+        if hasattr(self, 'compute_all_intersections_btn'):
+            self.compute_all_intersections_btn.setEnabled(True)
 
 
     def closeEvent(self, event):
@@ -4446,6 +4734,654 @@ segmentation, triangulation, and visualization.
                  except Exception as e:
                       logger.warning(f"Error closing standalone PyVista plotter: {e}")
             event.accept() # No thread running, close normally
+
+    def compute_intersections(self):
+        """Compute intersections globally (uses all eligible datasets)."""
+        # Check if there are at least two datasets with triangulation
+        eligible_datasets = [i for i, d in enumerate(self.datasets) if d.get('triangulation_result') is not None]
+        
+        if len(eligible_datasets) < 2:
+            QMessageBox.warning(self, "Not Enough Data", 
+                               "Need at least two triangulated datasets to compute intersections.")
+            return
+        
+        logger.info("Triggering global intersection computation.")
+        # Disable compute buttons during computation
+        # self._disable_compute_buttons() # This is now handled by _run_batch_computation
+        
+        # Run the single global computation task in a worker thread
+        # total_items is 1 because it's one global task
+        self._run_batch_computation("intersections", 1)
+
+    def compute_all_intersections(self):
+        """Compute intersections globally (this button now does the same as Compute Intersections)."""
+        # This button becomes redundant with the global approach, but we keep the UI
+        # and just call the same logic.
+        self.compute_intersections()
+
+    def _compute_global_intersections(self):
+        """
+        Compute intersections globally for all datasets with triangulation data.
+        This method is called by the worker thread.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        logger.info("Starting global intersection computation...")
+        try:
+            from meshit.intersection_utils import (
+                Vector3D, Triangle, Intersection, TriplePoint, 
+                run_intersection_workflow
+            )
+        except ImportError as e:
+            logger.error(f"Failed to import intersection utilities: {e}")
+            QMessageBox.critical(self, "Import Error", f"Failed to import intersection utilities: {e}\nPlease ensure meshit.intersection_utils is available.")
+            return False
+        
+        # Check if there are any datasets with triangulation
+        eligible_dataset_indices = [i for i, d in enumerate(self.datasets) if d.get('triangulation_result') is not None]
+        
+        if len(eligible_dataset_indices) < 2:
+            logger.warning("Need at least two triangulated datasets to compute intersections.")
+            QMessageBox.warning(self, "Not Enough Data", "Need at least two triangulated datasets to compute intersections.")
+            return False
+        
+        logger.info(f"Found {len(eligible_dataset_indices)} eligible datasets for intersection.")
+
+        # Create a structure similar to MeshItModel to store all eligible datasets
+        class ModelWrapper:
+            def __init__(self):
+                self.surfaces = []
+                self.model_polylines = [] # Future extension: Add polylines if needed
+                self.intersections = []
+                self.triple_points = []
+                self.original_indices = {} # Map model surface index back to original dataset index
+        
+        model = ModelWrapper()
+        
+        # Populate model with surfaces from eligible datasets
+        for original_index in eligible_dataset_indices:
+            dataset = self.datasets[original_index]
+            
+            # Create a surface object for this dataset
+            class SurfaceWrapper:
+                def __init__(self, dataset, index):
+                    self.name = dataset.get('name', f"Dataset {index+1}")
+                    self.vertices = [] # Vertices corresponding to the triangulation
+                    self.triangles = [] # Triangle indices referencing self.vertices
+                    self.convex_hull = []
+                    self.bounds = [Vector3D(), Vector3D()]
+                    self.type = "Surface"
+                    
+                    tri_result = dataset.get('triangulation_result')
+                    if not tri_result or 'vertices' not in tri_result or 'triangles' not in tri_result:
+                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: Missing valid triangulation result (vertices or triangles).")
+                        return # Skip if no valid triangulation result
+                        
+                    # --- CORRECTED: Use vertices from triangulation result --- 
+                    tri_vertices = tri_result['vertices']
+                    self.triangles = tri_result['triangles']
+                    
+                    if tri_vertices is None or len(tri_vertices) == 0 or self.triangles is None:
+                         logger.warning(f"Skipping SurfaceWrapper for dataset {index}: Empty vertices or triangles in triangulation result.")
+                         return
+                         
+                    # Convert triangulation vertices to Vector3D
+                    for point in tri_vertices:
+                         # Ensure points are 3D
+                         if len(point) >= 3:
+                             self.vertices.append(Vector3D(point[0], point[1], point[2]))
+                         elif len(point) == 2:
+                             self.vertices.append(Vector3D(point[0], point[1], 0.0)) # Assume Z=0 for 2D
+                         else:
+                             logger.warning(f"Skipping invalid vertex in triangulation result for dataset {index}: {point}")
+                    
+                    if not self.vertices:
+                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: No valid Vector3D vertices created from triangulation result.")
+                        return # Skip if no valid vertices could be created
+                        
+                    # Ensure triangle indices are valid for the created vertices list
+                    max_vertex_index = len(self.vertices) - 1
+                    valid_triangles = []
+                    for tri in self.triangles:
+                        if all(0 <= idx <= max_vertex_index for idx in tri):
+                            valid_triangles.append(tri)
+                        else:
+                            logger.warning(f"Skipping invalid triangle in dataset {index} (indices out of bounds): {tri}")
+                    self.triangles = valid_triangles
+                    
+                    if not self.triangles:
+                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: No valid triangles remain after index check.")
+                        return
+                    # --- END CORRECTION --- 
+                    
+                    # Add convex hull if available (optional for intersection but good practice)
+                    hull_points_data = dataset.get('hull_points')
+                    if hull_points_data is not None and len(hull_points_data) > 0:
+                        self.convex_hull = [Vector3D(p[0], p[1], p[2]) for p in hull_points_data if len(p) >= 3]
+                    
+                    # Calculate bounds for early rejection test using the triangulation vertices
+                    if self.vertices:
+                        min_x = min(v.x for v in self.vertices)
+                        min_y = min(v.y for v in self.vertices)
+                        min_z = min(v.z for v in self.vertices)
+                        max_x = max(v.x for v in self.vertices)
+                        max_y = max(v.y for v in self.vertices)
+                        max_z = max(v.z for v in self.vertices)
+                        
+                        self.bounds[0] = Vector3D(min_x, min_y, min_z)
+                        self.bounds[1] = Vector3D(max_x, max_y, max_z)
+            
+            # Add surface to model if valid
+            surface = SurfaceWrapper(dataset, original_index)
+            # --- START CORRECTED BLOCK ---
+            # Check the validity of the surface before adding
+            # Use explicit length checks for lists/arrays to avoid ValueError
+            vertices_valid = hasattr(surface, 'vertices') and surface.vertices is not None and len(surface.vertices) > 0
+            triangles_valid = hasattr(surface, 'triangles') and surface.triangles is not None and len(surface.triangles) > 0
+
+            if vertices_valid and triangles_valid:
+                # If checks pass, add the surface
+                model_surface_index = len(model.surfaces)
+                model.surfaces.append(surface)
+                model.original_indices[model_surface_index] = original_index # Store mapping
+                logger.debug(f"Added dataset {original_index} as model surface {model_surface_index}")
+            else:
+                # Log if checks fail
+                logger.warning(f"Dataset {original_index} ('{dataset.get('name')}') could not be added to intersection model (missing valid vertices or triangles). Vertices valid: {vertices_valid}, Triangles valid: {triangles_valid}")
+            # --- END CORRECTED BLOCK ---
+
+        # Check if we have enough valid surfaces in the model
+        if len(model.surfaces) < 2:
+            logger.warning("Need at least two valid surfaces in the model to compute intersections.")
+            QMessageBox.warning(self, "Not Enough Valid Data", "Need at least two valid triangulated datasets for intersection computation.")
+            return False
+
+        logger.info(f"Prepared intersection model with {len(model.surfaces)} surfaces.")
+
+        # Initialize progress reporting function for intersection_utils
+        def progress_callback(message):
+            # We can log this, but the main progress dialog is handled by batch_finished
+            logger.debug(f"Intersection util progress: {message.strip()}")
+            QApplication.processEvents() # Keep UI responsive during internal steps
+        
+        # --- Run the intersection workflow --- 
+        try:
+            logger.info("Calling run_intersection_workflow...")
+            model = run_intersection_workflow(model, progress_callback)
+            logger.info("run_intersection_workflow finished.")
+        except Exception as e:
+            error_msg = f"Error during run_intersection_workflow: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            QMessageBox.critical(self, "Intersection Computation Error", error_msg)
+            return False
+        
+        # --- Store the results --- 
+        # Clear previous results
+        self.datasets_intersections = {} # Store intersections per *original* dataset index
+        self.triple_points = [] # Store triple points globally
+        
+        logger.info(f"Processing {len(model.intersections)} raw intersections and {len(model.triple_points)} triple points from workflow.")
+
+        # Process intersections
+        found_intersections_count = 0
+        for intersection in model.intersections:
+            # Map model surface indices back to original dataset indices
+            original_id1 = model.original_indices.get(intersection.id1, -1)
+            original_id2 = model.original_indices.get(intersection.id2, -1)
+            
+            if original_id1 == -1 or original_id2 == -1:
+                logger.warning(f"Skipping intersection with invalid original index mapping (IDs: {intersection.id1}, {intersection.id2})")
+                continue # Skip invalid mappings
+            
+            # Convert points to regular lists for storage
+            points = []
+            for point in intersection.points:
+                points.append([point.x, point.y, point.z])
+            
+            # Create intersection info
+            intersection_info = {
+                'dataset_id1': original_id1,
+                'dataset_id2': original_id2,
+                'is_polyline_mesh': intersection.is_polyline_mesh,
+                'points': points
+            }
+            found_intersections_count += 1
+            
+            # Add the intersection info to *both* involved original datasets
+            if original_id1 not in self.datasets_intersections:
+                self.datasets_intersections[original_id1] = []
+            self.datasets_intersections[original_id1].append(intersection_info)
+            
+            if original_id2 not in self.datasets_intersections:
+                self.datasets_intersections[original_id2] = []
+            # Avoid adding the exact same object twice if id1 == id2 (shouldn't happen)
+            if original_id1 != original_id2:
+                 self.datasets_intersections[original_id2].append(intersection_info)
+        
+        # Process triple points
+        for tp in model.triple_points:
+            point = [tp.point.x, tp.point.y, tp.point.z]
+            # Note: intersection_ids in TriplePoint refer to the indices within model.intersections
+            # We might need to map these if we store intersections differently, but for now, store raw indices.
+            intersection_ids = tp.intersection_ids 
+            self.triple_points.append({
+                'point': point,
+                'intersection_ids': intersection_ids
+            })
+        
+        logger.info(f"Stored {found_intersections_count} intersections across datasets and {len(self.triple_points)} triple points.")
+
+        # --- Update UI --- 
+        # Use QTimer.singleShot to ensure UI updates happen on the main thread
+        # after the worker thread finishes processing this method.
+        QTimer.singleShot(0, self._update_statistics)
+        QTimer.singleShot(0, self._update_intersection_list)
+        QTimer.singleShot(0, self._visualize_intersections) # Or visualize selected if preferred
+        
+        logger.info("Global intersection computation successful.")
+        return True # Indicate success
+
+    def _clear_intersection_results(self):
+        """Clear all intersection results"""
+        # Clear intersection data
+        self.datasets_intersections = {}
+        self.triple_points = []
+        
+        # Clear UI
+        self.intersection_list.clear()
+        self._clear_intersection_plot()
+        self._update_statistics()
+        
+        QMessageBox.information(self, "Results Cleared", "Intersection results have been cleared.")
+
+    def _clear_intersection_plot(self):
+        """Clear the embedded intersection PyVista plotter."""
+        if hasattr(self, 'intersection_plotter') and self.intersection_plotter:
+            self.intersection_plotter.clear()
+            # Optionally add placeholder text back if desired
+            # self.intersection_plotter.add_text("Compute intersections or select one from the list.", position='upper_edge')
+            self.intersection_plotter.reset_camera()
+        else:
+            # Fallback for non-PyVista or error cases
+            if hasattr(self, 'intersection_plot_layout'):
+                 # Clear any potential old matplotlib widgets or placeholders
+                 for i in reversed(range(self.intersection_plot_layout.count())):
+                     widget = self.intersection_plot_layout.itemAt(i).widget()
+                     if widget:
+                         # Check if it's the plotter interactor itself before deleting
+                         if hasattr(self, 'intersection_plotter') and self.intersection_plotter and widget == self.intersection_plotter.interactor:
+                             continue # Don't delete the main interactor widget
+                         widget.setParent(None)
+                         widget.deleteLater()
+                 # Add text placeholder if plotter doesn't exist
+                 if not hasattr(self, 'intersection_plotter') or not self.intersection_plotter:
+                      placeholder = QLabel("PyVista required or plot cleared.")
+                      placeholder.setAlignment(Qt.AlignCenter)
+                      self.intersection_plot_layout.addWidget(placeholder)
+
+    def _update_intersection_list(self):
+        """Update the list of intersections in the UI"""
+        self.intersection_list.clear()
+        
+        # Add all intersections to the list
+        for dataset_index, intersections in self.datasets_intersections.items():
+            if not intersections:
+                continue
+                
+            dataset_name = self.datasets[dataset_index].get('name', f"Dataset {dataset_index+1}")
+            
+            # Add a header item for this dataset
+            dataset_item = QListWidgetItem(f"{dataset_name} Intersections:")
+            dataset_item.setBackground(QColor(240, 240, 240))
+            dataset_item.setFlags(dataset_item.flags() & ~Qt.ItemIsSelectable)
+            self.intersection_list.addItem(dataset_item)
+            
+            # Add intersections for this dataset
+            for i, intersection in enumerate(intersections):
+                other_dataset_id = (intersection['dataset_id1'] 
+                                   if intersection['dataset_id1'] != dataset_index 
+                                   else intersection['dataset_id2'])
+                
+                other_dataset_name = self.datasets[other_dataset_id].get('name', f"Dataset {other_dataset_id+1}")
+                
+                # Create a descriptive name for the intersection
+                intersection_type = "Polyline-Surface" if intersection['is_polyline_mesh'] else "Surface-Surface"
+                num_points = len(intersection['points'])
+                
+                item_text = f"  {intersection_type}: with {other_dataset_name} ({num_points} points)"
+                
+                # Create item with data
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.UserRole, {
+                    'dataset_index': dataset_index,
+                    'intersection_index': i
+                })
+                
+                self.intersection_list.addItem(item)
+
+    def _on_intersection_selection_changed(self):
+        """Handle selection changes in the intersection list"""
+        selected_items = self.intersection_list.selectedItems()
+        
+        if not selected_items:
+            return
+            
+        item = selected_items[0]
+        data = item.data(Qt.UserRole)
+        
+        if not data:
+            return  # Header item or invalid selection
+        
+        dataset_index = data['dataset_index']
+        intersection_index = data['intersection_index']
+        
+        # Visualize the selected intersection
+        self._visualize_selected_intersection(dataset_index, intersection_index)
+
+    def _visualize_selected_intersection(self, dataset_index, intersection_index):
+        """Visualize a specific intersection by highlighting it in the embedded plotter."""
+        if not hasattr(self, 'intersection_plotter') or not self.intersection_plotter:
+            logger.warning("Intersection plotter not available for selection visualization.")
+            return
+
+        plotter = self.intersection_plotter
+        # Don't clear everything, just update highlights or add emphasis
+        # Re-plotting everything might be simpler for now
+        logger.info(f"Highlighting intersection {intersection_index} from dataset {dataset_index}")
+        
+        # --- Re-plot everything, but highlight the selected intersection --- 
+        plotter.clear()
+        plotter.set_background('white')
+        
+        if dataset_index not in self.datasets_intersections or intersection_index >= len(self.datasets_intersections[dataset_index]):
+            logger.warning("Selected intersection data not found.")
+            plotter.add_text("Selected intersection not found.", position='upper_edge', color='red')
+            return
+            
+        selected_intersection = self.datasets_intersections[dataset_index][intersection_index]
+        involved_dataset_ids = {selected_intersection['dataset_id1'], selected_intersection['dataset_id2']}
+        
+        # Add involved dataset meshes (dim others slightly)
+        plotter_has_content = False
+        for index, dataset in enumerate(self.datasets):
+            if index not in involved_dataset_ids: continue # Skip uninvolved datasets for simplicity, or dim them:
+            # is_involved = index in involved_dataset_ids
+            # opacity = 0.6 if is_involved else 0.2
+            opacity = 0.6 # Keep involved ones clearly visible
+
+            tri_result = dataset.get('triangulation_result')
+            if tri_result:
+                vertices = tri_result.get('vertices')
+                triangles = tri_result.get('triangles')
+                color = dataset.get('color', self.DEFAULT_COLORS[index % len(self.DEFAULT_COLORS)])
+                name = dataset.get('name', f'Dataset {index+1}')
+
+                if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
+                    try:
+                        vertices = np.array(vertices)
+                        if vertices.shape[1] == 2: 
+                             temp_vertices = np.zeros((vertices.shape[0], 3)); temp_vertices[:,:2] = vertices; vertices = temp_vertices
+                        elif vertices.shape[1] > 3: vertices = vertices[:, :3]
+                        triangles = np.array(triangles)
+                        cells = np.hstack([np.full((len(triangles), 1), 3, dtype=triangles.dtype), triangles])
+                        surface_mesh = pv.PolyData(vertices, faces=cells)
+                        plotter.add_mesh(surface_mesh, color=color, opacity=opacity, show_edges=False, label=name)
+                        plotter_has_content = True
+                    except Exception as e:
+                         logger.error(f"Error creating mesh for dataset {index} ('{name}') during selection view: {e}")
+
+        # Add the selected intersection line prominently
+        if selected_intersection['points'] and len(selected_intersection['points']) >= 2:
+            line_points = np.array(selected_intersection['points'])
+            try:
+                 for i in range(len(line_points) - 1):
+                     segment = pv.Line(line_points[i], line_points[i+1])
+                     # Highlight: thicker and brighter red
+                     plotter.add_mesh(segment, color='#FF0000', line_width=6) 
+                 plotter_has_content = True
+            except Exception as e:
+                 logger.error(f"Error adding selected intersection line segment: {e}")
+
+        # Optionally add triple points if relevant to this intersection (more complex logic needed)
+        # For simplicity, we might omit triple points in single selection view or show all
+        if hasattr(self, 'triple_points') and self.triple_points:
+            all_triple_points_coords = [tp['point'] for tp in self.triple_points]
+            if all_triple_points_coords:
+                try:
+                    triple_points_poly = pv.PolyData(np.array(all_triple_points_coords))
+                    plotter.add_points(triple_points_poly, color='black', point_size=8, render_points_as_spheres=True)
+                    plotter_has_content = True
+                except Exception as e:
+                     logger.error(f"Error adding triple points during selection view: {e}")
+
+        if plotter_has_content:
+            plotter.add_legend(bcolor=None, face='circle', border=False, size=(0.15, 0.15))
+            plotter.add_axes()
+            plotter.reset_camera()
+            # Zoom slightly on the selected intersection line (optional)
+            if selected_intersection['points'] and len(selected_intersection['points']) >= 2:
+                 try:
+                      plotter.camera.focal_point = np.mean(line_points, axis=0)
+                      # plotter.camera.zoom(1.5) # Adjust zoom factor as needed
+                 except Exception as e:
+                      logger.warning(f"Could not adjust camera for selected intersection: {e}")
+            logger.info("Updated embedded view for selected intersection.")
+        else:
+            plotter.add_text("Could not display selected intersection.", position='upper_edge', color='orange')
+            logger.warning("No content added when visualizing selected intersection.")
+
+    def _visualize_intersections(self):
+        """Visualize all intersections in the embedded PyVista plotter."""
+        if not hasattr(self, 'intersection_plotter') or not self.intersection_plotter:
+            logger.warning("Intersection plotter not available for visualization.")
+            return
+            
+        plotter = self.intersection_plotter
+        plotter.clear() # Start fresh
+        plotter.set_background("white")
+        
+        # Check if data exists
+        if not hasattr(self, 'datasets_intersections') or not self.datasets_intersections:
+            plotter.add_text("No intersections computed yet.", position='upper_edge', color='gray')
+            plotter.reset_camera()
+            return
+
+        logger.info("Visualizing all intersections in embedded view...")
+        
+        involved_dataset_indices = set()
+        all_intersection_lines = []
+        unique_intersections = set()
+
+        # Collect intersection lines and involved datasets
+        for dataset_index, intersections in self.datasets_intersections.items():
+            involved_dataset_indices.add(dataset_index)
+            for i, intersection in enumerate(intersections):
+                involved_dataset_indices.add(intersection['dataset_id1'])
+                involved_dataset_indices.add(intersection['dataset_id2'])
+                key = tuple(sorted((intersection['dataset_id1'], intersection['dataset_id2']))) + (intersection['is_polyline_mesh'],)
+                if key not in unique_intersections:
+                    unique_intersections.add(key)
+                    if intersection['points'] and len(intersection['points']) >= 2:
+                        all_intersection_lines.append(np.array(intersection['points']))
+
+        # Collect triple points
+        all_triple_points_coords = []
+        if hasattr(self, 'triple_points') and self.triple_points:
+            all_triple_points_coords = [tp['point'] for tp in self.triple_points]
+
+        # Add involved dataset meshes
+        plotter_has_content = False
+        for index in involved_dataset_indices:
+            if 0 <= index < len(self.datasets):
+                dataset = self.datasets[index]
+                tri_result = dataset.get('triangulation_result')
+                if tri_result:
+                    vertices = tri_result.get('vertices')
+                    triangles = tri_result.get('triangles')
+                    color = dataset.get('color', self.DEFAULT_COLORS[index % len(self.DEFAULT_COLORS)])
+                    name = dataset.get('name', f'Dataset {index+1}')
+
+                    if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
+                        try:
+                            # Basic validation and formatting for PyVista
+                            vertices = np.array(vertices)
+                            if vertices.shape[1] == 2:
+                                 temp_vertices = np.zeros((vertices.shape[0], 3))
+                                 temp_vertices[:,:2] = vertices
+                                 vertices = temp_vertices
+                            elif vertices.shape[1] > 3:
+                                 vertices = vertices[:, :3]
+                            triangles = np.array(triangles)
+                            cells = np.hstack([np.full((len(triangles), 1), 3, dtype=triangles.dtype), triangles])
+                            
+                            surface_mesh = pv.PolyData(vertices, faces=cells)
+                            plotter.add_mesh(surface_mesh, color=color, opacity=0.5, 
+                                             show_edges=False, label=name)
+                            plotter_has_content = True
+                        except Exception as e:
+                             logger.error(f"Error creating mesh for dataset {index} ('{name}') in embedded view: {e}")
+
+        # Add intersection lines
+        if all_intersection_lines:
+            for line_points in all_intersection_lines:
+                try:
+                     for i in range(len(line_points) - 1):
+                         segment = pv.Line(line_points[i], line_points[i+1])
+                         plotter.add_mesh(segment, color='red', line_width=4) # Slightly thinner than standalone
+                     plotter_has_content = True
+                except Exception as e:
+                     logger.error(f"Error adding intersection line segment in embedded view: {e}")
+
+        # Add triple points
+        if all_triple_points_coords:
+            try:
+                triple_points_poly = pv.PolyData(np.array(all_triple_points_coords))
+                plotter.add_points(triple_points_poly, color='black', point_size=8, 
+                                   render_points_as_spheres=True, label="Triple Points")
+                plotter_has_content = True
+            except Exception as e:
+                logger.error(f"Error adding triple points in embedded view: {e}")
+
+        if plotter_has_content:
+            plotter.add_legend(bcolor=None, face='circle', border=False, size=(0.15, 0.15))
+            plotter.add_axes()
+            plotter.reset_camera()
+            logger.info("Updated embedded intersection view.")
+        else:
+            plotter.add_text("No valid intersection data to display.", position='upper_edge', color='gray')
+            logger.info("Embedded intersection view updated, but no content added.")
+
+    def show_intersections_3d_view(self):
+        """Show a 3D view of the datasets involved in intersections and the intersection lines/points."""
+        if not HAVE_PYVISTA:
+            QMessageBox.warning(self, "PyVista Needed", "PyVista is required for 3D visualization.")
+            return
+        
+        # Check if there are any intersections to show
+        if not hasattr(self, 'datasets_intersections') or not self.datasets_intersections:
+            QMessageBox.warning(self, "No Intersections", "No intersections computed yet.")
+            return
+
+        logger.info("Preparing data for Intersection 3D View...")
+        
+        plotter = pv.Plotter(window_size=[1000, 800], off_screen=False) # Create a new plotter instance
+        plotter.set_background("white")
+        
+        involved_dataset_indices = set()
+        all_intersection_lines = []
+        all_triple_points_coords = []
+
+        # Collect all intersection lines and involved dataset indices
+        unique_intersections = set() # Use a set to avoid plotting the same intersection twice
+        for dataset_index, intersections in self.datasets_intersections.items():
+            involved_dataset_indices.add(dataset_index)
+            for i, intersection in enumerate(intersections):
+                involved_dataset_indices.add(intersection['dataset_id1'])
+                involved_dataset_indices.add(intersection['dataset_id2'])
+                
+                # Create a unique key for the intersection (order-independent)
+                key = tuple(sorted((intersection['dataset_id1'], intersection['dataset_id2']))) + (intersection['is_polyline_mesh'],)
+                
+                if key not in unique_intersections:
+                    unique_intersections.add(key)
+                    if intersection['points'] and len(intersection['points']) >= 2:
+                        # Convert intersection points to NumPy array for PyVista Line
+                        line_points = np.array(intersection['points'])
+                        all_intersection_lines.append(line_points)
+
+        # Collect triple points coordinates
+        if hasattr(self, 'triple_points') and self.triple_points:
+            for tp in self.triple_points:
+                 all_triple_points_coords.append(tp['point'])
+
+        # Add involved dataset meshes (triangulated surfaces)
+        for index in involved_dataset_indices:
+            if 0 <= index < len(self.datasets):
+                dataset = self.datasets[index]
+                tri_result = dataset.get('triangulation_result')
+                if tri_result:
+                    vertices = tri_result.get('vertices')
+                    triangles = tri_result.get('triangles')
+                    color = dataset.get('color', self.DEFAULT_COLORS[index % len(self.DEFAULT_COLORS)])
+                    name = dataset.get('name', f'Dataset {index+1}')
+
+                    if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
+                        try:
+                            # Ensure vertices are 3D numpy array
+                            if isinstance(vertices, list):
+                                vertices = np.array(vertices)
+                            if vertices.shape[1] == 2:
+                                 # Pad with Z=0 if needed (should ideally come from tri_result)
+                                 temp_vertices = np.zeros((vertices.shape[0], 3))
+                                 temp_vertices[:,:2] = vertices
+                                 vertices = temp_vertices
+                            elif vertices.shape[1] > 3:
+                                 vertices = vertices[:, :3] # Ensure max 3 columns
+                                 
+                            # Ensure triangles are correctly formatted for PyVista
+                            if isinstance(triangles, list):
+                                triangles = np.array(triangles)
+                            # PyVista needs cells prepended with the number of points (3 for triangles)
+                            cells = np.hstack([np.full((len(triangles), 1), 3, dtype=triangles.dtype), triangles])
+                            
+                            surface_mesh = pv.PolyData(vertices, faces=cells)
+                            plotter.add_mesh(surface_mesh, color=color, opacity=0.6, 
+                                             show_edges=False, label=name)
+                            logger.debug(f"Added surface mesh for dataset {index} ('{name}')")
+                        except Exception as e:
+                             logger.error(f"Error creating mesh for dataset {index} ('{name}'): {e}", exc_info=True)
+                    else:
+                         logger.warning(f"Dataset {index} ('{name}') has triangulation result but missing valid vertices/triangles.")
+
+        # Add intersection lines
+        if all_intersection_lines:
+            for line_points in all_intersection_lines:
+                try:
+                     # Create line segments for the plotter
+                     for i in range(len(line_points) - 1):
+                         segment = pv.Line(line_points[i], line_points[i+1])
+                         plotter.add_mesh(segment, color='red', line_width=5) # Thicker red lines
+                except Exception as e:
+                     logger.error(f"Error adding intersection line segment: {e}", exc_info=True)
+            logger.info(f"Added {len(all_intersection_lines)} intersection lines.")
+
+        # Add triple points
+        if all_triple_points_coords:
+            try:
+                triple_points_poly = pv.PolyData(np.array(all_triple_points_coords))
+                plotter.add_points(triple_points_poly, color='black', point_size=10, 
+                                   render_points_as_spheres=True, label="Triple Points")
+                logger.info(f"Added {len(all_triple_points_coords)} triple points.")
+            except Exception as e:
+                logger.error(f"Error adding triple points: {e}", exc_info=True)
+
+        # Add legend, axes, etc.
+        plotter.add_legend(bcolor=None, face='circle') # Simple legend
+        plotter.add_axes()
+        plotter.reset_camera()
+        plotter.show(title="MeshIt Intersections 3D View")
+        logger.info("Showing Intersection 3D View.")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
