@@ -619,154 +619,141 @@ class MeshItWorkflowGUI(QMainWindow):
         """Sets up the triangulation tab with controls and visualization area"""
         # Main layout for the tab
         tab_layout = QHBoxLayout(self.triangulation_tab)
-        
+
         # --- Control panel (left side) ---
         control_panel = QWidget()
         control_panel.setMaximumWidth(300)
         control_layout = QVBoxLayout(control_panel)
-        
+
         # -- Triangulation Controls --
         tri_group = QGroupBox("Triangulation Controls")
         tri_layout = QVBoxLayout(tri_group)
-        
-        # Mesh density controls
-        density_layout = QFormLayout()
-        self.base_size_factor_input = QDoubleSpinBox()
-        self.base_size_factor_input.setRange(5.0, 30.0)
-        self.base_size_factor_input.setValue(15.0)
-        self.base_size_factor_input.setSingleStep(1.0)
-        density_layout.addRow("Mesh Density:", self.base_size_factor_input)
-        tri_layout.addLayout(density_layout)
-        
-        # Mesh quality controls
+
+        # Mesh target size controls <<--- RENAMED AND REPURPOSED
+        target_size_layout = QFormLayout()
+        self.target_edge_length_input = QDoubleSpinBox()
+        # Adjust range based on expected data scale. Example: 0.1 to 100 units
+        self.target_edge_length_input.setRange(0.1, 100.0)
+        self.target_edge_length_input.setValue(20.0) # Example default absolute size
+        self.target_edge_length_input.setSingleStep(0.5)
+        self.target_edge_length_input.setToolTip(
+            "Specify the desired approximate edge length for the triangles.\n"
+            "Smaller values result in denser meshes."
+        )
+        target_size_layout.addRow("Target Edge Length:", self.target_edge_length_input) # Changed Label
+        tri_layout.addLayout(target_size_layout)
+
+        # Mesh quality controls (remain the same)
         quality_group = QGroupBox("Quality Settings")
         quality_layout = QFormLayout(quality_group)
-        
+
         # Gradient
         self.gradient_input = QDoubleSpinBox()
         self.gradient_input.setRange(1.0, 3.0)
         self.gradient_input.setValue(1.0)
         self.gradient_input.setSingleStep(0.1)
         quality_layout.addRow("Gradient:", self.gradient_input)
-        
+
         # Min angle
         self.min_angle_input = QDoubleSpinBox()
         self.min_angle_input.setRange(10.0, 30.0)
         self.min_angle_input.setValue(25.0)
         self.min_angle_input.setSingleStep(1.0)
         quality_layout.addRow("Min Angle:", self.min_angle_input)
-        
+
         # Uniform triangulation
         self.uniform_checkbox = QCheckBox()
-        self.uniform_checkbox.setChecked(True)
+        self.uniform_checkbox.setChecked(True) # Default to uniform for consistent sizing
         quality_layout.addRow("Uniform:", self.uniform_checkbox)
-        
+
         tri_layout.addWidget(quality_group)
-        
-        # Feature points controls
-        feature_group = QGroupBox("Feature Points")
-        feature_layout = QFormLayout(feature_group)
-        
-        # Use features
-        self.use_feature_points_checkbox = QCheckBox()
-        feature_layout.addRow("Use Features:", self.use_feature_points_checkbox)
-        
-        # Number of features
-        self.num_features_input = QSpinBox()
-        self.num_features_input.setRange(1, 10)
-        self.num_features_input.setValue(3)
-        feature_layout.addRow("Count:", self.num_features_input)
-        
-        # Feature size
-        self.feature_size_input = QDoubleSpinBox()
-        self.feature_size_input.setRange(0.1, 3.0)
-        self.feature_size_input.setValue(1.0)
-        self.feature_size_input.setSingleStep(0.1)
-        feature_layout.addRow("Size:", self.feature_size_input)
-        
-        tri_layout.addWidget(feature_group)
-        
-        # 3D visualization settings
-        viz3d_group = QGroupBox("3D Settings")
-        viz3d_layout = QFormLayout(viz3d_group)
-        
-        # Height scale
-        self.height_factor_slider = QSlider(Qt.Horizontal)
-        self.height_factor_slider.setMinimum(0)
-        self.height_factor_slider.setMaximum(100)
-        self.height_factor_slider.setValue(20)  # 20% default
-        viz3d_layout.addRow("Height Scale:", self.height_factor_slider)
-        
-        tri_layout.addWidget(viz3d_group)
-        
+
+        # Feature points controls (remain the same)
+        # ... (feature_group setup remains the same) ...
+        feature_group = QGroupBox("Feature Points") # Added for completeness
+        feature_layout = QFormLayout(feature_group) # Added for completeness
+        self.use_feature_points_checkbox = QCheckBox() # Added for completeness
+        feature_layout.addRow("Use Features:", self.use_feature_points_checkbox) # Added for completeness
+        self.num_features_input = QSpinBox() # Added for completeness
+        self.num_features_input.setRange(1, 10) # Added for completeness
+        self.num_features_input.setValue(3) # Added for completeness
+        feature_layout.addRow("Count:", self.num_features_input) # Added for completeness
+        self.feature_size_input = QDoubleSpinBox() # Added for completeness
+        self.feature_size_input.setRange(0.1, 3.0) # Added for completeness
+        self.feature_size_input.setValue(1.0) # Added for completeness
+        self.feature_size_input.setSingleStep(0.1) # Added for completeness
+        feature_layout.addRow("Size:", self.feature_size_input) # Added for completeness
+        tri_layout.addWidget(feature_group) # Added for completeness
+
+
+        # 3D visualization settings (remain the same)
+        # ... (viz3d_group setup remains the same) ...
+        viz3d_group = QGroupBox("3D Settings") # Added for completeness
+        viz3d_layout = QFormLayout(viz3d_group) # Added for completeness
+        self.height_factor_slider = QSlider(Qt.Horizontal) # Added for completeness
+        self.height_factor_slider.setMinimum(0) # Added for completeness
+        self.height_factor_slider.setMaximum(100) # Added for completeness
+        self.height_factor_slider.setValue(20)  # Added for completeness
+        viz3d_layout.addRow("Height Scale:", self.height_factor_slider) # Added for completeness
+        tri_layout.addWidget(viz3d_group) # Added for completeness
+
         # Run triangulation button
         run_btn = QPushButton("Run Triangulation (All Datasets)") # Update button text
         run_btn.setObjectName("run_btn") # Set the object name
         run_btn.setToolTip("Run triangulation for all datasets with computed segments") # Update tooltip
         run_btn.clicked.connect(self.run_all_triangulations) # Connect to the new batch method
         tri_layout.addWidget(run_btn)
-        
+
         control_layout.addWidget(tri_group)
-        
-        # -- Statistics --
-        stats_group = QGroupBox("Triangulation Statistics")
-        stats_layout = QVBoxLayout(stats_group)
-        
-        # Number of triangles
-        self.num_triangles_label = QLabel("Triangles: 0")
-        stats_layout.addWidget(self.num_triangles_label)
-        
-        # Number of vertices
-        self.num_vertices_label = QLabel("Vertices: 0")
-        stats_layout.addWidget(self.num_vertices_label)
-        
-        # Mean edge length
-        self.mean_edge_label = QLabel("Mean edge: 0.0")
-        stats_layout.addWidget(self.mean_edge_label)
-        
-        # Edge uniformity
-        self.uniformity_label = QLabel("Uniformity: 0.0")
-        stats_layout.addWidget(self.uniformity_label)
-        
-        control_layout.addWidget(stats_group)
-        
-        # Export button
-        export_btn = QPushButton("Export Results...")
-        export_btn.clicked.connect(self.export_results)
-        control_layout.addWidget(export_btn)
-        
-        # Navigation buttons
-        nav_layout = QHBoxLayout()
-        
-        prev_btn = QPushButton("← Previous")
-        prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(2))
-        nav_layout.addWidget(prev_btn)
-        
-        control_layout.addLayout(nav_layout)
-        control_layout.addStretch()
-        
+
+        # -- Statistics -- (remain the same)
+        # ... (stats_group setup remains the same) ...
+        stats_group = QGroupBox("Triangulation Statistics") # Added for completeness
+        stats_layout = QVBoxLayout(stats_group) # Added for completeness
+        self.num_triangles_label = QLabel("Triangles: 0") # Added for completeness
+        stats_layout.addWidget(self.num_triangles_label) # Added for completeness
+        self.num_vertices_label = QLabel("Vertices: 0") # Added for completeness
+        stats_layout.addWidget(self.num_vertices_label) # Added for completeness
+        self.mean_edge_label = QLabel("Mean edge: 0.0") # Added for completeness
+        stats_layout.addWidget(self.mean_edge_label) # Added for completeness
+        self.uniformity_label = QLabel("Uniformity: 0.0") # Added for completeness
+        stats_layout.addWidget(self.uniformity_label) # Added for completeness
+        control_layout.addWidget(stats_group) # Added for completeness
+
+
+        # Export button (remain the same)
+        # ... (export_btn setup remains the same) ...
+        export_btn = QPushButton("Export Results...") # Added for completeness
+        export_btn.clicked.connect(self.export_results) # Added for completeness
+        control_layout.addWidget(export_btn) # Added for completeness
+
+
+        # Navigation buttons (remain the same)
+        # ... (nav_layout setup remains the same) ...
+        nav_layout = QHBoxLayout() # Added for completeness
+        prev_btn = QPushButton("← Previous") # Added for completeness
+        prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(2)) # Added for completeness
+        nav_layout.addWidget(prev_btn) # Added for completeness
+        control_layout.addLayout(nav_layout) # Added for completeness
+        control_layout.addStretch() # Added for completeness
+
         tab_layout.addWidget(control_panel)
-        
-        # --- Visualization Area (right side) ---
-        viz_group = QGroupBox("Triangulation Visualization")
-        viz_layout = QVBoxLayout(viz_group)
-        
-        # Create container for visualization
-        self.tri_viz_frame = QWidget()
-        self.tri_viz_layout = QVBoxLayout(self.tri_viz_frame)
-        
-        # Initial visualization panel will show placeholder message
-        if HAVE_PYVISTA:
-            placeholder_text = "Run triangulation to visualize in 3D"
-        else:
-            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nRun triangulation to visualize in 2D."
-            
-        self.tri_viz_placeholder = QLabel(placeholder_text)
-        self.tri_viz_placeholder.setAlignment(Qt.AlignCenter)
-        self.tri_viz_layout.addWidget(self.tri_viz_placeholder)
-        
-        viz_layout.addWidget(self.tri_viz_frame)
-        tab_layout.addWidget(viz_group, 1)  # 1 = stretch factor
+
+        # --- Visualization Area (right side) --- (remain the same)
+        # ... (viz_group setup remains the same) ...
+        viz_group = QGroupBox("Triangulation Visualization") # Added for completeness
+        viz_layout = QVBoxLayout(viz_group) # Added for completeness
+        self.tri_viz_frame = QWidget() # Added for completeness
+        self.tri_viz_layout = QVBoxLayout(self.tri_viz_frame) # Added for completeness
+        if HAVE_PYVISTA: # Added for completeness
+            placeholder_text = "Run triangulation to visualize in 3D" # Added for completeness
+        else: # Added for completeness
+            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nRun triangulation to visualize in 2D." # Added for completeness
+        self.tri_viz_placeholder = QLabel(placeholder_text) # Added for completeness
+        self.tri_viz_placeholder.setAlignment(Qt.AlignCenter) # Added for completeness
+        self.tri_viz_layout.addWidget(self.tri_viz_placeholder) # Added for completeness
+        viz_layout.addWidget(self.tri_viz_frame) # Added for completeness
+        tab_layout.addWidget(viz_group, 1)  # 1 = stretch factor # Added for completeness
 
     # Event handlers - placeholder implementations
     def load_file(self):
@@ -2187,41 +2174,44 @@ segmentation, triangulation, and visualization.
 
         dataset = self.datasets[dataset_index]
         dataset_name = dataset.get('name', f"Dataset {dataset_index}")
-        
+
         segments_data = dataset.get('segments')
         if segments_data is None or len(segments_data) < 3:
-            self.statusBar().showMessage(f"Skipping triangulation for {dataset_name}: Compute segments first")
+            # Note: Status bar updates are removed from worker context
+            # self.statusBar().showMessage(f"Skipping triangulation for {dataset_name}: Compute segments first")
             logger.warning(f"Skipping triangulation for {dataset_name}: segments not computed.")
             return False # Indicate error or skip
 
-        # Get triangulation parameters from UI (use consistent settings for all)
+        # --- Get triangulation parameters from GUI ---
         gradient = self.gradient_input.value()
         min_angle = self.min_angle_input.value()
-        base_size_factor = self.base_size_factor_input.value()
+        # Get the ABSOLUTE target edge length from the GUI
+        target_edge_length = self.target_edge_length_input.value()
+        # Ensure the target edge length is positive
+        base_size = max(1e-9, target_edge_length) # Use a small positive minimum
         uniform = self.uniform_checkbox.isChecked()
-        
+        # --- End Get Parameters ---
+
         try:
             start_time = time.time()
-            
-            # --- Use points and segments from the segmentation step --- 
-            # Extract unique points from the segments
+
+            # --- Use points and segments from the segmentation step ---
+            # (This part remains the same: extracting unique points and segment indices)
             segment_points = []
             for segment in segments_data:
                 segment_points.append(segment[0])
                 segment_points.append(segment[1])
-            
-            # Use unique points, preserving order as much as possible
-            # Using np.unique might reorder points, so we build manually
+
             unique_points_list = []
             point_to_index = {}
             segment_indices = []
-            
+
             current_index = 0
             for segment in segments_data:
                 start_pt, end_pt = segment[0], segment[1]
                 start_tuple = tuple(start_pt)
                 end_tuple = tuple(end_pt)
-                
+
                 if start_tuple not in point_to_index:
                     point_to_index[start_tuple] = current_index
                     unique_points_list.append(start_pt)
@@ -2229,7 +2219,7 @@ segmentation, triangulation, and visualization.
                     current_index += 1
                 else:
                     start_idx = point_to_index[start_tuple]
-                    
+
                 if end_tuple not in point_to_index:
                     point_to_index[end_tuple] = current_index
                     unique_points_list.append(end_pt)
@@ -2237,22 +2227,22 @@ segmentation, triangulation, and visualization.
                     current_index += 1
                 else:
                     end_idx = point_to_index[end_tuple]
-                    
+
                 segment_indices.append([start_idx, end_idx])
 
             all_boundary_points = np.array(unique_points_list)
             boundary_segments_indices = np.array(segment_indices)
             logger.info(f"Using {len(all_boundary_points)} unique points and {len(boundary_segments_indices)} segments from segmentation step for triangulation.")
-            # --- End using points/segments from segmentation --- 
-            
+            # --- End using points/segments from segmentation ---
+
             # Make a working copy for potential projection
             projected_boundary_points = all_boundary_points.copy()
-            
-            # For 3D points, we need to project to a plane for triangulation
+
+            # --- Projection Logic (Remains the same) ---
             plane_normal = None # Initialize plane_normal
             if projected_boundary_points.shape[1] > 2:
                 logger.info(f"Projecting 3D points to best-fit plane for triangulation for {dataset_name}")
-                
+
                 # Find best-fitting plane using PCA/SVD
                 centroid = np.mean(projected_boundary_points, axis=0)
                 centered = projected_boundary_points - centroid
@@ -2260,163 +2250,123 @@ segmentation, triangulation, and visualization.
                 projection_basis = vh[:2]
                 plane_normal = vh[2] # *** STORE THE NORMAL VECTOR ***
                 points_2d = np.dot(centered, projection_basis.T)
-                
+
                 # Store original points and projection info for reconstruction
-                original_boundary_points_for_recon = all_boundary_points.copy() 
-                projected_boundary_points = points_2d 
-                
+                original_boundary_points_for_recon = all_boundary_points.copy()
+                projected_boundary_points = points_2d
+
                 # Store projection parameters for reconstruction
                 dataset['projection_params'] = {
                     'centroid': centroid,
                     'basis': projection_basis,
                     'normal': plane_normal, # *** STORE IT HERE ***
-                    'original_points': original_boundary_points_for_recon 
+                    'original_points': original_boundary_points_for_recon
                 }
             else:
                 # Store info showing no projection was needed
                 dataset['projection_params'] = None
-            
-            # Calculate diagonal for base size using the projected points
+            # --- End Projection Logic ---
+
+            # --- REMOVED: Calculation of base_size based on dataset geometry ---
             # min_coords = np.min(projected_boundary_points, axis=0)
             # max_coords = np.max(projected_boundary_points, axis=0)
-            # diagonal = np.sqrt(np.sum((max_coords - min_coords) ** 2))
-            # Ensure base_size_factor is positive to avoid division by zero or negative base_size
-            # density_factor_val = max(0.1, self.base_size_factor_input.value()) # Ensure positive factor
-            # base_size = diagonal / (density_factor_val * 2.0)
-            # Add a safeguard for extremely small diagonals or factors
-            # if base_size < 1e-9:
-            #      logger.warning(f"Calculated base_size {base_size:.2e} is extremely small. Using a fallback minimum.")
-            #      base_size = max(1e-6, diagonal * 0.01) # Fallback based on diagonal
-            
-            # Calculate bounding box of projected points
-            min_coords = np.min(projected_boundary_points, axis=0)
-            max_coords = np.max(projected_boundary_points, axis=0)
-            width = max_coords[0] - min_coords[0]
-            height = max_coords[1] - min_coords[1]
-            # Use minimum dimension for characteristic length (ensure non-zero)
-            characteristic_length = max(1e-9, min(width, height))
-            density_factor_val = max(0.1, self.base_size_factor_input.value()) # Ensure positive factor
-            base_size = characteristic_length / (density_factor_val * 2.0)
-            # Safeguard for base_size
-            if base_size < 1e-9:
-                 logger.warning(f"Calculated base_size {base_size:.2e} is extremely small. Using fallback.")
-                 diag = np.sqrt(width**2 + height**2) if width > 0 or height > 0 else 1.0
-                 base_size = max(1e-6, diag * 0.01) # Fallback based on diagonal
-            logger.info(f"Dataset {dataset_name}: Projected W={width:.2f}, H={height:.2f}. Char. Length={characteristic_length:.2f}. Base Size={base_size:.4f}")
+            # width = max_coords[0] - min_coords[0]
+            # height = max_coords[1] - min_coords[1]
+            # characteristic_length = max(1e-9, min(width, height))
+            # density_factor_val = max(0.1, self.base_size_factor_input.value()) # Old input
+            # base_size = characteristic_length / (density_factor_val * 2.0) # Old calculation
+            # ... Safeguard ...
+            # logger.info(f"Dataset {dataset_name}: Projected W={width:.2f}, H={height:.2f}. Char. Length={characteristic_length:.2f}. Base Size={base_size:.4f}")
+            # --- End Removed Calculation ---
 
-            # --- Unified Path for ALL Datasets using DirectTriangleWrapper --- 
+            # --- Unified Path for ALL Datasets using DirectTriangleWrapper ---
             logger.info(f"Using DirectTriangleWrapper for: {dataset_name}")
             if not HAVE_DIRECT_WRAPPER:
                  logger.error("DirectTriangleWrapper not available!")
                  raise ImportError("DirectTriangleWrapper failed to import.")
 
-            # Get parameters from GUI
-            gradient = self.gradient_input.value()
-            min_angle = self.min_angle_input.value()
-            uniform = self.uniform_checkbox.isChecked()
+            # We now use the 'base_size' calculated directly from the GUI's absolute input
+            logger.info(f"Triangulating {dataset_name} with Target Edge Length (base_size) = {base_size:.4f}")
 
             triangulator = DirectTriangleWrapper(
                 gradient=gradient,
                 min_angle=min_angle,
-                base_size=base_size # Pass the calculated base_size
+                base_size=base_size # <<< Pass the ABSOLUTE base_size from GUI
             )
-            
-            # Wrapper internally sets options based on params, but can be overridden:
-            # triangle_options = f"pzq{min_angle}a{base_size*base_size*0.5}"
-            # triangulator.set_triangle_options(triangle_options)
 
             # Run triangulation using the wrapper
             logger.debug(f"Running triangulation with {len(projected_boundary_points)} points, {len(boundary_segments_indices)} segments, base_size={base_size:.4f}, uniform={uniform}")
             triangulation_result = triangulator.triangulate(
-                points=projected_boundary_points, 
+                points=projected_boundary_points,
                 segments=boundary_segments_indices,
                 uniform=uniform # Pass uniform flag from GUI
             )
-            # --- End Unified Path --- 
+            # --- End Unified Path ---
 
-            # --- Process the result --- 
+            # --- Process the result (Remains the same) ---
             if triangulation_result is None or 'vertices' not in triangulation_result or 'triangles' not in triangulation_result:
                 raise ValueError("Triangulation failed to produce valid output.")
-                
+
             # Get vertices and triangles
-            vertices_2d = triangulation_result['vertices'] 
+            vertices_2d = triangulation_result['vertices']
             triangles = triangulation_result['triangles']
-            
+
             logger.info(f"Triangulation produced {len(vertices_2d)} vertices and {len(triangles)} triangles")
 
-            # --- Reconstruction logic - MODIFIED --- 
+            # --- Reconstruction logic (Remains the same) ---
             if dataset['projection_params'] is not None:
                 projection_params = dataset['projection_params']
                 centroid = projection_params['centroid']
                 basis = projection_params['basis']
-                normal = projection_params.get('normal') # *** GET THE NORMAL ***
+                normal = projection_params.get('normal')
                 original_points_for_recon = projection_params['original_points']
-                
-                # Check if normal vector is valid for plane equation
-                if normal is None:
-                    logger.error("Plane normal not found in projection parameters. Cannot reconstruct planar Z.")
-                    # Fallback: Use nearest neighbor Z (original flawed approach)
-                    normal = np.array([0, 0, 1]) # Assume XY plane
-                    can_calculate_planar_z = False
-                else:
-                     can_calculate_planar_z = abs(normal[2]) > 1e-9 # Check for non-horizontal plane
-                
-                # Convert 2D triangulation vertices back to 3D
+
+                can_calculate_planar_z = normal is not None and abs(normal[2]) > 1e-9
+
                 final_vertices_3d = np.zeros((len(vertices_2d), 3))
-                
+
                 for i, vertex_2d in enumerate(vertices_2d):
                     is_boundary_point = False
-                    # Check if vertex_2d matches any projected_boundary_points (original unique segment points after projection)
                     for j, bp_2d in enumerate(projected_boundary_points):
                         if np.allclose(vertex_2d, bp_2d, atol=1e-10):
-                             # If it matches a projected boundary point, use its original 3D coordinate
                             if j < len(original_points_for_recon):
-                                final_vertices_3d[i] = original_points_for_recon[j] # Use original 3D pt
+                                final_vertices_3d[i] = original_points_for_recon[j]
                                 is_boundary_point = True
                                 break
-                            else: 
+                            else:
                                 logger.warning(f"Index mismatch when mapping boundary point {j}")
-                                break # Avoid potential error, treat as interior
-                    
+                                break
+
                     if not is_boundary_point:
-                        # --- Calculate Planar Z for Interior Points --- 
-                        # Project 2D point back to its 3D XY location on the plane
                         vertex_3d_on_plane = centroid.copy()
                         vertex_3d_on_plane += vertex_2d[0] * basis[0]
                         vertex_3d_on_plane += vertex_2d[1] * basis[1]
-                        
+
                         if can_calculate_planar_z:
-                            # Use plane equation: normal . (point - centroid) = 0
-                            # z = cz - (normal[0]*(x-cx) + normal[1]*(y-cy)) / normal[2]
                             z_planar = centroid[2] - (normal[0]*(vertex_3d_on_plane[0] - centroid[0]) + normal[1]*(vertex_3d_on_plane[1] - centroid[1])) / normal[2]
                             vertex_3d_on_plane[2] = z_planar
                         else:
-                            # Fallback for horizontal plane (or if normal was missing)
-                            logger.warning(f"Plane normal is nearly horizontal ({normal}). Using centroid Z for interior point {i}.")
-                            vertex_3d_on_plane[2] = centroid[2] 
-                            
+                            logger.warning(f"Plane normal is nearly horizontal or missing ({normal}). Using centroid Z for interior point {i}.")
+                            vertex_3d_on_plane[2] = centroid[2]
+
                         final_vertices_3d[i] = vertex_3d_on_plane
-                        # --- End Planar Z Calculation --- 
-                
-                # Use the reconstructed 3D vertices
+
                 final_vertices = final_vertices_3d
             else:
-                # No projection was done, vertices are already correct (2D or 3D)
                  if vertices_2d.shape[1] == 2:
-                      # If input was 2D, ensure output is 3D with Z=0
                       final_vertices = np.zeros((len(vertices_2d), 3))
                       final_vertices[:, :2] = vertices_2d
                  else:
-                      final_vertices = vertices_2d # Already 3D
+                      final_vertices = vertices_2d
 
-            # --- Store results logic remains the same --- 
+            # --- Store results logic ---
             dataset['triangulation_result'] = {
                 'vertices': final_vertices,
                 'triangles': triangles,
-                'uniform': uniform, # Store parameters used
+                'uniform': uniform,
                 'gradient': gradient,
                 'min_angle': min_angle,
-                'base_size': base_size,
+                'target_edge_length': base_size, # Store the absolute size used
             }
             logger.info(f"Triangulation for {dataset_name} completed. Vertices: {len(final_vertices)}, Triangles: {len(triangles)}")
             return True # Indicate success
@@ -2426,7 +2376,7 @@ segmentation, triangulation, and visualization.
             import traceback
             logger.debug(f"Triangulation error traceback: {traceback.format_exc()}")
             return False # Indicate error
-            
+
     def run_triangulation(self):
         """Run triangulation on the segments and points of the *active* dataset (primarily for context menu)"""
         # Check if we have an active dataset
