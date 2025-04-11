@@ -2240,19 +2240,31 @@ segmentation, triangulation, and visualization.
             
         # Create 3D visualization
         if self.view_3d_enabled:
-            # Create unique points for visualization to avoid duplicates
-            # unique_points, indices = np.unique(segment_points, axis=0, return_inverse=True) # Not needed here anymore
+            # Extract unique segment endpoints (these are the segmentation points along the hull)
+            segment_endpoints = []
+            for segment in segments:
+                # Add both endpoints of each segment
+                if hasattr(segment[0], 'shape'):  # NumPy array format
+                    segment_endpoints.append(segment[0])
+                    segment_endpoints.append(segment[1])
+                else:  # List format
+                    segment_endpoints.append(np.array(segment[0]))
+                    segment_endpoints.append(np.array(segment[1]))
             
-            # Create different point colors: blue for regular points, red for hull vertices
+            # Remove duplicates by converting to tuples and back
+            unique_endpoints = []
+            seen = set()
+            for point in segment_endpoints:
+                point_tuple = tuple(point)
+                if point_tuple not in seen:
+                    seen.add(point_tuple)
+                    unique_endpoints.append(point)
+            
+            # Convert to numpy array for visualization
+            segmentation_points = np.array(unique_endpoints) if unique_endpoints else np.empty((0, points.shape[1]))
+            
+            # Create different point colors: blue for regular points, red for segmentation points
             point_colors = np.full(len(points), 'blue')
-            
-            # Find indices of hull points in the original points array
-            for hp in hull_points[:-1]:  # Exclude the closing point
-                # Find matching points
-                for i, p in enumerate(points):
-                    if np.array_equal(hp, p):
-                        point_colors[i] = 'red'
-                        break
             
             self._create_3d_visualization(
                 self.segment_viz_frame, 
@@ -2260,7 +2272,7 @@ segmentation, triangulation, and visualization.
                 title=f"Segmentation: {len(segments)} segments",
                 point_colors=point_colors,
                 lines=segments,
-                feature_points=all_endpoints # Pass segment endpoints as feature points
+                feature_points=segmentation_points # Pass segment endpoints as feature points
             )
         else:
             # Fall back to matplotlib if PyVista is not available
@@ -2270,18 +2282,40 @@ segmentation, triangulation, and visualization.
             # Plot all points
             ax.scatter(points[:, 0], points[:, 1], s=5, c='blue', alpha=0.4, label='Points')
             
-            # Plot hull
+            # Plot hull outline
             ax.plot(hull_points[:, 0], hull_points[:, 1], 'r-', alpha=0.5, linewidth=1, label='Hull')
+            
+            # Extract unique segment endpoints (these are the segmentation points along the hull)
+            segment_endpoints = []
+            for segment in segments:
+                # Add both endpoints of each segment
+                if hasattr(segment[0], 'shape'):  # NumPy array format
+                    segment_endpoints.append(segment[0])
+                    segment_endpoints.append(segment[1])
+                else:  # List format
+                    segment_endpoints.append(np.array(segment[0]))
+                    segment_endpoints.append(np.array(segment[1]))
+            
+            # Remove duplicates by converting to tuples and back
+            unique_endpoints = []
+            seen = set()
+            for point in segment_endpoints:
+                point_tuple = tuple(point)
+                if point_tuple not in seen:
+                    seen.add(point_tuple)
+                    unique_endpoints.append(point)
+            
+            # Convert to numpy array for plotting
+            if unique_endpoints:
+                unique_endpoints_array = np.array(unique_endpoints)
+                # Plot segmentation points as red points
+                ax.scatter(unique_endpoints_array[:, 0], unique_endpoints_array[:, 1], 
+                         s=20, c='red', edgecolor='black', label='Segmentation Points')
             
             # Plot segments
             for segment in segments:
                 ax.plot([segment[0][0], segment[1][0]], [segment[0][1], segment[1][1]], 
                       'g-', linewidth=1.5)
-            
-            # Plot segment endpoints (make them smaller and slightly transparent)
-            if all_endpoints.shape[0] > 0:
-                ax.scatter(all_endpoints[:, 0], all_endpoints[:, 1], s=10, c='green', alpha=0.6, # Reduced size, added alpha
-                         label='Segment Points')
             
             ax.set_aspect('equal')
             ax.set_title(f"Segmentation: {len(segments)} segments")
@@ -3886,7 +3920,6 @@ segmentation, triangulation, and visualization.
             # Plot each dataset with its color
             for dataset in visible_datasets:
                 points = dataset['points']
-                # hull_points = dataset.get('hull_points') # No longer needed for plotting here
                 segments = dataset['segments']
                 
                 if points is not None and len(points) > 0 and segments is not None and len(segments) > 0:
@@ -3896,22 +3929,37 @@ segmentation, triangulation, and visualization.
                     # Plot points
                     ax.scatter(points[:, 0], points[:, 1], s=5, c=color, alpha=0.3)
                     
-                    # # Plot hull if available - REMOVED to show segment boundary instead
-                    # if hull_points is not None and len(hull_points) > 0:
-                    #     ax.plot(hull_points[:, 0], hull_points[:, 1],
-                    #           color=color, linewidth=1, alpha=0.5)
+                    # Collect all segment endpoints
+                    segment_endpoints = []
+                    for segment in segments:
+                        # Add both endpoints of each segment
+                        if hasattr(segment[0], 'shape'):  # NumPy array format
+                            segment_endpoints.append(segment[0])
+                            segment_endpoints.append(segment[1])
+                        else:  # List format
+                            segment_endpoints.append(np.array(segment[0]))
+                            segment_endpoints.append(np.array(segment[1]))
+                    
+                    # Remove duplicates by converting to tuples and back
+                    unique_endpoints = []
+                    seen = set()
+                    for point in segment_endpoints:
+                        point_tuple = tuple(point)
+                        if point_tuple not in seen:
+                            seen.add(point_tuple)
+                            unique_endpoints.append(point)
+                    
+                    # Convert to numpy array for plotting
+                    if unique_endpoints:
+                        unique_endpoints_array = np.array(unique_endpoints)
+                        # Plot segment endpoints as red points
+                        ax.scatter(unique_endpoints_array[:, 0], unique_endpoints_array[:, 1], 
+                                s=20, c='red', edgecolor='black', label=f"{name} Segment Points")
 
                     # Plot segments - make them slightly more prominent
                     for segment in segments:
                         ax.plot([segment[0][0], segment[1][0]], [segment[0][1], segment[1][1]], 
                               color=color, linewidth=1.8, alpha=0.9) # Increased linewidth/alpha
-                    
-                    # Plot segment endpoints
-                    all_endpoints = np.vstack([segment[0] for segment in segments] + 
-                                            [segment[1] for segment in segments])
-                    unique_endpoints = np.unique(all_endpoints, axis=0)
-                    ax.scatter(unique_endpoints[:, 0], unique_endpoints[:, 1], 
-                             s=20, c=color, edgecolor='black', label=f"{name} Boundary Points") # Adjusted label
             
             ax.set_aspect('equal')
             ax.set_title("Segmentations (Boundary Defined by Segments)") # Updated title
@@ -4226,8 +4274,8 @@ segmentation, triangulation, and visualization.
                         
                         # Create lines for the hull
                         for j in range(len(hull_3d)-1):
-                            line = pv.Line(hull_3d[j], hull_3d[j+1])
-                            self.current_plotter.add_mesh(line, color=color, line_width=3)
+                            hull_line = pv.Line(hull_3d[j], hull_3d[j+1])
+                            self.current_plotter.add_mesh(hull_line, color=color, line_width=3)
                             
                         # Add the original points with reduced opacity for context
                         point_cloud = pv.PolyData(points_3d)
@@ -4242,62 +4290,67 @@ segmentation, triangulation, and visualization.
 
                 elif view_type == "segments":
                     segments = dataset.get('segments')
-                    if segments is not None and len(segments) > 0:
+                    hull_points = dataset.get('hull_points')
+                    
+                    if segments is not None and len(segments) > 0 and hull_points is not None:
                         # Add points for context
                         point_cloud = pv.PolyData(points_3d)
                         self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.3, render_points_as_spheres=True,
                                          point_size=5)
-
-                        # Create 3D lines for segments - handle both list and numpy array formats
-                        for segment in segments:
-                            line_points = np.zeros((2, 3))
+                        
+                        # Create segmentation points directly from the hull_points
+                        # In the C++ version, segments are created by subdividing hull edges
+                        
+                        # First, create properly sized 3D hull points
+                        hull_3d = hull_points
+                        if hull_3d.shape[1] == 2:
+                            hull_3d_with_z = np.zeros((len(hull_3d), 3))
+                            hull_3d_with_z[:, 0:2] = hull_3d
+                            hull_3d = hull_3d_with_z
                             
-                            # Handle both 2D and 3D segment points
-                            if hasattr(segment[0], 'shape'):
-                                # For numpy arrays
-                                if segment[0].shape[0] == 2:
-                                    # For 2D segments, copy X,Y and find Z from closest point
-                                    line_points[0, 0:2] = segment[0]
-                                    line_points[1, 0:2] = segment[1]
-                                    
-                                    # Set Z values based on closest original points
-                                    for j in range(2):
-                                        point_2d = segment[j]
-                                        # Find closest point in original dataset for Z value
-                                        distances = np.sum((points_3d[:, 0:2] - point_2d)**2, axis=1)
-                                        closest_idx = np.argmin(distances)
-                                        line_points[j, 2] = points_3d[closest_idx, 2]
-                                else:
-                                    # For 3D segments, use all dimensions directly
-                                    line_points[0] = segment[0]
-                                    line_points[1] = segment[1]
-                            else:
-                                # For list-based points
-                                if len(segment[0]) == 2:
-                                    # For 2D segments, copy X,Y and find Z from closest point
-                                    line_points[0, 0] = segment[0][0]
-                                    line_points[0, 1] = segment[0][1]
-                                    line_points[1, 0] = segment[1][0]
-                                    line_points[1, 1] = segment[1][1]
-                                    
-                                    # Set Z values based on closest original points
-                                    for j in range(2):
-                                        point_2d = np.array([segment[j][0], segment[j][1]])
-                                        # Find closest point in original dataset for Z value
-                                        distances = np.sum((points_3d[:, 0:2] - point_2d)**2, axis=1)
-                                        closest_idx = np.argmin(distances)
-                                        line_points[j, 2] = points_3d[closest_idx, 2]
-                                else:
-                                    # For 3D segments, use all dimensions directly
-                                    line_points[0, 0] = segment[0][0]
-                                    line_points[0, 1] = segment[0][1]
-                                    line_points[0, 2] = segment[0][2]
-                                    line_points[1, 0] = segment[1][0]
-                                    line_points[1, 1] = segment[1][1]
-                                    line_points[1, 2] = segment[1][2]
+                        # Get the target edge length from the triangulation settings, or use default
+                        target_edge_length = 20
+                        if hasattr(self, 'target_edge_length_input'):
+                            try:
+                                target_edge_length = self.target_edge_length_input.value()
+                            except:
+                                pass
+                        
+                        # Initialize list for interpolated points
+                        interpolated_hull_points = []
+                        
+                        # Add all original hull points first (they're always included)
+                        for p in hull_3d:
+                            interpolated_hull_points.append(p)
+                        
+                        # Now add interpolated points based on target edge length
+                        for i in range(len(hull_3d) - 1):
+                            p1 = hull_3d[i]
+                            p2 = hull_3d[i+1]
+                            segment_length = np.linalg.norm(p2 - p1)
                             
-                            line_obj = pv.Line(line_points[0], line_points[1])
-                            self.current_plotter.add_mesh(line_obj, color=color, line_width=2.5)
+                            # Only add points if segment is longer than target edge length
+                            if segment_length > target_edge_length:
+                                # Calculate how many points to add
+                                num_points = int(segment_length / target_edge_length)
+                                
+                                # Create interpolated points
+                                for j in range(1, num_points):
+                                    t = j / num_points
+                                    interp_point = p1 + t * (p2 - p1)
+                                    interpolated_hull_points.append(interp_point)
+                        
+                        # Create point cloud for visualization
+                        interpolated_hull_array = np.array(interpolated_hull_points)
+                        hull_point_cloud = pv.PolyData(interpolated_hull_array)
+                        self.current_plotter.add_mesh(hull_point_cloud, color='red', 
+                                        render_points_as_spheres=True, point_size=3)
+                        
+                        # Draw the hull boundary
+                        for j in range(len(hull_3d) - 1):
+                            hull_line = pv.Line(hull_3d[j], hull_3d[j+1])
+                            self.current_plotter.add_mesh(hull_line, color='black', line_width=2.5, opacity=0.5)
+                        
                         plotter_has_geometry = True
 
                 elif view_type == "triangulation":
@@ -4392,7 +4445,6 @@ segmentation, triangulation, and visualization.
 
         # Add the visualization container widget to the parent frame provided
         parent_layout.addWidget(vis_container_widget)
-
 
         return vis_container_widget # Return the main container widget
 
@@ -4499,6 +4551,9 @@ segmentation, triangulation, and visualization.
         # the notebook is correctly placed in the main layout.
         # No additional widget adding needed here if setup methods are correct.
         logger.debug("Main layout structure finalized.")
+
+
+        
 
 
     def _run_batch_computation(self, compute_type, total_items):
