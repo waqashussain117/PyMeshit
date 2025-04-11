@@ -59,6 +59,9 @@ except ImportError as e:
     logger.error(f"Failed to import DirectTriangleWrapper: {e}")
     HAVE_DIRECT_WRAPPER = False
 
+# Add Scipy import for interpolation
+from scipy.interpolate import griddata
+
 # Worker class for background computations
 class ComputationWorker(QObject):
     dataset_finished = pyqtSignal(int, str, bool) # index, name, success
@@ -2328,26 +2331,20 @@ segmentation, triangulation, and visualization.
 
         segments_data = dataset.get('segments')
         if segments_data is None or len(segments_data) < 3:
-            # Note: Status bar updates are removed from worker context
-            # self.statusBar().showMessage(f"Skipping triangulation for {dataset_name}: Compute segments first")
             logger.warning(f"Skipping triangulation for {dataset_name}: segments not computed.")
-            return False # Indicate error or skip
+            return False
 
-        # --- Get triangulation parameters from GUI ---
+        # Get triangulation parameters from GUI
         gradient = self.gradient_input.value()
         min_angle = self.min_angle_input.value()
-        # Get the ABSOLUTE target edge length from the GUI
         target_edge_length = self.target_edge_length_input.value()
-        # Ensure the target edge length is positive
-        base_size = max(1e-9, target_edge_length) # Use a small positive minimum
+        base_size = max(1e-9, target_edge_length)
         uniform = self.uniform_checkbox.isChecked()
-        # --- End Get Parameters ---
 
         try:
             start_time = time.time()
 
-            # --- Use points and segments from the segmentation step ---
-            # (This part remains the same: extracting unique points and segment indices)
+            # Extract unique points and segment indices from segments
             segment_points = []
             for segment in segments_data:
                 segment_points.append(segment[0])
@@ -2384,149 +2381,182 @@ segmentation, triangulation, and visualization.
             all_boundary_points = np.array(unique_points_list)
             boundary_segments_indices = np.array(segment_indices)
             logger.info(f"Using {len(all_boundary_points)} unique points and {len(boundary_segments_indices)} segments from segmentation step for triangulation.")
-            # --- End using points/segments from segmentation ---
 
-            # Make a working copy for potential projection
+            # Projection and reconstruction logic
+            all_dataset_points = np.array(dataset['points'])
+            plane_normal = None
             projected_boundary_points = all_boundary_points.copy()
 
-            # --- Projection Logic (Remains the same) ---
-            plane_normal = None # Initialize plane_normal
-            if projected_boundary_points.shape[1] > 2:
-                logger.info(f"Projecting 3D points to best-fit plane for triangulation for {dataset_name}")
-
-                # Find best-fitting plane using PCA/SVD
-                centroid = np.mean(projected_boundary_points, axis=0)
-                centered = projected_boundary_points - centroid
-                u, s, vh = np.linalg.svd(centered, full_matrices=False)
+            if all_dataset_points.shape[1] > 2:
+                logger.info(f"Projecting ALL 3D points to best-fit plane for triangulation for {dataset_name}")
+                
+                # Find best-fitting plane using ALL points
+                centroid = np.mean(all_dataset_points, axis=0)
+                centered_all_points = all_dataset_points - centroid
+                u, s, vh = np.linalg.svd(centered_all_points, full_matrices=False)
                 projection_basis = vh[:2]
-                plane_normal = vh[2] # *** STORE THE NORMAL VECTOR ***
-                points_2d = np.dot(centered, projection_basis.T)
-
-                # Store original points and projection info for reconstruction
-                original_boundary_points_for_recon = all_boundary_points.copy()
-                projected_boundary_points = points_2d
-
-                # Store projection parameters for reconstruction
+                plane_normal = vh[2]
+                
+                # Project ALL points to 2D
+                all_points_2d = np.dot(centered_all_points, projection_basis.T)
+                
+                # Project boundary points using the same projection
+                centered_boundary = all_boundary_points - centroid
+                boundary_points_2d = np.dot(centered_boundary, projection_basis.T)
+                
+                # Store projection data
+                dataset['original_points_3d'] = all_dataset_points.copy()
+                dataset['projected_points_2d'] = all_points_2d
+                projected_boundary_points = boundary_points_2d
+                
                 dataset['projection_params'] = {
                     'centroid': centroid,
                     'basis': projection_basis,
-                    'normal': plane_normal, # *** STORE IT HERE ***
-                    'original_points': original_boundary_points_for_recon
+                    'normal': plane_normal,
+                    'original_points': all_boundary_points.copy(),
+                    'all_original_points': all_dataset_points.copy()
                 }
             else:
-                # Store info showing no projection was needed
+                projected_boundary_points = all_boundary_points
                 dataset['projection_params'] = None
-            # --- End Projection Logic ---
 
-            # --- REMOVED: Calculation of base_size based on dataset geometry ---
-            # min_coords = np.min(projected_boundary_points, axis=0)
-            # max_coords = np.max(projected_boundary_points, axis=0)
-            # width = max_coords[0] - min_coords[0]
-            # height = max_coords[1] - min_coords[1]
-            # characteristic_length = max(1e-9, min(width, height))
-            # density_factor_val = max(0.1, self.base_size_factor_input.value()) # Old input
-            # base_size = characteristic_length / (density_factor_val * 2.0) # Old calculation
-            # ... Safeguard ...
-            # logger.info(f"Dataset {dataset_name}: Projected W={width:.2f}, H={height:.2f}. Char. Length={characteristic_length:.2f}. Base Size={base_size:.4f}")
-            # --- End Removed Calculation ---
-
-            # --- Unified Path for ALL Datasets using DirectTriangleWrapper ---
-            logger.info(f"Using DirectTriangleWrapper for: {dataset_name}")
+            # Run triangulation
             if not HAVE_DIRECT_WRAPPER:
-                 logger.error("DirectTriangleWrapper not available!")
-                 raise ImportError("DirectTriangleWrapper failed to import.")
+                logger.error("DirectTriangleWrapper not available!")
+                raise ImportError("DirectTriangleWrapper failed to import.")
 
-            # We now use the 'base_size' calculated directly from the GUI's absolute input
-            logger.info(f"Triangulating {dataset_name} with Target Edge Length (base_size) = {base_size:.4f}")
+            logger.info(f"Triangulating {dataset_name} with Target Edge Length = {base_size:.4f}")
 
+            # Initialize triangulator with mesh quality parameters
             triangulator = DirectTriangleWrapper(
                 gradient=gradient,
                 min_angle=min_angle,
-                base_size=base_size # <<< Pass the ABSOLUTE base_size from GUI
+                base_size=base_size
             )
 
-            # Run triangulation using the wrapper
-            logger.debug(f"Running triangulation with {len(projected_boundary_points)} points, {len(boundary_segments_indices)} segments, base_size={base_size:.4f}, uniform={uniform}")
+            # Set up triangulation with enhanced transition feature points
             triangulation_result = triangulator.triangulate(
                 points=projected_boundary_points,
                 segments=boundary_segments_indices,
-                uniform=uniform # Pass uniform flag from GUI
+                uniform=uniform,
+                create_transition=True  # Enable enhanced transition point generation
             )
-            # --- End Unified Path ---
 
-            # --- Process the result (Remains the same) ---
             if triangulation_result is None or 'vertices' not in triangulation_result or 'triangles' not in triangulation_result:
                 raise ValueError("Triangulation failed to produce valid output.")
 
-            # Get vertices and triangles
             vertices_2d = triangulation_result['vertices']
             triangles = triangulation_result['triangles']
 
-            logger.info(f"Triangulation produced {len(vertices_2d)} vertices and {len(triangles)} triangles")
-
-            # --- Reconstruction logic (Remains the same) ---
+            # Reconstruction logic
             if dataset['projection_params'] is not None:
                 projection_params = dataset['projection_params']
                 centroid = projection_params['centroid']
                 basis = projection_params['basis']
                 normal = projection_params.get('normal')
-                original_points_for_recon = projection_params['original_points']
+                original_boundary_points = projection_params['original_points']
+                all_original_points = projection_params.get('all_original_points')
+                all_projected_points = dataset.get('projected_points_2d')
 
                 can_calculate_planar_z = normal is not None and abs(normal[2]) > 1e-9
-
                 final_vertices_3d = np.zeros((len(vertices_2d), 3))
-
+                
                 for i, vertex_2d in enumerate(vertices_2d):
-                    is_boundary_point = False
-                    for j, bp_2d in enumerate(projected_boundary_points):
-                        if np.allclose(vertex_2d, bp_2d, atol=1e-10):
-                            if j < len(original_points_for_recon):
-                                final_vertices_3d[i] = original_points_for_recon[j]
-                                is_boundary_point = True
-                                break
-                            else:
-                                logger.warning(f"Index mismatch when mapping boundary point {j}")
-                                break
+                    is_matched_point = False
+                    
+                    # Try to match with all points first
+                    if all_original_points is not None and all_projected_points is not None:
+                        for j, proj_pt in enumerate(all_projected_points):
+                            if np.allclose(vertex_2d, proj_pt, atol=1e-10):
+                                if j < len(all_original_points):
+                                    final_vertices_3d[i] = all_original_points[j]
+                                    is_matched_point = True
+                                    break
+                    
+                    # Try boundary points if no match found
+                    if not is_matched_point:
+                        for j, bp_2d in enumerate(projected_boundary_points):
+                            if np.allclose(vertex_2d, bp_2d, atol=1e-10):
+                                if j < len(original_boundary_points):
+                                    final_vertices_3d[i] = original_boundary_points[j]
+                                    is_matched_point = True
+                                    break
+                    
+                    # Calculate z using plane equation if still no match
+                    if not is_matched_point:
+                        # --- START EDIT: Replace planar Z with interpolation ---
+                        # Get original 3D points and their 2D projections from stored params
+                        original_3d = projection_params.get('all_original_points')
+                        projected_2d = dataset.get('projected_points_2d')
 
-                    if not is_boundary_point:
-                        vertex_3d_on_plane = centroid.copy()
-                        vertex_3d_on_plane += vertex_2d[0] * basis[0]
-                        vertex_3d_on_plane += vertex_2d[1] * basis[1]
+                        if original_3d is not None and projected_2d is not None and len(original_3d) > 0:
+                            # Extract original Z values
+                            original_z = original_3d[:, 2]
+                            
+                            # Interpolate Z value for the new 2D point (vertex_2d)
+                            # Use linear interpolation, fallback to nearest if linear fails 
+                            # (e.g., outside convex hull of original projected points)
+                            interpolated_z = griddata(projected_2d, original_z, vertex_2d, method='linear')
+                            if np.isnan(interpolated_z):
+                                interpolated_z = griddata(projected_2d, original_z, vertex_2d, method='nearest')
 
-                        if can_calculate_planar_z:
-                            z_planar = centroid[2] - (normal[0]*(vertex_3d_on_plane[0] - centroid[0]) + normal[1]*(vertex_3d_on_plane[1] - centroid[1])) / normal[2]
-                            vertex_3d_on_plane[2] = z_planar
+                            # Check if interpolation was successful (might still be NaN if projected_2d is degenerate)
+                            if np.isnan(interpolated_z):
+                                logger.warning(f"Interpolation failed for point {vertex_2d}. Falling back to centroid Z.")
+                                interpolated_z = centroid[2] # Fallback Z
+
+                            # --- START EDIT: Ensure scalar float ---
+                            interpolated_z = float(interpolated_z)
+                            # --- END EDIT ---
+                            
+                            # Reconstruct the 3D point using the interpolated Z
+                            vertex_3d_reconstructed = centroid.copy()
+                            vertex_3d_reconstructed += vertex_2d[0] * basis[0]
+                            vertex_3d_reconstructed += vertex_2d[1] * basis[1]
+                            vertex_3d_reconstructed[2] = interpolated_z # Use interpolated Z
+                            
+                            final_vertices_3d[i] = vertex_3d_reconstructed
                         else:
-                            logger.warning(f"Plane normal is nearly horizontal or missing ({normal}). Using centroid Z for interior point {i}.")
-                            vertex_3d_on_plane[2] = centroid[2]
-
-                        final_vertices_3d[i] = vertex_3d_on_plane
-
+                            # Fallback if original points or projections are missing
+                            logger.warning(f"Original 3D points or 2D projections missing for interpolation. Falling back.")
+                            # Fallback to original planar Z calculation (or just centroid Z)
+                            vertex_3d_on_plane = centroid.copy()
+                            vertex_3d_on_plane += vertex_2d[0] * basis[0]
+                            vertex_3d_on_plane += vertex_2d[1] * basis[1]
+                            if can_calculate_planar_z:
+                                z_planar = centroid[2] - (normal[0]*(vertex_3d_on_plane[0] - centroid[0]) + 
+                                                        normal[1]*(vertex_3d_on_plane[1] - centroid[1])) / normal[2]
+                                vertex_3d_on_plane[2] = z_planar
+                            else:
+                                vertex_3d_on_plane[2] = centroid[2] # Use centroid Z if planar calc fails
+                            final_vertices_3d[i] = vertex_3d_on_plane
+                        # --- END EDIT ---
+                
                 final_vertices = final_vertices_3d
             else:
-                 if vertices_2d.shape[1] == 2:
-                      final_vertices = np.zeros((len(vertices_2d), 3))
-                      final_vertices[:, :2] = vertices_2d
-                 else:
-                      final_vertices = vertices_2d
+                if vertices_2d.shape[1] == 2:
+                    final_vertices = np.zeros((len(vertices_2d), 3))
+                    final_vertices[:, :2] = vertices_2d
+                else:
+                    final_vertices = vertices_2d
 
-            # --- Store results logic ---
+            # Store results
             dataset['triangulation_result'] = {
                 'vertices': final_vertices,
                 'triangles': triangles,
                 'uniform': uniform,
                 'gradient': gradient,
                 'min_angle': min_angle,
-                'target_edge_length': base_size, # Store the absolute size used
+                'target_edge_length': base_size,
             }
             logger.info(f"Triangulation for {dataset_name} completed. Vertices: {len(final_vertices)}, Triangles: {len(triangles)}")
-            return True # Indicate success
+            return True
 
         except Exception as e:
             logger.error(f"Error triangulating {dataset_name}: {str(e)}")
             import traceback
             logger.debug(f"Triangulation error traceback: {traceback.format_exc()}")
-            return False # Indicate error
+            return False
 
     def run_triangulation(self):
         """Run triangulation on the segments and points of the *active* dataset (primarily for context menu)"""
@@ -4497,6 +4527,10 @@ segmentation, triangulation, and visualization.
         self.progress_dialog.canceled.connect(self.cancel_computation) # Connect cancel signal
         self.progress_dialog.show()
 
+        # Initialize counters for progress tracking
+        self.processed_count = 0
+        self.total_to_process = progress_max # Use the calculated max value
+
         # Setup worker and thread
         self.worker = ComputationWorker(self) # Pass GUI instance
         self.thread = QThread()
@@ -4527,15 +4561,23 @@ segmentation, triangulation, and visualization.
 
     def handle_dataset_finished(self, index, name, success):
         """Handles the completion of computation for a single dataset."""
-        # This is not used for global intersections, but check progress dialog exists
-        if hasattr(self, 'progress_dialog') and self.progress_dialog and self.progress_dialog.maximum() > 1:
-            logger.debug(f"Dataset finished: Index={index}, Name='{name}', Success={success}")
-            current_value = self.progress_dialog.value()
-            self.progress_dialog.setValue(current_value + 1)
-            self.progress_dialog.setLabelText(f"Processed: {name} ({'OK' if success else 'Fail'})")
-            QApplication.processEvents() # Keep UI responsive
+        # REMOVED old progress update logic here
+        
+        self.processed_count += 1
+
+        # Update progress dialog
+        # --- START EDIT: Check if progress_dialog exists ---
+        if self.progress_dialog is not None:
+            self.progress_dialog.setLabelText(f"Processed: {name} ({'OK' if success else 'Fail'}) - {self.processed_count}/{self.total_to_process}")
+            self.progress_dialog.setValue(self.processed_count)
+        # --- END EDIT ---
+
+        # Update dataset list styling
+        item = self.dataset_list_widget.item(index)
+        if success:
+            item.setForeground(QColor(Qt.black))
         else:
-            logger.debug(f"Dataset finished signal received but not updating progress (Index={index}, Name='{name}', Success={success})")
+            item.setForeground(QColor(Qt.red))
 
     def handle_batch_finished(self, success_count, total_eligible, elapsed_time):
         """Handles the completion of a batch computation."""

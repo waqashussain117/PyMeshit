@@ -162,8 +162,8 @@ class DirectTriangleWrapper:
     def _create_transition_feature_points(self, points: np.ndarray, hull_points: np.ndarray, 
                                          segments: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Create more uniform transition feature points between hull and interior.
-        Modified to create a more evenly distributed mesh like in MeshIt.
+        Create more uniform transition feature points between hull and interior
+        with enhanced distribution for high-quality meshes similar to C++ MeshIt.
         
         Args:
             points: All input points
@@ -179,104 +179,194 @@ class DirectTriangleWrapper:
         # Calculate bounding box diagonal for scaling
         min_coords = np.min(points, axis=0)
         max_coords = np.max(points, axis=0)
-        diagonal = np.sqrt(np.sum((max_coords - min_coords) ** 2))
+        domain_width = max_coords[0] - min_coords[0]
+        domain_height = max_coords[1] - min_coords[1]
+        diagonal = np.sqrt(domain_width**2 + domain_height**2)
         
-        # For more uniform meshes, use a more consistent base size across the domain
-        uniform_size = self.base_size * 0.8
+        # Calculate target element size based on domain size
+        # C++ MeshIt likely uses similar scaling
+        uniform_size = self.base_size * 0.85  # Base size is already set from outside
         
-        # Create boundary feature points with more consistent sizing
+        # --- Boundary feature points with consistent spacing ---
         boundary_points = []
         boundary_sizes = []
         
-        # Use a more uniform size for boundary points
-        boundary_size = uniform_size
+        # Higher density for boundary points (smaller than uniform_size)
+        boundary_size = uniform_size * 0.7
         
-        # For each hull edge, create evenly spaced points
+        # Create evenly distributed points along the boundary
         for i in range(len(hull_points)):
             p1 = hull_points[i]
             p2 = hull_points[(i + 1) % len(hull_points)]
             
             edge_length = np.linalg.norm(p2 - p1)
-            
             if edge_length < 1e-8:
                 continue
                 
-            # More evenly distributed divisions
-            num_divisions = max(2, int(edge_length / (boundary_size * 1.2)))
+            # Calculate number of divisions based on edge length
+            num_divisions = max(3, int(edge_length / (boundary_size * 0.8)))
             
+            # Create points along the edge
             for j in range(1, num_divisions):
                 t = j / num_divisions
                 point = p1 + t * (p2 - p1)
                 boundary_points.append(point)
-                # Use more consistent sizing
+                # Use consistent sizing for boundary
                 boundary_sizes.append(boundary_size)
         
-        # Create grid-based interior points for more uniform distribution
-        # This is closer to MeshIt's approach in the second image
+        # --- Interior grid with controlled perturbation (C++ MeshIt style) ---
         interior_points = []
         interior_sizes = []
         
-        # Find a suitable grid spacing based on the domain size
-        # This creates a more uniform mesh
-        grid_spacing = uniform_size * 1.5
+        # Calculate the optimal grid spacing based on base_size
+        grid_spacing = uniform_size * 1.3  # Slightly larger than element size
         
-        # Create a bounding box with some margin
-        x_min, y_min = np.min(hull_points, axis=0) + grid_spacing * 0.5
-        x_max, y_max = np.max(hull_points, axis=0) - grid_spacing * 0.5
+        # Determine the safe zone for interior points (inset from hull to avoid bad elements)
+        hull_bb_min = np.min(hull_points, axis=0)
+        hull_bb_max = np.max(hull_points, axis=0)
         
-        # Generate grid points
-        x_range = np.arange(x_min, x_max + grid_spacing, grid_spacing)
-        y_range = np.arange(y_min, y_max + grid_spacing, grid_spacing)
+        # Add a small inset to avoid points too close to boundary
+        inset = grid_spacing * 0.25
+        x_min = hull_bb_min[0] + inset
+        y_min = hull_bb_min[1] + inset
+        x_max = hull_bb_max[0] - inset
+        y_max = hull_bb_max[1] - inset
+        
+        # Generate grid with slight offset to avoid alignment with boundary
+        offset_factor = 0.1
+        x_offset = grid_spacing * offset_factor
+        y_offset = grid_spacing * offset_factor
+        
+        # Create grid ranges with offset
+        x_range = np.arange(x_min + x_offset, x_max, grid_spacing)
+        y_range = np.arange(y_min + y_offset, y_max, grid_spacing)
         
         # Create a path object for point-in-polygon test
         hull_path = Path(hull_points)
         
-        # Add points on a regular grid inside the hull
+        # Generate grid points with MeshIt-style sinusoidal perturbation
+        base_grid_points = []
+        
+        # First create a base grid
         for x in x_range:
             for y in y_range:
                 point = np.array([x, y])
                 if hull_path.contains_point(point):
-                    interior_points.append(point)
+                    base_grid_points.append(point)
+        
+        # Apply sinusoidal perturbation to create C++ MeshIt-like distribution
+        grid_points = []
+        
+        # Parameters for sinusoidal perturbation
+        freq_factor_x = 2.0 * np.pi / domain_width
+        freq_factor_y = 2.0 * np.pi / domain_height
+        amp_factor = grid_spacing * 0.2  # Amplitude of perturbation (20% of grid spacing)
+        
+        for point in base_grid_points:
+            # Distance from centroid (normalized)
+            dx = point[0] - centroid[0]
+            dy = point[1] - centroid[1]
+            dist = np.sqrt(dx**2 + dy**2)
+            
+            # Calculate angle from centroid
+            angle = np.arctan2(dy, dx)
+            
+            # Calculate perturbation factors using multiple frequencies for natural distribution
+            # This creates the sinusoidal pattern visible in C++ MeshIt
+            perturb_x = amp_factor * np.sin(freq_factor_x * point[0] + freq_factor_y * point[1] * 0.5)
+            perturb_y = amp_factor * np.sin(freq_factor_y * point[1] + freq_factor_x * point[0] * 0.5)
+            
+            # Add small radial component to make elements grow gradually from boundary
+            radial_factor = 0.15
+            boundary_dist = min_distance_to_boundary(point, hull_points)
+            scaling = min(1.0, boundary_dist / (grid_spacing * 2))
+            radial_perturb = radial_factor * scaling * grid_spacing
+            
+            perturb_x += radial_perturb * np.cos(angle)
+            perturb_y += radial_perturb * np.sin(angle)
+            
+            # Apply perturbation to create a more natural distribution
+            perturbed_point = np.array([point[0] + perturb_x, point[1] + perturb_y])
+            
+            # Verify perturbed point is still inside hull
+            if hull_path.contains_point(perturbed_point):
+                grid_points.append(perturbed_point)
+                
+                # Size variation based on distance from boundary
+                size_factor = 0.9 + 0.2 * (scaling ** 0.5)  # Smoother transition
+                interior_sizes.append(uniform_size * size_factor)
+        
+        # --- Add additional points for smoother transitions ---
+        # This is similar to how C++ MeshIt creates more uniform transitions
+        transition_points = []
+        transition_sizes = []
+        
+        # Add radial rays from centroid to help with size transitions
+        num_rays = 12
+        ray_angles = np.linspace(0, 2*np.pi, num_rays, endpoint=False)
+        
+        # Find typical distance from centroid to boundary
+        distances_to_centroid = [np.linalg.norm(p - centroid) for p in hull_points]
+        avg_radius = np.mean(distances_to_centroid) * 0.8
+        
+        # Create rays from centroid (not all the way to boundary)
+        for angle in ray_angles:
+            # Create points along ray with increasing spacing
+            num_points = 5
+            for i in range(1, num_points):
+                # Gradually increasing spacing from centroid
+                t = (i / num_points) ** 1.2  # Non-linear spacing for better transitions
+                ray_length = avg_radius * t
+                
+                # Calculate point on ray
+                ray_point = np.array([
+                    centroid[0] + ray_length * np.cos(angle),
+                    centroid[1] + ray_length * np.sin(angle)
+                ])
+                
+                # Check if point is inside hull
+                if hull_path.contains_point(ray_point):
+                    # Size increases with distance from centroid
+                    size_factor = 0.8 + 0.4 * t
                     
-                    # Use more consistent sizing for uniform triangulation
-                    # Only slight variation to avoid grid artifacts
-                    variation = np.random.uniform(0.9, 1.1)
-                    interior_sizes.append(uniform_size * variation)
+                    # Add slightly randomized point to break regularity
+                    jitter = (np.random.random(2) - 0.5) * grid_spacing * 0.1
+                    jittered_ray_point = ray_point + jitter
+                    
+                    if hull_path.contains_point(jittered_ray_point):
+                        transition_points.append(jittered_ray_point)
+                        transition_sizes.append(uniform_size * size_factor)
         
-        # Add some jittered grid points to break up the regularity
-        # This helps achieve a more natural but still uniform distribution
-        num_jittered = int(len(interior_points) * 0.3)
-        for _ in range(num_jittered):
-            # Pick a random existing interior point
-            if interior_points:
-                idx = np.random.randint(0, len(interior_points))
-                base_point = interior_points[idx]
-                
-                # Add jitter (within 30% of grid spacing)
-                jitter = (np.random.random(2) - 0.5) * grid_spacing * 0.6
-                jittered_point = base_point + jitter
-                
-                # Check if still inside hull
-                if hull_path.contains_point(jittered_point):
-                    interior_points.append(jittered_point)
-                    interior_sizes.append(uniform_size * np.random.uniform(0.9, 1.1))
+        # --- Combine all points ---
+        all_feature_points = []
+        all_feature_sizes = []
         
-        # Combine points
-        if boundary_points and interior_points:
-            all_trans_points = np.vstack((np.array(boundary_points), np.array(interior_points)))
-            all_trans_sizes = np.concatenate((np.array(boundary_sizes), np.array(interior_sizes)))
-        elif boundary_points:
-            all_trans_points = np.array(boundary_points)
-            all_trans_sizes = np.array(boundary_sizes)
-        elif interior_points:
-            all_trans_points = np.array(interior_points)
-            all_trans_sizes = np.array(interior_sizes)
+        # Add boundary points (always include these)
+        if boundary_points:
+            all_feature_points.extend(boundary_points)
+            all_feature_sizes.extend(boundary_sizes)
+        
+        # Add interior grid points (main distribution)
+        if grid_points:
+            all_feature_points.extend(grid_points)
+            all_feature_sizes.extend(interior_sizes)
+            
+        # Add transition points (improves smoothness)
+        if transition_points:
+            all_feature_points.extend(transition_points)
+            all_feature_sizes.extend(transition_sizes)
+            
+        # Convert to numpy arrays
+        if all_feature_points:
+            all_trans_points = np.array(all_feature_points)
+            all_trans_sizes = np.array(all_feature_sizes)
         else:
             all_trans_points = np.empty((0, 2))
             all_trans_sizes = np.empty(0)
             
+        self.logger.info(f"Created {len(all_trans_points)} enhanced transition points for more uniform mesh")
         return all_trans_points, all_trans_sizes
-        
+
     def triangulate(self, points: np.ndarray, segments: Optional[np.ndarray] = None,
                    holes: Optional[np.ndarray] = None, create_feature_points: bool = False,
                    create_transition: bool = False, uniform: bool = True) -> Dict:
@@ -518,3 +608,43 @@ class DirectTriangleWrapper:
         """
         self.triangle_opts = options
         self.logger.info(f"Setting custom Triangle options: {options}") 
+
+# Helper function for calculating minimum distance to boundary
+def min_distance_to_boundary(point, hull_points):
+    """Calculate minimum distance from a point to the hull boundary."""
+    min_dist = float('inf')
+    
+    for i in range(len(hull_points)):
+        p1 = hull_points[i]
+        p2 = hull_points[(i + 1) % len(hull_points)]
+        
+        # Line segment vector
+        line_vec = p2 - p1
+        line_len = np.linalg.norm(line_vec)
+        
+        if line_len < 1e-8:
+            continue
+            
+        # Normalize line vector
+        line_vec = line_vec / line_len
+        
+        # Vector from line start to point
+        point_vec = point - p1
+        
+        # Project point onto line
+        proj_len = np.dot(point_vec, line_vec)
+        
+        # Calculate closest point on line segment
+        if proj_len < 0:
+            closest = p1  # Before start of segment
+        elif proj_len > line_len:
+            closest = p2  # After end of segment
+        else:
+            # On the segment
+            closest = p1 + line_vec * proj_len
+            
+        # Calculate distance to closest point
+        dist = np.linalg.norm(point - closest)
+        min_dist = min(min_dist, dist)
+        
+    return min_dist 
