@@ -459,106 +459,249 @@ def calculate_polyline_surface_intersection(polyline_idx: int, surface_idx: int,
     return None
 
 
-def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, model) -> List[TriplePoint]:
+def closest_point_on_segment(p: Vector3D, a: Vector3D, b: Vector3D) -> Vector3D:
+    """Find the closest point on the line segment [a, b] to point p."""
+    ap = p - a
+    ab = b - a
+    ab_len_sq = ab.dot(ab)
+    if ab_len_sq < 1e-10:
+        return a # Segment is a point
+    t = ap.dot(ab) / ab_len_sq
+    t = max(0, min(1, t)) # Clamp t to [0, 1] for segment
+    return a + ab * t
+
+
+def segment_segment_distance(a1: Vector3D, b1: Vector3D, a2: Vector3D, b2: Vector3D) -> Tuple[float, Vector3D, Vector3D]:
+    """Calculate the minimum distance between two 3D line segments [a1, b1] and [a2, b2],
+       and the closest points on each segment.
+
+       Uses the algorithm described by Dan Sunday:
+       http://geomalgorithms.com/a07-_distance.html#dist3D_Segment_to_Segment
     """
-    Calculate triple points between two intersections.
-    
+    u = b1 - a1
+    v = b2 - a2
+    w = a1 - a2
+
+    a = u.dot(u)  # always >= 0
+    b = u.dot(v)
+    c = v.dot(v)  # always >= 0
+    d = u.dot(w)
+    e = v.dot(w)
+    D = a * c - b * b  # always >= 0
+    sc, sN, sD = D, D, D  # sc = sN / sD, default sD = D >= 0
+    tc, tN, tD = D, D, D  # tc = tN / tD, default tD = D >= 0
+
+    # compute the line parameters of the two closest points
+    if D < 1e-10:  # the lines are almost parallel
+        sN = 0.0  # force using point a1 on segment S1
+        sD = 1.0  # to prevent possible division by 0
+        tN = e
+        tD = c
+    else:  # get the closest points on the infinite lines
+        sN = (b * e - c * d)
+        tN = (a * e - b * d)
+        if sN < 0.0:  # sc < 0 => the s=0 edge is visible
+            sN = 0.0
+            tN = e
+            tD = c
+        elif sN > sD:  # sc > 1 => the s=1 edge is visible
+            sN = sD
+            tN = e + b
+            tD = c
+
+    if tN < 0.0:  # tc < 0 => the t=0 edge is visible
+        tN = 0.0
+        # recompute sc for this edge
+        if -d < 0.0:
+            sN = 0.0
+        elif -d > a:
+            sN = sD
+        else:
+            sN = -d
+            sD = a
+    elif tN > tD:  # tc > 1 => the t=1 edge is visible
+        tN = tD
+        # recompute sc for this edge
+        if (-d + b) < 0.0:
+            sN = 0
+        elif (-d + b) > a:
+            sN = sD
+        else:
+            sN = (-d + b)
+            sD = a
+
+    # finally do the division to get sc and tc
+    sc = 0.0 if abs(sN) < 1e-10 else sN / sD
+    tc = 0.0 if abs(tN) < 1e-10 else tN / tD
+
+    # get the difference of the two closest points
+    dP = w + (u * sc) - (v * tc)
+    closest_p1 = a1 + u * sc
+    closest_p2 = a2 + v * tc
+
+    return dP.length(), closest_p1, closest_p2
+
+
+def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, model, tolerance=1e-5) -> List[TriplePoint]:
+    """
+    Calculate triple points between two intersection polylines using
+    segment-segment intersection.
+
     Args:
-        intersection1_idx: Index of first intersection
-        intersection2_idx: Index of second intersection
+        intersection1_idx: Index of first intersection polyline in model.intersections
+        intersection2_idx: Index of second intersection polyline in model.intersections
         model: MeshItModel instance containing intersections
-        
+        tolerance: Distance tolerance to consider segments intersecting
+
     Returns:
-        List of TriplePoint objects
+        List of TriplePoint objects found at the intersections.
     """
     intersection1 = model.intersections[intersection1_idx]
     intersection2 = model.intersections[intersection2_idx]
-    
-    # Check if the intersections share a common surface/polyline
-    common_object = False
-    if intersection1.id1 == intersection2.id1 or intersection1.id1 == intersection2.id2:
-        common_object = True
-    elif intersection1.id2 == intersection2.id1 or intersection1.id2 == intersection2.id2:
-        common_object = True
-    
-    if not common_object:
-        return []  # No common object, no triple points possible
-    
-    # Find closest points between the two intersection sets
-    triple_points = []
-    
-    for point1 in intersection1.points:
-        for point2 in intersection2.points:
-            # Calculate distance
-            distance = (point1 - point2).length()
-            
-            # If points are close enough, they form a triple point
-            if distance < 1e-5:  # Tolerance for considering points as coincident
-                # Create a new triple point at the midpoint
-                midpoint = (point1 + point2) * 0.5
-                triple_point = TriplePoint(midpoint)
-                triple_point.add_intersection(intersection1_idx)
-                triple_point.add_intersection(intersection2_idx)
-                triple_points.append(triple_point)
-    
-    return triple_points
+
+    # Check if the intersections share a common surface/polyline ID
+    # This is a basic check, more robust checks might involve surface indices
+    ids1 = {intersection1.id1, intersection1.id2}
+    ids2 = {intersection2.id1, intersection2.id2}
+    if not ids1.intersection(ids2):
+        return [] # No common parent object, cannot form a triple point
+
+    found_triple_points = []
+
+    # Iterate through segments of the first intersection polyline
+    for i in range(len(intersection1.points) - 1):
+        p1a = intersection1.points[i]
+        p1b = intersection1.points[i+1]
+
+        # Iterate through segments of the second intersection polyline
+        for j in range(len(intersection2.points) - 1):
+            p2a = intersection2.points[j]
+            p2b = intersection2.points[j+1]
+
+            # Calculate the distance between the two segments
+            dist, closest1, closest2 = segment_segment_distance(p1a, p1b, p2a, p2b)
+
+            # If the distance is within tolerance, consider it an intersection
+            if dist < tolerance:
+                # The intersection point is the midpoint of the closest points
+                intersection_point = (closest1 + closest2) * 0.5
+
+                # Create a triple point
+                # Check for duplicates before adding
+                is_duplicate = False
+                for existing_tp in found_triple_points:
+                    if (existing_tp.point - intersection_point).length() < tolerance:
+                        # Add intersection indices to existing triple point if needed
+                        existing_tp.add_intersection(intersection1_idx)
+                        existing_tp.add_intersection(intersection2_idx)
+                        is_duplicate = True
+                        break
+
+                if not is_duplicate:
+                    triple_point = TriplePoint(intersection_point)
+                    triple_point.add_intersection(intersection1_idx)
+                    triple_point.add_intersection(intersection2_idx)
+                    found_triple_points.append(triple_point)
+
+    return found_triple_points
 
 
-def insert_triple_points(model):
+def insert_triple_points(model, tolerance=1e-5):
     """
-    Insert triple points into model.
-    
-    This function merges close triple points and adds them to appropriate intersections.
-    
+    Insert triple points into the corresponding intersection polylines.
+
     Args:
-        model: MeshItModel instance
+        model: MeshItModel instance containing intersections and triple_points
+        tolerance: Tolerance for merging close points and finding segments
     """
     if not hasattr(model, 'triple_points') or not model.triple_points:
-        return
-    
-    # Merge triple points that are close to each other
-    i = 0
-    while i < len(model.triple_points):
-        j = i + 1
-        while j < len(model.triple_points):
-            # Check if triple points are close
-            distance = (model.triple_points[i].point - model.triple_points[j].point).length()
-            
-            if distance < 1e-5:  # Close enough to merge
-                # Merge j into i
-                for intersection_id in model.triple_points[j].intersection_ids:
-                    model.triple_points[i].add_intersection(intersection_id)
-                
-                # Remove triple point j
-                model.triple_points.pop(j)
+        return # Nothing to insert
+
+    # 1. Merge close triple points
+    merged_triple_points = []
+    used_indices = set()
+
+    for i in range(len(model.triple_points)):
+        if i in used_indices:
+            continue
+
+        current_tp = model.triple_points[i]
+        merged_tp = TriplePoint(current_tp.point)
+        for int_id in current_tp.intersection_ids:
+            merged_tp.add_intersection(int_id)
+        used_indices.add(i)
+
+        for j in range(i + 1, len(model.triple_points)):
+            if j in used_indices:
+                continue
+
+            other_tp = model.triple_points[j]
+            if (current_tp.point - other_tp.point).length() < tolerance:
+                # Merge intersection IDs
+                for int_id in other_tp.intersection_ids:
+                    merged_tp.add_intersection(int_id)
+                used_indices.add(j)
+
+        merged_triple_points.append(merged_tp)
+
+    model.triple_points = merged_triple_points # Replace with merged list
+    if not model.triple_points:
+         return # Nothing left after merging
+
+    # 2. Insert merged triple points into intersection polylines
+    for tp in model.triple_points:
+        for intersection_idx in tp.intersection_ids:
+            if not (0 <= intersection_idx < len(model.intersections)):
+                print(f"Warning: Invalid intersection index {intersection_idx} in triple point.")
+                continue
+
+            intersection = model.intersections[intersection_idx]
+            points = intersection.points
+            inserted = False
+
+            # Check if point already exists (within tolerance)
+            for k, existing_point in enumerate(points):
+                if (tp.point - existing_point).length() < tolerance:
+                    # Update existing point to the exact triple point coordinate? Optional.
+                    # points[k] = tp.point
+                    inserted = True
+                    break
+            if inserted:
+                continue # Already exists (or is very close)
+
+            # Find the segment the triple point lies on
+            best_segment_idx = -1
+            min_dist_to_segment = float('inf')
+
+            for k in range(len(points) - 1):
+                p_a = points[k]
+                p_b = points[k+1]
+                closest_on_seg = closest_point_on_segment(tp.point, p_a, p_b)
+                dist_sq = (tp.point - closest_on_seg).length() # Use length directly here
+
+                # Check if the point projects onto the segment line itself (collinear check)
+                if dist_sq < tolerance:
+                    # Check if it's between endpoints (already handled by closest_point_on_segment clamping)
+                    # Store the segment index if it's the best fit so far
+                    # We need to make sure it's *on* the segment, not just near it.
+                    # Recalculate distance to ensure it's the segment, not just the line projection
+                    dist_to_segment_line = (tp.point - closest_on_seg).length()
+                    if dist_to_segment_line < min_dist_to_segment:
+                         min_dist_to_segment = dist_to_segment_line
+                         best_segment_idx = k
+
+            # Insert the point if a suitable segment was found within tolerance
+            if best_segment_idx != -1 and min_dist_to_segment < tolerance:
+                 # Insert after the starting point of the segment
+                 points.insert(best_segment_idx + 1, tp.point)
+                 inserted = True
             else:
-                j += 1
-        i += 1
-    
-    # Add triple points to the intersections they belong to
-    for tp_idx, triple_point in enumerate(model.triple_points):
-        for intersection_id in triple_point.intersection_ids:
-            # Insert triple point into the intersection's point list
-            intersection = model.intersections[intersection_id]
-            
-            # Find the best position to insert the triple point (closest to existing points)
-            best_pos = 0
-            min_dist = float('inf')
-            
-            for i, point in enumerate(intersection.points):
-                dist = (point - triple_point.point).length()
-                if dist < min_dist:
-                    min_dist = dist
-                    best_pos = i
-            
-            # Insert the triple point at the best position
-            # (In practice, we might want a more sophisticated algorithm to maintain the
-            # order of points along the intersection curve)
-            if min_dist < 1e-5:  # If very close, replace the existing point
-                intersection.points[best_pos] = triple_point.point
-            else:
-                # Otherwise, insert at the beginning
-                intersection.points.insert(0, triple_point.point)
+                 # Fallback: If no segment is found (e.g., TP is outside polyline bounds
+                 # or exactly at an endpoint already checked), we might append it,
+                 # but ideally, it should lie on a segment. For now, we log a warning.
+                 print(f"Warning: Could not find segment for triple point {tp.point} on intersection {intersection_idx}. Min dist: {min_dist_to_segment}")
+                 # As a simple fallback, add to the beginning (less ideal)
+                 # points.insert(0, tp.point)
 
 
 def align_intersections_to_convex_hull(surface_idx: int, model):

@@ -1771,8 +1771,8 @@ class MeshItWorkflowGUI(QMainWindow):
                     
                     # Create point cloud for feature points
                     fp_cloud = pv.PolyData(fp_3d)
-                    self.current_plotter.add_mesh(fp_cloud, color='red', render_points_as_spheres=True, 
-                                              point_size=15)
+                    self.current_plotter.add_mesh(fp_cloud, color='yellow', render_points_as_spheres=True, 
+                                              point_size=18) # Changed color to yellow and increased size
                 except Exception as e:
                     print(f"Error adding feature points: {str(e)}")
             
@@ -1940,8 +1940,8 @@ class MeshItWorkflowGUI(QMainWindow):
                 
                 # Create point cloud for feature points
                 fp_cloud = pv.PolyData(fp_3d)
-                self.pv_plotter.add_mesh(fp_cloud, color='red', render_points_as_spheres=True, 
-                                      point_size=15)
+                self.pv_plotter.add_mesh(fp_cloud, color='yellow', render_points_as_spheres=True, 
+                                      point_size=18) # Changed color to yellow and increased size
             except Exception as e:
                 print(f"Error adding feature points: {str(e)}")
         
@@ -2210,6 +2210,7 @@ segmentation, triangulation, and visualization.
         
         # Calculate average segment length
         segment_lengths = []
+        all_endpoints_list = [] # Collect endpoints
         for segment in segments:
             # Get segment endpoints correctly for either format
             if hasattr(segment[0], 'shape'):
@@ -2221,10 +2222,15 @@ segmentation, triangulation, and visualization.
                 p2 = np.array(segment[1])
             
             segment_lengths.append(np.linalg.norm(p2 - p1))
+            all_endpoints_list.append(p1) # Add endpoint
+            all_endpoints_list.append(p2) # Add endpoint
             
-        avg_length = np.mean(segment_lengths)
+        avg_length = np.mean(segment_lengths) if segment_lengths else 0 # Handle empty list
         self.avg_segment_length_label.setText(f"Avg length: {avg_length:.2f}")
-        
+
+        # Convert collected endpoints to numpy array
+        all_endpoints = np.array(all_endpoints_list) if all_endpoints_list else np.empty((0, points.shape[1] if points is not None and points.shape[1] > 0 else 2)) # Ensure shape consistency
+
         # Clear existing visualization
         while self.segment_viz_layout.count():
             item = self.segment_viz_layout.takeAt(0)
@@ -2234,25 +2240,10 @@ segmentation, triangulation, and visualization.
             
         # Create 3D visualization
         if self.view_3d_enabled:
-            # Convert segments to consistent format for visualization
-            segment_points = []
-            for segment in segments:
-                if hasattr(segment[0], 'shape'):
-                    # NumPy array format
-                    segment_points.append(segment[0])
-                    segment_points.append(segment[1])
-                else:
-                    # List format
-                    segment_points.append(np.array(segment[0]))
-                    segment_points.append(np.array(segment[1]))
-            
-            # Convert to numpy array for processing
-            segment_points = np.vstack(segment_points)
-            
             # Create unique points for visualization to avoid duplicates
-            unique_points, indices = np.unique(segment_points, axis=0, return_inverse=True)
+            # unique_points, indices = np.unique(segment_points, axis=0, return_inverse=True) # Not needed here anymore
             
-            # Create different point colors: blue for regular points, red for hull vertices, green for segment points
+            # Create different point colors: blue for regular points, red for hull vertices
             point_colors = np.full(len(points), 'blue')
             
             # Find indices of hull points in the original points array
@@ -2268,7 +2259,8 @@ segmentation, triangulation, and visualization.
                 points, 
                 title=f"Segmentation: {len(segments)} segments",
                 point_colors=point_colors,
-                lines=segments
+                lines=segments,
+                feature_points=all_endpoints # Pass segment endpoints as feature points
             )
         else:
             # Fall back to matplotlib if PyVista is not available
@@ -2286,11 +2278,10 @@ segmentation, triangulation, and visualization.
                 ax.plot([segment[0][0], segment[1][0]], [segment[0][1], segment[1][1]], 
                       'g-', linewidth=1.5)
             
-            # Plot segment endpoints
-            all_endpoints = np.vstack([segment[0] for segment in segments] + 
-                                     [segment[1] for segment in segments])
-            ax.scatter(all_endpoints[:, 0], all_endpoints[:, 1], s=15, c='green', 
-                     label='Segment Points')
+            # Plot segment endpoints (make them smaller and slightly transparent)
+            if all_endpoints.shape[0] > 0:
+                ax.scatter(all_endpoints[:, 0], all_endpoints[:, 1], s=10, c='green', alpha=0.6, # Reduced size, added alpha
+                         label='Segment Points')
             
             ax.set_aspect('equal')
             ax.set_title(f"Segmentation: {len(segments)} segments")
@@ -2306,7 +2297,7 @@ segmentation, triangulation, and visualization.
             max_coords = np.max(points, axis=0)
             
             # Add 10% margin
-            margin = 0.1 * np.max(max_coords - min_coords)
+            margin = 0.1 * np.max(max_coords - min_coords) if np.max(max_coords - min_coords) > 1e-9 else 0.1
             
             ax.set_xlim(min_coords[0] - margin, max_coords[0] + margin)
             ax.set_ylim(min_coords[1] - margin, max_coords[1] + margin)
