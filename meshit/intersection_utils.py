@@ -332,7 +332,7 @@ def calculate_surface_surface_intersection(surface1_idx: int, surface2_idx: int,
         intersection = Intersection(surface1_idx, surface2_idx, False)
         
         # Sort points to form a continuous polyline
-        sorted_points = sort_intersection_points(intersection_points)
+        sorted_points = sort_intersection_points_pca(intersection_points)
         
         # Add sorted points to the intersection
         for point in sorted_points:
@@ -343,44 +343,37 @@ def calculate_surface_surface_intersection(surface1_idx: int, surface2_idx: int,
     return None
 
 
-def sort_intersection_points(points: List[Vector3D]) -> List[Vector3D]:
+def sort_intersection_points_pca(points: List[Vector3D]) -> List[Vector3D]:
     """
-    Sort intersection points to form a continuous polyline.
-    
-    This function uses a nearest-neighbor approach to connect points
-    into a continuous polyline by always moving to the closest unvisited point.
-    
-    Args:
-        points: List of unsorted intersection points
-        
-    Returns:
-        Sorted list of points forming a continuous polyline
+    Sort intersection points using PCA projection for better linearity.
     """
     if len(points) <= 2:
-        return points  # Already a line or single point
-        
-    # Start with a random point (first one)
-    sorted_points = [points[0]]
-    remaining_points = points[1:]
-    
-    # Keep adding the nearest point until all are used
-    while remaining_points:
-        current = sorted_points[-1]
-        
-        # Find closest remaining point
-        min_dist = float('inf')
-        closest_idx = -1
-        
-        for i, point in enumerate(remaining_points):
-            dist = (current - point).length()
-            if dist < min_dist:
-                min_dist = dist
-                closest_idx = i
-                
-        # Add the closest point to our sorted list
-        sorted_points.append(remaining_points.pop(closest_idx))
-    
-    return sorted_points
+        return points
+
+    # Convert points to numpy array
+    points_np = np.array([p.to_numpy() for p in points])
+
+    # Center the points
+    centroid = np.mean(points_np, axis=0)
+    centered_points = points_np - centroid
+
+    # Perform SVD to find the principal axis (first singular vector)
+    try:
+        _, _, vh = np.linalg.svd(centered_points, full_matrices=False)
+        principal_axis = vh[0] # Direction of greatest variance
+    except np.linalg.LinAlgError:
+         # Fallback if SVD fails (e.g., all points are identical)
+         print("Warning: SVD failed in sort_intersection_points_pca. Using original order.")
+         return points
+
+    # Project points onto the principal axis
+    projected_distances = centered_points @ principal_axis
+
+    # Sort original points based on projected distances
+    sorted_indices = np.argsort(projected_distances)
+    sorted_points_list = [points[i] for i in sorted_indices]
+
+    return sorted_points_list
 
 
 def calculate_polyline_surface_intersection(polyline_idx: int, surface_idx: int, model) -> Optional[Intersection]:
@@ -450,7 +443,7 @@ def calculate_polyline_surface_intersection(polyline_idx: int, surface_idx: int,
         
         # For polyline-surface intersections, we sort the points along the polyline
         # to maintain the original structure of the polyline
-        sorted_points = sort_intersection_points(intersection_points)
+        sorted_points = sort_intersection_points_pca(intersection_points)
         
         for point in sorted_points:
             intersection.add_point(point)

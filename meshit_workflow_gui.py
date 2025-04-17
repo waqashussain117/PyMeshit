@@ -5036,17 +5036,17 @@ segmentation, triangulation, and visualization.
             }
             found_intersections_count += 1
             
-            # Add the intersection info to *both* involved original datasets
-            if original_id1 not in self.datasets_intersections:
-                self.datasets_intersections[original_id1] = []
-            self.datasets_intersections[original_id1].append(intersection_info)
-            
-            if original_id2 not in self.datasets_intersections:
-                self.datasets_intersections[original_id2] = []
-            # Avoid adding the exact same object twice if id1 == id2 (shouldn't happen)
-            if original_id1 != original_id2:
-                 self.datasets_intersections[original_id2].append(intersection_info)
-        
+
+            # Store only with the dataset having the lower ID
+            if original_id1 <= original_id2:
+                if original_id1 not in self.datasets_intersections:
+                    self.datasets_intersections[original_id1] = []
+                self.datasets_intersections[original_id1].append(intersection_info)
+            else:
+                if original_id2 not in self.datasets_intersections:
+                    self.datasets_intersections[original_id2] = []
+                self.datasets_intersections[original_id2].append(intersection_info)
+  
         # Process triple points
         for tp in model.triple_points:
             point = [tp.point.x, tp.point.y, tp.point.z]
@@ -5069,7 +5069,6 @@ segmentation, triangulation, and visualization.
         
         logger.info("Global intersection computation successful.")
         return True # Indicate success
-
     def _clear_intersection_results(self):
         """Clear all intersection results"""
         # Clear intersection data
