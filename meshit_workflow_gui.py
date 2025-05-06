@@ -564,90 +564,105 @@ class MeshItWorkflowGUI(QMainWindow):
         """Sets up the segmentation tab with controls and visualization area"""
         # Main layout for the tab
         tab_layout = QHBoxLayout(self.segment_tab)
-        
+
         # --- Control panel (left side) ---
         control_panel = QWidget()
         control_panel.setMaximumWidth(300)
         control_layout = QVBoxLayout(control_panel)
-        
+
         # -- Segmentation Controls --
         segment_group = QGroupBox("Segmentation Controls")
         segment_layout = QVBoxLayout(segment_group)
-        
-        # Segment length control
-        length_layout = QHBoxLayout()
-        length_layout.addWidget(QLabel("Segment Length:"))
-        self.segment_length_input = QLineEdit("1.0")
-        length_layout.addWidget(self.segment_length_input)
-        segment_layout.addLayout(length_layout)
-        
-        # Segment density control
-        density_layout = QHBoxLayout()
-        density_layout.addWidget(QLabel("Density:"))
-        self.segment_density_slider = QSlider(Qt.Horizontal)
-        self.segment_density_slider.setMinimum(50)
-        self.segment_density_slider.setMaximum(200)
-        self.segment_density_slider.setValue(100)
-        density_layout.addWidget(self.segment_density_slider)
-        segment_layout.addLayout(density_layout)
-        
+
+        # --- START EDIT: Replace old controls with Target Feature Size ---
+        # Remove old segment length and density controls
+        # length_layout = QHBoxLayout()
+        # length_layout.addWidget(QLabel("Segment Length:"))
+        # self.segment_length_input = QLineEdit("1.0")
+        # length_layout.addWidget(self.segment_length_input)
+        # segment_layout.addLayout(length_layout)
+        #
+        # density_layout = QHBoxLayout()
+        # density_layout.addWidget(QLabel("Density:"))
+        # self.segment_density_slider = QSlider(Qt.Horizontal)
+        # self.segment_density_slider.setMinimum(50)
+        # self.segment_density_slider.setMaximum(200)
+        # self.segment_density_slider.setValue(100)
+        # density_layout.addWidget(self.segment_density_slider)
+        # segment_layout.addLayout(density_layout)
+
+        # Add new Target Feature Size control
+        target_size_layout = QFormLayout()
+        self.target_feature_size_input = QDoubleSpinBox()
+        self.target_feature_size_input.setRange(0.1, 500.0) # Adjust range as needed
+        self.target_feature_size_input.setValue(20.0)    # Example default size
+        self.target_feature_size_input.setSingleStep(0.5)
+        self.target_feature_size_input.setToolTip(
+            "Specify the desired approximate size for features (e.g., segment length).\n"
+            "This value also influences the base size for triangulation.\n"
+            "Smaller values result in denser segmentation and meshes."
+        )
+        target_size_layout.addRow("Target Feature Size:", self.target_feature_size_input)
+        segment_layout.addLayout(target_size_layout)
+        # --- END EDIT ---
+
         # Compute segments button
         compute_btn = QPushButton("Compute Segmentation (All Datasets)") # Update button text
         compute_btn.setObjectName("compute_btn") # Set the object name
         compute_btn.setToolTip("Compute segmentation for all datasets with computed hulls") # Update tooltip
         compute_btn.clicked.connect(self.compute_all_segments) # Connect to the new batch method
         segment_layout.addWidget(compute_btn)
-        
+
         control_layout.addWidget(segment_group)
-        
+
         # -- Statistics --
         stats_group = QGroupBox("Segment Statistics")
         stats_layout = QVBoxLayout(stats_group)
-        
+
         # Number of segments
         self.num_segments_label = QLabel("Segments: 0")
         stats_layout.addWidget(self.num_segments_label)
-        
+
         # Average segment length
         self.avg_segment_length_label = QLabel("Avg length: 0.0")
         stats_layout.addWidget(self.avg_segment_length_label)
-        
+
         control_layout.addWidget(stats_group)
-        
+
         # Navigation buttons
         nav_layout = QHBoxLayout()
-        
+
         prev_btn = QPushButton("← Previous")
         prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(1))
         nav_layout.addWidget(prev_btn)
-        
+
         next_btn = QPushButton("Next →")
         next_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(3))
         nav_layout.addWidget(next_btn)
-        
+
         control_layout.addLayout(nav_layout)
         control_layout.addStretch()
-        
+
         tab_layout.addWidget(control_panel)
-        
+
         # --- Visualization Area (right side) ---
         viz_group = QGroupBox("Segmentation Visualization")
         viz_layout = QVBoxLayout(viz_group)
-        
+
         # Create container for visualization
         self.segment_viz_frame = QWidget()
         self.segment_viz_layout = QVBoxLayout(self.segment_viz_frame)
-        
+
         # Initial visualization panel will show placeholder message
         if HAVE_PYVISTA:
             placeholder_text = "Compute segmentation to visualize in 3D"
         else:
-            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nCompute segmentation to visualize in 2D."
-            
+            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\\nCompute segmentation to visualize in 2D."
+
         self.segment_viz_placeholder = QLabel(placeholder_text)
         self.segment_viz_placeholder.setAlignment(Qt.AlignCenter)
         self.segment_viz_layout.addWidget(self.segment_viz_placeholder)
-        
+
         viz_layout.addWidget(self.segment_viz_frame)
         tab_layout.addWidget(viz_group, 1)  # 1 = stretch factor
     
@@ -665,20 +680,6 @@ class MeshItWorkflowGUI(QMainWindow):
         tri_group = QGroupBox("Triangulation Controls")
         tri_layout = QVBoxLayout(tri_group)
 
-        # Mesh target size controls <<--- RENAMED AND REPURPOSED
-        target_size_layout = QFormLayout()
-        self.target_edge_length_input = QDoubleSpinBox()
-        # Adjust range based on expected data scale. Example: 0.1 to 100 units
-        self.target_edge_length_input.setRange(0.1, 100.0)
-        self.target_edge_length_input.setValue(20.0) # Example default absolute size
-        self.target_edge_length_input.setSingleStep(0.5)
-        self.target_edge_length_input.setToolTip(
-            "Specify the desired approximate edge length for the triangles.\n"
-            "Smaller values result in denser meshes."
-        )
-        target_size_layout.addRow("Target Edge Length:", self.target_edge_length_input) # Changed Label
-        tri_layout.addLayout(target_size_layout)
-
         # Mesh quality controls (remain the same)
         quality_group = QGroupBox("Quality Settings")
         quality_layout = QFormLayout(quality_group)
@@ -686,14 +687,14 @@ class MeshItWorkflowGUI(QMainWindow):
         # Gradient
         self.gradient_input = QDoubleSpinBox()
         self.gradient_input.setRange(1.0, 3.0)
-        self.gradient_input.setValue(1.0)
+        self.gradient_input.setValue(2.0)
         self.gradient_input.setSingleStep(0.1)
         quality_layout.addRow("Gradient:", self.gradient_input)
 
         # Min angle
         self.min_angle_input = QDoubleSpinBox()
         self.min_angle_input.setRange(10.0, 30.0)
-        self.min_angle_input.setValue(25.0)
+        self.min_angle_input.setValue(20.0)
         self.min_angle_input.setSingleStep(1.0)
         quality_layout.addRow("Min Angle:", self.min_angle_input)
 
@@ -2098,17 +2099,28 @@ segmentation, triangulation, and visualization.
             logger.warning(f"Skipping segments for {dataset_name}: hull not computed.")
             return False # Indicate error or skip
 
-        # Get the segmentation parameters from the UI (use consistent settings for all)
+        # --- START EDIT: Get target size from new control ---
+        # Get the segmentation parameter from the UI
         try:
-            segment_length = float(self.segment_length_input.text())
-            if segment_length <= 0:
-                segment_length = 1.0
+            effective_segment_length = float(self.target_feature_size_input.value())
+            if effective_segment_length <= 1e-6: # Use a small threshold instead of zero
+                logger.warning("Target Feature Size is too small, using default value (1.0).")
+                effective_segment_length = 1.0
         except ValueError:
-            segment_length = 1.0
+            logger.warning("Invalid Target Feature Size, using default value (1.0).")
+            effective_segment_length = 1.0
+        # Remove old parameter calculations
+        # try:
+        #     segment_length = float(self.segment_length_input.text())
+        #     if segment_length <= 0:
+        #         segment_length = 1.0
+        # except ValueError:
+        #     segment_length = 1.0
+        #
+        # density_factor = self.segment_density_slider.value() / 100.0
+        # effective_segment_length = segment_length / density_factor
+        # --- END EDIT ---
 
-        density_factor = self.segment_density_slider.value() / 100.0
-        effective_segment_length = segment_length / density_factor
-        
         try:
             # Extract the hull boundary (excluding the closing point)
             hull_boundary = dataset['hull_points'][:-1]
@@ -2362,9 +2374,21 @@ segmentation, triangulation, and visualization.
         # Get triangulation parameters from GUI
         gradient = self.gradient_input.value()
         min_angle = self.min_angle_input.value()
-        target_edge_length = self.target_edge_length_input.value()
-        base_size = max(1e-9, target_edge_length)
         uniform = self.uniform_checkbox.isChecked()
+
+        # --- START EDIT: Get base_size from the unified control ---
+        try:
+            base_size = float(self.target_feature_size_input.value())
+            if base_size <= 1e-6:
+                logger.warning("Target Feature Size (used as base_size) is too small, using default (1.0).")
+                base_size = 1.0
+        except ValueError:
+            logger.warning("Invalid Target Feature Size (used as base_size), using default (1.0).")
+            base_size = 1.0
+        # Remove old target_edge_length reading
+        # target_edge_length = self.target_edge_length_input.value()
+        # base_size = max(1e-9, target_edge_length)
+        # --- END EDIT ---
 
         try:
             start_time = time.time()
@@ -4290,68 +4314,54 @@ segmentation, triangulation, and visualization.
 
                 elif view_type == "segments":
                     segments = dataset.get('segments')
-                    hull_points = dataset.get('hull_points')
-                    
-                    if segments is not None and len(segments) > 0 and hull_points is not None:
+                    # hull_points = dataset.get('hull_points') # Not needed for drawing segments directly
+
+                    # --- START EDIT: Visualize actual segments, not recalculated points ---
+                    if segments is not None and len(segments) > 0:
                         # Add points for context
                         point_cloud = pv.PolyData(points_3d)
                         self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.3, render_points_as_spheres=True,
                                          point_size=5)
+
+                        # Draw the actual segments
+                        for segment in segments:
+                            # Ensure segment points are 3D NumPy arrays
+                            p1 = np.array(segment[0])
+                            p2 = np.array(segment[1])
+                            # Pad with zeros if dimension is less than 3
+                            if p1.shape[0] < 3: p1 = np.append(p1, [0.0] * (3 - p1.shape[0]))
+                            if p2.shape[0] < 3: p2 = np.append(p2, [0.0] * (3 - p2.shape[0]))
+                            # TODO: Optionally use actual Z if available from points_3d proximity
+
+                            segment_line = pv.Line(p1[:3], p2[:3]) # Ensure only 3 coords
+                            # Use dataset color for segments
+                            self.current_plotter.add_mesh(segment_line, color=color, line_width=2.5)
+
+                        # Add segment endpoints as distinct points (optional)
+                        segment_endpoints = []
+                        for seg in segments:
+                            # Pad with zeros if dimension is less than 3 before appending
+                            p1_3d = np.array(seg[0])
+                            p2_3d = np.array(seg[1])
+                            if p1_3d.shape[0] < 3: p1_3d = np.append(p1_3d, [0.0] * (3 - p1_3d.shape[0]))
+                            if p2_3d.shape[0] < 3: p2_3d = np.append(p2_3d, [0.0] * (3 - p2_3d.shape[0]))
+                            segment_endpoints.append(p1_3d[:3])
+                            segment_endpoints.append(p2_3d[:3])
                         
-                        # Create segmentation points directly from the hull_points
-                        # In the C++ version, segments are created by subdividing hull edges
-                        
-                        # First, create properly sized 3D hull points
-                        hull_3d = hull_points
-                        if hull_3d.shape[1] == 2:
-                            hull_3d_with_z = np.zeros((len(hull_3d), 3))
-                            hull_3d_with_z[:, 0:2] = hull_3d
-                            hull_3d = hull_3d_with_z
-                            
-                        # Get the target edge length from the triangulation settings, or use default
-                        target_edge_length = 20
-                        if hasattr(self, 'target_edge_length_input'):
-                            try:
-                                target_edge_length = self.target_edge_length_input.value()
-                            except:
-                                pass
-                        
-                        # Initialize list for interpolated points
-                        interpolated_hull_points = []
-                        
-                        # Add all original hull points first (they're always included)
-                        for p in hull_3d:
-                            interpolated_hull_points.append(p)
-                        
-                        # Now add interpolated points based on target edge length
-                        for i in range(len(hull_3d) - 1):
-                            p1 = hull_3d[i]
-                            p2 = hull_3d[i+1]
-                            segment_length = np.linalg.norm(p2 - p1)
-                            
-                            # Only add points if segment is longer than target edge length
-                            if segment_length > target_edge_length:
-                                # Calculate how many points to add
-                                num_points = int(segment_length / target_edge_length)
-                                
-                                # Create interpolated points
-                                for j in range(1, num_points):
-                                    t = j / num_points
-                                    interp_point = p1 + t * (p2 - p1)
-                                    interpolated_hull_points.append(interp_point)
-                        
-                        # Create point cloud for visualization
-                        interpolated_hull_array = np.array(interpolated_hull_points)
-                        hull_point_cloud = pv.PolyData(interpolated_hull_array)
-                        self.current_plotter.add_mesh(hull_point_cloud, color='red', 
-                                        render_points_as_spheres=True, point_size=3)
-                        
-                        # Draw the hull boundary
-                        for j in range(len(hull_3d) - 1):
-                            hull_line = pv.Line(hull_3d[j], hull_3d[j+1])
-                            self.current_plotter.add_mesh(hull_line, color='black', line_width=2.5, opacity=0.5)
-                        
+                        if segment_endpoints: # Check if list is not empty
+                            try: # Add try-except for robustness
+                                unique_endpoints = np.unique(np.array(segment_endpoints), axis=0)
+                                if unique_endpoints.shape[0] > 0:
+                                     endpoint_cloud = pv.PolyData(unique_endpoints)
+                                     self.current_plotter.add_points(endpoint_cloud, color='red', point_size=8, 
+                                                                render_points_as_spheres=True, label=f"{name} Endpoints")
+                            except Exception as e_ep:
+                                logger.warning(f"Could not create unique endpoint cloud for {name}: {e_ep}")
+
                         plotter_has_geometry = True
+                    # --- END EDIT ---
+
+                    # --- Implicitly REMOVED old recalculation logic by replacing the block ---
 
                 elif view_type == "triangulation":
                     triangulation_result = dataset.get('triangulation_result')
