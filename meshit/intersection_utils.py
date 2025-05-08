@@ -8,15 +8,20 @@ surfaces and polylines, following the MeshIt workflow.
 import numpy as np
 import concurrent.futures
 from typing import List, Dict, Tuple, Optional, Union
+import math # Ensure math is imported for floor
+import logging
+
+logger = logging.getLogger(__name__)
 
 class Vector3D:
     """Simple 3D vector class compatible with MeshIt's Vector3D"""
     
-    def __init__(self, x=0.0, y=0.0, z=0.0):
+    def __init__(self, x=0.0, y=0.0, z=0.0, point_type=None):
         self.x = float(x)
         self.y = float(y)
         self.z = float(z)
-        self.type = "DEFAULT"  # Point type: DEFAULT, CORNER, INTERSECTION_POINT, TRIPLE_POINT, COMMON_INTERSECTION_CONVEXHULL_POINT
+        self.type = "DEFAULT" 
+        self.type = point_type  # Store type information # Point type: DEFAULT, CORNER, INTERSECTION_POINT, TRIPLE_POINT, COMMON_INTERSECTION_CONVEXHULL_POINT
     
     def __add__(self, other):
         return Vector3D(self.x + other.x, self.y + other.y, self.z + other.z)
@@ -345,7 +350,7 @@ class Box:
                                 #     # triple_point_obj = TriplePoint(tp_point)
                                 #     # triple_point_obj.add_intersection(i1)
                                 #     # triple_point_obj.add_intersection(i2)
-                                #     # triple_points.append(triple_point_obj)
+                                #     # found_triple_points.append(triple_point_obj)
                                 # --- END REMOVAL ---
 
 
@@ -1693,3 +1698,197 @@ def run_intersection_workflow(model, progress_callback=None, tolerance=1e-5):
     # ...
 
     return model
+
+
+def compute_angle_between_segments(p1, p2, p3):
+    """
+    Calculate the angle in degrees between two line segments p1-p2 and p2-p3
+    
+    Args:
+        p1, p2, p3: Vector3D points forming two segments
+        
+    Returns:
+        Angle in degrees
+    """
+    if p1 is None or p2 is None or p3 is None:
+        return 0.0
+        
+    # Create vectors for the two segments
+    v1 = Vector3D(p2.x - p1.x, p2.y - p1.y, p2.z - p1.z)
+    v2 = Vector3D(p3.x - p2.x, p3.y - p2.y, p3.z - p2.z)
+    
+    # Normalize the vectors
+    len1 = v1.length()
+    len2 = v2.length()
+    
+    if len1 < 1e-6 or len2 < 1e-6:
+        return 0.0
+    
+    v1 = v1 / len1
+    v2 = v2 / len2
+    
+    # Calculate the dot product
+    dot_product = v1.dot(v2)
+    
+    # Clamp dot product to [-1, 1] to avoid numerical issues
+    dot_product = max(-1.0, min(1.0, dot_product))
+    
+    # Calculate angle in degrees
+    angle_rad = math.acos(dot_product)
+    angle_deg = angle_rad * 180.0 / math.pi
+    
+    return angle_deg
+def refine_intersection_line_by_length(intersection, target_length):
+    """
+    Refines an intersection line by ensuring segment lengths are close to the target length.
+    Also identifies and marks special points based on various geometric criteria.
+    
+    Args:
+        intersection: Intersection object to refine
+        target_length: Target segment length
+    """
+    if not intersection.points or len(intersection.points) < 2:
+        return
+
+    # Constants for classification
+    ANGLE_THRESHOLD = 0.5  # Lowered to 0.5 degrees as requested
+    
+    logger.info("==================================================")
+    logger.info(f"STARTING REFINEMENT with target length: {target_length}")
+    logger.info(f"Original points count: {len(intersection.points)}")
+    
+    # Save the original points for angle calculation
+    original_points = list(intersection.points)
+    
+    # Store refined points
+    refined_points = []
+    special_points_count = 0
+    
+    # Classification counters
+    start_points = 0
+    end_points = 0
+    triple_points = 0
+    high_curvature_points = 0
+    feature_edge_points = 0
+    
+    # Add the first point - always keep start point
+    first_point = intersection.points[0]
+    # Add point_type attribute if not present
+    if not hasattr(first_point, 'point_type'):
+        first_point.point_type = "START_POINT"
+    else:
+        first_point.point_type = "START_POINT"
+    start_points += 1
+    refined_points.append(first_point)
+    logger.info(f"Added first point: {first_point.x}, {first_point.y}, {first_point.z}, type: {first_point.point_type}")
+    
+    # Process each segment
+    for i in range(len(intersection.points) - 1):
+        p1 = intersection.points[i]
+        p2 = intersection.points[i + 1]
+        
+        # Ensure point_type attribute exists
+        if not hasattr(p1, 'point_type'):
+            p1.point_type = None
+        if not hasattr(p2, 'point_type'):
+            p2.point_type = None
+        
+        # Calculate segment length
+        segment = p2 - p1
+        length = segment.length()
+        logger.info(f"Segment {i}: length = {length}, target = {target_length}")
+        
+        # Calculate angle at this point if it's not the first point
+        angle_degrees = 0.0
+        if i > 0:
+            prev_p = intersection.points[i - 1]
+            angle_degrees = compute_angle_between_segments(prev_p, p1, p2)
+            logger.info(f"Point {i}: Angle = {angle_degrees:.2f} degrees (threshold: {ANGLE_THRESHOLD})")
+            
+            # Classify points based on angle
+            if angle_degrees >= ANGLE_THRESHOLD:
+                # Classify based on angle magnitude
+                if angle_degrees >= 5.0:
+                    refined_points[-1].point_type = "HIGH_CURVATURE_POINT"
+                    high_curvature_points += 1
+                    logger.info(f"Marked point {i} as HIGH_CURVATURE_POINT (angle: {angle_degrees:.2f})")
+                elif angle_degrees >= 2.0:
+                    refined_points[-1].point_type = "FEATURE_EDGE_POINT"
+                    feature_edge_points += 1
+                    logger.info(f"Marked point {i} as FEATURE_EDGE_POINT (angle: {angle_degrees:.2f})")
+                else:
+                    refined_points[-1].point_type = "SPECIAL_POINT"
+                    special_points_count += 1
+                    logger.info(f"Marked point {i} as SPECIAL_POINT (angle: {angle_degrees:.2f})")
+        
+        # Determine number of segments to divide into
+        num_segments = max(1, round(length / target_length))
+        logger.info(f"Segment {i} will be divided into {num_segments} parts")
+        
+        # Add intermediate points if needed
+        for j in range(1, num_segments):
+            t = j / num_segments
+            new_point = p1 + segment * t
+            # Add point_type attribute to new points
+            new_point.point_type = None
+            refined_points.append(new_point)
+            logger.info(f"Added intermediate point at t={t}: {new_point.x}, {new_point.y}, {new_point.z}")
+        
+        # Add the endpoint
+        if i < len(intersection.points) - 2:
+            # Check if it's a potential triple point (based on properties or marked in original data)
+            if hasattr(p2, 'is_triple_point') and p2.is_triple_point:
+                p2.point_type = "TRIPLE_POINT"
+                triple_points += 1
+                logger.info(f"Marked point {i+1} as TRIPLE_POINT (from original data)")
+            
+            refined_points.append(p2)
+            logger.info(f"Added endpoint {i+1}: {p2.x}, {p2.y}, {p2.z}, type: {p2.point_type}")
+    
+    # Add the last point - always keep end point
+    last_point = intersection.points[-1]
+    if not hasattr(last_point, 'point_type'):
+        last_point.point_type = "END_POINT"
+    else:
+        last_point.point_type = "END_POINT"
+    end_points += 1
+    refined_points.append(last_point)
+    logger.info(f"Added last point: {last_point.x}, {last_point.y}, {last_point.z}, type: {last_point.point_type}")
+    
+    # Identify special points at extreme angles (post-processing)
+    # Second pass to catch any angles between newly created points
+    for i in range(1, len(refined_points) - 1):
+        prev_p = refined_points[i - 1]
+        curr_p = refined_points[i]
+        next_p = refined_points[i + 1]
+        
+        # Skip points already marked with a type
+        if curr_p.point_type is not None:
+            continue
+            
+        angle = compute_angle_between_segments(prev_p, curr_p, next_p)
+        # Classify based on angle magnitude
+        if angle >= ANGLE_THRESHOLD:
+            if angle >= 5.0:
+                curr_p.point_type = "HIGH_CURVATURE_POINT"
+                high_curvature_points += 1
+                logger.info(f"Post-processing: Marked point at index {i} as HIGH_CURVATURE_POINT (angle: {angle:.2f})")
+            elif angle >= 2.0:
+                curr_p.point_type = "FEATURE_EDGE_POINT"
+                feature_edge_points += 1
+                logger.info(f"Post-processing: Marked point at index {i} as FEATURE_EDGE_POINT (angle: {angle:.2f})")
+            else:
+                curr_p.point_type = "SPECIAL_POINT"
+                special_points_count += 1
+                logger.info(f"Post-processing: Marked point at index {i} as SPECIAL_POINT (angle: {angle:.2f})")
+    
+    # Replace the original points with the refined points
+    intersection.points = refined_points
+    
+    # Count the total number of special points of all types
+    total_special = special_points_count + high_curvature_points + feature_edge_points + triple_points
+    
+    logger.info(f"REFINEMENT COMPLETE: {len(original_points)} original points → {len(refined_points)} refined points")
+    logger.info(f"POINT CLASSIFICATIONS: {start_points} start points, {end_points} end points, {total_special} special points")
+    logger.info(f"SPECIAL POINTS: {special_points_count} special, {high_curvature_points} high curvature, {feature_edge_points} feature edge, {triple_points} triple points")
+    logger.info("==================================================")

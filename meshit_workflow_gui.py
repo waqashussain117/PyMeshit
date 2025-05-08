@@ -18,6 +18,7 @@ from matplotlib.colors import ListedColormap, to_rgba
 import re
 # import QAbsractItemView
 from PyQt5.QtWidgets import QAbstractItemView
+from meshit.intersection_utils import align_intersections_to_convex_hull, Vector3D, Intersection, refine_intersection_line_by_length, insert_triple_points
 
 # Import PyQt5
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
@@ -40,10 +41,13 @@ except ImportError:
     HAVE_PYVISTA = False
     logging.warning("PyVista not available. 3D visualization disabled.")
 
-# Configure logging
+# Configure logging to show ALL messages at INFO level
 logging.basicConfig(level=logging.INFO, 
-                   format='%(name)s - %(levelname)s - %(message)s')
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("MeshIt-Workflow")
+
+# Also ensure meshit module logs are visible
+logging.getLogger("meshit").setLevel(logging.INFO)
 
 # Add the current directory to the path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -232,6 +236,7 @@ class MeshItWorkflowGUI(QMainWindow):
         self.current_dataset_index = -1  # Index of the currently active dataset
         self._color_index = 0 # For assigning colors to datasets
         
+        self.plotters = {}
         # Visualization placeholders and state
         self.points = None
         self.hull_points = None
@@ -284,6 +289,16 @@ class MeshItWorkflowGUI(QMainWindow):
         # Add to __init__ after other tabs are created
         self._setup_intersection_tab()
         
+        # Setup Refine & Mesh Settings tab
+        self.refine_mesh_tab = QWidget() # Add this line
+        self.notebook.addTab(self.refine_mesh_tab, "6. Refine & Mesh") # Add this line
+        self._setup_refine_mesh_tab() # Add this line
+
+        # Placeholder for the refine_mesh_tab plotter
+        self.refine_mesh_plotter = None
+        self.refine_mesh_viz_frame = None # Add this line for consistency
+        
+
         # Create menu bar
         self._create_menu_bar()
         
@@ -373,7 +388,7 @@ class MeshItWorkflowGUI(QMainWindow):
         view_3d_action.setStatusTip("Open a separate interactive 3D view (requires PyVista)")
         view_3d_action.triggered.connect(self.show_3d_view)
         view_3d_action.setEnabled(HAVE_PYVISTA) # Disable if PyVista not available
-        
+    
         viz_menu.addSeparator()
         
         # --- Height Factor Submenu ---
@@ -490,12 +505,12 @@ class MeshItWorkflowGUI(QMainWindow):
         """Sets up the convex hull tab with controls and visualization area"""
         # Main layout for the tab
         tab_layout = QHBoxLayout(self.hull_tab)
-        
+
         # --- Control panel (left side) ---
         control_panel = QWidget()
         control_panel.setMaximumWidth(300)
         control_layout = QVBoxLayout(control_panel)
-        
+
         # -- Hull Controls --
         hull_group = QGroupBox("Hull Controls")
         hull_layout = QVBoxLayout(hull_group)
@@ -909,8 +924,528 @@ class MeshItWorkflowGUI(QMainWindow):
         
         if not hasattr(self, 'triple_points'):
             self.triple_points = []
+    def _setup_refine_mesh_tab(self):
+        """Sets up the Refine & Mesh Settings tab."""
+        tab_layout = QHBoxLayout(self.refine_mesh_tab)
 
+        # --- Control panel (left side) ---
+        control_panel = QWidget()
+        control_panel.setMaximumWidth(350)  # Limit width
+        control_layout = QVBoxLayout(control_panel)
+
+        # -- Refinement Controls --
+        refinement_group = QGroupBox("Intersection Refinement")
+        refinement_layout = QVBoxLayout(refinement_group)
+
+        self.refine_intersections_btn = QPushButton("Refine Intersection Lines")
+        self.refine_intersections_btn.setToolTip(
+            "Align intersection line endpoints to the convex hulls of involved surfaces."
+        )
+        self.refine_intersections_btn.clicked.connect(self._refine_intersection_lines_action)
+        refinement_layout.addWidget(self.refine_intersections_btn)
+        self.show_original_lines_checkbox = QCheckBox("Show Original Lines")
+        self.show_original_lines_checkbox.setChecked(True)
+        self.show_original_lines_checkbox.toggled.connect(self._update_refined_visualization)
+        refinement_layout.addWidget(self.show_original_lines_checkbox)
+        control_layout.addWidget(refinement_group)
+
+        # -- Global Mesh Settings --
+        mesh_settings_group = QGroupBox("Global Mesh Settings")
+        mesh_settings_layout = QFormLayout(mesh_settings_group) # Use QFormLayout for label-input pairs
+
+        # Target Feature Size (copied from segment tab's target_feature_size_input)
+        self.mesh_target_feature_size_input = QDoubleSpinBox()
+        self.mesh_target_feature_size_input.setRange(0.1, 500.0)
+        self.mesh_target_feature_size_input.setValue(20.0) # Default
+        self.mesh_target_feature_size_input.setSingleStep(0.5)
+        self.mesh_target_feature_size_input.setToolTip(
+            "Global target size for features/elements in the final mesh."
+        )
+        mesh_settings_layout.addRow("Target Feature Size:", self.mesh_target_feature_size_input)
+
+        # Gradient (copied from triangulation tab's gradient_input)
+        self.mesh_gradient_input = QDoubleSpinBox()
+        self.mesh_gradient_input.setRange(1.0, 3.0)
+        self.mesh_gradient_input.setValue(2.0) # Default
+        self.mesh_gradient_input.setSingleStep(0.1)
+        mesh_settings_layout.addRow("Gradient:", self.mesh_gradient_input)
+
+        # Min Angle (copied from triangulation tab's min_angle_input)
+        self.mesh_min_angle_input = QDoubleSpinBox()
+        self.mesh_min_angle_input.setRange(10.0, 30.0)
+        self.mesh_min_angle_input.setValue(20.0) # Default
+        self.mesh_min_angle_input.setSingleStep(1.0)
+        mesh_settings_layout.addRow("Min Angle:", self.mesh_min_angle_input)
+
+        # Uniform Meshing (copied from triangulation tab's uniform_checkbox)
+        self.mesh_uniform_checkbox = QCheckBox()
+        self.mesh_uniform_checkbox.setChecked(True) # Default
+        mesh_settings_layout.addRow("Uniform Meshing:", self.mesh_uniform_checkbox)
+
+        # Add information labels for constraints
+        self.constraints_label = QLabel("<b>Mesh Constraints</b>")
+        self.constraints_label.setAlignment(Qt.AlignCenter)
+        mesh_settings_layout.addRow("", self.constraints_label)
+
+        # Add a separator line
+        self.separator = QFrame()
+        self.separator.setFrameShape(QFrame.HLine)
+        self.separator.setFrameShadow(QFrame.Sunken)
+        mesh_settings_layout.addRow("", self.separator)
+
+        # Add explanatory text
+        self.target_size_info = QLabel("Controls the general element size in the final mesh")
+        self.target_size_info.setWordWrap(True)
+        mesh_settings_layout.addRow("", self.target_size_info)
+
+        self.gradient_info = QLabel("Controls the sizing transition rate from smaller to larger elements")
+        self.gradient_info.setWordWrap(True)
+        mesh_settings_layout.addRow("", self.gradient_info)
+
+        self.min_angle_info = QLabel("Ensures triangle quality by setting minimum internal angles")
+        self.min_angle_info.setWordWrap(True)
+        mesh_settings_layout.addRow("", self.min_angle_info)
+
+        # Visual indicator for constraints impact (simple color code)
+        self.constraint_indicator = QLabel("◼ Strict constraints may result in more elements/longer processing")
+        self.constraint_indicator.setStyleSheet("color: orange;")
+        mesh_settings_layout.addRow("", self.constraint_indicator)
+
+        control_layout.addWidget(mesh_settings_group)
+        # Placeholder for future "Generate Mesh" button
+        # generate_mesh_btn = QPushButton("Generate Final Mesh (Placeholder)")
+        # generate_mesh_btn.setEnabled(False) # Disabled for now
+        # control_layout.addWidget(generate_mesh_btn)
+
+        # Navigation buttons
+        nav_layout = QHBoxLayout()
+        prev_btn = QPushButton("← Previous (Intersections)")
+        prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(self.notebook.indexOf(self.intersection_tab)))
+        nav_layout.addWidget(prev_btn)
+        # No "Next" button for the last tab for now
+        control_layout.addLayout(nav_layout)
+        control_layout.addStretch()
+        tab_layout.addWidget(control_panel)
+
+        # --- Visualization Area (right side) ---
+        viz_group = QGroupBox("Refined Intersections & Mesh Preview")
+        viz_layout = QVBoxLayout(viz_group)
+
+        self.refine_mesh_viz_frame = QFrame() # Use the class attribute
+        self.refine_mesh_viz_frame.setFrameShape(QFrame.StyledPanel)
+        self.refine_mesh_viz_frame.setMinimumSize(400, 300)
+        self.refine_mesh_plot_layout = QVBoxLayout(self.refine_mesh_viz_frame)
+        self.refine_mesh_plot_layout.setContentsMargins(0, 0, 0, 0)
+
+        if HAVE_PYVISTA:
+            try:
+                from pyvistaqt import QtInteractor
+                plotter = QtInteractor(self.refine_mesh_viz_frame)
+                self.refine_mesh_plot_layout.addWidget(plotter.interactor)
+                plotter.set_background([0.318, 0.341, 0.431])
+                plotter.add_text("Refine intersections to visualize or load data.", position='upper_edge', color='white')
+                # Store in both attribute and dictionary
+                self.refine_mesh_plotter = plotter
+                self.plotters['refine_mesh'] = plotter
+                logger.info("Successfully created refine_mesh_plotter")
+            except Exception as e:
+                logger.error(f"Error initializing Refine/Mesh plotter: {e}", exc_info=True)
+                placeholder = QLabel(f"Error initializing PyVista plotter: {e}")
+                placeholder.setAlignment(Qt.AlignCenter)
+                placeholder.setWordWrap(True)
+                self.refine_mesh_plot_layout.addWidget(placeholder)
+                self.refine_mesh_plotter = None
+        else:
+            placeholder = QLabel("PyVista is required for 3D visualization.")
+            placeholder.setAlignment(Qt.AlignCenter)
+            self.refine_mesh_plot_layout.addWidget(placeholder)
+            self.refine_mesh_plotter = None
+
+        viz_layout.addWidget(self.refine_mesh_viz_frame, 1)
+        # Add to _setup_refine_mesh_tab in viz_layout
+        self.refinement_summary_label = QLabel("Run refinement to see summary")
+        self.refinement_summary_label.setWordWrap(True)
+        self.refinement_summary_label.setTextFormat(Qt.RichText)
+        viz_layout.addWidget(self.refinement_summary_label)
+        tab_layout.addWidget(viz_group, 1)
     # Event handlers - placeholder implementations
+
+    def _analyze_refinement_results(self):
+        """Analyze refinement results and return a summary string."""
+        if not hasattr(self, 'original_intersections') or not self.original_intersections or not self.datasets_intersections:
+            return "No data to analyze."
+        
+        # Compare original vs refined intersections
+        modified_count = 0
+        aligned_count = 0
+        added_points_count = 0
+        special_points_count = 0
+        high_curvature_points_count = 0
+        feature_edge_points_count = 0
+        triple_points_count = 0
+        polyline_surf_intersections = 0
+        surf_surf_intersections = 0
+        
+        # Collect all points before and after
+        all_original_points = []
+        all_refined_points = []
+        
+        # Count by intersection
+        for ds_key in self.datasets_intersections.keys():
+            if ds_key in self.original_intersections:
+                for i, refined_intersection in enumerate(self.datasets_intersections[ds_key]):
+                    if i < len(self.original_intersections[ds_key]):
+                        original_intersection = self.original_intersections[ds_key][i]
+                        
+                        # Count by intersection type
+                        if refined_intersection.get('is_polyline_mesh', False):
+                            polyline_surf_intersections += 1
+                        else:
+                            surf_surf_intersections += 1
+                        
+                        # Get points
+                        original_points = original_intersection.get('points', [])
+                        refined_points = refined_intersection.get('points', [])
+                        
+                        all_original_points.extend(original_points)
+                        all_refined_points.extend(refined_points)
+                        
+                        # Count modifications
+                        if len(original_points) != len(refined_points):
+                            modified_count += 1
+                            added_points_count += len(refined_points) - len(original_points)
+                        
+                        # Count different types of special points in the refined data
+                        for point in refined_points:
+                            # Check point format - could be a list with type at index 3 or an object with point_type
+                            if isinstance(point, list) and len(point) > 3:
+                                if point[3] == "SPECIAL_POINT":
+                                    special_points_count += 1
+                                elif point[3] == "TRIPLE_POINT":
+                                    triple_points_count += 1
+                                elif point[3] == "HIGH_CURVATURE_POINT":
+                                    high_curvature_points_count += 1
+                                elif point[3] == "FEATURE_EDGE_POINT":
+                                    feature_edge_points_count += 1
+                            elif hasattr(point, 'point_type'):
+                                if point.point_type == "SPECIAL_POINT":
+                                    special_points_count += 1
+                                elif point.point_type == "TRIPLE_POINT":
+                                    triple_points_count += 1
+                                elif point.point_type == "HIGH_CURVATURE_POINT":
+                                    high_curvature_points_count += 1
+                                elif point.point_type == "FEATURE_EDGE_POINT":
+                                    feature_edge_points_count += 1
+        
+        # Create summary
+        summary = "Refinement Summary:\n"
+        if surf_surf_intersections > 0:
+            summary += f"• {surf_surf_intersections} surface-surface intersections\n"
+        if polyline_surf_intersections > 0:
+            summary += f"• {polyline_surf_intersections} polyline-surface intersections\n"
+        summary += f"• {modified_count}/{len(self.datasets_intersections)} intersection lines modified\n"
+        summary += f"• {aligned_count} endpoints aligned to convex hulls\n"
+        summary += f"• {added_points_count} points added by refinement\n"
+        
+        # Add counts of special point types
+        if special_points_count > 0:
+            summary += f"• {special_points_count} special points identified\n"
+        if high_curvature_points_count > 0:
+            summary += f"• {high_curvature_points_count} high curvature points identified\n"
+        if feature_edge_points_count > 0:
+            summary += f"• {feature_edge_points_count} feature edge points identified\n"
+        if triple_points_count > 0:
+            summary += f"• {triple_points_count} triple points identified"
+        
+        return summary
+    def _update_refined_visualization(self):
+        """Update the refined intersection visualization based on UI settings"""
+        # Simply call visualize method again to refresh with current settings
+        self._visualize_refined_intersections()
+    def _refine_intersection_lines_action(self):
+        """
+        Action to refine intersection lines by aligning their endpoints
+        to the convex hulls of the involved surfaces and adding special points.
+        Now includes proper handling for polyline-surface intersections.
+        """
+        # Store the original intersection data for comparison
+        if not hasattr(self, 'original_intersections'):
+            self.original_intersections = {}
+
+        # Make a deep copy of the current intersections
+        import copy
+        self.original_intersections = copy.deepcopy(self.datasets_intersections)
+        logger.info("Refining intersection lines...")
+        self.statusBar().showMessage("Refining intersection lines...")
+
+        if not hasattr(self, 'datasets_intersections') or not self.datasets_intersections:
+            QMessageBox.information(self, "No Intersections", "No intersections found to refine.")
+            return
+
+        # Create a temporary model to work with
+        class TempModelWrapper:
+            def __init__(self):
+                self.surfaces = []
+                self.polylines = []  # New list to track polyline datasets separately
+                self.intersections = []
+                self.triple_points = []
+                self.original_indices_map = {}  # Map temp model indices to original dataset indices
+                self.is_polyline = {}  # Track which datasets are polylines
+
+        temp_model = TempModelWrapper()
+        valid_surfaces_count = 0
+        valid_polylines_count = 0
+
+        # Collect all datasets involved in intersections first, to ensure we include polylines
+        involved_datasets = set()
+        for original_ds_idx, intersections_list in self.datasets_intersections.items():
+            for intersection_data in intersections_list:
+                involved_datasets.add(intersection_data['dataset_id1'])
+                involved_datasets.add(intersection_data['dataset_id2'])
+
+        # First, populate temp_model with all datasets involved in intersections
+        for original_idx, dataset in enumerate(self.datasets):
+            # Skip datasets not involved in any intersections
+            if original_idx not in involved_datasets:
+                continue
+                
+            # Create a generic wrapper that works for both surfaces and polylines
+            class TempDataWrapper:
+                def __init__(self):
+                    self.vertices = []
+                    self.convex_hull = []
+                    self.triangles = []
+                    self.size = 1.0  # Default size
+                    self.name = "Dataset"
+                    self.is_polyline = False
+
+            data_wrapper = TempDataWrapper()
+            
+            # Set the data name
+            data_wrapper.name = dataset.get('name', f"Dataset {original_idx+1}")
+            
+            # Determine whether this is a polyline based on intersection data
+            is_polyline = False
+            for ds_idx, intersections_list in self.datasets_intersections.items():
+                for intersection_data in intersections_list:
+                    if intersection_data['is_polyline_mesh']:
+                        # In polyline-mesh intersection, the first ID is usually the polyline
+                        if intersection_data['dataset_id1'] == original_idx:
+                            is_polyline = True
+                            break
+                if is_polyline:
+                    break
+            
+            data_wrapper.is_polyline = is_polyline
+
+            # Set the dataset size based on bounding box
+            hull_points_np = dataset.get('hull_points')
+            if hull_points_np is not None and len(hull_points_np) > 0:
+                # Calculate rough size based on bounding box diagonal
+                hull_points_arr = np.array(hull_points_np)
+                if hull_points_arr.shape[0] > 0:
+                    if hull_points_arr.shape[1] >= 3:
+                        min_pt = np.min(hull_points_arr, axis=0)
+                        max_pt = np.max(hull_points_arr, axis=0)
+                        size = np.linalg.norm(max_pt - min_pt) / 10.0  # 1/10th of bbox diagonal
+                        data_wrapper.size = size
+
+            # Populate convex_hull (Vector3D list)
+            if hull_points_np is not None:
+                for hp in hull_points_np:
+                    if len(hp) >= 3:
+                        data_wrapper.convex_hull.append(Vector3D(hp[0], hp[1], hp[2]))
+                    elif len(hp) == 2:
+                        data_wrapper.convex_hull.append(Vector3D(hp[0], hp[1], 0.0))
+            
+            # For surfaces, try to get vertices from triangulation
+            if not is_polyline and dataset.get('triangulation_result'):
+                tri_vertices_np = dataset['triangulation_result'].get('vertices')
+                if tri_vertices_np is not None:
+                    for tv in tri_vertices_np:
+                        if len(tv) >= 3:
+                            data_wrapper.vertices.append(Vector3D(tv[0], tv[1], tv[2]))
+                        elif len(tv) == 2:
+                            data_wrapper.vertices.append(Vector3D(tv[0], tv[1], 0.0))
+            
+            # For polylines, use points as vertices
+            if is_polyline:
+                points_np = dataset.get('points')
+                if points_np is not None:
+                    for pt in points_np:
+                        if len(pt) >= 3:
+                            data_wrapper.vertices.append(Vector3D(pt[0], pt[1], pt[2]))
+                        elif len(pt) == 2:
+                            data_wrapper.vertices.append(Vector3D(pt[0], pt[1], 0.0))
+            
+            # Add a dummy vertex if hull is empty
+            if not data_wrapper.convex_hull and not data_wrapper.vertices:
+                logger.warning(f"Dataset {original_idx} has empty geometry for refinement.")
+                continue
+            
+            # Use points as hull if hull is empty
+            if not data_wrapper.convex_hull and data_wrapper.vertices:
+                data_wrapper.convex_hull = data_wrapper.vertices
+                
+            # Add to appropriate collection in model
+            model_dataset_idx = len(temp_model.surfaces) if not is_polyline else len(temp_model.polylines)
+            
+            if is_polyline:
+                temp_model.polylines.append(data_wrapper)
+                temp_model.is_polyline[model_dataset_idx] = True
+                temp_model.original_indices_map[model_dataset_idx] = original_idx
+                valid_polylines_count += 1
+                logger.info(f"Added polyline dataset {original_idx} to temp model")
+            else:
+                temp_model.surfaces.append(data_wrapper)
+                temp_model.is_polyline[model_dataset_idx] = False
+                temp_model.original_indices_map[model_dataset_idx] = original_idx
+                valid_surfaces_count += 1
+
+        logger.info(f"Created temp model with {valid_surfaces_count} surfaces and {valid_polylines_count} polylines")
+        
+        if valid_surfaces_count + valid_polylines_count == 0:
+            QMessageBox.warning(self, "No Valid Datasets", "No valid datasets found for refinement.")
+            self.statusBar().showMessage("Refinement failed: No valid datasets.", 5000)
+            return
+
+        # Create a combined bidirectional mapping between original and temp model indices
+        bidirectional_map = {}
+        for temp_idx, orig_idx in temp_model.original_indices_map.items():
+            bidirectional_map[orig_idx] = temp_idx
+            bidirectional_map[temp_idx] = orig_idx
+
+        # Now populate temp_model.intersections from self.datasets_intersections
+        for original_ds_idx, intersections_list in self.datasets_intersections.items():
+            for intersection_data in intersections_list:
+                # Map original dataset IDs to temporary model dataset IDs
+                temp_id1 = bidirectional_map.get(intersection_data['dataset_id1'])
+                temp_id2 = bidirectional_map.get(intersection_data['dataset_id2'])
+
+                if temp_id1 is None or temp_id2 is None:
+                    logger.warning(f"Could not map dataset IDs {intersection_data['dataset_id1']} and {intersection_data['dataset_id2']} for intersection. Skipping.")
+                    continue
+
+                new_intersection = Intersection(temp_id1, temp_id2, intersection_data['is_polyline_mesh'])
+                for pt_coords in intersection_data['points']:
+                    if len(pt_coords) >= 3:
+                        new_intersection.add_point(Vector3D(pt_coords[0], pt_coords[1], pt_coords[2]))
+                    elif len(pt_coords) == 2:
+                        new_intersection.add_point(Vector3D(pt_coords[0], pt_coords[1], 0.0))
+                temp_model.intersections.append(new_intersection)
+        
+        if not temp_model.intersections:
+            QMessageBox.information(self, "No Intersections", "No intersections could be prepared.")
+            self.statusBar().showMessage("Refinement skipped: No intersections.", 5000)
+            return
+
+        # Apply the alignment to convex hulls
+        try:
+            # Only apply to true surfaces (not polylines)
+            for i in range(len(temp_model.surfaces)):
+                align_intersections_to_convex_hull(i, temp_model)
+            logger.info("Intersection alignment to convex hulls complete.")
+        except Exception as e:
+            logger.error(f"Error during convex hull alignment: {e}", exc_info=True)
+            QMessageBox.warning(self, "Refinement Error", f"Error during convex hull alignment: {str(e)}")
+            return
+
+        # After aligning, perform triple point insertion
+        try:
+            insert_triple_points(temp_model)
+            logger.info("Triple points insertion complete.")
+        except Exception as e:
+            logger.error(f"Error during triple points insertion: {e}", exc_info=True)
+
+        # Now apply length-based refinement with special point detection
+        try:
+            for intersection in temp_model.intersections:
+                # Calculate target length
+                target_length = 0.0
+                count = 0
+                
+                # Get sizes from appropriate collections
+                for idx in [intersection.id1, intersection.id2]:
+                    if temp_model.is_polyline.get(idx, False):
+                        # This is a polyline
+                        if idx < len(temp_model.polylines):
+                            polyline = temp_model.polylines[idx]
+                            if hasattr(polyline, 'size') and polyline.size > 0:
+                                target_length += polyline.size
+                                count += 1
+                    else:
+                        # This is a surface
+                        if idx < len(temp_model.surfaces):
+                            surface = temp_model.surfaces[idx]
+                            if hasattr(surface, 'size') and surface.size > 0:
+                                target_length += surface.size
+                                count += 1
+                
+                if count > 0:
+                    target_length /= count
+                    # Use a fraction of the average size for refinement
+                    target_length *= 0.2  # 1/5th of average size
+                else:
+                    target_length = 0.1  # Default small value
+                
+                # Apply the refinement with debugging
+                logger.info(f"Refining intersection between datasets {intersection.id1} and {intersection.id2}")
+                logger.info(f"Before refinement: {len(intersection.points)} points")
+                logger.info(f"Target length: {target_length}")
+                refine_intersection_line_by_length(intersection, target_length)
+                logger.info(f"After refinement: {len(intersection.points)} points")
+            
+            logger.info("Length-based refinement complete.")
+        except Exception as e:
+            logger.error(f"Error during length-based refinement: {e}", exc_info=True)
+
+        # Map the refined intersections back to the original data structure
+        for original_ds_idx in list(self.datasets_intersections.keys()):
+            self.datasets_intersections[original_ds_idx] = []  # Clear existing data
+        
+        # Transfer all refined intersections back
+        for intersection in temp_model.intersections:
+            # Map back to original dataset indices
+            orig_id1 = temp_model.original_indices_map.get(intersection.id1)
+            orig_id2 = temp_model.original_indices_map.get(intersection.id2)
+            
+            if orig_id1 is None or orig_id2 is None:
+                logger.warning(f"Could not map refined intersection back to original datasets: {intersection.id1}, {intersection.id2}")
+                continue
+            
+            # Create intersection data in original format
+            refined_intersection = {
+                'dataset_id1': orig_id1,
+                'dataset_id2': orig_id2,
+                'is_polyline_mesh': intersection.is_polyline_mesh,
+                'points': []
+            }
+            
+            # Convert Vector3D points back to coordinate lists,
+            # preserving any type information if available
+            for point in intersection.points:
+                # Ensure type information is preserved
+                if hasattr(point, 'point_type') and point.point_type:
+                    point_data = [point.x, point.y, point.z, point.point_type]
+                else:
+                    point_data = [point.x, point.y, point.z]
+                refined_intersection['points'].append(point_data)
+                
+            # Add to the right dataset
+            ds_key = min(orig_id1, orig_id2)  # Use same convention as before
+            if ds_key not in self.datasets_intersections:
+                self.datasets_intersections[ds_key] = []
+            self.datasets_intersections[ds_key].append(refined_intersection)
+        
+        # Analyze results and show summary
+        results_summary = self._analyze_refinement_results()
+        logger.info(f"Refinement complete: {results_summary}")
+        
+        # Update visualization
+        self._update_refined_visualization()
+        
+        QMessageBox.information(self, "Refinement Complete", results_summary)
+        self.statusBar().showMessage("Refinement complete.")
     def load_file(self):
         """Load data from a file"""
         self.statusBar().showMessage("Loading file...")
@@ -3545,13 +4080,16 @@ segmentation, triangulation, and visualization.
         """Remove the active dataset"""
         if 0 <= self.current_dataset_index < len(self.datasets):
             self._remove_dataset(self.current_dataset_index)
-    
     def _clear_visualizations(self):
         """Clear all visualizations"""
+        # ... existing clear calls ...
         self._clear_hull_plot()
         self._clear_segment_plot()
         self._clear_triangulation_plot()
         self._clear_intersection_plot()
+        self._clear_refine_mesh_plot() # Add this line
+        
+        # ... rest of the method ...
         
         # Clear points visualization
         while self.file_viz_layout.count():
@@ -4117,6 +4655,469 @@ segmentation, triangulation, and visualization.
         # Update the triangulation legend (remains the same)
         # ... existing legend update code ...
     
+    def _visualize_refined_intersections(self):
+        """Visualize refined intersections in the 'Refine & Mesh Settings' tab plotter."""
+        # First try the direct plotter attribute
+        plotter = None
+        if hasattr(self, 'refine_mesh_plotter') and self.refine_mesh_plotter:
+            plotter = self.refine_mesh_plotter
+        # If attribute isn't available, try the plotters dictionary
+        elif hasattr(self, 'plotters') and 'refine_mesh' in self.plotters and self.plotters['refine_mesh']:
+            plotter = self.plotters['refine_mesh']
+            # Reconnect the attribute if it was missing
+            self.refine_mesh_plotter = plotter
+        
+        if not plotter:
+            logger.warning("Refine/Mesh plotter not available for visualization. Creating a new one...")
+            
+            # Try to recreate the plotter if it's missing
+            if HAVE_PYVISTA and hasattr(self, 'refine_mesh_viz_frame') and self.refine_mesh_viz_frame:
+                try:
+                    from pyvistaqt import QtInteractor
+                    new_plotter = QtInteractor(self.refine_mesh_viz_frame)
+                    self.refine_mesh_plot_layout.addWidget(new_plotter.interactor)
+                    new_plotter.set_background([0.318, 0.341, 0.431])
+                    plotter = new_plotter
+                    self.refine_mesh_plotter = plotter
+                    if hasattr(self, 'plotters'):
+                        self.plotters['refine_mesh'] = plotter
+                    logger.info("Successfully recreated refine_mesh_plotter")
+                except Exception as e:
+                    logger.error(f"Error recreating Refine/Mesh plotter: {e}")
+                    return
+            else:
+                return
+
+        plotter.clear()
+        plotter.set_background([0.318, 0.341, 0.431]) # MeshIt background
+
+        if not hasattr(self, 'datasets_intersections') or not self.datasets_intersections:
+            plotter.add_text("No refined intersections to display.", position='upper_edge', color='white')
+            plotter.reset_camera()
+            return
+
+        logger.info("Visualizing refined intersections...")
+
+        involved_dataset_indices = set()
+        all_refined_intersection_lines = []
+        # Use a more robust way to track intersections that accounts for polyline-surf and surf-surf differently
+        unique_intersections = set()
+        # Collect original and refined intersection lines
+        original_intersection_lines = []
+        refined_intersection_lines = []
+        endpoints_before = []
+        endpoints_after = []
+        plotter_has_content = False
+        
+        # Point type collections for visualization
+        start_points = []
+        end_points = []
+        special_points = []
+        high_curvature_points = []
+        feature_edge_points = []
+        triple_points = []
+        
+        # Check if original intersections exist
+        has_original = hasattr(self, 'original_intersections') and self.original_intersections
+        
+        # Get original lines if available
+        if has_original:
+            for dataset_idx_key, intersections_list in self.original_intersections.items():
+                for intersection_data in intersections_list:
+                    if intersection_data['points'] and len(intersection_data['points']) >= 2:
+                        try:
+                            # Convert points to proper numpy array format
+                            points_list = []
+                            for p in intersection_data['points']:
+                                if isinstance(p, list) or isinstance(p, tuple):
+                                    # Make sure we have at least 3 coordinates
+                                    if len(p) >= 3:
+                                        points_list.append([float(p[0]), float(p[1]), float(p[2])])
+                                    elif len(p) == 2:
+                                        points_list.append([float(p[0]), float(p[1]), 0.0])
+                                elif hasattr(p, 'x') and hasattr(p, 'y') and hasattr(p, 'z'):
+                                    # Handle Vector3D objects
+                                    points_list.append([float(p.x), float(p.y), float(p.z)])
+                                else:
+                                    logger.warning(f"Skipping unknown original point format")
+                                    continue
+                                    
+                            points = np.array(points_list)
+                            if len(points) >= 2:  # Make sure we still have at least 2 points
+                                original_intersection_lines.append((points, intersection_data.get('is_polyline_mesh', False)))
+                                # Store endpoints for comparison
+                                endpoints_before.append(points[0])  # First point
+                                endpoints_before.append(points[-1])  # Last point
+                        except Exception as e:
+                            logger.error(f"Error processing original intersection: {e}")
+        
+        # Get refined lines - process ALL intersections regardless of dataset key
+        for dataset_idx_key in self.datasets_intersections.keys():
+            intersections_list = self.datasets_intersections[dataset_idx_key]
+            for intersection_data in intersections_list:
+                if 'points' not in intersection_data or not intersection_data['points'] or len(intersection_data['points']) < 2:
+                    continue
+                    
+                try:
+                    # Track datasets involved in this intersection
+                    involved_dataset_indices.add(intersection_data.get('dataset_id1', -1))
+                    involved_dataset_indices.add(intersection_data.get('dataset_id2', -1))
+                    
+                    # Convert points to proper numpy array format
+                    points_list = []
+                    point_types = []
+                    for p in intersection_data['points']:
+                        point_type = None
+                        if isinstance(p, list) or isinstance(p, tuple):
+                            # Make sure we have at least 3 coordinates
+                            if len(p) >= 3:
+                                coord = [float(p[0]), float(p[1]), float(p[2])]
+                                points_list.append(coord)
+                                
+                                # Check for type information in the 4th element
+                                if len(p) > 3:
+                                    point_type = p[3]
+                                    if point_type == "START_POINT":
+                                        start_points.append(coord)
+                                    elif point_type == "END_POINT":
+                                        end_points.append(coord)
+                                    elif point_type == "SPECIAL_POINT":
+                                        special_points.append(coord)
+                                    elif point_type == "TRIPLE_POINT":
+                                        triple_points.append(coord)
+                                    elif point_type == "HIGH_CURVATURE_POINT":
+                                        high_curvature_points.append(coord)
+                                    elif point_type == "FEATURE_EDGE_POINT":
+                                        feature_edge_points.append(coord)
+                            elif len(p) == 2:
+                                points_list.append([float(p[0]), float(p[1]), 0.0])
+                        elif hasattr(p, 'x') and hasattr(p, 'y') and hasattr(p, 'z'):
+                            # Handle Vector3D objects
+                            coord = [float(p.x), float(p.y), float(p.z)]
+                            points_list.append(coord)
+                            
+                            # Add point to appropriate collection based on type
+                            # First check point_type attribute (primary way)
+                            if hasattr(p, 'point_type') and p.point_type:
+                                point_type = p.point_type
+                                if p.point_type == "START_POINT":
+                                    start_points.append(coord)
+                                elif p.point_type == "END_POINT":
+                                    end_points.append(coord)
+                                elif p.point_type == "SPECIAL_POINT":
+                                    special_points.append(coord)
+                                elif p.point_type == "HIGH_CURVATURE_POINT":
+                                    high_curvature_points.append(coord)
+                                elif p.point_type == "FEATURE_EDGE_POINT":
+                                    feature_edge_points.append(coord)
+                                elif p.point_type == "TRIPLE_POINT":
+                                    triple_points.append(coord)
+                            # Also check type attribute (fallback way)
+                            elif hasattr(p, 'type') and p.type:
+                                point_type = p.type
+                                if p.type == "START_POINT":
+                                    start_points.append(coord)
+                                elif p.type == "END_POINT":
+                                    end_points.append(coord)
+                                elif p.type == "SPECIAL_POINT":
+                                    special_points.append(coord)
+                                elif p.type == "HIGH_CURVATURE_POINT":
+                                    high_curvature_points.append(coord)
+                                elif p.type == "FEATURE_EDGE_POINT":
+                                    feature_edge_points.append(coord)
+                                elif p.type == "TRIPLE_POINT":
+                                    triple_points.append(coord)
+                        else:
+                            continue
+                        
+                        point_types.append(point_type)
+                            
+                    points = np.array(points_list)
+                    if len(points) >= 2:  # Make sure we still have at least 2 points
+                        # Track whether this is a polyline intersection
+                        is_polyline = intersection_data.get('is_polyline_mesh', False)
+                        
+                        # Add to both collections for different visualizations
+                        refined_intersection_lines.append((points, is_polyline))
+                        all_refined_intersection_lines.append(points)
+                        
+                        # Store endpoints for comparison
+                        if len(points) > 0:
+                            endpoints_after.append(points[0])  # First point
+                            endpoints_after.append(points[-1])  # Last point
+                            
+                        # Log that we're processing this intersection
+                        logger.debug(f"Processing intersection between datasets {intersection_data.get('dataset_id1', -1)} " +
+                                    f"and {intersection_data.get('dataset_id2', -1)}, " +
+                                    f"is_polyline={is_polyline}, points={len(points)}")
+                except Exception as e:
+                    logger.error(f"Error processing refined intersection: {str(e)}")
+
+        # If we have both original and refined, show the differences
+        if has_original and original_intersection_lines:
+            # Add original lines in red/orange with less opacity
+            for line_points_np, is_polyline in original_intersection_lines:
+                try:
+                    for i in range(len(line_points_np) - 1):
+                        pt1 = tuple(float(x) for x in line_points_np[i][:3])  # Ensure exactly 3 floats
+                        pt2 = tuple(float(x) for x in line_points_np[i+1][:3])  # Ensure exactly 3 floats
+                        segment = pv.Line(pt1, pt2)
+                        # Use different color for polyline intersections
+                        color = 'orange' if not is_polyline else 'chocolate'
+                        plotter.add_mesh(segment, color=color, opacity=0.4, 
+                                    line_width=3, label="Original Lines")
+                    plotter_has_content = True
+                except Exception as e:
+                    logger.error(f"Error adding original intersection line segment: {e}")
+
+        # Add refined lines in bright green (or cyan for polylines)
+        if refined_intersection_lines:
+            for line_points_np, is_polyline in refined_intersection_lines:
+                try:
+                    for i in range(len(line_points_np) - 1):
+                        pt1 = tuple(float(x) for x in line_points_np[i][:3])  # Ensure exactly 3 floats
+                        pt2 = tuple(float(x) for x in line_points_np[i+1][:3])  # Ensure exactly 3 floats
+                        segment = pv.Line(pt1, pt2)
+                        # Use different color for polyline intersections
+                        color = 'lime' if not is_polyline else 'cyan'
+                        label = "Refined Lines" if not is_polyline else "Refined Polyline Ints"
+                        plotter.add_mesh(segment, color=color, line_width=5, 
+                                    label=label)
+                    plotter_has_content = True
+                    logger.debug(f"Added refined line with {len(line_points_np)} points, is_polyline={is_polyline}")
+                except Exception as e:
+                    logger.error(f"Error adding refined intersection line segment: {e}")
+        
+        # Add original endpoints as yellow spheres
+        if has_original and endpoints_before:
+            try:
+                # Convert to numpy array of proper shape
+                endpoints_np = np.array([[float(p[0]), float(p[1]), float(p[2])] for p in endpoints_before])
+                if len(endpoints_np) > 0:
+                    endpoints_poly = pv.PolyData(endpoints_np)
+                    plotter.add_points(endpoints_poly, color='yellow', point_size=8,
+                                    render_points_as_spheres=True, label="Original Endpoints")
+            except Exception as e:
+                logger.error(f"Error adding original endpoints: {e}")
+        
+        # Add refined endpoints as blue spheres
+        if endpoints_after:
+            try:
+                # Convert to numpy array of proper shape
+                endpoints_np = np.array([[float(p[0]), float(p[1]), float(p[2])] for p in endpoints_after])
+                if len(endpoints_np) > 0:
+                    endpoints_poly = pv.PolyData(endpoints_np)
+                    plotter.add_points(endpoints_poly, color='cyan', point_size=10,
+                                    render_points_as_spheres=True, label="Refined Endpoints")
+            except Exception as e:
+                logger.error(f"Error adding refined endpoints: {e}")
+        
+        # Visualize specific point types
+        # Start points - green
+        if start_points:
+            try:
+                start_points_np = np.array(start_points)
+                if len(start_points_np) > 0:
+                    start_points_poly = pv.PolyData(start_points_np)
+                    plotter.add_points(start_points_poly, color='green', point_size=8,
+                                    render_points_as_spheres=True, label="Start Points")
+                    plotter_has_content = True
+            except Exception as e:
+                logger.error(f"Error adding start points: {e}")
+                
+        # End points - blue
+        if end_points:
+            try:
+                end_points_np = np.array(end_points)
+                if len(end_points_np) > 0:
+                    end_points_poly = pv.PolyData(end_points_np)
+                    plotter.add_points(end_points_poly, color='blue', point_size=8,
+                                    render_points_as_spheres=True, label="End Points")
+                    plotter_has_content = True
+            except Exception as e:
+                logger.error(f"Error adding end points: {e}")
+                
+        # Special points - red (increased size)
+        if special_points:
+            try:
+                special_points_np = np.array(special_points)
+                if len(special_points_np) > 0:
+                    special_points_poly = pv.PolyData(special_points_np)
+                    plotter.add_points(special_points_poly, color='red', point_size=12,
+                                    render_points_as_spheres=True, label="Special Points")
+                    plotter_has_content = True
+                    logger.info(f"Added {len(special_points)} special points to visualization")
+            except Exception as e:
+                logger.error(f"Error adding special points: {e}")
+                
+        # High curvature points - orange
+        if high_curvature_points:
+            try:
+                hc_points_np = np.array(high_curvature_points)
+                if len(hc_points_np) > 0:
+                    hc_points_poly = pv.PolyData(hc_points_np)
+                    plotter.add_points(hc_points_poly, color='orange', point_size=12,
+                                    render_points_as_spheres=True, label="High Curvature Points")
+                    plotter_has_content = True
+                    logger.info(f"Added {len(high_curvature_points)} high curvature points to visualization")
+            except Exception as e:
+                logger.error(f"Error adding high curvature points: {e}")
+                
+        # Feature edge points - yellow
+        if feature_edge_points:
+            try:
+                fe_points_np = np.array(feature_edge_points)
+                if len(fe_points_np) > 0:
+                    fe_points_poly = pv.PolyData(fe_points_np)
+                    plotter.add_points(fe_points_poly, color='yellow', point_size=12,
+                                    render_points_as_spheres=True, label="Feature Edge Points")
+                    plotter_has_content = True
+                    logger.info(f"Added {len(feature_edge_points)} feature edge points to visualization")
+            except Exception as e:
+                logger.error(f"Error adding feature edge points: {e}")
+        
+        # Collect triple points (if they are also updated/re-calculated after refinement)
+        all_triple_points_coords = []
+        if hasattr(self, 'triple_points') and self.triple_points:
+            try:
+                for tp in self.triple_points:
+                    p = tp['point']
+                    if isinstance(p, list) or isinstance(p, tuple):
+                        if len(p) >= 3:
+                            all_triple_points_coords.append([float(p[0]), float(p[1]), float(p[2])])
+                    elif hasattr(p, 'x') and hasattr(p, 'y') and hasattr(p, 'z'):
+                        all_triple_points_coords.append([float(p.x), float(p.y), float(p.z)])
+            except Exception as e:
+                logger.error(f"Error processing triple points: {e}")
+        
+        # Add triple points - magenta
+        if triple_points or all_triple_points_coords:
+            try:
+                # Merge any additional triple points from our new classification
+                if triple_points:
+                    all_triple_points_coords.extend(triple_points)
+                
+                triple_points_np = np.array(all_triple_points_coords)
+                if len(triple_points_np) > 0:
+                    triple_points_poly = pv.PolyData(triple_points_np)
+                    plotter.add_points(triple_points_poly, color='magenta', point_size=12,
+                                    render_points_as_spheres=True, label="Triple Points")
+                    plotter_has_content = True
+            except Exception as e:
+                logger.error(f"Error adding triple points: {e}")
+
+        # Add involved dataset meshes (triangulated surfaces)
+        for original_idx in involved_dataset_indices:
+            if original_idx >= 0 and original_idx < len(self.datasets):
+                dataset = self.datasets[original_idx]
+                if not dataset.get('visible', True): continue
+
+                tri_result = dataset.get('triangulation_result')
+                if tri_result:
+                    vertices_np = tri_result.get('vertices')
+                    triangles_np = tri_result.get('triangles')
+                    mesh_color = dataset.get('color', '#CCCCCC')
+                    name = dataset.get('name', f'Dataset {original_idx + 1}')
+
+                    if vertices_np is not None and len(vertices_np) > 0 and \
+                    triangles_np is not None and len(triangles_np) > 0:
+                        try:
+                            vertices_np = np.array(vertices_np)
+                            if vertices_np.shape[1] == 2:
+                                temp_v = np.zeros((vertices_np.shape[0], 3))
+                                temp_v[:,:2] = vertices_np
+                                vertices_np = temp_v
+                            elif vertices_np.shape[1] > 3:
+                                vertices_np = vertices_np[:,:3]
+                            
+                            triangles_np = np.array(triangles_np)
+                            cells = np.hstack([np.full((len(triangles_np), 1), 3, dtype=triangles_np.dtype), triangles_np])
+                            
+                            surface_mesh = pv.PolyData(vertices_np, faces=cells)
+                            plotter.add_mesh(surface_mesh, color=mesh_color, opacity=0.7,
+                                            show_edges=True, edge_color='black',
+                                            line_width=1, label=name)
+                            plotter_has_content = True
+                        except Exception as e:
+                            logger.error(f"Error creating mesh for dataset {original_idx} ('{name}') in refined view: {e}")
+
+        # Add special points like angle-based special points (from old implementation, kept for compatibility)
+        special_points_coords = []
+        for dataset_idx_key, intersections_list in self.datasets_intersections.items():
+            for intersection_data in intersections_list:
+                if intersection_data['points']:
+                    for p in intersection_data['points']:
+                        # Check if this is a special point by type
+                        is_special = False
+                        if isinstance(p, list) or isinstance(p, tuple):
+                            if len(p) > 3 and p[3] in ["SPECIAL_ANGLE_POINT", "TRIPLE_POINT"]:
+                                is_special = True
+                                if len(p) >= 3:
+                                    special_points_coords.append([float(p[0]), float(p[1]), float(p[2])])
+                        elif hasattr(p, 'type') and p.type in ["SPECIAL_ANGLE_POINT", "TRIPLE_POINT"]:
+                            is_special = True
+                            special_points_coords.append([float(p.x), float(p.y), float(p.z)])
+
+        if special_points_coords:
+            try:
+                special_points_np = np.array(special_points_coords)
+                if len(special_points_np) > 0:
+                    special_points_poly = pv.PolyData(special_points_np)
+                    plotter.add_points(special_points_poly, color='pink', point_size=10,
+                                    render_points_as_spheres=True, label="Legacy Special Points")
+                    plotter_has_content = True
+            except Exception as e:
+                logger.error(f"Error adding legacy special points to refined view: {e}")
+
+        # Add a text with statistics about the points if we have them
+        if any([start_points, end_points, special_points, high_curvature_points, feature_edge_points, triple_points]):
+            try:
+                stats_text = (
+                    f"Point Statistics:\n"
+                    f"Start Points: {len(start_points)}\n"
+                    f"End Points: {len(end_points)}\n"
+                    f"Special Points: {len(special_points)}\n"
+                    f"High Curvature: {len(high_curvature_points)}\n"
+                    f"Feature Edges: {len(feature_edge_points)}\n"
+                    f"Triple Points: {len(triple_points)}"
+                )
+                plotter.add_text(stats_text, position='lower_left', font_size=10, color='white')
+            except Exception as e:
+                logger.error(f"Error adding statistics text: {e}")
+
+        if plotter_has_content:
+            plotter.add_legend(bcolor=None, face='circle', border=False, size=(0.15, 0.15))
+            plotter.add_axes()
+            plotter.reset_camera()
+            logger.info("Updated refined intersections view.")
+        else:
+            plotter.add_text("No valid data to display in refined view.", position='upper_edge', color='white')
+        def _clear_refine_mesh_plot(self):
+            """Clear the embedded Refine & Mesh PyVista plotter."""
+            plotter = None
+            if hasattr(self, 'refine_mesh_plotter') and self.refine_mesh_plotter:
+                plotter = self.refine_mesh_plotter
+            elif 'refine_mesh' in self.plotters and self.plotters['refine_mesh']:
+                plotter = self.plotters['refine_mesh']
+                self.refine_mesh_plotter = plotter
+            
+            if plotter:
+                plotter.clear()
+                plotter.add_text("Refine intersections to visualize or load data.", position='upper_edge', color='white')
+                plotter.reset_camera()
+            elif hasattr(self, 'refine_mesh_plot_layout'): # Fallback if plotter is None but layout exists
+                for i in reversed(range(self.refine_mesh_plot_layout.count())):
+                    widget = self.refine_mesh_plot_layout.itemAt(i).widget()
+                    if widget:
+                        if hasattr(self, 'refine_mesh_plotter') and self.refine_mesh_plotter and widget == self.refine_mesh_plotter.interactor:
+                            continue
+                        widget.setParent(None)
+                        widget.deleteLater()
+                if not hasattr(self, 'refine_mesh_plotter') or not self.refine_mesh_plotter:
+                    placeholder = QLabel("PyVista required or plot cleared.")
+                    placeholder.setAlignment(Qt.AlignCenter)
+                    self.refine_mesh_plot_layout.addWidget(placeholder)
+
     def _create_multi_dataset_3d_visualization(self, parent_frame, datasets, title, view_type="points"):
         """Create a 3D visualization of multiple datasets
         
@@ -4465,56 +5466,49 @@ segmentation, triangulation, and visualization.
         current_index = self.notebook.currentIndex()
         self._on_tab_changed(current_index)
 
-
     def _on_tab_changed(self, index):
         """Handle tab changes to update visualizations as needed"""
         logger.debug(f"Tab changed to index {index}")
-        # Check if datasets exist before trying to visualize
+        # Get the widget associated with the current index
+        current_tab_widget = self.notebook.widget(index)
+
         if not self.datasets:
-             logger.debug("No datasets loaded, clearing visualizations.")
-             self._clear_visualizations() # Clear plots if no data
-             if index == 0: pass
-             elif index == 1: self._clear_hull_plot()
-             elif index == 2: self._clear_segment_plot()
-             elif index == 3: self._clear_triangulation_plot()
-             elif index == 4: self._clear_intersection_plot() # Clear plotter when tab is selected with no data
-             return
+            logger.debug("No datasets loaded, clearing visualizations.")
+            self._clear_visualizations() # Clears all known plots
+            # Explicitly clear the current tab's specific plot if it has one and _clear_visualizations doesn't cover it
+            if current_tab_widget == self.file_tab: pass # Covered
+            elif current_tab_widget == self.hull_tab: self._clear_hull_plot()
+            elif current_tab_widget == self.segment_tab: self._clear_segment_plot()
+            elif current_tab_widget == self.triangulation_tab: self._clear_triangulation_plot()
+            elif current_tab_widget == self.intersection_tab: self._clear_intersection_plot()
+            elif current_tab_widget == self.refine_mesh_tab: self._clear_refine_mesh_plot() # Add this
+            return
 
-        # Logic to update visualization based on the selected tab
-        if index == 0:  # File tab
+        if current_tab_widget == self.file_tab:  # File tab
             self._visualize_all_points()
-        elif index == 1:  # Hull tab
-            # Check visibility and data existence
+        elif current_tab_widget == self.hull_tab:  # Hull tab
             needs_update = any(d.get('visible', True) and d.get('hull_points') is not None for d in self.datasets)
-            if needs_update:
-                self._visualize_all_hulls()
-            else:
-                self._clear_hull_plot()
-                self.statusBar().showMessage("No visible hulls computed.")
-        elif index == 2:  # Segment tab
+            if needs_update: self._visualize_all_hulls()
+            else: self._clear_hull_plot(); self.statusBar().showMessage("No visible hulls computed.")
+        elif current_tab_widget == self.segment_tab:  # Segment tab
             needs_update = any(d.get('visible', True) and d.get('segments') is not None for d in self.datasets)
-            if needs_update:
-                self._visualize_all_segments()
-            else:
-                self._clear_segment_plot()
-                self.statusBar().showMessage("No visible segments computed.")
-        elif index == 3:  # Triangulation tab
+            if needs_update: self._visualize_all_segments()
+            else: self._clear_segment_plot(); self.statusBar().showMessage("No visible segments computed.")
+        elif current_tab_widget == self.triangulation_tab:  # Triangulation tab
             needs_update = any(d.get('visible', True) and d.get('triangulation_result') is not None for d in self.datasets)
-            if needs_update:
-                self._visualize_all_triangulations()
-            else:
-                self._clear_triangulation_plot()
-                self.statusBar().showMessage("No visible triangulations computed.")
-        elif index == 4:  # Intersection tab
-            # Trigger visualization update for the embedded plotter when tab becomes active
-            # Check if intersection data exists before visualizing
+            if needs_update: self._visualize_all_triangulations()
+            else: self._clear_triangulation_plot(); self.statusBar().showMessage("No visible triangulations computed.")
+        elif current_tab_widget == self.intersection_tab:  # Intersection tab
             has_intersections = hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections)
-            if has_intersections:
-                 self._visualize_intersections() 
+            if has_intersections: self._visualize_intersections()
+            else: self._clear_intersection_plot(); self.statusBar().showMessage("No intersections computed yet.")
+        elif current_tab_widget == self.refine_mesh_tab: # Refine & Mesh tab - Add this block
+            has_refined_intersections = hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections) # Check if any intersections exist (refined or not)
+            if has_refined_intersections:
+                self._visualize_refined_intersections() # This will show current state of intersections
             else:
-                 self._clear_intersection_plot() # Ensure plotter is cleared if no data
-                 self.statusBar().showMessage("No intersections computed yet.")
-
+                self._clear_refine_mesh_plot()
+                self.statusBar().showMessage("No intersections to refine or display.")
     # ... rest of the class methods (_get_next_color, _create_main_layout, etc.) ...
 
     def _get_boundary_edges(self, triangles):
