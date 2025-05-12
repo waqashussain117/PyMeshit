@@ -23,6 +23,15 @@ class Vector3D:
         self.type = "DEFAULT" 
         self.type = point_type  # Store type information # Point type: DEFAULT, CORNER, INTERSECTION_POINT, TRIPLE_POINT, COMMON_INTERSECTION_CONVEXHULL_POINT
     
+    # Add property for compatibility with MeshIt's Vector3D
+    @property
+    def type(self):
+        return self.point_type
+    
+    @type.setter
+    def type(self, value):
+        self.point_type = value
+
     def __add__(self, other):
         return Vector3D(self.x + other.x, self.y + other.y, self.z + other.z)
     
@@ -1400,116 +1409,198 @@ def insert_triple_points(model, tolerance=1e-5):
                  points.append(tp.point) # Append as a fallback
 
 
+def clean_identical_points(points_list: List[Vector3D], tolerance=1e-8) -> List[Vector3D]:
+    """Removes duplicate points from a list, preserving order and special types."""
+    if not points_list:
+        return []
+    
+    cleaned_list = []
+    for point_to_add in points_list:
+        if not cleaned_list:
+            cleaned_list.append(point_to_add)
+            continue
+
+        # Check against the last added point in the cleaned list
+        if (point_to_add - cleaned_list[-1]).length() > tolerance:
+            cleaned_list.append(point_to_add)
+        else:
+            # Points are identical or very close
+            # Prioritize special types over DEFAULT or if types differ, log it (or define priority)
+            if point_to_add.type != "DEFAULT" and cleaned_list[-1].type == "DEFAULT":
+                cleaned_list[-1] = point_to_add # Replace default with special
+            elif point_to_add.type != "DEFAULT" and cleaned_list[-1].type != "DEFAULT" and point_to_add.type != cleaned_list[-1].type:
+                # Both are special but different. For now, keep the one already in cleaned_list.
+                # logger.warning(f"CleanIdenticalPoints: Conflicting special types for merged points: {cleaned_list[-1].type} and {point_to_add.type}. Keeping first.")
+                pass # Keep the existing special point in cleaned_list
+            # If point_to_add.type is DEFAULT and cleaned_list[-1] is special, do nothing.
+            # If both are DEFAULT, or both are the same special type, do nothing.
+            
+    return cleaned_list
+
+
 def align_intersections_to_convex_hull(surface_idx: int, model):
     """
     Align intersection points to the convex hull of a surface.
-    Following the C++ implementation more closely.
+    Modified to closely follow C++: inserts points into the hull and cleans it.
     
     Args:
-        surface_idx: Index of the surface
-        model: MeshItModel instance
+        surface_idx: Index of the surface in model.surfaces
+        model: MeshItModel instance (temporary model wrapper from GUI)
     """
     surface = model.surfaces[surface_idx]
     
-    # If no convex hull, calculate it first
     if not hasattr(surface, 'convex_hull') or not surface.convex_hull:
-        if hasattr(surface, 'calculate_convex_hull'):
-            surface.calculate_convex_hull()
-        else:
-            print(f"Warning: Surface {surface_idx} has no convex hull and no method to calculate it")
-            return
+        # In the GUI context, convex_hull should be populated from dataset['hull_points']
+        # For robustness, if it's missing, we might log and return or try to compute if a method existed.
+        # print(f"Warning: Surface {surface_idx} ({getattr(surface, 'name', 'N/A')}) has no convex hull for alignment.")
+        return
     
-    # For each intersection involving this surface
-    for intersection in model.intersections:
-        if intersection.id1 == surface_idx or intersection.id2 == surface_idx:
-            # Check first and last points of the intersection line
-            if len(intersection.points) < 2:
-                continue
-            
-            # Check the first point
-            first_point = intersection.points[0]
-            last_point = intersection.points[-1]
-            
-            # For the first point: Check if it's close to a special point in the convex hull
-            close_to_special_first = False
-            close_to_special_last = False
-            
-            for i, hull_point in enumerate(surface.convex_hull):
-                if hull_point.type != "DEFAULT":  # It's a special point (corner, etc.)
-                    # Check first point proximity
-                    if (first_point - hull_point).length() < 1e-8:
-                        # Merge first point to hull special point
-                        intersection.points[0] = hull_point
-                        close_to_special_first = True
-                    
-                    # Check last point proximity
-                    if (last_point - hull_point).length() < 1e-8:
-                        # Merge last point to hull special point
-                        intersection.points[-1] = hull_point
-                        close_to_special_last = True
-            
-            # If not close to a special point, check if it's close to a segment in the convex hull
-            if not close_to_special_first:
-                closest_on_hull_first = None
-                min_dist_first = float('inf')
-                
-                for i in range(len(surface.convex_hull) - 1):
-                    p1 = surface.convex_hull[i]
-                    p2 = surface.convex_hull[i+1]
-                    
-                    # Find closest point on this segment
-                    closest = closest_point_on_segment(first_point, p1, p2)
-                    dist = (first_point - closest).length()
-                    
-                    if dist < min_dist_first:
-                        min_dist_first = dist
-                        closest_on_hull_first = closest
-                
-                # If close enough to a segment, snap to it
-                if min_dist_first < 1e-8 and closest_on_hull_first:
-                    # If the closest point is not directly on a vertex, add it to the hull as a special point
-                    for hull_point in surface.convex_hull:
-                        if (closest_on_hull_first - hull_point).length() < 1e-8:
-                            intersection.points[0] = hull_point
-                            break
-                    else:
-                        # Point not already in hull, add it with special type
-                        closest_on_hull_first.type = "COMMON_INTERSECTION_CONVEXHULL_POINT"
-                        # In real implementation, would add it to the hull here
-                        # surface.convex_hull.append(closest_on_hull_first)
-                        intersection.points[0] = closest_on_hull_first
-            
-            # Do the same for the last point if it wasn't close to a special hull point
-            if not close_to_special_last:
-                closest_on_hull_last = None
-                min_dist_last = float('inf')
-                
-                for i in range(len(surface.convex_hull) - 1):
-                    p1 = surface.convex_hull[i]
-                    p2 = surface.convex_hull[i+1]
-                    
-                    # Find closest point on this segment
-                    closest = closest_point_on_segment(last_point, p1, p2)
-                    dist = (last_point - closest).length()
-                    
-                    if dist < min_dist_last:
-                        min_dist_last = dist
-                        closest_on_hull_last = closest
-                
-                # If close enough to a segment, snap to it
-                if min_dist_last < 1e-8 and closest_on_hull_last:
-                    # If the closest point is not directly on a vertex, add it to the hull as a special point
-                    for hull_point in surface.convex_hull:
-                        if (closest_on_hull_last - hull_point).length() < 1e-8:
-                            intersection.points[-1] = hull_point
-                            break
-                    else:
-                        # Point not already in hull, add it with special type
-                        closest_on_hull_last.type = "COMMON_INTERSECTION_CONVEXHULL_POINT"
-                        # In real implementation, would add it to the hull here
-                        # surface.convex_hull.append(closest_on_hull_last)
-                        intersection.points[-1] = closest_on_hull_last
+    # Loop over all intersections in the model
+    for intersection_idx, intersection in enumerate(model.intersections):
+        # Check if the current surface is involved in this intersection
+        # In the temp_model, id1 and id2 are indices for surfaces or polylines list
+        # We need to check if it's the current surface based on whether it's a surface or polyline
+        is_surface1 = not model.is_polyline.get(intersection.id1, True) # Default to polyline if not in map
+        is_surface2 = not model.is_polyline.get(intersection.id2, True)
 
+        surface_is_id1 = is_surface1 and intersection.id1 == surface_idx
+        surface_is_id2 = is_surface2 and intersection.id2 == surface_idx
+
+        
+        
+        if not (surface_is_id1 or surface_is_id2):
+            continue # This surface is not part of this intersection
+            
+        if len(intersection.points) < 1: # Need at least one point to align
+            continue
+
+        points_to_process = []
+        if len(intersection.points) == 1:
+            points_to_process = [(0, intersection.points[0])] # Index and point
+        elif len(intersection.points) >= 2:
+            points_to_process = [(0, intersection.points[0]), (-1, intersection.points[-1])] # Process first and last
+
+        for point_index_in_intersection, intersection_point_obj in points_to_process:
+            original_intersection_point = Vector3D(intersection_point_obj.x, intersection_point_obj.y, intersection_point_obj.z, intersection_point_obj.type)
+            snapped_to_existing_special = False
+
+            # 1. Check if intersection point is already close to a SPECIAL convex hull point
+            for hull_pt_idx, hull_pt_obj in enumerate(surface.convex_hull):
+                if hull_pt_obj.type != "DEFAULT": # It's a special point
+                    if (original_intersection_point - hull_pt_obj).length() < 1e-8:
+                        if point_index_in_intersection == 0:
+                            intersection.points[0] = hull_pt_obj
+                        else: # -1 for last point
+                            intersection.points[-1] = hull_pt_obj
+                        snapped_to_existing_special = True
+                        break
+            if snapped_to_existing_special:
+                continue # Move to the next intersection point (or next intersection)
+
+            # 2. If not snapped to special, check projection onto hull segments
+            segment_idx = 0
+            point_inserted_or_snapped_on_segment = False
+            while segment_idx < len(surface.convex_hull) - 1: # Use while for dynamic length of hull list
+                p1 = surface.convex_hull[segment_idx]
+                p2 = surface.convex_hull[segment_idx + 1]
+                
+                closest_pt_on_segment = closest_point_on_segment(original_intersection_point, p1, p2)
+                dist_to_segment_projection = (original_intersection_point - closest_pt_on_segment).length()
+
+                new_hull_point = Vector3D(closest_pt_on_segment.x, closest_pt_on_segment.y, closest_pt_on_segment.z)
+                # Add this logging statement:
+                logger.info(f"Adding COMMON_INTERSECTION_CONVEXHULL_POINT to surface {surface_idx} at ({new_hull_point.x:.3f}, {new_hull_point.y:.3f}, {new_hull_point.z:.3f})")
+                new_hull_point.type = "COMMON_INTERSECTION_CONVEXHULL_POINT"
+
+                if dist_to_segment_projection < 1e-8: # Projection is on or very close to this segment
+                    # Check if this closest_pt_on_segment is an existing hull vertex (p1 or p2 or any other)
+                    snapped_to_existing_vertex_on_segment = False
+                    for existing_hull_pt_idx, existing_hull_pt_obj in enumerate(surface.convex_hull):
+                        if (closest_pt_on_segment - existing_hull_pt_obj).length() < 1e-8:
+                           if point_index_in_intersection == 0:
+                            intersection.points[0] = new_hull_point
+                        else:
+                            intersection.points[-1] = new_hull_point
+                            snapped_to_existing_vertex_on_segment = True
+                            break
+                    
+                    if not snapped_to_existing_vertex_on_segment:
+                        # Not an existing vertex, so insert this new point into the hull
+                        new_hull_point = Vector3D(closest_pt_on_segment.x, closest_pt_on_segment.y, closest_pt_on_segment.z, 
+                                                point_type="COMMON_INTERSECTION_CONVEXHULL_POINT")
+                        
+                        # Update intersection point to new hull point
+                        if point_index_in_intersection == 0:
+                            intersection.points[0] = new_hull_point
+                        else:
+                            intersection.points[-1] = new_hull_point
+                        
+                        # Insert the new point into the hull
+                        surface.convex_hull.insert(segment_idx + 1, new_hull_point)
+                        # Point inserted, break from this segment loop for this endpoint (mimics C++)
+                        # The while loop condition (len) will be updated in the next iteration.
+                    
+                    point_inserted_or_snapped_on_segment = True
+                    break # Break from while segment_idx loop (found its place on a segment)
+                
+                segment_idx += 1
+            # End of while loop for segments for this intersection_point_obj
+        # End of loop for points_to_process (first/last of an intersection)
+    # End of loop for all intersections for this surface
+
+    # After all intersections involving this surface have been processed and potentially modified the hull:
+    # Clean up the convex hull for this surface
+        # After all intersections involving this surface have been processed and potentially modified the hull:
+    # Clean up the convex hull for this surface
+    # Replace the existing code in meshit/intersection_utils.py around line 1580-1600 with this:
+    if hasattr(surface, 'convex_hull') and surface.convex_hull:
+        surface.convex_hull = clean_identical_points(surface.convex_hull)
+        
+        # Replicate C++ RefineByLength for the convex hull
+        # Get the surface's target edge length - use a default if not available
+        target_length = getattr(surface, 'size', 20.0)
+        
+        # Refine the convex hull polygon into segments of target_length
+        refined_hull = []
+        
+        # For each segment in the convex hull
+        for i in range(len(surface.convex_hull)):
+            p1 = surface.convex_hull[i]
+            p2 = surface.convex_hull[(i + 1) % len(surface.convex_hull)]  # Wrap around for last segment
+            
+            # Always include the first point of the segment
+            refined_hull.append(p1)
+            
+            # Calculate segment length
+            segment_length = (p2 - p1).length()
+            
+            # Calculate how many points to add - C++ style with better spacing
+            if segment_length > target_length * 1.2:  # Add 20% buffer to avoid tiny segments
+                # Calculate number of segments (not points)
+                num_segments = max(1, int(round(segment_length / target_length)))
+                segment_vector = (p2 - p1) / num_segments
+                
+                # Add intermediate points at exact intervals
+                for j in range(1, num_segments):
+                    # Create point at exact position
+                    new_point = Vector3D(
+                        p1.x + segment_vector.x * j,
+                        p1.y + segment_vector.y * j,
+                        p1.z + segment_vector.z * j,
+                        point_type="COMMON_INTERSECTION_CONVEXHULL_POINT"
+                    )
+                    refined_hull.append(new_point)
+                    # Log the new point for debugging
+                    logging.getLogger('meshit.intersection_utils').info(
+                        f"Adding COMMON_INTERSECTION_CONVEXHULL_POINT to surface {surface_idx} at "
+                        f"({new_point.x:.3f}, {new_point.y:.3f}, {new_point.z:.3f})"
+                    )
+        
+        # Replace the convex hull with the refined version
+        surface.convex_hull = refined_hull
+        
+        # Clean up again in case the refinement introduced any duplicate points
+        surface.convex_hull = clean_identical_points(surface.convex_hull)
 
 def calculate_size_of_intersections(model):
     """
@@ -1738,157 +1829,180 @@ def compute_angle_between_segments(p1, p2, p3):
     angle_deg = angle_rad * 180.0 / math.pi
     
     return angle_deg
-def refine_intersection_line_by_length(intersection, target_length):
+
+
+import math # Ensure math is imported
+# Ensure logger is configured if you use logger.info, e.g.:
+# import logging
+# logger = logging.getLogger(__name__) # Or your specific logger
+
+# ... (Vector3D, Intersection, compute_angle_between_segments, clean_identical_points - assumed to be present) ...
+
+def refine_intersection_line_by_length(intersection, target_length, min_angle_deg=20.0, uniform_meshing=True):
     """
     Refines an intersection line by ensuring segment lengths are close to the target length.
-    Also identifies and marks special points based on various geometric criteria.
+    Identifies and marks special points based on internal geometric criteria.
+    The min_angle_deg from UI is for eventual mesh quality, not directly for point classification here.
     
     Args:
-        intersection: Intersection object to refine
-        target_length: Target segment length
+        intersection: Intersection object to refine. Its .points attribute will be modified.
+        target_length: Target segment length, determined by calling context.
+        min_angle_deg: (Ignored for point classification here) UI hint for mesh cell quality.
+        uniform_meshing: If True, strictly adheres to target_length. If False, uses ceil
+                         to ensure segments are not longer than target_length.
+    Returns:
+        The list of refined points (also updates intersection.points directly).
     """
     if not intersection.points or len(intersection.points) < 2:
-        return
+        return intersection.points if hasattr(intersection, 'points') else []
 
-    # Constants for classification
-    ANGLE_THRESHOLD = 0.5  # Lowered to 0.5 degrees as requested
+    # Internal thresholds for point classification on the line based on angle severity
+    HC_ANGLE_THRESHOLD = 5.0  # High Curvature
+    FE_ANGLE_THRESHOLD = 2.0  # Feature Edge
+    SP_ANGLE_THRESHOLD = 0.2  # General Special Point (slight deviation from straight)
     
     logger.info("==================================================")
-    logger.info(f"STARTING REFINEMENT with target length: {target_length}")
-    logger.info(f"Original points count: {len(intersection.points)}")
+    logger.info(f"REFINE_LINE: TargetLen={target_length:.3f}, UI_MinAngle(ignored)={min_angle_deg:.1f}, Uniform={uniform_meshing}")
+    logger.info(f"Original points: {len(intersection.points)}")
     
-    # Save the original points for angle calculation
-    original_points = list(intersection.points)
-    
-    # Store refined points
     refined_points = []
-    special_points_count = 0
-    
-    # Classification counters
-    start_points = 0
-    end_points = 0
-    triple_points = 0
-    high_curvature_points = 0
-    feature_edge_points = 0
-    
-    # Add the first point - always keep start point
-    first_point = intersection.points[0]
-    # Add point_type attribute if not present
-    if not hasattr(first_point, 'point_type'):
-        first_point.point_type = "START_POINT"
-    else:
-        first_point.point_type = "START_POINT"
-    start_points += 1
-    refined_points.append(first_point)
-    logger.info(f"Added first point: {first_point.x}, {first_point.y}, {first_point.z}, type: {first_point.point_type}")
-    
-    # Process each segment
-    for i in range(len(intersection.points) - 1):
-        p1 = intersection.points[i]
-        p2 = intersection.points[i + 1]
+    original_points = intersection.points # Work with the original list for iteration
+
+    # Add the first point, preserving its type if already set (e.g. COMMON_*, TRIPLE_POINT)
+    # If not set, mark as START_POINT.
+    p_start = original_points[0]
+    if not hasattr(p_start, 'point_type') or p_start.point_type is None:
+        p_start.point_type = "START_POINT"
+    refined_points.append(p_start)
+
+    for i in range(len(original_points) - 1):
+        p1 = original_points[i]      # Start of the current original segment
+        p2 = original_points[i+1]    # End of the current original segment
+
+        # The actual segment to divide starts from the last point added to refined_points,
+        # which is p1 (or a point very close to it if p1 was merged by clean_identical_points previously,
+        # though clean_identical_points is at the end now).
+        # For simplicity in this loop, we consider subdividing the original segment p1-p2.
+        # The first point of this segment (p1) is already in refined_points (or handled as p_start).
+
+        segment_vec = p2 - p1
+        length = segment_vec.length()
+
+        if length < 1e-7: # Effectively a zero-length segment in original list
+            num_segments = 1
+        elif target_length < 1e-7: # Avoid division by zero if target_length is tiny
+             num_segments = 1
+        elif uniform_meshing:
+            num_segments = max(1, round(length / target_length))
+        else: # Non-uniform: ensure segments are not longer than target_length
+            num_segments = max(1, math.ceil(length / target_length))
         
-        # Ensure point_type attribute exists
-        if not hasattr(p1, 'point_type'):
-            p1.point_type = None
-        if not hasattr(p2, 'point_type'):
-            p2.point_type = None
-        
-        # Calculate segment length
-        segment = p2 - p1
-        length = segment.length()
-        logger.info(f"Segment {i}: length = {length}, target = {target_length}")
-        
-        # Calculate angle at this point if it's not the first point
-        angle_degrees = 0.0
-        if i > 0:
-            prev_p = intersection.points[i - 1]
-            angle_degrees = compute_angle_between_segments(prev_p, p1, p2)
-            logger.info(f"Point {i}: Angle = {angle_degrees:.2f} degrees (threshold: {ANGLE_THRESHOLD})")
-            
-            # Classify points based on angle
-            if angle_degrees >= ANGLE_THRESHOLD:
-                # Classify based on angle magnitude
-                if angle_degrees >= 5.0:
-                    refined_points[-1].point_type = "HIGH_CURVATURE_POINT"
-                    high_curvature_points += 1
-                    logger.info(f"Marked point {i} as HIGH_CURVATURE_POINT (angle: {angle_degrees:.2f})")
-                elif angle_degrees >= 2.0:
-                    refined_points[-1].point_type = "FEATURE_EDGE_POINT"
-                    feature_edge_points += 1
-                    logger.info(f"Marked point {i} as FEATURE_EDGE_POINT (angle: {angle_degrees:.2f})")
-                else:
-                    refined_points[-1].point_type = "SPECIAL_POINT"
-                    special_points_count += 1
-                    logger.info(f"Marked point {i} as SPECIAL_POINT (angle: {angle_degrees:.2f})")
-        
-        # Determine number of segments to divide into
-        num_segments = max(1, round(length / target_length))
-        logger.info(f"Segment {i} will be divided into {num_segments} parts")
-        
-        # Add intermediate points if needed
-        for j in range(1, num_segments):
+        # Add intermediate points for the segment p1 to p2
+        for j in range(1, num_segments): # Inserts num_segments - 1 points
             t = j / num_segments
-            new_point = p1 + segment * t
-            # Add point_type attribute to new points
-            new_point.point_type = None
-            refined_points.append(new_point)
-            logger.info(f"Added intermediate point at t={t}: {new_point.x}, {new_point.y}, {new_point.z}")
+            new_intermediate_point = p1 + segment_vec * t
+            new_intermediate_point.point_type = None # Type to be determined in post-processing
+            refined_points.append(new_intermediate_point)
         
-        # Add the endpoint
-        if i < len(intersection.points) - 2:
-            # Check if it's a potential triple point (based on properties or marked in original data)
-            if hasattr(p2, 'is_triple_point') and p2.is_triple_point:
-                p2.point_type = "TRIPLE_POINT"
-                triple_points += 1
-                logger.info(f"Marked point {i+1} as TRIPLE_POINT (from original data)")
+        # Add the end point of the original segment (p2)
+        # Preserve its type if already set (e.g., TRIPLE_POINT)
+        if not hasattr(p2, 'point_type'): # Ensure attribute exists
+            p2.point_type = None
+        # If it's the very last point of the line, its type will be set to END_POINT later
+        # if not already something more specific.
+        refined_points.append(p2)
+
+    # Clean identical points that might have resulted from adding original p1 and then p2 if num_segments was 1.
+    # This pass also handles start/end points if the list is very short.
+    if refined_points:
+        refined_points = clean_identical_points(refined_points) # Use the helper
+
+    # Ensure Start and End points are correctly typed if not overridden by something more specific
+    if refined_points:
+        if not refined_points[0].point_type or refined_points[0].point_type == "DEFAULT":
+            refined_points[0].point_type = "START_POINT"
+        if len(refined_points) > 1: # Only if there's more than one point
+            # If last point's type is None, DEFAULT, or was START (in case of 2-pt line that became 1pt after clean)
+            if not refined_points[-1].point_type or \
+               refined_points[-1].point_type == "DEFAULT" or \
+               (refined_points[-1].point_type == "START_POINT" and len(refined_points) == 1) :
+                 refined_points[-1].point_type = "END_POINT"
+
+
+    # --- Post-processing pass for angle-based classification ---
+    if len(refined_points) > 2:
+        # We iterate using indices on a temporary copy to avoid issues if points were ever merged (though clean handles it now)
+        # The actual modification happens on `refined_points`'s point objects.
+        points_to_check_angles = list(refined_points)
+        for k_idx in range(1, len(points_to_check_angles) - 1):
+            p_prev = points_to_check_angles[k_idx-1]
+            curr_p = points_to_check_angles[k_idx] # This is the point object from refined_points
+            p_next = points_to_check_angles[k_idx+1]
             
-            refined_points.append(p2)
-            logger.info(f"Added endpoint {i+1}: {p2.x}, {p2.y}, {p2.z}, type: {p2.point_type}")
+            # Only classify/re-classify if not an immutable type like START, END, TRIPLE, COMMON
+            # Allow re-classification if it's None, DEFAULT, or a previous angle-based type.
+            current_type = curr_p.point_type if hasattr(curr_p, 'point_type') else None
+            is_immutable_type = current_type in ["START_POINT", "END_POINT", "TRIPLE_POINT", "COMMON_INTERSECTION_CONVEXHULL_POINT"]
+            
+            if not is_immutable_type:
+                angle = compute_angle_between_segments(p_prev, curr_p, p_next)
+                new_angle_type = None
+                if angle >= HC_ANGLE_THRESHOLD: new_angle_type = "HIGH_CURVATURE_POINT"
+                elif angle >= FE_ANGLE_THRESHOLD: new_angle_type = "FEATURE_EDGE_POINT"
+                elif angle >= SP_ANGLE_THRESHOLD: new_angle_type = "SPECIAL_POINT"
+                
+                if new_angle_type:
+                    # Logic to upgrade if already an angle type, or set if None/DEFAULT
+                    angle_types_priority = ["SPECIAL_POINT", "FEATURE_EDGE_POINT", "HIGH_CURVATURE_POINT"]
+                    current_priority = angle_types_priority.index(current_type) if current_type in angle_types_priority else -1
+                    new_priority = angle_types_priority.index(new_angle_type)
+
+                    if new_priority > current_priority:
+                        curr_p.point_type = new_angle_type
+                elif current_type in ["SPECIAL_POINT", "FEATURE_EDGE_POINT", "HIGH_CURVATURE_POINT"]: 
+                    # Was an angle type, but angle no longer qualifies. Reset to None.
+                    curr_p.point_type = None 
+
+
+        # Ensure the last point is always marked as an END_POINT in its type
+    # We need to preserve any existing special type but add END_POINT designation
     
-    # Add the last point - always keep end point
-    last_point = intersection.points[-1]
-    if not hasattr(last_point, 'point_type'):
-        last_point.point_type = "END_POINT"
-    else:
-        last_point.point_type = "END_POINT"
-    end_points += 1
-    refined_points.append(last_point)
-    logger.info(f"Added last point: {last_point.x}, {last_point.y}, {last_point.z}, type: {last_point.point_type}")
     
-    # Identify special points at extreme angles (post-processing)
-    # Second pass to catch any angles between newly created points
-    for i in range(1, len(refined_points) - 1):
-        prev_p = refined_points[i - 1]
-        curr_p = refined_points[i]
-        next_p = refined_points[i + 1]
+    # Final pass of cleaning, in case post-processing angles created near-duplicates (unlikely but safe)
+    if refined_points:
+        intersection.points = clean_identical_points(refined_points)
+    else: # Should not happen if original had points
+        intersection.points = []
+    if len(intersection.points) > 1:
+        last_point = intersection.points[-1]
+        current_type = last_point.point_type if hasattr(last_point, 'point_type') else None
         
-        # Skip points already marked with a type
-        if curr_p.point_type is not None:
-            continue
+        # If it already has a special type, append END_POINT to it
+        if current_type and current_type not in ["END_POINT", "DEFAULT", None]:
+            last_point.point_type = f"{current_type}_END_POINT"
+        else:
+            # If no special type or just DEFAULT, set to END_POINT
+            last_point.point_type = "END_POINT"
             
-        angle = compute_angle_between_segments(prev_p, curr_p, next_p)
-        # Classify based on angle magnitude
-        if angle >= ANGLE_THRESHOLD:
-            if angle >= 5.0:
-                curr_p.point_type = "HIGH_CURVATURE_POINT"
-                high_curvature_points += 1
-                logger.info(f"Post-processing: Marked point at index {i} as HIGH_CURVATURE_POINT (angle: {angle:.2f})")
-            elif angle >= 2.0:
-                curr_p.point_type = "FEATURE_EDGE_POINT"
-                feature_edge_points += 1
-                logger.info(f"Post-processing: Marked point at index {i} as FEATURE_EDGE_POINT (angle: {angle:.2f})")
-            else:
-                curr_p.point_type = "SPECIAL_POINT"
-                special_points_count += 1
-                logger.info(f"Post-processing: Marked point at index {i} as SPECIAL_POINT (angle: {angle:.2f})")
+    # Similarly, ensure first point is always marked as START_POINT
+    if len(intersection.points) > 0:
+        first_point = intersection.points[0]
+        current_type = first_point.point_type if hasattr(first_point, 'point_type') else None
+        
+        # If it already has a special type, append START_POINT to it
+        if current_type and current_type not in ["START_POINT", "DEFAULT", None]:
+            first_point.point_type = f"{current_type}_START_POINT"
+        else:
+            # If no special type or just DEFAULT, set to START_POINT
+            first_point.point_type = "START_POINT"
+    # Log summary of point types from the final list
+    _types_count = {}
+    for p in intersection.points:
+        ptype = p.point_type if hasattr(p, 'point_type') and p.point_type else "NONE_OR_DEFAULT"
+        _types_count[ptype] = _types_count.get(ptype, 0) + 1
     
-    # Replace the original points with the refined points
-    intersection.points = refined_points
-    
-    # Count the total number of special points of all types
-    total_special = special_points_count + high_curvature_points + feature_edge_points + triple_points
-    
-    logger.info(f"REFINEMENT COMPLETE: {len(original_points)} original points → {len(refined_points)} refined points")
-    logger.info(f"POINT CLASSIFICATIONS: {start_points} start points, {end_points} end points, {total_special} special points")
-    logger.info(f"SPECIAL POINTS: {special_points_count} special, {high_curvature_points} high curvature, {feature_edge_points} feature edge, {triple_points} triple points")
+    logger.info(f"REFINEMENT COMPLETE: {len(intersection.points)} final points.")
+    logger.info(f"  Final Types: {_types_count}")
     logger.info("==================================================")
+    
+    return intersection.points

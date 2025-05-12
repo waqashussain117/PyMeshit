@@ -49,6 +49,15 @@ logger = logging.getLogger("MeshIt-Workflow")
 # Also ensure meshit module logs are visible
 logging.getLogger("meshit").setLevel(logging.INFO)
 
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
 # Add the current directory to the path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
@@ -1166,286 +1175,414 @@ class MeshItWorkflowGUI(QMainWindow):
         """
         Action to refine intersection lines by aligning their endpoints
         to the convex hulls of the involved surfaces and adding special points.
-        Now includes proper handling for polyline-surface intersections.
+        Follows C++ style ordering and updates data for visualization.
         """
-        # Store the original intersection data for comparison
-        if not hasattr(self, 'original_intersections'):
-            self.original_intersections = {}
-
-        # Make a deep copy of the current intersections
-        import copy
-        self.original_intersections = copy.deepcopy(self.datasets_intersections)
-        logger.info("Refining intersection lines...")
+        logger.info("Starting refinement of intersection lines...")
         self.statusBar().showMessage("Refining intersection lines...")
 
         if not hasattr(self, 'datasets_intersections') or not self.datasets_intersections:
             QMessageBox.information(self, "No Intersections", "No intersections found to refine.")
+            self.statusBar().showMessage("Refinement skipped: No intersections found.", 5000)
             return
 
-        # Create a temporary model to work with
+        # --- Store original for summary ---
+        import copy
+        self.original_intersections_backup = copy.deepcopy(self.datasets_intersections)
+
+        # --- Get UI Parameters ---
+                # --- Get UI Parameters --- Corrected names
+        try:
+            target_feature_size = float(self.mesh_target_feature_size_input.text())
+            gradient = float(self.mesh_gradient_input.text()) # Currently not used in Python refinement directly
+            min_angle_deg = float(self.mesh_min_angle_input.text())
+            uniform_meshing = self.mesh_uniform_checkbox.isChecked()
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Invalid numeric input for refinement parameters.")
+            self.statusBar().showMessage("Refinement failed: Invalid input.", 5000)
+            return
+        
+        # --- Temporary Model Setup ---
         class TempModelWrapper:
             def __init__(self):
-                self.surfaces = []
-                self.polylines = []  # New list to track polyline datasets separately
-                self.intersections = []
-                self.triple_points = []
-                self.original_indices_map = {}  # Map temp model indices to original dataset indices
-                self.is_polyline = {}  # Track which datasets are polylines
+                self.surfaces = [] # List of TempDataWrapper for surfaces
+                self.polylines = []# List of TempDataWrapper for polylines
+                self.intersections = [] # List of Intersection objects
+                # self.triple_points = [] # Triple points are part of Intersection objects
+                
+                # Mappings:
+                # original_indices_map: maps temp_model's combined list index (0 to N-1 for all data items)
+                # to the original self.datasets index.
+                self.original_indices_map = {} 
+                
+                # is_polyline: maps temp_model's combined list index to a boolean.
+                self.is_polyline = {}
+                
+                # surface_temp_idx_map: maps original dataset index (if it's a surface) to its index in temp_model.surfaces
+                self.surface_original_to_temp_idx_map = {}
+                # polyline_temp_idx_map: maps original dataset index (if it's a polyline) to its index in temp_model.polylines
+                self.polyline_original_to_temp_idx_map = {}
+
 
         temp_model = TempModelWrapper()
-        valid_surfaces_count = 0
-        valid_polylines_count = 0
 
-        # Collect all datasets involved in intersections first, to ensure we include polylines
-        involved_datasets = set()
-        for original_ds_idx, intersections_list in self.datasets_intersections.items():
+        involved_original_indices = set()
+        for _, intersections_list in self.datasets_intersections.items():
             for intersection_data in intersections_list:
-                involved_datasets.add(intersection_data['dataset_id1'])
-                involved_datasets.add(intersection_data['dataset_id2'])
+                involved_original_indices.add(intersection_data['dataset_id1'])
+                involved_original_indices.add(intersection_data['dataset_id2'])
 
-        # First, populate temp_model with all datasets involved in intersections
-        for original_idx, dataset in enumerate(self.datasets):
-            # Skip datasets not involved in any intersections
-            if original_idx not in involved_datasets:
+        temp_data_idx_counter = 0 # This will be the key for original_indices_map and is_polyline
+
+        for original_idx, dataset_content in enumerate(self.datasets):
+            if original_idx not in involved_original_indices:
                 continue
-                
-            # Create a generic wrapper that works for both surfaces and polylines
+
             class TempDataWrapper:
                 def __init__(self):
-                    self.vertices = []
-                    self.convex_hull = []
-                    self.triangles = []
-                    self.size = 1.0  # Default size
-                    self.name = "Dataset"
-                    self.is_polyline = False
+                    self.convex_hull = [] # List of Vector3D
+                    self.size = 0.1 # Default size
+                    self.name = f"Dataset_{original_idx}"
+                    # self.vertices = [] # Could add if needed by some refinement step
 
             data_wrapper = TempDataWrapper()
+            data_wrapper.name = dataset_content.get('name', f"Dataset_{original_idx}")
             
-            # Set the data name
-            data_wrapper.name = dataset.get('name', f"Dataset {original_idx+1}")
-            
-            # Determine whether this is a polyline based on intersection data
-            is_polyline = False
-            for ds_idx, intersections_list in self.datasets_intersections.items():
-                for intersection_data in intersections_list:
-                    if intersection_data['is_polyline_mesh']:
-                        # In polyline-mesh intersection, the first ID is usually the polyline
-                        if intersection_data['dataset_id1'] == original_idx:
-                            is_polyline = True
-                            break
-                if is_polyline:
-                    break
-            
-            data_wrapper.is_polyline = is_polyline
-
-            # Set the dataset size based on bounding box
-            hull_points_np = dataset.get('hull_points')
+            current_geom_points = [] # For calculating size if hull_points is missing
+            hull_points_np = dataset_content.get('hull_points')
             if hull_points_np is not None and len(hull_points_np) > 0:
-                # Calculate rough size based on bounding box diagonal
-                hull_points_arr = np.array(hull_points_np)
-                if hull_points_arr.shape[0] > 0:
-                    if hull_points_arr.shape[1] >= 3:
-                        min_pt = np.min(hull_points_arr, axis=0)
-                        max_pt = np.max(hull_points_arr, axis=0)
-                        size = np.linalg.norm(max_pt - min_pt) / 10.0  # 1/10th of bbox diagonal
-                        data_wrapper.size = size
-
-            # Populate convex_hull (Vector3D list)
-            if hull_points_np is not None:
+                data_wrapper.convex_hull = []
                 for hp in hull_points_np:
-                    if len(hp) >= 3:
-                        data_wrapper.convex_hull.append(Vector3D(hp[0], hp[1], hp[2]))
-                    elif len(hp) == 2:
-                        data_wrapper.convex_hull.append(Vector3D(hp[0], hp[1], 0.0))
+                    point_type = hp[3] if len(hp) > 3 and isinstance(hp[3], str) else "DEFAULT"
+                    data_wrapper.convex_hull.append(Vector3D(hp[0], hp[1], hp[2] if len(hp) > 2 else 0.0, point_type=point_type))
+                current_geom_points = hull_points_np
+            else: # Fallback: use 'points' if 'hull_points' is missing
+                points_np = dataset_content.get('points')
+                if points_np is not None and len(points_np) > 0:
+                    data_wrapper.convex_hull = [Vector3D(p[0], p[1], p[2] if len(p) > 2 else 0.0) for p in points_np]
+                    current_geom_points = points_np
+                else:
+                    logger.warning(f"Dataset {original_idx} ({data_wrapper.name}) has no hull_points or points. Skipping for temp_model.")
+                    continue
             
-            # For surfaces, try to get vertices from triangulation
-            if not is_polyline and dataset.get('triangulation_result'):
-                tri_vertices_np = dataset['triangulation_result'].get('vertices')
-                if tri_vertices_np is not None:
-                    for tv in tri_vertices_np:
-                        if len(tv) >= 3:
-                            data_wrapper.vertices.append(Vector3D(tv[0], tv[1], tv[2]))
-                        elif len(tv) == 2:
-                            data_wrapper.vertices.append(Vector3D(tv[0], tv[1], 0.0))
+            if len(current_geom_points) > 1:
+                min_pt, max_pt = np.min(current_geom_points, axis=0), np.max(current_geom_points, axis=0)
+                diag_length = np.linalg.norm(max_pt - min_pt)
+                data_wrapper.size = diag_length / 10.0 if diag_length > 0 else 0.1
             
-            # For polylines, use points as vertices
-            if is_polyline:
-                points_np = dataset.get('points')
-                if points_np is not None:
-                    for pt in points_np:
-                        if len(pt) >= 3:
-                            data_wrapper.vertices.append(Vector3D(pt[0], pt[1], pt[2]))
-                        elif len(pt) == 2:
-                            data_wrapper.vertices.append(Vector3D(pt[0], pt[1], 0.0))
-            
-            # Add a dummy vertex if hull is empty
-            if not data_wrapper.convex_hull and not data_wrapper.vertices:
-                logger.warning(f"Dataset {original_idx} has empty geometry for refinement.")
-                continue
-            
-            # Use points as hull if hull is empty
-            if not data_wrapper.convex_hull and data_wrapper.vertices:
-                data_wrapper.convex_hull = data_wrapper.vertices
-                
-            # Add to appropriate collection in model
-            model_dataset_idx = len(temp_model.surfaces) if not is_polyline else len(temp_model.polylines)
-            
-            if is_polyline:
-                temp_model.polylines.append(data_wrapper)
-                temp_model.is_polyline[model_dataset_idx] = True
-                temp_model.original_indices_map[model_dataset_idx] = original_idx
-                valid_polylines_count += 1
-                logger.info(f"Added polyline dataset {original_idx} to temp model")
+            # Determine if it's a polyline (heuristic, improve if type is stored in dataset_content)
+            if original_idx == 0:  # Force first dataset to be a surface
+                is_p = False
+                logger.info(f"Dataset {original_idx} ({data_wrapper.name}) FORCED as surface for testing")
             else:
-                temp_model.surfaces.append(data_wrapper)
-                temp_model.is_polyline[model_dataset_idx] = False
-                temp_model.original_indices_map[model_dataset_idx] = original_idx
-                valid_surfaces_count += 1
+                # Original logic with triangulation check
+                is_p = (dataset_content.get('type') == 'polyline' or
+                        ('segments' in dataset_content and 'triangles' not in dataset_content and 'hull_points' not in dataset_content))
+                logger.info(f"Dataset {original_idx} ({data_wrapper.name}) classified as {'polyline' if is_p else 'surface'}")
+            if not is_p: # Check intersection involvement if not clearly a polyline
+                for _, intersection_list_check in self.datasets_intersections.items():
+                    for intersection_d_check in intersection_list_check:
+                        if intersection_d_check['is_polyline_mesh'] and intersection_d_check['dataset_id1'] == original_idx:
+                            is_p = True; break
+                    if is_p: break
+            
+            temp_model.original_indices_map[temp_data_idx_counter] = original_idx
+            temp_model.is_polyline[temp_data_idx_counter] = is_p
 
-        logger.info(f"Created temp model with {valid_surfaces_count} surfaces and {valid_polylines_count} polylines")
-        
-        if valid_surfaces_count + valid_polylines_count == 0:
-            QMessageBox.warning(self, "No Valid Datasets", "No valid datasets found for refinement.")
+            if is_p:
+                temp_model.polyline_original_to_temp_idx_map[original_idx] = len(temp_model.polylines)
+                temp_model.polylines.append(data_wrapper)
+            else:
+                temp_model.surface_original_to_temp_idx_map[original_idx] = len(temp_model.surfaces)
+                temp_model.surfaces.append(data_wrapper)
+            
+            temp_data_idx_counter += 1
+
+        if not temp_model.surfaces and not temp_model.polylines:
+            QMessageBox.warning(self, "No Valid Datasets", "No datasets with geometry were prepared for refinement.")
             self.statusBar().showMessage("Refinement failed: No valid datasets.", 5000)
             return
+        logger.info(f"Temp model created: {len(temp_model.surfaces)} surfaces, {len(temp_model.polylines)} polylines.")
 
-        # Create a combined bidirectional mapping between original and temp model indices
-        bidirectional_map = {}
-        for temp_idx, orig_idx in temp_model.original_indices_map.items():
-            bidirectional_map[orig_idx] = temp_idx
-            bidirectional_map[temp_idx] = orig_idx
+        # Map original self.datasets_intersections to temp_model.intersections using temp_data_idx_counter keys
+        original_to_temp_combined_idx_map = {v: k for k, v in temp_model.original_indices_map.items()}
 
-        # Now populate temp_model.intersections from self.datasets_intersections
-        for original_ds_idx, intersections_list in self.datasets_intersections.items():
+        for _, intersections_list in self.datasets_intersections.items():
             for intersection_data in intersections_list:
-                # Map original dataset IDs to temporary model dataset IDs
-                temp_id1 = bidirectional_map.get(intersection_data['dataset_id1'])
-                temp_id2 = bidirectional_map.get(intersection_data['dataset_id2'])
+                temp_combined_id1 = original_to_temp_combined_idx_map.get(intersection_data['dataset_id1'])
+                temp_combined_id2 = original_to_temp_combined_idx_map.get(intersection_data['dataset_id2'])
 
-                if temp_id1 is None or temp_id2 is None:
-                    logger.warning(f"Could not map dataset IDs {intersection_data['dataset_id1']} and {intersection_data['dataset_id2']} for intersection. Skipping.")
+                if temp_combined_id1 is None or temp_combined_id2 is None:
+                    logger.warning(f"Skipping intersection: Original IDs {intersection_data['dataset_id1']}/{intersection_data['dataset_id2']} not in temp_model map.")
                     continue
-
-                new_intersection = Intersection(temp_id1, temp_id2, intersection_data['is_polyline_mesh'])
+                
+                new_int = Intersection(temp_combined_id1, temp_combined_id2, intersection_data['is_polyline_mesh'])
                 for pt_coords in intersection_data['points']:
-                    if len(pt_coords) >= 3:
-                        new_intersection.add_point(Vector3D(pt_coords[0], pt_coords[1], pt_coords[2]))
-                    elif len(pt_coords) == 2:
-                        new_intersection.add_point(Vector3D(pt_coords[0], pt_coords[1], 0.0))
-                temp_model.intersections.append(new_intersection)
+                    new_int.add_point(Vector3D(pt_coords[0], pt_coords[1], pt_coords[2] if len(pt_coords) > 2 else 0.0))
+                temp_model.intersections.append(new_int)
         
         if not temp_model.intersections:
-            QMessageBox.information(self, "No Intersections", "No intersections could be prepared.")
-            self.statusBar().showMessage("Refinement skipped: No intersections.", 5000)
+            QMessageBox.information(self, "No Intersections", "No intersections populated in temp_model.")
+            self.statusBar().showMessage("Refinement skipped: No intersections in temp model.", 5000)
             return
+        logger.info(f"Temp model has {len(temp_model.intersections)} intersections to process.")
 
-        # Apply the alignment to convex hulls
+        # --- C++ Order Step 1: Perform triple point insertion ---
         try:
-            # Only apply to true surfaces (not polylines)
-            for i in range(len(temp_model.surfaces)):
-                align_intersections_to_convex_hull(i, temp_model)
+            insert_triple_points(temp_model) 
+            logger.info("Triple points insertion complete.")
+        except Exception as e:
+            logger.error(f"Error during triple points insertion: {e}", exc_info=True)
+            QMessageBox.warning(self, "Refinement Error", f"Error during triple point insertion: {str(e)}")
+            return 
+
+        # --- C++ Order Step 2: Apply the alignment to convex hulls ---
+        # align_intersections_to_convex_hull expects index relative to temp_model.surfaces list
+        try:
+            for temp_surface_list_idx in range(len(temp_model.surfaces)):
+                # Pass the index for temp_model.surfaces, not the combined temp_data_idx_counter
+                align_intersections_to_convex_hull(temp_surface_list_idx, temp_model)
             logger.info("Intersection alignment to convex hulls complete.")
         except Exception as e:
             logger.error(f"Error during convex hull alignment: {e}", exc_info=True)
             QMessageBox.warning(self, "Refinement Error", f"Error during convex hull alignment: {str(e)}")
             return
-
-        # After aligning, perform triple point insertion
-        try:
-            insert_triple_points(temp_model)
-            logger.info("Triple points insertion complete.")
-        except Exception as e:
-            logger.error(f"Error during triple points insertion: {e}", exc_info=True)
-
-        # Now apply length-based refinement with special point detection
+            
+        # --- C++ Order Step 3: Refine intersection lines by length ---
         try:
             for intersection in temp_model.intersections:
-                # Calculate target length
-                target_length = 0.0
-                count = 0
+                eff_target_length = target_feature_size 
                 
-                # Get sizes from appropriate collections
-                for idx in [intersection.id1, intersection.id2]:
-                    if temp_model.is_polyline.get(idx, False):
-                        # This is a polyline
-                        if idx < len(temp_model.polylines):
-                            polyline = temp_model.polylines[idx]
-                            if hasattr(polyline, 'size') and polyline.size > 0:
-                                target_length += polyline.size
-                                count += 1
-                    else:
-                        # This is a surface
-                        if idx < len(temp_model.surfaces):
-                            surface = temp_model.surfaces[idx]
-                            if hasattr(surface, 'size') and surface.size > 0:
-                                target_length += surface.size
-                                count += 1
+                id1_temp_combined = intersection.id1
+                id2_temp_combined = intersection.id2
+
+                obj1_is_poly = temp_model.is_polyline.get(id1_temp_combined, False)
+                obj2_is_poly = temp_model.is_polyline.get(id2_temp_combined, False)
                 
-                if count > 0:
-                    target_length /= count
-                    # Use a fraction of the average size for refinement
-                    target_length *= 0.2  # 1/5th of average size
-                else:
-                    target_length = 0.1  # Default small value
+                obj1_data = temp_model.polylines[temp_model.polyline_original_to_temp_idx_map[temp_model.original_indices_map[id1_temp_combined]]] if obj1_is_poly else temp_model.surfaces[temp_model.surface_original_to_temp_idx_map[temp_model.original_indices_map[id1_temp_combined]]]
+                obj2_data = temp_model.polylines[temp_model.polyline_original_to_temp_idx_map[temp_model.original_indices_map[id2_temp_combined]]] if obj2_is_poly else temp_model.surfaces[temp_model.surface_original_to_temp_idx_map[temp_model.original_indices_map[id2_temp_combined]]]
                 
-                # Apply the refinement with debugging
-                logger.info(f"Refining intersection between datasets {intersection.id1} and {intersection.id2}")
-                logger.info(f"Before refinement: {len(intersection.points)} points")
-                logger.info(f"Target length: {target_length}")
-                refine_intersection_line_by_length(intersection, target_length)
-                logger.info(f"After refinement: {len(intersection.points)} points")
-            
-            logger.info("Length-based refinement complete.")
+                obj1_size = obj1_data.size if hasattr(obj1_data, 'size') else 0.1
+                obj2_size = obj2_data.size if hasattr(obj2_data, 'size') else 0.1
+
+                if not uniform_meshing:
+                    valid_sizes = [s for s in [obj1_size, obj2_size] if s > 1e-6]
+                    if valid_sizes:
+                        eff_target_length = min(valid_sizes)
+                    # If target_feature_size is very small, it might override object-based size
+                    if target_feature_size > 1e-6 and target_feature_size < eff_target_length :
+                         eff_target_length = target_feature_size
+                
+                if eff_target_length <= 1e-6: eff_target_length = 0.1 
+
+                refined_points = refine_intersection_line_by_length(
+                    intersection, 
+                    target_length=eff_target_length,
+                    min_angle_deg=min_angle_deg,
+                    uniform_meshing=uniform_meshing 
+                )
+                intersection.points = refined_points
+            logger.info("Length-based refinement and special point detection complete.")
         except Exception as e:
             logger.error(f"Error during length-based refinement: {e}", exc_info=True)
+            QMessageBox.warning(self, "Refinement Error", f"Error during length-based refinement: {str(e)}")
+            return
 
-        # Map the refined intersections back to the original data structure
-        for original_ds_idx in list(self.datasets_intersections.keys()):
-            self.datasets_intersections[original_ds_idx] = []  # Clear existing data
-        
-        # Transfer all refined intersections back
-        for intersection in temp_model.intersections:
-            # Map back to original dataset indices
-            orig_id1 = temp_model.original_indices_map.get(intersection.id1)
-            orig_id2 = temp_model.original_indices_map.get(intersection.id2)
+        # --- Update main data structures and visualization ---
+        self.datasets_intersections.clear() 
+        self.refined_intersections_for_visualization = {}
+
+        for temp_s_list_idx, temp_surface_data in enumerate(temp_model.surfaces):
+    # Find the original dataset index for this temp surface
+            original_dataset_idx = None
+            for orig_idx, temp_idx in temp_model.surface_original_to_temp_idx_map.items():
+                if temp_idx == temp_s_list_idx:
+                    original_dataset_idx = orig_idx
+                    break
             
-            if orig_id1 is None or orig_id2 is None:
-                logger.warning(f"Could not map refined intersection back to original datasets: {intersection.id1}, {intersection.id2}")
+            if original_dataset_idx is not None:
+                if hasattr(temp_surface_data, 'convex_hull') and temp_surface_data.convex_hull:
+                    # Create hull points array with type information
+                    hull_points_with_type = []
+                    for p in temp_surface_data.convex_hull:
+                        point_type = "DEFAULT"
+                        if hasattr(p, 'type') and p.type:
+                            point_type = p.type
+                        elif hasattr(p, 'point_type') and p.point_type:
+                            point_type = p.point_type
+                        
+                        # Store points with type as 4th element [x, y, z, type]
+                        hull_points_with_type.append([p.x, p.y, p.z, point_type])
+                        logger.info(f"Copying hull point: ({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) type={point_type}")
+
+                    # Store hull points with their types
+                    self.datasets[original_dataset_idx]['hull_points'] = np.array(hull_points_with_type, dtype=object)
+                    logger.info(f"Updated convex hull for dataset {original_dataset_idx} with {len(hull_points_with_type)} points.")
+                else:
+                    logger.warning(f"No convex hull data in temp_surface_data for original_dataset_idx {original_dataset_idx} to copy back.")
+            else:
+                logger.warning(f"Could not map temp_model.surfaces index {temp_s_list_idx} to an original dataset index for hull update.")
+        for intersection in temp_model.intersections:
+            original_id1 = temp_model.original_indices_map.get(intersection.id1)
+            original_id2 = temp_model.original_indices_map.get(intersection.id2)
+
+            if original_id1 is None or original_id2 is None:
+                logger.warning(f"Post-refinement: Skipping intersection due to missing original ID map for temp IDs {intersection.id1}/{intersection.id2}.")
                 continue
             
-            # Create intersection data in original format
-            refined_intersection = {
-                'dataset_id1': orig_id1,
-                'dataset_id2': orig_id2,
+                      # Prepare points with embedded types for visualization compatibility
+            points_for_entry = []
+            for p_obj in intersection.points: # Iterate over the point objects from refinement
+                p_type_str = "DEFAULT" # Default type if none found
+                if hasattr(p_obj, 'point_type') and p_obj.point_type:
+                    p_type_str = p_obj.point_type
+                
+                points_for_entry.append([p_obj.x, p_obj.y, p_obj.z, p_type_str])
+
+            intersection_entry = {
+                'dataset_id1': original_id1,
+                'dataset_id2': original_id2,
                 'is_polyline_mesh': intersection.is_polyline_mesh,
-                'points': []
+                'points': points_for_entry, # Now contains [x,y,z,type_string]
+                # The separate 'point_types' list that was here before is no longer needed
+                # as the type is embedded directly with the coordinates for visualization.
             }
             
-            # Convert Vector3D points back to coordinate lists,
-            # preserving any type information if available
-            for point in intersection.points:
-                # Ensure type information is preserved
-                if hasattr(point, 'point_type') and point.point_type:
-                    point_data = [point.x, point.y, point.z, point.point_type]
+            # Store in self.datasets_intersections (main data)
+            # Key by the dataset that is involved (can be either id1 or id2)
+            # To avoid duplicates if an intersection is processed from "both sides", use a combined key or primary key
+            primary_key_ds = min(original_id1, original_id2) # Consistent keying
+            if primary_key_ds not in self.datasets_intersections:
+                 self.datasets_intersections[primary_key_ds] = []
+            
+            # Check if this specific intersection is already added under this key to avoid exact duplicates
+            already_added = False
+            for existing_entry in self.datasets_intersections[primary_key_ds]:
+                if (existing_entry['dataset_id1'] == original_id1 and \
+                    existing_entry['dataset_id2'] == original_id2 and \
+                    existing_entry['is_polyline_mesh'] == intersection.is_polyline_mesh) or \
+                   (existing_entry['dataset_id1'] == original_id2 and \
+                    existing_entry['dataset_id2'] == original_id1 and \
+                    existing_entry['is_polyline_mesh'] == intersection.is_polyline_mesh) :
+                    # A more robust check might compare point lists if order can vary
+                    if len(existing_entry['points']) == len(intersection_entry['points']):
+                         already_added = True # Simple check, assume it's the same
+                         break
+            if not already_added:
+                self.datasets_intersections[primary_key_ds].append(intersection_entry)
+
+            # Store for self.refined_intersections_for_visualization (visualization helper)
+            # This is keyed by *each* dataset involved.
+            for vis_key_id in [original_id1, original_id2]:
+                if vis_key_id not in self.refined_intersections_for_visualization:
+                    self.refined_intersections_for_visualization[vis_key_id] = []
+                # Add if not already present for this specific vis_key_id
+                # (to prevent adding the same intersection twice if original_id1 == original_id2, or if processing from other partner)
+                vis_already_added = any(
+                    ie['dataset_id1'] == intersection_entry['dataset_id1'] and
+                    ie['dataset_id2'] == intersection_entry['dataset_id2'] and
+                    ie['is_polyline_mesh'] == intersection_entry['is_polyline_mesh'] and
+                    len(ie['points']) == len(intersection_entry['points']) # simple identity check
+                    for ie in self.refined_intersections_for_visualization[vis_key_id]
+                )
+                if not vis_already_added:
+                     self.refined_intersections_for_visualization[vis_key_id].append(intersection_entry.copy())
+
+        # --- NEW: Sync special convex hull points from intersections to hulls ---
+        for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
+            if not hasattr(temp_surface, 'convex_hull') or not temp_surface.convex_hull:
+                continue
+            # Find all intersection points for this surface that are special convex hull points
+            for intersection in temp_model.intersections:
+                # Only consider intersections involving this surface
+                if intersection.id1 != temp_surface_idx and intersection.id2 != temp_surface_idx:
+                    continue
+                for pt in intersection.points:
+                    # Only insert if it's a convex hull special point
+                    pt_type = getattr(pt, 'type', getattr(pt, 'point_type', None))
+                    if pt_type == "COMMON_INTERSECTION_CONVEXHULL_POINT":
+                        # Check if this point is already in the hull (within tolerance)
+                        already_in_hull = any(
+                            abs(pt.x - hp.x) < 1e-8 and abs(pt.y - hp.y) < 1e-8 and abs(pt.z - hp.z) < 1e-8
+                            for hp in temp_surface.convex_hull
+                        )
+                        if not already_in_hull:
+                            # Find the closest segment and insert
+                            min_dist = float('inf')
+                            insert_idx = 0
+                            for i in range(len(temp_surface.convex_hull) - 1):
+                                seg_start = temp_surface.convex_hull[i]
+                                seg_end = temp_surface.convex_hull[i+1]
+                                # Project pt onto segment
+                                seg_vec = Vector3D(seg_end.x - seg_start.x, seg_end.y - seg_start.y, seg_end.z - seg_start.z)
+                                seg_len2 = seg_vec.x**2 + seg_vec.y**2 + seg_vec.z**2
+                                if seg_len2 == 0:
+                                    continue
+                                t = ((pt.x - seg_start.x) * seg_vec.x + (pt.y - seg_start.y) * seg_vec.y + (pt.z - seg_start.z) * seg_vec.z) / seg_len2
+                                t = max(0, min(1, t))
+                                proj = Vector3D(
+                                    seg_start.x + (seg_end.x - seg_start.x) * t,
+                                    seg_start.y + (seg_end.y - seg_start.y) * t,
+                                    seg_start.z + (seg_end.z - seg_start.z) * t,
+                                    point_type=pt_type
+                                )
+                                dist = (Vector3D(pt.x, pt.y, pt.z) - proj).length()
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    insert_idx = i + 1
+                            temp_surface.convex_hull.insert(insert_idx, pt)
+
+        for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
+            if hasattr(temp_surface, 'convex_hull') and temp_surface.convex_hull:
+                logger.info(f"After insertion, convex hull for surface {temp_surface_idx} has {len(temp_surface.convex_hull)} points.")
+                # Count special points by type
+                type_counts = {}
+                for hp in temp_surface.convex_hull:
+                    pt_type = getattr(hp, 'type', getattr(hp, 'point_type', 'NONE'))
+                    type_counts[pt_type] = type_counts.get(pt_type, 0) + 1
+                    if pt_type == "COMMON_INTERSECTION_CONVEXHULL_POINT":
+                        logger.info(f"  SPECIAL Hull pt: ({hp.x:.3f}, {hp.y:.3f}, {hp.z:.3f}) type={pt_type}")
+        
+                logger.info(f"  Hull point types: {type_counts}")
+        # Copy back modified convex hulls from temp_model.surfaces to self.datasets
+        for temp_s_list_idx, temp_surface_data in enumerate(temp_model.surfaces):
+            # Find the original_dataset_idx for temp_model.surfaces[temp_s_list_idx]
+            original_dataset_idx = -1
+            for orig_idx_key, temp_surf_map_idx_val in temp_model.surface_original_to_temp_idx_map.items():
+                if temp_surf_map_idx_val == temp_s_list_idx:
+                    original_dataset_idx = orig_idx_key
+                    break
+            
+            if original_dataset_idx != -1 and original_dataset_idx < len(self.datasets):
+                if hasattr(temp_surface_data, 'convex_hull') and temp_surface_data.convex_hull:
+                    # Create hull points array with type information
+                    hull_points_with_type = []
+                    for p in temp_surface_data.convex_hull:
+                        point_type = "DEFAULT"
+                        if hasattr(p, 'type') and p.type:
+                            point_type = p.type
+                        elif hasattr(p, 'point_type') and p.point_type:
+                            point_type = p.point_type
+                        
+                        # Store points with type as 4th element [x, y, z, type]
+                        hull_points_with_type.append([p.x, p.y, p.z, point_type])
+                        logger.info(f"Copying hull point: ({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) type={point_type}")
+
+                    # Store hull points with their types
+                    self.datasets[original_dataset_idx]['hull_points'] = np.array(hull_points_with_type, dtype=object)
+                    logger.info(f"Updated convex hull for dataset {original_dataset_idx} with {len(hull_points_with_type)} points.")
+                    logger.info(f"Updated convex hull for dataset {original_dataset_idx} ('{self.datasets[original_dataset_idx].get('name')}') with {len(hull_points_with_type)} points.")
                 else:
-                    point_data = [point.x, point.y, point.z]
-                refined_intersection['points'].append(point_data)
-                
-            # Add to the right dataset
-            ds_key = min(orig_id1, orig_id2)  # Use same convention as before
-            if ds_key not in self.datasets_intersections:
-                self.datasets_intersections[ds_key] = []
-            self.datasets_intersections[ds_key].append(refined_intersection)
-        
-        # Analyze results and show summary
-        results_summary = self._analyze_refinement_results()
-        logger.info(f"Refinement complete: {results_summary}")
-        
-        # Update visualization
+                    logger.warning(f"No convex hull data in temp_surface_data for original_dataset_idx {original_dataset_idx} to copy back.")
+            else:
+                logger.warning(f"Could not map temp_model.surfaces index {temp_s_list_idx} to an original dataset index for hull update.")
+
+        summary = self._analyze_refinement_results() 
+        self.refinement_summary_label.setText(summary)
+
+        self.statusBar().showMessage("Intersection lines refined successfully.", 5000)
+        logger.info("Intersection lines refined successfully.")
+
         self._update_refined_visualization()
-        
-        QMessageBox.information(self, "Refinement Complete", results_summary)
-        self.statusBar().showMessage("Refinement complete.")
     def load_file(self):
         """Load data from a file"""
         self.statusBar().showMessage("Loading file...")
@@ -4716,13 +4853,14 @@ segmentation, triangulation, and visualization.
         high_curvature_points = []
         feature_edge_points = []
         triple_points = []
+        convexhull_points = []  # Points on convex hull that are special
         
         # Check if original intersections exist
-        has_original = hasattr(self, 'original_intersections') and self.original_intersections
+        has_original = hasattr(self, 'original_intersections_backup') and self.original_intersections_backup
         
         # Get original lines if available
         if has_original:
-            for dataset_idx_key, intersections_list in self.original_intersections.items():
+            for dataset_idx_key, intersections_list in self.original_intersections_backup.items():
                 for intersection_data in intersections_list:
                     if intersection_data['points'] and len(intersection_data['points']) >= 2:
                         try:
@@ -4760,8 +4898,10 @@ segmentation, triangulation, and visualization.
                     
                 try:
                     # Track datasets involved in this intersection
-                    involved_dataset_indices.add(intersection_data.get('dataset_id1', -1))
-                    involved_dataset_indices.add(intersection_data.get('dataset_id2', -1))
+                    dataset_id1 = intersection_data.get('dataset_id1', -1)
+                    dataset_id2 = intersection_data.get('dataset_id2', -1)
+                    involved_dataset_indices.add(dataset_id1)
+                    involved_dataset_indices.add(dataset_id2)
                     
                     # Convert points to proper numpy array format
                     points_list = []
@@ -4777,9 +4917,9 @@ segmentation, triangulation, and visualization.
                                 # Check for type information in the 4th element
                                 if len(p) > 3:
                                     point_type = p[3]
-                                    if point_type == "START_POINT":
+                                    if "START_POINT" in str(point_type):
                                         start_points.append(coord)
-                                    elif point_type == "END_POINT":
+                                    elif "END_POINT" in str(point_type):
                                         end_points.append(coord)
                                     elif point_type == "SPECIAL_POINT":
                                         special_points.append(coord)
@@ -4789,6 +4929,8 @@ segmentation, triangulation, and visualization.
                                         high_curvature_points.append(coord)
                                     elif point_type == "FEATURE_EDGE_POINT":
                                         feature_edge_points.append(coord)
+                                    elif point_type == "COMMON_INTERSECTION_CONVEXHULL_POINT":
+                                        convexhull_points.append(coord)
                             elif len(p) == 2:
                                 points_list.append([float(p[0]), float(p[1]), 0.0])
                         elif hasattr(p, 'x') and hasattr(p, 'y') and hasattr(p, 'z'):
@@ -4800,9 +4942,9 @@ segmentation, triangulation, and visualization.
                             # First check point_type attribute (primary way)
                             if hasattr(p, 'point_type') and p.point_type:
                                 point_type = p.point_type
-                                if p.point_type == "START_POINT":
+                                if "START_POINT" in str(p.point_type):
                                     start_points.append(coord)
-                                elif p.point_type == "END_POINT":
+                                elif "END_POINT" in str(p.point_type):
                                     end_points.append(coord)
                                 elif p.point_type == "SPECIAL_POINT":
                                     special_points.append(coord)
@@ -4812,12 +4954,14 @@ segmentation, triangulation, and visualization.
                                     feature_edge_points.append(coord)
                                 elif p.point_type == "TRIPLE_POINT":
                                     triple_points.append(coord)
+                                elif p.point_type == "COMMON_INTERSECTION_CONVEXHULL_POINT":
+                                    convexhull_points.append(coord)
                             # Also check type attribute (fallback way)
                             elif hasattr(p, 'type') and p.type:
                                 point_type = p.type
-                                if p.type == "START_POINT":
+                                if "START_POINT" in str(p.type):
                                     start_points.append(coord)
-                                elif p.type == "END_POINT":
+                                elif "END_POINT" in str(p.type):
                                     end_points.append(coord)
                                 elif p.type == "SPECIAL_POINT":
                                     special_points.append(coord)
@@ -4827,6 +4971,8 @@ segmentation, triangulation, and visualization.
                                     feature_edge_points.append(coord)
                                 elif p.type == "TRIPLE_POINT":
                                     triple_points.append(coord)
+                                elif p.type == "COMMON_INTERSECTION_CONVEXHULL_POINT":
+                                    convexhull_points.append(coord)
                         else:
                             continue
                         
@@ -4847,97 +4993,191 @@ segmentation, triangulation, and visualization.
                             endpoints_after.append(points[-1])  # Last point
                             
                         # Log that we're processing this intersection
-                        logger.debug(f"Processing intersection between datasets {intersection_data.get('dataset_id1', -1)} " +
-                                    f"and {intersection_data.get('dataset_id2', -1)}, " +
+                        logger.debug(f"Processing intersection between datasets {dataset_id1} " +
+                                    f"and {dataset_id2}, " +
                                     f"is_polyline={is_polyline}, points={len(points)}")
                 except Exception as e:
                     logger.error(f"Error processing refined intersection: {str(e)}")
 
+
+        
+
         # If we have both original and refined, show the differences
         if has_original and original_intersection_lines:
-            # Add original lines in red/orange with less opacity
-            for line_points_np, is_polyline in original_intersection_lines:
+            logger.info("Both original and refined intersections available.")
+            
+            # Show original lines with a transparent appearance
+            for i, (line_points, is_polyline) in enumerate(original_intersection_lines):
                 try:
-                    for i in range(len(line_points_np) - 1):
-                        pt1 = tuple(float(x) for x in line_points_np[i][:3])  # Ensure exactly 3 floats
-                        pt2 = tuple(float(x) for x in line_points_np[i+1][:3])  # Ensure exactly 3 floats
-                        segment = pv.Line(pt1, pt2)
-                        # Use different color for polyline intersections
-                        color = 'orange' if not is_polyline else 'chocolate'
-                        plotter.add_mesh(segment, color=color, opacity=0.4, 
-                                    line_width=3, label="Original Lines")
-                    plotter_has_content = True
+                    if len(line_points) >= 2:
+                        # Create a line from original intersection
+                        cell_types = np.ones(len(line_points) - 1, dtype=np.int32) * 3  # CELL_LINE
+                        cells = []
+                        for i in range(len(line_points) - 1):
+                            cells.extend([2, i, i + 1])  # 2 points per cell
+                        cells = np.array(cells)
+                        
+                        original_line = pv.PolyData(line_points, lines=cells)
+                        plotter.add_mesh(original_line, 
+                                        color='gray', 
+                                        opacity=0.2,
+                                        line_width=2.0,
+                                        render_lines_as_tubes=True,
+                                        smooth_shading=True)
+                        plotter_has_content = True
                 except Exception as e:
-                    logger.error(f"Error adding original intersection line segment: {e}")
+                    logger.error(f"Error visualizing original line: {e}")
 
-        # Add refined lines in bright green (or cyan for polylines)
         if refined_intersection_lines:
-            for line_points_np, is_polyline in refined_intersection_lines:
+            # Different styles for surface-surface vs. surface-polyline
+            surfsurfcolor = [0.9, 0.5, 0.1]  # Orange for surf-surf
+            surfpolycolor = [0.1, 0.8, 0.9]  # Cyan for surf-poly
+            
+            # Add all the refined lines
+            for i, (line_points, is_polyline) in enumerate(refined_intersection_lines):
                 try:
-                    for i in range(len(line_points_np) - 1):
-                        pt1 = tuple(float(x) for x in line_points_np[i][:3])  # Ensure exactly 3 floats
-                        pt2 = tuple(float(x) for x in line_points_np[i+1][:3])  # Ensure exactly 3 floats
-                        segment = pv.Line(pt1, pt2)
-                        # Use different color for polyline intersections
-                        color = 'lime' if not is_polyline else 'cyan'
-                        label = "Refined Lines" if not is_polyline else "Refined Polyline Ints"
-                        plotter.add_mesh(segment, color=color, line_width=5, 
-                                    label=label)
-                    plotter_has_content = True
-                    logger.debug(f"Added refined line with {len(line_points_np)} points, is_polyline={is_polyline}")
+                    if len(line_points) >= 2:
+                        # Create a line object
+                        cell_types = np.ones(len(line_points) - 1, dtype=np.int32) * 3  # CELL_LINE
+                        cells = []
+                        for i in range(len(line_points) - 1):
+                            cells.extend([2, i, i + 1])  # 2 points per cell
+                        cells = np.array(cells)
+                        refined_line = pv.PolyData(line_points, lines=cells)
+                        
+                        color = surfpolycolor if is_polyline else surfsurfcolor
+                        plotter.add_mesh(refined_line, 
+                                        color=color, 
+                                        line_width=4.0,
+                                        render_lines_as_tubes=True,
+                                        smooth_shading=True)
+                        plotter_has_content = True
                 except Exception as e:
-                    logger.error(f"Error adding refined intersection line segment: {e}")
-        
-        # Add original endpoints as yellow spheres
-        if has_original and endpoints_before:
+                    logger.error(f"Error visualizing refined line: {e}")
+
+        # Add convex hull visualization with special points
+        for original_idx in involved_dataset_indices:
+            if original_idx >= 0 and original_idx < len(self.datasets):
+                dataset = self.datasets[original_idx]
+                if not dataset.get('visible', True): continue
+                
+                # Check if this dataset has a convex hull
+                hull_points = dataset.get('hull_points')
+                if hull_points is None or len(hull_points) < 3:
+                    continue
+                
+                name = dataset.get('name', f'Dataset {original_idx + 1}')
+                hull_color = dataset.get('color', '#CCCCCC')
+                
+                # Add this line before the loop to see what we're working with
+                logger.info(f"Hull points for dataset {original_idx}: {len(hull_points)}, types: {[pt[3] if len(pt) > 3 else 'NONE' for pt in hull_points[:5]]}...")
+
+                # Directly check for special point types in the hull points array
+                hull_special_points = []
+                logger.info(f"Examining dataset {original_idx} with {len(hull_points)} hull points")
+                for pt_idx, pt in enumerate(hull_points):
+                    # Check if this hull point has a type in the 4th element that indicates it's special
+                    pt_type = pt[3] if len(pt) > 3 else "UNKNOWN"
+                    logger.info(f"Hull point {pt_idx}: coords={pt[:3]}, type={pt_type}")
+                    
+                    if len(pt) > 3 and isinstance(pt[3], str):
+                        pt_type = str(pt[3])
+                        if "CONVEXHULL" in pt_type or "SPECIAL" in pt_type or pt_type == "COMMON_INTERSECTION_CONVEXHULL_POINT":
+                            coord = [float(pt[0]), float(pt[1]), float(pt[2])]
+                            hull_special_points.append(coord)
+                            # Also add to the convexhull_points list for statistics
+                            convexhull_points.append(coord)
+                            logger.info(f"Found special hull point with type {pt_type}")
+
+                logger.info(f"Found {len(hull_special_points)} special hull points in dataset {original_idx}")
+                # Create a set of known special points for matching
+                special_points_set = set()
+                for point_list in [triple_points, high_curvature_points, feature_edge_points, 
+                                special_points, convexhull_points]:
+                    if point_list:
+                        for p in point_list:
+                            # Round to avoid floating point precision issues when comparing
+                            special_points_set.add((round(p[0], 5), round(p[1], 5), round(p[2], 5)))
+                
+                # Draw hull edges and identify special points
+                hull_special_points = []
+                try:
+                    # Create lines for each segment of the convex hull
+                    for i in range(len(hull_points)):
+                        pt1 = hull_points[i]
+                        pt2 = hull_points[(i+1) % len(hull_points)]  # Wrap around for the last point
+                        
+                        # Ensure 3D coordinates
+                        p1 = [pt1[0], pt1[1], pt1[2] if len(pt1) > 2 else 0.0]
+                        p2 = [pt2[0], pt2[1], pt2[2] if len(pt2) > 2 else 0.0]
+                        
+                        # Check if this hull point is a special point
+                        pt1_tuple = (round(p1[0], 5), round(p1[1], 5), round(p1[2], 5))
+                        if pt1_tuple in special_points_set:
+                            hull_special_points.append(p1)
+                        
+                        # Draw the hull edge
+                        # Check if this hull point has a special type
+                        if len(pt1) > 3 and isinstance(pt1[3], str) and "COMMON_INTERSECTION_CONVEXHULL_POINT" in pt1[3]:
+                            logger.info(f"Found convex hull special point in visualization: {pt1}")
+                            hull_special_points.append(p1)
+                        hull_line = pv.Line(p1, p2)
+                        plotter.add_mesh(hull_line, color=hull_color, line_width=2, opacity=0.7)
+                    
+                    # Highlight the special points on the hull
+                    if hull_special_points:
+                        hull_special_points_np = np.array(hull_special_points)
+                        if len(hull_special_points_np) > 0:
+                            hull_sp_mesh = pv.PolyData(hull_special_points_np)
+                            plotter.add_points(hull_sp_mesh, color='red', point_size=12,
+                                            render_points_as_spheres=True, 
+                                            label="Special Points")
+                    
+                    logger.info(f"Added convex hull visualization for {name} with {len(hull_special_points)} special points")
+                    plotter_has_content = True
+                except Exception as e:
+                    logger.error(f"Error visualizing convex hull for dataset {original_idx} ('{name}'): {e}")
+
+        # Add regular triple points - magenta
+        if triple_points:
             try:
-                # Convert to numpy array of proper shape
-                endpoints_np = np.array([[float(p[0]), float(p[1]), float(p[2])] for p in endpoints_before])
-                if len(endpoints_np) > 0:
-                    endpoints_poly = pv.PolyData(endpoints_np)
-                    plotter.add_points(endpoints_poly, color='yellow', point_size=8,
-                                    render_points_as_spheres=True, label="Original Endpoints")
+                triple_points_np = np.array(triple_points)
+                if len(triple_points_np) > 0:
+                    triple_points_poly = pv.PolyData(triple_points_np)
+                    plotter.add_points(triple_points_poly, color='magenta', point_size=12,
+                                    render_points_as_spheres=True, label="Triple Points")
+                    plotter_has_content = True
+                    logger.info(f"Added {len(triple_points)} triple points to visualization")
             except Exception as e:
-                logger.error(f"Error adding original endpoints: {e}")
+                logger.error(f"Error adding triple points: {e}")
         
-        # Add refined endpoints as blue spheres
-        if endpoints_after:
-            try:
-                # Convert to numpy array of proper shape
-                endpoints_np = np.array([[float(p[0]), float(p[1]), float(p[2])] for p in endpoints_after])
-                if len(endpoints_np) > 0:
-                    endpoints_poly = pv.PolyData(endpoints_np)
-                    plotter.add_points(endpoints_poly, color='cyan', point_size=10,
-                                    render_points_as_spheres=True, label="Refined Endpoints")
-            except Exception as e:
-                logger.error(f"Error adding refined endpoints: {e}")
-        
-        # Visualize specific point types
-        # Start points - green
+
+        # Add start points - green
         if start_points:
             try:
                 start_points_np = np.array(start_points)
                 if len(start_points_np) > 0:
                     start_points_poly = pv.PolyData(start_points_np)
-                    plotter.add_points(start_points_poly, color='green', point_size=8,
+                    plotter.add_points(start_points_poly, color='cyan', point_size=15,
                                     render_points_as_spheres=True, label="Start Points")
                     plotter_has_content = True
+                    logger.info(f"Added {len(start_points)} start points to visualization")
             except Exception as e:
                 logger.error(f"Error adding start points: {e}")
-                
-        # End points - blue
+
+        # Add end points - blue
         if end_points:
             try:
                 end_points_np = np.array(end_points)
                 if len(end_points_np) > 0:
                     end_points_poly = pv.PolyData(end_points_np)
-                    plotter.add_points(end_points_poly, color='blue', point_size=8,
+                    plotter.add_points(end_points_poly, color='blue', point_size=15,
                                     render_points_as_spheres=True, label="End Points")
                     plotter_has_content = True
+                    logger.info(f"Added {len(end_points)} end points to visualization")
             except Exception as e:
                 logger.error(f"Error adding end points: {e}")
-                
-        # Special points - red (increased size)
+        # Add special points - red
         if special_points:
             try:
                 special_points_np = np.array(special_points)
@@ -5070,8 +5310,14 @@ segmentation, triangulation, and visualization.
                 logger.error(f"Error adding legacy special points to refined view: {e}")
 
         # Add a text with statistics about the points if we have them
-        if any([start_points, end_points, special_points, high_curvature_points, feature_edge_points, triple_points]):
+        if any([start_points, end_points, special_points, high_curvature_points, feature_edge_points, triple_points, convexhull_points]):
             try:
+                # Count convex hull points specifically to ensure accuracy
+                ch_points_count = len(convexhull_points)
+                
+                # Log each type of point for debugging
+                logger.info(f"Statistics: Start={len(start_points)}, End={len(end_points)}, Special={len(special_points)}, CH={ch_points_count}")
+                
                 stats_text = (
                     f"Point Statistics:\n"
                     f"Start Points: {len(start_points)}\n"
@@ -5079,7 +5325,8 @@ segmentation, triangulation, and visualization.
                     f"Special Points: {len(special_points)}\n"
                     f"High Curvature: {len(high_curvature_points)}\n"
                     f"Feature Edges: {len(feature_edge_points)}\n"
-                    f"Triple Points: {len(triple_points)}"
+                    f"Triple Points: {len(triple_points)}\n"
+                    f"ConvexHull Points: {ch_points_count}"
                 )
                 plotter.add_text(stats_text, position='lower_left', font_size=10, color='white')
             except Exception as e:
@@ -5092,7 +5339,7 @@ segmentation, triangulation, and visualization.
             logger.info("Updated refined intersections view.")
         else:
             plotter.add_text("No valid data to display in refined view.", position='upper_edge', color='white')
-        def _clear_refine_mesh_plot(self):
+    def _clear_refine_mesh_plot(self):
             """Clear the embedded Refine & Mesh PyVista plotter."""
             plotter = None
             if hasattr(self, 'refine_mesh_plotter') and self.refine_mesh_plotter:
@@ -6039,7 +6286,6 @@ segmentation, triangulation, and visualization.
                 'points': points
             }
             found_intersections_count += 1
-            
 
             # Store only with the dataset having the lower ID
             if original_id1 <= original_id2:
