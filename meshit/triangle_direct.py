@@ -434,11 +434,13 @@ class DirectTriangleWrapper:
             if self.gradient > 1.0:
                 effective_min_angle = max(20.0 - (self.gradient - 1.0) * 5.0, 10.0)
                 
-            # Area constraint
-            area_constraint = self.base_size * self.base_size * 0.5
+            # Area constraint (we will not use it in tri_options directly for this test)
+            # area_constraint = self.base_size * self.base_size * 0.5 
             
-            # Base triangle options
-            tri_options = f'pzYYq{effective_min_angle}a{area_constraint}'
+            # Base triangle options - MODIFIED: Removed area_constraint 'a' for robustness
+            # Still includes q (quality), c (enclose convex hull), C (consistency), D (Conforming Delaunay)
+            tri_options = f'pzq{effective_min_angle:.1f}cCD'
+            self.logger.info(f"Using robust options (no area constraint) for constrained triangulation: '{tri_options}'")
             
             # Generate feature points only if requested
             if create_feature_points:
@@ -514,16 +516,56 @@ class DirectTriangleWrapper:
                 return result
             else:
                 self.logger.error("Triangulation failed to produce triangles")
-                # Fall back to standard Triangle without callback
-                fallback_options = tri_options.replace('u', '')
-                self.logger.info(f"Falling back to standard Triangle: '{fallback_options}'")
-                return tr.triangulate(tri_input, fallback_options)
+                # Fall back to standard Triangle without callback and with exact arithmetic
+                base_fallback_options = tri_options.replace('u', '') # Remove size callback option
+                robust_fallback_options = base_fallback_options.replace('Y', '') # Remove no-exact-arithmetic option
+                
+                if robust_fallback_options == base_fallback_options: # Y was not there
+                    self.logger.info(f"Falling back to standard Triangle (no 'u', Y was not present): '{robust_fallback_options}'")
+                else:
+                    self.logger.info(f"Falling back to standard Triangle with exact arithmetic (no 'u', removed 'Y'): '{robust_fallback_options}'")
+                
+                # It's possible the error is unrelated to 'u' or 'Y', so try with robust_fallback_options
+                try:
+                    return tr.triangulate(tri_input, robust_fallback_options)
+                except Exception as e_fallback:
+                    self.logger.error(f"Robust fallback triangulation also failed: {str(e_fallback)}")
+                    # As a last resort, if the original options didn't have 'u' but had 'Y', try removing 'Y' from original
+                    if 'u' not in tri_options and 'Y' in tri_options:
+                        ultimate_fallback_options = tri_options.replace('Y', '')
+                        self.logger.info(f"Attempting ultimate fallback (original opts, removed 'Y'): '{ultimate_fallback_options}'")
+                        try:
+                            return tr.triangulate(tri_input, ultimate_fallback_options)
+                        except Exception as e_ultimate:
+                            self.logger.error(f"Ultimate fallback triangulation also failed: {str(e_ultimate)}")
+                            raise e_ultimate # Re-raise the last error if all fallbacks fail
+                    raise e_fallback # Re-raise the fallback error
         except Exception as e:
             self.logger.error(f"Error during triangulation: {str(e)}")
-            # Fall back to standard Triangle without callback
-            fallback_options = tri_options.replace('u', '')
-            self.logger.info(f"Falling back to standard Triangle due to error: '{fallback_options}'")
-            return tr.triangulate(tri_input, fallback_options)
+            # Fall back to standard Triangle without callback and with exact arithmetic
+            base_fallback_options = tri_options.replace('u', '') # Remove size callback option
+            robust_fallback_options = base_fallback_options.replace('Y', '') # Remove no-exact-arithmetic option
+            
+            if robust_fallback_options == base_fallback_options: # Y was not there
+                self.logger.info(f"Falling back to standard Triangle (no 'u', Y was not present): '{robust_fallback_options}'")
+            else:
+                self.logger.info(f"Falling back to standard Triangle with exact arithmetic (no 'u', removed 'Y'): '{robust_fallback_options}'")
+            
+            # It's possible the error is unrelated to 'u' or 'Y', so try with robust_fallback_options
+            try:
+                return tr.triangulate(tri_input, robust_fallback_options)
+            except Exception as e_fallback:
+                self.logger.error(f"Robust fallback triangulation also failed: {str(e_fallback)}")
+                # As a last resort, if the original options didn't have 'u' but had 'Y', try removing 'Y' from original
+                if 'u' not in tri_options and 'Y' in tri_options:
+                    ultimate_fallback_options = tri_options.replace('Y', '')
+                    self.logger.info(f"Attempting ultimate fallback (original opts, removed 'Y'): '{ultimate_fallback_options}'")
+                    try:
+                        return tr.triangulate(tri_input, ultimate_fallback_options)
+                    except Exception as e_ultimate:
+                        self.logger.error(f"Ultimate fallback triangulation also failed: {str(e_ultimate)}")
+                        raise e_ultimate # Re-raise the last error if all fallbacks fail
+                raise e_fallback # Re-raise the fallback error
     
     def _create_uniform_grid_points(self, hull_points: np.ndarray, 
                                   spacing: float = None) -> Tuple[np.ndarray, np.ndarray]:

@@ -10,6 +10,24 @@ import concurrent.futures
 from typing import List, Dict, Tuple, Optional, Union
 import math # Ensure math is imported for floor
 import logging
+import triangle as tr_standard # Import unconditionally for fallback
+
+try:
+    from meshit.triangle_direct import DirectTriangleWrapper
+    HAVE_DIRECT_WRAPPER_INTERSECTION_UTILS = True
+except ImportError:
+    HAVE_DIRECT_WRAPPER_INTERSECTION_UTILS = False
+    print("WARNING (intersection_utils): DirectTriangleWrapper not found. Constrained triangulation might be limited.")
+    # tr_standard is already imported above
+
+# Attempt to import PyVista for an alternative triangulation method
+try:
+    import pyvista as pv
+    HAVE_PYVISTA_UTILS = True
+    logging.info("PyVista imported successfully in intersection_utils.")
+except ImportError:
+    HAVE_PYVISTA_UTILS = False
+    logging.warning("PyVista not available in intersection_utils. PyVista triangulation fallback disabled.")
 
 logger = logging.getLogger(__name__)
 
@@ -1438,10 +1456,89 @@ def clean_identical_points(points_list: List[Vector3D], tolerance=1e-8) -> List[
     return cleaned_list
 
 
+def make_corners_special(convex_hull: List[Vector3D], angle_threshold_deg: float = 135.0):
+    """
+    Identify and mark corner points on a convex hull based on angle analysis.
+    This follows the C++ MeshIt MakeCornersSpecial function.
+    
+    Args:
+        convex_hull: List of Vector3D points forming the convex hull
+        angle_threshold_deg: Angle threshold in degrees (points with angles > this are marked special)
+    
+    Returns:
+        Modified convex hull with special points marked
+    """
+    if len(convex_hull) < 3:
+        return convex_hull
+    
+    # Convert threshold to radians and to dot product value
+    # For angles > threshold, the dot product will be < cos(threshold)
+    angle_threshold_rad = math.radians(angle_threshold_deg)
+    dot_threshold = math.cos(angle_threshold_rad)
+    
+    logger.info(f"Making corners special with angle threshold {angle_threshold_deg}° (dot < {dot_threshold:.3f})")
+    
+    special_count = 0
+    
+    # Check each point in the convex hull
+    for n in range(len(convex_hull)):
+        # Get the three points for angle calculation
+        if n == 0:
+            # First point: use last-2, current, and next
+            prev_pt = convex_hull[-2] if len(convex_hull) > 2 else convex_hull[-1]
+            curr_pt = convex_hull[0]
+            next_pt = convex_hull[1]
+        else:
+            prev_pt = convex_hull[n - 1]
+            curr_pt = convex_hull[n]
+            next_pt = convex_hull[(n + 1) % len(convex_hull)]
+        
+        # Calculate vectors from current point
+        diff1 = prev_pt - curr_pt
+        diff2 = next_pt - curr_pt
+        
+        # Normalize the vectors
+        len1 = diff1.length()
+        len2 = diff2.length()
+        
+        if len1 > 1e-10 and len2 > 1e-10:
+            diff1_norm = diff1 / len1
+            diff2_norm = diff2 / len2
+            
+            # Calculate dot product
+            dot_product = diff1_norm.dot(diff2_norm)
+            
+            # Check if angle is sharp enough (dot product < threshold means angle > threshold)
+            # In C++: if (alpha > (-0.5*SQUAREROOTTWO)) which is approximately -0.707 (135°)
+            if dot_product < dot_threshold:
+                curr_pt.point_type = "CORNER"
+                if hasattr(curr_pt, 'type'):
+                    curr_pt.type = "CORNER"
+                special_count += 1
+                
+                # If this is the first point, also mark the last point (closed polygon)
+                if n == 0 and len(convex_hull) > 2:
+                    convex_hull[-1].point_type = "CORNER"
+                    if hasattr(convex_hull[-1], 'type'):
+                        convex_hull[-1].type = "CORNER"
+                
+                angle_deg = math.degrees(math.acos(max(-1.0, min(1.0, dot_product))))
+                logger.info(f"*** Found CORNER point at ({curr_pt.x:.3f}, {curr_pt.y:.3f}, {curr_pt.z:.3f}) with angle {angle_deg:.1f}° ***")
+    
+    logger.info(f"Identified {special_count} corner points on convex hull")
+    return convex_hull
+
+
 def align_intersections_to_convex_hull(surface_idx: int, model):
     """
     Align intersection points to the convex hull of a surface.
-    Modified to closely follow C++: inserts points into the hull and cleans it.
+    This closely follows the C++ MeshIt alignIntersectionsToConvexHull function.
+    
+    Key behaviors:
+    1. Snap intersection endpoints to existing special hull points if close enough
+    2. Project intersection endpoints onto hull segments and create new special points
+    3. Insert these new special points into the convex hull
+    4. Clean up and refine the hull
     
     Args:
         surface_idx: Index of the surface in model.surfaces
@@ -1450,157 +1547,161 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
     surface = model.surfaces[surface_idx]
     
     if not hasattr(surface, 'convex_hull') or not surface.convex_hull:
-        # In the GUI context, convex_hull should be populated from dataset['hull_points']
-        # For robustness, if it's missing, we might log and return or try to compute if a method existed.
-        # print(f"Warning: Surface {surface_idx} ({getattr(surface, 'name', 'N/A')}) has no convex hull for alignment.")
+        logger.warning(f"Surface {surface_idx} has no convex hull for alignment.")
         return
     
-    # Loop over all intersections in the model
+    if len(surface.convex_hull) < 3:
+        logger.warning(f"Surface {surface_idx} convex hull has < 3 points, skipping alignment.")
+        return
+    
+    logger.info(f"Aligning intersections to convex hull for surface {surface_idx}")
+    
+    # Process all intersections that involve this surface
     for intersection_idx, intersection in enumerate(model.intersections):
-        # Check if the current surface is involved in this intersection
-        # In the temp_model, id1 and id2 are indices for surfaces or polylines list
-        # We need to check if it's the current surface based on whether it's a surface or polyline
-        is_surface1 = not model.is_polyline.get(intersection.id1, True) # Default to polyline if not in map
+        # Check if this surface is involved in this intersection
+        is_surface1 = not model.is_polyline.get(intersection.id1, True)
         is_surface2 = not model.is_polyline.get(intersection.id2, True)
-
+        
         surface_is_id1 = is_surface1 and intersection.id1 == surface_idx
         surface_is_id2 = is_surface2 and intersection.id2 == surface_idx
-
-        
         
         if not (surface_is_id1 or surface_is_id2):
-            continue # This surface is not part of this intersection
-            
-        if len(intersection.points) < 1: # Need at least one point to align
             continue
-
+            
+        if len(intersection.points) < 1:
+            continue
+        
+        # Process first and last points of the intersection (like C++ version)
         points_to_process = []
         if len(intersection.points) == 1:
-            points_to_process = [(0, intersection.points[0])] # Index and point
-        elif len(intersection.points) >= 2:
-            points_to_process = [(0, intersection.points[0]), (-1, intersection.points[-1])] # Process first and last
-
-        for point_index_in_intersection, intersection_point_obj in points_to_process:
-            original_intersection_point = Vector3D(intersection_point_obj.x, intersection_point_obj.y, intersection_point_obj.z, intersection_point_obj.type)
-            snapped_to_existing_special = False
-
-            # 1. Check if intersection point is already close to a SPECIAL convex hull point
-            for hull_pt_idx, hull_pt_obj in enumerate(surface.convex_hull):
-                if hull_pt_obj.type != "DEFAULT": # It's a special point
-                    if (original_intersection_point - hull_pt_obj).length() < 1e-8:
-                        if point_index_in_intersection == 0:
-                            intersection.points[0] = hull_pt_obj
-                        else: # -1 for last point
-                            intersection.points[-1] = hull_pt_obj
-                        snapped_to_existing_special = True
-                        break
-            if snapped_to_existing_special:
-                continue # Move to the next intersection point (or next intersection)
-
-            # 2. If not snapped to special, check projection onto hull segments
-            segment_idx = 0
-            point_inserted_or_snapped_on_segment = False
-            while segment_idx < len(surface.convex_hull) - 1: # Use while for dynamic length of hull list
-                p1 = surface.convex_hull[segment_idx]
-                p2 = surface.convex_hull[segment_idx + 1]
-                
-                closest_pt_on_segment = closest_point_on_segment(original_intersection_point, p1, p2)
-                dist_to_segment_projection = (original_intersection_point - closest_pt_on_segment).length()
-
-                new_hull_point = Vector3D(closest_pt_on_segment.x, closest_pt_on_segment.y, closest_pt_on_segment.z)
-                # Add this logging statement:
-                logger.info(f"Adding COMMON_INTERSECTION_CONVEXHULL_POINT to surface {surface_idx} at ({new_hull_point.x:.3f}, {new_hull_point.y:.3f}, {new_hull_point.z:.3f})")
-                new_hull_point.type = "COMMON_INTERSECTION_CONVEXHULL_POINT"
-
-                if dist_to_segment_projection < 1e-8: # Projection is on or very close to this segment
-                    # Check if this closest_pt_on_segment is an existing hull vertex (p1 or p2 or any other)
-                    snapped_to_existing_vertex_on_segment = False
-                    for existing_hull_pt_idx, existing_hull_pt_obj in enumerate(surface.convex_hull):
-                        if (closest_pt_on_segment - existing_hull_pt_obj).length() < 1e-8:
-                           if point_index_in_intersection == 0:
-                            intersection.points[0] = new_hull_point
+            points_to_process = [(0, intersection.points[0])]
+        else:
+            points_to_process = [(0, intersection.points[0]), (-1, intersection.points[-1])]
+        
+        for point_idx_in_intersection, intersection_point in points_to_process:
+            # Try to align this intersection point to the convex hull
+            aligned = False
+            
+            # Step 1: Check if close to existing special hull points
+            for hull_pt_idx, hull_pt in enumerate(surface.convex_hull):
+                # Only snap to special points (non-DEFAULT)
+                hull_pt_type = getattr(hull_pt, 'point_type', getattr(hull_pt, 'type', "DEFAULT"))
+                if hull_pt_type != "DEFAULT":
+                    distance = (intersection_point - hull_pt).length()
+                    if distance < 1e-8:  # Very close to special point
+                        # Snap intersection point to the special hull point
+                        if point_idx_in_intersection == 0:
+                            intersection.points[0] = hull_pt
                         else:
-                            intersection.points[-1] = new_hull_point
-                            snapped_to_existing_vertex_on_segment = True
+                            intersection.points[-1] = hull_pt
+                        aligned = True
+                        logger.info(f"*** Snapped intersection point to existing special hull point at ({hull_pt.x:.3f}, {hull_pt.y:.3f}, {hull_pt.z:.3f}) ***")
+                        break
+            
+            if aligned:
+                continue
+            
+            # Step 2: Project onto hull segments and create new special points
+            for segment_idx in range(len(surface.convex_hull)):
+                p1 = surface.convex_hull[segment_idx]
+                p2 = surface.convex_hull[(segment_idx + 1) % len(surface.convex_hull)]
+                
+                # Project intersection point onto this hull segment
+                closest_pt_on_segment = closest_point_on_segment(intersection_point, p1, p2)
+                distance_to_segment = (intersection_point - closest_pt_on_segment).length()
+                
+                if distance_to_segment < 1e-8:  # Very close to this segment
+                    # Check if the projection point is already an existing hull vertex
+                    is_existing_vertex = False
+                    for existing_hull_pt in surface.convex_hull:
+                        if (closest_pt_on_segment - existing_hull_pt).length() < 1e-8:
+                            # Snap to existing vertex
+                            if point_idx_in_intersection == 0:
+                                intersection.points[0] = existing_hull_pt
+                            else:
+                                intersection.points[-1] = existing_hull_pt
+                            is_existing_vertex = True
+                            logger.info(f"*** Snapped intersection point to existing hull vertex at ({existing_hull_pt.x:.3f}, {existing_hull_pt.y:.3f}, {existing_hull_pt.z:.3f}) ***")
                             break
                     
-                    if not snapped_to_existing_vertex_on_segment:
-                        # Not an existing vertex, so insert this new point into the hull
-                        new_hull_point = Vector3D(closest_pt_on_segment.x, closest_pt_on_segment.y, closest_pt_on_segment.z, 
-                                                point_type="COMMON_INTERSECTION_CONVEXHULL_POINT")
+                    if not is_existing_vertex:
+                        # Create new special point and insert into hull
+                        new_hull_point = Vector3D(
+                            closest_pt_on_segment.x,
+                            closest_pt_on_segment.y,
+                            closest_pt_on_segment.z,
+                            point_type="COMMON_INTERSECTION_CONVEXHULL_POINT"
+                        )
                         
-                        # Update intersection point to new hull point
-                        if point_index_in_intersection == 0:
+                        # Update intersection point to reference the new hull point
+                        if point_idx_in_intersection == 0:
                             intersection.points[0] = new_hull_point
                         else:
                             intersection.points[-1] = new_hull_point
                         
-                        # Insert the new point into the hull
-                        surface.convex_hull.insert(segment_idx + 1, new_hull_point)
-                        # Point inserted, break from this segment loop for this endpoint (mimics C++)
-                        # The while loop condition (len) will be updated in the next iteration.
+                        # Insert the new point into the convex hull at the correct position
+                        insert_position = segment_idx + 1
+                        surface.convex_hull.insert(insert_position, new_hull_point)
+                        
+                        logger.info(f"*** Created COMMON_INTERSECTION_CONVEXHULL_POINT at ({new_hull_point.x:.3f}, {new_hull_point.y:.3f}, {new_hull_point.z:.3f}) and inserted into hull ***")
                     
-                    point_inserted_or_snapped_on_segment = True
-                    break # Break from while segment_idx loop (found its place on a segment)
-                
-                segment_idx += 1
-            # End of while loop for segments for this intersection_point_obj
-        # End of loop for points_to_process (first/last of an intersection)
-    # End of loop for all intersections for this surface
-
-    # After all intersections involving this surface have been processed and potentially modified the hull:
-    # Clean up the convex hull for this surface
-        # After all intersections involving this surface have been processed and potentially modified the hull:
-    # Clean up the convex hull for this surface
-    # Replace the existing code in meshit/intersection_utils.py around line 1580-1600 with this:
+                    aligned = True
+                    break
+            
+            if not aligned:
+                logger.warning(f"Could not align intersection point ({intersection_point.x:.3f}, {intersection_point.y:.3f}, {intersection_point.z:.3f}) to convex hull")
+    
+    # Clean up the convex hull after all insertions
     if hasattr(surface, 'convex_hull') and surface.convex_hull:
+        original_count = len(surface.convex_hull)
         surface.convex_hull = clean_identical_points(surface.convex_hull)
+        final_count = len(surface.convex_hull)
         
-        # Replicate C++ RefineByLength for the convex hull
-        # Get the surface's target edge length - use a default if not available
-        target_length = getattr(surface, 'size', 20.0)
+        if final_count != original_count:
+            logger.info(f"Cleaned convex hull: {original_count} -> {final_count} points")
         
-        # Refine the convex hull polygon into segments of target_length
-        refined_hull = []
-        
-        # For each segment in the convex hull
-        for i in range(len(surface.convex_hull)):
-            p1 = surface.convex_hull[i]
-            p2 = surface.convex_hull[(i + 1) % len(surface.convex_hull)]  # Wrap around for last segment
+        # Refine the hull by length (like C++ RefineByLength)
+        target_length = getattr(surface, 'size', 0.1)
+        if target_length > 1e-6:
+            refined_hull = []
             
-            # Always include the first point of the segment
-            refined_hull.append(p1)
-            
-            # Calculate segment length
-            segment_length = (p2 - p1).length()
-            
-            # Calculate how many points to add - C++ style with better spacing
-            if segment_length > target_length * 1.2:  # Add 20% buffer to avoid tiny segments
-                # Calculate number of segments (not points)
-                num_segments = max(1, int(round(segment_length / target_length)))
-                segment_vector = (p2 - p1) / num_segments
+            for i in range(len(surface.convex_hull)):
+                p1 = surface.convex_hull[i]
+                p2 = surface.convex_hull[(i + 1) % len(surface.convex_hull)]
                 
-                # Add intermediate points at exact intervals
-                for j in range(1, num_segments):
-                    # Create point at exact position
-                    new_point = Vector3D(
-                        p1.x + segment_vector.x * j,
-                        p1.y + segment_vector.y * j,
-                        p1.z + segment_vector.z * j,
-                        point_type="COMMON_INTERSECTION_CONVEXHULL_POINT"
-                    )
-                    refined_hull.append(new_point)
-                    # Log the new point for debugging
-                    logging.getLogger('meshit.intersection_utils').info(
-                        f"Adding COMMON_INTERSECTION_CONVEXHULL_POINT to surface {surface_idx} at "
-                        f"({new_point.x:.3f}, {new_point.y:.3f}, {new_point.z:.3f})"
-                    )
+                # Always add the current point
+                refined_hull.append(p1)
+                
+                # Check if we need to add intermediate points
+                segment_length = (p2 - p1).length()
+                if segment_length > target_length * 1.2:  # Add buffer to avoid tiny segments
+                    num_segments = max(1, int(round(segment_length / target_length)))
+                    segment_vector = (p2 - p1) / num_segments
+                    
+                    # Add intermediate points
+                    for j in range(1, num_segments):
+                        new_point = Vector3D(
+                            p1.x + segment_vector.x * j,
+                            p1.y + segment_vector.y * j,
+                            p1.z + segment_vector.z * j,
+                            point_type="DEFAULT"
+                        )
+                        refined_hull.append(new_point)
+            
+            surface.convex_hull = refined_hull
+            surface.convex_hull = clean_identical_points(surface.convex_hull)
+            
+            logger.info(f"Refined convex hull for surface {surface_idx}: final count = {len(surface.convex_hull)} points")
         
-        # Replace the convex hull with the refined version
-        surface.convex_hull = refined_hull
+        # Count special points for debugging
+        special_count = 0
+        for pt in surface.convex_hull:
+            pt_type = getattr(pt, 'point_type', getattr(pt, 'type', "DEFAULT"))
+            if pt_type != "DEFAULT":
+                special_count += 1
+                logger.info(f"  Special hull point: ({pt.x:.3f}, {pt.y:.3f}, {pt.z:.3f}) type={pt_type}")
         
-        # Clean up again in case the refinement introduced any duplicate points
-        surface.convex_hull = clean_identical_points(surface.convex_hull)
+        logger.info(f"Convex hull alignment complete for surface {surface_idx}: {special_count} special points out of {len(surface.convex_hull)} total")
 
 def calculate_size_of_intersections(model):
     """
@@ -1840,169 +1941,543 @@ import math # Ensure math is imported
 
 def refine_intersection_line_by_length(intersection, target_length, min_angle_deg=20.0, uniform_meshing=True):
     """
-    Refines an intersection line by ensuring segment lengths are close to the target length.
-    Identifies and marks special points based on internal geometric criteria.
-    The min_angle_deg from UI is for eventual mesh quality, not directly for point classification here.
+    Refines an intersection line by length following the C++ MeshIt RefineByLength logic.
+    
+    C++ Algorithm:
+    1. Remove all points with type "DEFAULT" 
+    2. Keep only special points (TRIPLE_POINT, SPECIAL_POINT, etc.) as anchor points
+    3. Subdivide segments between anchor points to target_length
+    4. New subdivision points are marked as "DEFAULT"
     
     Args:
-        intersection: Intersection object to refine. Its .points attribute will be modified.
-        target_length: Target segment length, determined by calling context.
-        min_angle_deg: (Ignored for point classification here) UI hint for mesh cell quality.
-        uniform_meshing: If True, strictly adheres to target_length. If False, uses ceil
-                         to ensure segments are not longer than target_length.
+        intersection: Intersection object to refine
+        target_length: Target segment length
+        min_angle_deg: Minimum angle for mesh quality (not used for point classification)
+        uniform_meshing: If True, use round(); if False, use ceil()
+    
     Returns:
-        The list of refined points (also updates intersection.points directly).
+        List of refined points
     """
     if not intersection.points or len(intersection.points) < 2:
+        logger.info("REFINE_LINE: Not enough points to refine.")
         return intersection.points if hasattr(intersection, 'points') else []
 
-    # Internal thresholds for point classification on the line based on angle severity
-    HC_ANGLE_THRESHOLD = 5.0  # High Curvature
-    FE_ANGLE_THRESHOLD = 2.0  # Feature Edge
-    SP_ANGLE_THRESHOLD = 0.2  # General Special Point (slight deviation from straight)
-    
     logger.info("==================================================")
-    logger.info(f"REFINE_LINE: TargetLen={target_length:.3f}, UI_MinAngle(ignored)={min_angle_deg:.1f}, Uniform={uniform_meshing}")
-    logger.info(f"Original points: {len(intersection.points)}")
+    logger.info(f"REFINE_LINE (C++ Logic): TargetLen={target_length:.3f}")
+    logger.info(f"Original points count: {len(intersection.points)}")
+
+    original_points = intersection.points
     
+    # Step 1: Create anchor line - remove all DEFAULT points, keep only special points
+    # This mirrors the C++ logic exactly
+    anchor_points = []
+    
+    # Always keep first point (even if DEFAULT - it becomes an anchor)
+    first_point = original_points[0]
+    anchor_points.append(first_point)
+    logger.debug(f"Anchor: FIRST point ({first_point.x:.3f}, {first_point.y:.3f}, {first_point.z:.3f}) "
+                f"Type: {getattr(first_point, 'point_type', 'DEFAULT')}")
+    
+    # Keep middle points only if they are NOT "DEFAULT"
+    for i in range(1, len(original_points) - 1):
+        point = original_points[i]
+        point_type = getattr(point, 'point_type', None)
+        
+        if point_type and point_type != "DEFAULT":
+            anchor_points.append(point)
+            logger.debug(f"Anchor: SPECIAL point ({point.x:.3f}, {point.y:.3f}, {point.z:.3f}) "
+                        f"Type: {point_type}")
+        else:
+            logger.debug(f"Removed: DEFAULT point ({point.x:.3f}, {point.y:.3f}, {point.z:.3f})")
+    
+    # Always keep last point (even if DEFAULT - it becomes an anchor)
+    if len(original_points) > 1:
+        last_point = original_points[-1]
+        # Avoid duplicating if it's the same as first (closed loop)
+        if (last_point - anchor_points[0]).length() > 1e-8:
+            anchor_points.append(last_point)
+            logger.debug(f"Anchor: LAST point ({last_point.x:.3f}, {last_point.y:.3f}, {last_point.z:.3f}) "
+                        f"Type: {getattr(last_point, 'point_type', 'DEFAULT')}")
+    
+    logger.info(f"Anchor points after filtering: {len(anchor_points)}")
+    
+    # Step 2: Subdivide segments between anchor points
     refined_points = []
-    original_points = intersection.points # Work with the original list for iteration
-
-    # Add the first point, preserving its type if already set (e.g. COMMON_*, TRIPLE_POINT)
-    # If not set, mark as START_POINT.
-    p_start = original_points[0]
-    if not hasattr(p_start, 'point_type') or p_start.point_type is None:
-        p_start.point_type = "START_POINT"
-    refined_points.append(p_start)
-
-    for i in range(len(original_points) - 1):
-        p1 = original_points[i]      # Start of the current original segment
-        p2 = original_points[i+1]    # End of the current original segment
-
-        # The actual segment to divide starts from the last point added to refined_points,
-        # which is p1 (or a point very close to it if p1 was merged by clean_identical_points previously,
-        # though clean_identical_points is at the end now).
-        # For simplicity in this loop, we consider subdividing the original segment p1-p2.
-        # The first point of this segment (p1) is already in refined_points (or handled as p_start).
-
+    
+    if not anchor_points:
+        return original_points
+    
+    refined_points.append(anchor_points[0])
+    
+    for i in range(len(anchor_points) - 1):
+        p1 = anchor_points[i]
+        p2 = anchor_points[i + 1]
+        
         segment_vec = p2 - p1
-        length = segment_vec.length()
-
-        if length < 1e-7: # Effectively a zero-length segment in original list
-            num_segments = 1
-        elif target_length < 1e-7: # Avoid division by zero if target_length is tiny
-             num_segments = 1
+        segment_length = segment_vec.length()
+        
+        if segment_length < 1e-7:  # Skip zero-length segments
+            continue
+            
+        # Calculate number of subdivisions
+        if target_length < 1e-7:
+            num_subdivisions = 1
         elif uniform_meshing:
-            num_segments = max(1, round(length / target_length))
-        else: # Non-uniform: ensure segments are not longer than target_length
-            num_segments = max(1, math.ceil(length / target_length))
+            num_subdivisions = max(1, round(segment_length / target_length))
+        else:
+            num_subdivisions = max(1, math.ceil(segment_length / target_length))
         
-        # Add intermediate points for the segment p1 to p2
-        for j in range(1, num_segments): # Inserts num_segments - 1 points
-            t = j / num_segments
-            new_intermediate_point = p1 + segment_vec * t
-            new_intermediate_point.point_type = None # Type to be determined in post-processing
-            refined_points.append(new_intermediate_point)
+        logger.debug(f"Segment {i}: length={segment_length:.3f}, subdivisions={num_subdivisions}")
         
-        # Add the end point of the original segment (p2)
-        # Preserve its type if already set (e.g., TRIPLE_POINT)
-        if not hasattr(p2, 'point_type'): # Ensure attribute exists
-            p2.point_type = None
-        # If it's the very last point of the line, its type will be set to END_POINT later
-        # if not already something more specific.
+        # Add intermediate points
+        for j in range(1, num_subdivisions):
+            t = j / num_subdivisions
+            new_point = p1 + segment_vec * t
+            new_point.point_type = "DEFAULT"  # New subdivision points are DEFAULT
+            if hasattr(new_point, 'type'):
+                new_point.type = "DEFAULT"
+            refined_points.append(new_point)
+            logger.debug(f"  Added subdivision point ({new_point.x:.3f}, {new_point.y:.3f}, {new_point.z:.3f})")
+        
+        # Add the next anchor point
         refined_points.append(p2)
-
-    # Clean identical points that might have resulted from adding original p1 and then p2 if num_segments was 1.
-    # This pass also handles start/end points if the list is very short.
+    
+    # Clean up any potential duplicates
+    refined_points = clean_identical_points(refined_points)
+    
+    # Step 3: Assign proper start/end types
     if refined_points:
-        refined_points = clean_identical_points(refined_points) # Use the helper
+        # Handle first point
+        first_p = refined_points[0]
+        fp_type = getattr(first_p, 'point_type', "DEFAULT")
+        if fp_type == "DEFAULT" or "START_POINT" not in fp_type:
+            if fp_type == "DEFAULT":
+                first_p.point_type = "START_POINT"
+            else:
+                first_p.point_type = f"{fp_type}_START_POINT"
+            if hasattr(first_p, 'type'):
+                first_p.type = first_p.point_type
+        
+        # Handle last point
+        if len(refined_points) > 1:
+            last_p = refined_points[-1]
+            lp_type = getattr(last_p, 'point_type', "DEFAULT")
+            if lp_type == "DEFAULT" or "END_POINT" not in lp_type:
+                if lp_type == "DEFAULT":
+                    last_p.point_type = "END_POINT"
+                else:
+                    last_p.point_type = f"{lp_type}_END_POINT"
+                if hasattr(last_p, 'type'):
+                    last_p.type = last_p.point_type
+        else:
+            # Single point case
+            refined_points[0].point_type = "START_POINT_END_POINT"
+            if hasattr(refined_points[0], 'type'):
+                refined_points[0].type = "START_POINT_END_POINT"
+    
+    logger.info(f"Final refined points count: {len(refined_points)}")
+    
+    # Update the intersection object
+    intersection.points = refined_points
+    
+    return refined_points
 
-    # Ensure Start and End points are correctly typed if not overridden by something more specific
-    if refined_points:
-        if not refined_points[0].point_type or refined_points[0].point_type == "DEFAULT":
-            refined_points[0].point_type = "START_POINT"
-        if len(refined_points) > 1: # Only if there's more than one point
-            # If last point's type is None, DEFAULT, or was START (in case of 2-pt line that became 1pt after clean)
-            if not refined_points[-1].point_type or \
-               refined_points[-1].point_type == "DEFAULT" or \
-               (refined_points[-1].point_type == "START_POINT" and len(refined_points) == 1) :
-                 refined_points[-1].point_type = "END_POINT"
+def prepare_plc_for_surface_triangulation(surface_data, intersections_on_surface_data, config):
+    """
+    Prepares Points and Segments for constrained 2D triangulation of a surface.
+    Focuses on robust unique point handling and segment creation.
+    """
+    all_3d_points_for_plc_map = {} # Using a dictionary to ensure unique points by rounded 3D coords
+    # Initialize unique_3d_points_for_plc as an empty array with the correct shape and dtype.
+    # This will be populated if points are found, or returned as empty if an early exit occurs.
+    unique_3d_points_for_plc = np.empty((0, 3), dtype=float)
+
+    # 1. Collect all potential 3D points for the PLC (hull and intersections)
+    # Store them with their original unrounded 3D coordinates for later Z reconstruction
+    # and with their type.
+    
+    # From Hull
+    hull_points_data = surface_data.get('hull_points', [])
+    if hull_points_data is None: hull_points_data = []
+    for pt_data in hull_points_data:
+        pt_3d_orig = None
+        pt_type = 'HULL_POINT'
+        if isinstance(pt_data, Vector3D):
+            pt_3d_orig = (pt_data.x, pt_data.y, pt_data.z)
+            pt_type = getattr(pt_data, 'type', 'HULL_POINT')
+        elif isinstance(pt_data, (list, tuple, np.ndarray)) and len(pt_data) >= 3:
+            pt_3d_orig = (float(pt_data[0]), float(pt_data[1]), float(pt_data[2]))
+            if len(pt_data) > 3 and isinstance(pt_data[3], str): pt_type = pt_data[3]
+        
+        if pt_3d_orig:
+            pt_3d_rounded = tuple(round(c, 6) for c in pt_3d_orig)
+            if pt_3d_rounded not in all_3d_points_for_plc_map:
+                all_3d_points_for_plc_map[pt_3d_rounded] = {'orig_3d': np.array(pt_3d_orig), 'type': pt_type}
+            # Optionally, prioritize type if point already exists
+            elif pt_type != 'HULL_POINT' and all_3d_points_for_plc_map[pt_3d_rounded]['type'] == 'HULL_POINT':
+                 all_3d_points_for_plc_map[pt_3d_rounded]['type'] = pt_type
 
 
-    # --- Post-processing pass for angle-based classification ---
-    if len(refined_points) > 2:
-        # We iterate using indices on a temporary copy to avoid issues if points were ever merged (though clean handles it now)
-        # The actual modification happens on `refined_points`'s point objects.
-        points_to_check_angles = list(refined_points)
-        for k_idx in range(1, len(points_to_check_angles) - 1):
-            p_prev = points_to_check_angles[k_idx-1]
-            curr_p = points_to_check_angles[k_idx] # This is the point object from refined_points
-            p_next = points_to_check_angles[k_idx+1]
+    # From Intersections
+    for intersection_data in intersections_on_surface_data:
+        intersection_points_data = intersection_data.get('points', [])
+        if intersection_points_data is None: intersection_points_data = []
+        for pt_data in intersection_points_data:
+            pt_3d_orig = None
+            pt_type = 'INTERSECTION_POINT'
+            if isinstance(pt_data, Vector3D):
+                pt_3d_orig = (pt_data.x, pt_data.y, pt_data.z)
+                pt_type = getattr(pt_data, 'type', 'INTERSECTION_POINT')
+            elif isinstance(pt_data, (list, tuple, np.ndarray)) and len(pt_data) >= 3:
+                pt_3d_orig = (float(pt_data[0]), float(pt_data[1]), float(pt_data[2]))
+                if len(pt_data) > 3 and isinstance(pt_data[3], str): pt_type = pt_data[3]
+
+            if pt_3d_orig:
+                pt_3d_rounded = tuple(round(c, 6) for c in pt_3d_orig)
+                if pt_3d_rounded not in all_3d_points_for_plc_map:
+                    all_3d_points_for_plc_map[pt_3d_rounded] = {'orig_3d': np.array(pt_3d_orig), 'type': pt_type}
+                # Prioritize more specific types
+                elif pt_type != 'INTERSECTION_POINT' and all_3d_points_for_plc_map[pt_3d_rounded]['type'] == 'INTERSECTION_POINT':
+                     all_3d_points_for_plc_map[pt_3d_rounded]['type'] = pt_type
+                elif "POINT" not in all_3d_points_for_plc_map[pt_3d_rounded]['type'] and "POINT" in pt_type :
+                     all_3d_points_for_plc_map[pt_3d_rounded]['type'] = pt_type
+
+
+    if not all_3d_points_for_plc_map:
+        logger.warning("No unique 3D points collected for PLC.")
+        return None, None, np.empty((0,2)), unique_3d_points_for_plc # Return initialized empty array
+
+    # If points were collected, now populate unique_3d_points_for_plc
+    unique_3d_points_list = [data['orig_3d'] for data in all_3d_points_for_plc_map.values()]
+    unique_3d_points_for_plc = np.array(unique_3d_points_list) # This re-assigns it
+    
+    rounded_3d_to_final_idx_map = {pt_rounded: i for i, pt_rounded in enumerate(all_3d_points_for_plc_map.keys())}
+
+    # 2. Project unique 3D points to 2D
+    plc_points_2d_list = []
+    projection_params = surface_data.get('projection_params')
+    if projection_params:
+        centroid = np.array(projection_params['centroid'])
+        basis = np.array(projection_params['basis'])
+        for pt_3d in unique_3d_points_for_plc:
+            centered_pt = pt_3d - centroid
+            pt_2d = np.dot(centered_pt, basis.T)
+            plc_points_2d_list.append(pt_2d[:2]) 
+    else:
+        logger.info("No projection_params, using X,Y for 2D PLC.")
+        for pt_3d in unique_3d_points_for_plc:
+            plc_points_2d_list.append(pt_3d[:2])
+    plc_points_2d = np.array(plc_points_2d_list)
+
+    if len(plc_points_2d) < 3:
+        logger.warning(f"Not enough unique 2D points ({len(plc_points_2d)}) for PLC.")
+        return None, None, np.empty((0,2)), unique_3d_points_for_plc # unique_3d_points_for_plc is now populated or empty
+
+    # 3. Create segments using indices from unique_3d_points_for_plc
+    plc_segments_indices_set = set() # Use a set for segments to ensure uniqueness (idx1, idx2) with idx1 < idx2
+    segment_length_tolerance = 1e-7
+
+    # Hull segments
+    if len(hull_points_data) > 0:
+        for i in range(len(hull_points_data)):
+            pt1_data = hull_points_data[i]
+            pt2_data = hull_points_data[(i + 1) % len(hull_points_data)] # Close loop
+
+            pt1_3d_orig_tuple = None
+            pt2_3d_orig_tuple = None
+
+            if isinstance(pt1_data, Vector3D): pt1_3d_orig_tuple = (pt1_data.x, pt1_data.y, pt1_data.z)
+            elif isinstance(pt1_data, (list,tuple,np.ndarray)) and len(pt1_data) >=3: pt1_3d_orig_tuple = (float(pt1_data[0]), float(pt1_data[1]), float(pt1_data[2]))
             
-            # Only classify/re-classify if not an immutable type like START, END, TRIPLE, COMMON
-            # Allow re-classification if it's None, DEFAULT, or a previous angle-based type.
-            current_type = curr_p.point_type if hasattr(curr_p, 'point_type') else None
-            is_immutable_type = current_type in ["START_POINT", "END_POINT", "TRIPLE_POINT", "COMMON_INTERSECTION_CONVEXHULL_POINT"]
+            if isinstance(pt2_data, Vector3D): pt2_3d_orig_tuple = (pt2_data.x, pt2_data.y, pt2_data.z)
+            elif isinstance(pt2_data, (list,tuple,np.ndarray)) and len(pt2_data) >=3: pt2_3d_orig_tuple = (float(pt2_data[0]), float(pt2_data[1]), float(pt2_data[2]))
+
+            if pt1_3d_orig_tuple and pt2_3d_orig_tuple:
+                idx1 = rounded_3d_to_final_idx_map.get(tuple(round(c, 6) for c in pt1_3d_orig_tuple))
+                idx2 = rounded_3d_to_final_idx_map.get(tuple(round(c, 6) for c in pt2_3d_orig_tuple))
+
+                if idx1 is not None and idx2 is not None and idx1 != idx2:
+                    p1_2d = plc_points_2d[idx1]
+                    p2_2d = plc_points_2d[idx2]
+                    if np.linalg.norm(p1_2d - p2_2d) > segment_length_tolerance:
+                        plc_segments_indices_set.add(tuple(sorted((idx1, idx2))))
+
+    # Intersection segments
+    for intersection_data in intersections_on_surface_data:
+        intersection_points_data = intersection_data.get('points', [])
+        if len(intersection_points_data) < 2: continue
+        for i in range(len(intersection_points_data) - 1):
+            pt1_data = intersection_points_data[i]
+            pt2_data = intersection_points_data[i+1]
+
+            pt1_3d_orig_tuple = None
+            pt2_3d_orig_tuple = None
+
+            if isinstance(pt1_data, Vector3D): pt1_3d_orig_tuple = (pt1_data.x, pt1_data.y, pt1_data.z)
+            elif isinstance(pt1_data, (list,tuple,np.ndarray)) and len(pt1_data) >=3: pt1_3d_orig_tuple = (float(pt1_data[0]), float(pt1_data[1]), float(pt1_data[2]))
             
-            if not is_immutable_type:
-                angle = compute_angle_between_segments(p_prev, curr_p, p_next)
-                new_angle_type = None
-                if angle >= HC_ANGLE_THRESHOLD: new_angle_type = "HIGH_CURVATURE_POINT"
-                elif angle >= FE_ANGLE_THRESHOLD: new_angle_type = "FEATURE_EDGE_POINT"
-                elif angle >= SP_ANGLE_THRESHOLD: new_angle_type = "SPECIAL_POINT"
+            if isinstance(pt2_data, Vector3D): pt2_3d_orig_tuple = (pt2_data.x, pt2_data.y, pt2_data.z)
+            elif isinstance(pt2_data, (list,tuple,np.ndarray)) and len(pt2_data) >=3: pt2_3d_orig_tuple = (float(pt2_data[0]), float(pt2_data[1]), float(pt2_data[2]))
+
+            if pt1_3d_orig_tuple and pt2_3d_orig_tuple:
+                idx1 = rounded_3d_to_final_idx_map.get(tuple(round(c, 6) for c in pt1_3d_orig_tuple))
+                idx2 = rounded_3d_to_final_idx_map.get(tuple(round(c, 6) for c in pt2_3d_orig_tuple))
+
+                if idx1 is not None and idx2 is not None and idx1 != idx2:
+                    p1_2d = plc_points_2d[idx1]
+                    p2_2d = plc_points_2d[idx2]
+                    if np.linalg.norm(p1_2d - p2_2d) > segment_length_tolerance:
+                        plc_segments_indices_set.add(tuple(sorted((idx1, idx2))))
+    
+    plc_segments_indices_list = [list(seg) for seg in plc_segments_indices_set]
+
+    if not plc_segments_indices_list:
+        logger.warning("No segments created for PLC after filtering and unique point processing.")
+        if len(plc_points_2d) >= 3:
+            logger.info("Attempting fallback ConvexHull for PLC segments.")
+            try:
+                from scipy.spatial import ConvexHull as ScipyConvexHull
+                if np.all(np.isfinite(plc_points_2d)):
+                    hull = ScipyConvexHull(plc_points_2d)
+                    for simplex in hull.simplices:
+                        p1_2d = plc_points_2d[simplex[0]]
+                        p2_2d = plc_points_2d[simplex[1]]
+                        if np.linalg.norm(p1_2d - p2_2d) > segment_length_tolerance:
+                            seg_tuple = tuple(sorted((simplex[0], simplex[1])))
+                            if seg_tuple not in plc_segments_indices_set:
+                                plc_segments_indices_list.append(list(seg_tuple))
+                                plc_segments_indices_set.add(seg_tuple)
+                    logger.info(f"Fallback ConvexHull generated {len(plc_segments_indices_list)} segments.")
+                else:
+                    logger.warning("Fallback ConvexHull: plc_points_2d contains non-finite values.")
+            except Exception as e_hull_fallback:
+                logger.error(f"Fallback convex hull generation failed: {e_hull_fallback}")
+                return None, None, np.empty((0,2)), unique_3d_points_for_plc # unique_3d_points_for_plc is populated or empty
+        else:
+             logger.warning("Not enough points for fallback hull generation.")
+             return None, None, np.empty((0,2)), unique_3d_points_for_plc # unique_3d_points_for_plc is populated or empty
+             
+    if not plc_segments_indices_list:
+        logger.error("Still no segments for PLC after all processing. Cannot triangulate.")
+        return None, None, np.empty((0,2)), unique_3d_points_for_plc # unique_3d_points_for_plc is populated or empty
+
+    plc_segments_indices = np.array(plc_segments_indices_list, dtype=np.int32)
+    plc_holes_2d = np.empty((0, 2)) 
+    
+    logger.info(f"PLC prepared: {len(plc_points_2d)} unique 2D points, {len(plc_segments_indices)} unique segments (after filtering).")
+
+    # --- BEGIN DETAILED PLC LOGGING ---
+    logger.info("--- BEGIN PLC DATA FOR DEBUGGING ---")
+    logger.info(f"PLC 2D Points (Total: {len(plc_points_2d)}):")
+    # Log first few and last few points if many, or all if few
+    if len(plc_points_2d) > 10:
+        for i in range(5):
+            logger.info(f"  Point {i}: {plc_points_2d[i]}")
+        logger.info("  ...")
+        for i in range(len(plc_points_2d) - 5, len(plc_points_2d)):
+            logger.info(f"  Point {i}: {plc_points_2d[i]}")
+    else:
+        for i, pt in enumerate(plc_points_2d):
+            logger.info(f"  Point {i}: {pt}")
+
+    logger.info(f"PLC Segment Indices (Total: {len(plc_segments_indices)}):")
+    # Log first few and last few segments if many, or all if few
+    if len(plc_segments_indices) > 10:
+        for i in range(5):
+            logger.info(f"  Segment {i}: {plc_segments_indices[i]}")
+        logger.info("  ...")
+        for i in range(len(plc_segments_indices) - 5, len(plc_segments_indices)):
+            logger.info(f"  Segment {i}: {plc_segments_indices[i]}")
+    else:
+        for i, seg in enumerate(plc_segments_indices):
+            logger.info(f"  Segment {i}: {seg}")
+    logger.info("--- END PLC DATA FOR DEBUGGING ---")
+    # --- END DETAILED PLC LOGGING ---
+
+    return plc_points_2d, plc_segments_indices, plc_holes_2d, unique_3d_points_for_plc
+
+def run_constrained_triangulation_py(plc_points_2d, plc_segments_indices, plc_holes_2d, 
+                                     surface_projection_params, original_3d_points_for_plc, config):
+    """
+    Runs constrained 2D triangulation using the Triangle library (via a wrapper)
+    and reconstructs 3D vertices.
+    """
+    if plc_points_2d is None or len(plc_points_2d) < 3 or \
+       plc_segments_indices is None or len(plc_segments_indices) < 3: # Need at least 3 segments for a closed polygon
+        logger.error("Not enough points or segments for constrained triangulation.")
+        return None, None
+
+    tri_result = None
+    tri_vertices_2d_final = None
+    tri_triangles_indices_final = None
+
+    # Attempt 1: PyVista triangulation (if available)
+    if HAVE_PYVISTA_UTILS:
+        logger.info("Attempting constrained triangulation with PyVista.")
+        if original_3d_points_for_plc is not None:
+            try:
+                # PyVista needs 3D points. We use original_3d_points_for_plc which corresponds to plc_points_2d.
+                # Ensure original_3d_points_for_plc has Z coordinates (even if they are all zero or from projection).
+                if original_3d_points_for_plc.shape[1] == 2:
+                    # If original points were only 2D, add a Z column of zeros for PyVista
+                    pv_points_3d = np.hstack((original_3d_points_for_plc, np.zeros((original_3d_points_for_plc.shape[0], 1))))
+                else:
+                    pv_points_3d = original_3d_points_for_plc
+
+                # Create PyVista lines array for PolyData
+                # Each line is [2, idx1, idx2]
+                lines_pv = np.hstack((np.full((len(plc_segments_indices), 1), 2), plc_segments_indices))
                 
-                if new_angle_type:
-                    # Logic to upgrade if already an angle type, or set if None/DEFAULT
-                    angle_types_priority = ["SPECIAL_POINT", "FEATURE_EDGE_POINT", "HIGH_CURVATURE_POINT"]
-                    current_priority = angle_types_priority.index(current_type) if current_type in angle_types_priority else -1
-                    new_priority = angle_types_priority.index(new_angle_type)
+                # Create PolyData object
+                poly_data = pv.PolyData(pv_points_3d, lines=lines_pv.ravel())
+                
+                triangulated_pv = poly_data.triangulate(inplace=False, best_results=True, tolerance=1e-7)
+                
+                if triangulated_pv and triangulated_pv.n_points > 0 and triangulated_pv.n_cells > 0:
+                    logger.info(f"PyVista triangulation successful: {triangulated_pv.n_points} points, {triangulated_pv.n_cells} triangles.")
+                    pv_tri_vertices_3d = triangulated_pv.points
+                    if surface_projection_params:
+                        centroid = np.array(surface_projection_params['centroid'])
+                        basis = np.array(surface_projection_params['basis'])
+                        centered_pv_pts = pv_tri_vertices_3d - centroid
+                        tri_vertices_2d_final = np.dot(centered_pv_pts, basis.T)[:,:2]
+                    else: 
+                        tri_vertices_2d_final = pv_tri_vertices_3d[:, :2]
+                    tri_triangles_indices_final = triangulated_pv.faces.reshape(-1, 4)[:, 1:]
+                    logger.info("Using PyVista triangulation result.")
+                else:
+                    logger.warning("PyVista triangulation did not produce a valid mesh. Trying other methods.")
+                    tri_vertices_2d_final = None # Ensure reset if not successful
+                    tri_triangles_indices_final = None
+            except Exception as e_pv:
+                logger.error(f"PyVista triangulation failed: {e_pv}. Trying other methods.")
+                tri_vertices_2d_final = None # Explicitly reset on error
+                tri_triangles_indices_final = None
+        else: # original_3d_points_for_plc was None
+            logger.warning("original_3d_points_for_plc is None, cannot attempt PyVista triangulation.")
 
-                    if new_priority > current_priority:
-                        curr_p.point_type = new_angle_type
-                elif current_type in ["SPECIAL_POINT", "FEATURE_EDGE_POINT", "HIGH_CURVATURE_POINT"]: 
-                    # Was an angle type, but angle no longer qualifies. Reset to None.
-                    curr_p.point_type = None 
+    # If PyVista failed or was not used, try DirectTriangleWrapper
+    if tri_vertices_2d_final is None and HAVE_DIRECT_WRAPPER_INTERSECTION_UTILS:
+        logger.info("Using DirectTriangleWrapper for constrained triangulation.")
+        triangulation_options_dtw = {
+            'gradient': config.get('gradient', 2.0),
+            'min_angle': config.get('min_angle', 20.0),
+            'base_size': config.get('target_feature_size', 1.0),
+            'uniform': config.get('uniform_meshing', False), # Ensure False for constrained
+        }
+        triangulator = DirectTriangleWrapper(
+            gradient=triangulation_options_dtw['gradient'],
+            min_angle=triangulation_options_dtw['min_angle'],
+            base_size=triangulation_options_dtw['base_size']
+        )
+        try:
+            tri_result = triangulator.triangulate(
+                points=plc_points_2d, 
+                segments=plc_segments_indices, 
+                holes=plc_holes_2d if plc_holes_2d is not None and plc_holes_2d.size > 0 else None,
+                uniform=triangulation_options_dtw['uniform'],
+                create_transition=True 
+            )
+            if tri_result and 'vertices' in tri_result and 'triangles' in tri_result:
+                tri_vertices_2d_final = tri_result['vertices']
+                tri_triangles_indices_final = tri_result['triangles']
+                logger.info("Using DirectTriangleWrapper result.")
+        except Exception as e_dtw:
+            logger.error(f"DirectTriangleWrapper failed: {e_dtw}. Trying standard triangle.")
 
-
-        # Ensure the last point is always marked as an END_POINT in its type
-    # We need to preserve any existing special type but add END_POINT designation
-    
-    
-    # Final pass of cleaning, in case post-processing angles created near-duplicates (unlikely but safe)
-    if refined_points:
-        intersection.points = clean_identical_points(refined_points)
-    else: # Should not happen if original had points
-        intersection.points = []
-    if len(intersection.points) > 1:
-        last_point = intersection.points[-1]
-        current_type = last_point.point_type if hasattr(last_point, 'point_type') else None
+    # If DirectTriangleWrapper also failed or was not used, try standard triangle lib
+    if tri_vertices_2d_final is None:
+        logger.warning("DirectTriangleWrapper failed or not available. Using standard 'triangle' library.")
+        # Standard triangle options from your original fallback
+        opts = f"pYzq{config.get('min_angle', 20.0)}" 
+        base_size_std = config.get('target_feature_size', 1.0)
+        if base_size_std > 0:
+            area_constraint_std = (np.sqrt(3)/4) * (base_size_std ** 2)
+            opts += f"a{area_constraint_std:.8f}"
         
-        # If it already has a special type, append END_POINT to it
-        if current_type and current_type not in ["END_POINT", "DEFAULT", None]:
-            last_point.point_type = f"{current_type}_END_POINT"
-        else:
-            # If no special type or just DEFAULT, set to END_POINT
-            last_point.point_type = "END_POINT"
+        tri_input = {'vertices': plc_points_2d}
+        if plc_segments_indices is not None and len(plc_segments_indices) > 0:
+            tri_input['segments'] = plc_segments_indices
+        if plc_holes_2d is not None and len(plc_holes_2d) > 0:
+            tri_input['holes'] = plc_holes_2d
+        
+        try:
+            tri_result_std = tr_standard.triangulate(tri_input, opts=opts)
+            if 'vertices' in tri_result_std and 'triangles' in tri_result_std:
+                tri_vertices_2d_final = tri_result_std['vertices']
+                tri_triangles_indices_final = tri_result_std['triangles']
+                logger.info("Using standard triangle library result.")
+            else:
+                logger.error("Standard triangle library did not return expected keys.")
+        except Exception as e_std_tri:
+            logger.error(f"Standard triangle library triangulation failed: {e_std_tri}")
+
+    if tri_vertices_2d_final is None or tri_triangles_indices_final is None:
+        logger.error("All triangulation attempts failed.")
+        return None, None
+
+    # Z-reconstruction logic (remains the same)
+    final_vertices_3d_list = []
+    
+    if surface_projection_params:
+        centroid = surface_projection_params['centroid']
+        basis = surface_projection_params['basis']
+        # Use the unique_3d_points_for_plc that correspond to plc_points_2d
+        # The order of tri_vertices_2d_final might not directly map to original_3d_points_for_plc
+        # We need to map tri_vertices_2d_final back to their original 3D counterparts if they were boundary/PLC points
+        # or interpolate for new Steiner points.
+
+        # Create a KD-tree for fast lookup of original 2D PLC points
+        from scipy.spatial import KDTree
+        plc_kdtree = KDTree(plc_points_2d)
+
+        for new_v_2d in tri_vertices_2d_final:
+            # Check if this new 2D vertex is one of the original PLC points
+            dist, idx_in_plc = plc_kdtree.query(new_v_2d, k=1)
             
-    # Similarly, ensure first point is always marked as START_POINT
-    if len(intersection.points) > 0:
-        first_point = intersection.points[0]
-        current_type = first_point.point_type if hasattr(first_point, 'point_type') else None
-        
-        # If it already has a special type, append START_POINT to it
-        if current_type and current_type not in ["START_POINT", "DEFAULT", None]:
-            first_point.point_type = f"{current_type}_START_POINT"
-        else:
-            # If no special type or just DEFAULT, set to START_POINT
-            first_point.point_type = "START_POINT"
-    # Log summary of point types from the final list
-    _types_count = {}
-    for p in intersection.points:
-        ptype = p.point_type if hasattr(p, 'point_type') and p.point_type else "NONE_OR_DEFAULT"
-        _types_count[ptype] = _types_count.get(ptype, 0) + 1
+            if dist < 1e-9: # It's (close to) an original PLC point
+                # Use its original 3D Z value
+                original_3d_pt_for_this_plc_pt = original_3d_points_for_plc[idx_in_plc]
+                final_vertices_3d_list.append(original_3d_pt_for_this_plc_pt)
+            else: # It's a new Steiner point, interpolate Z
+                # Use original_3d_points_for_plc and plc_points_2d for interpolation
+                try:
+                    from scipy.interpolate import griddata
+                    original_z_values = original_3d_points_for_plc[:, 2]
+                    interpolated_z = griddata(plc_points_2d, original_z_values, new_v_2d, method='linear')
+                    if np.isnan(interpolated_z):
+                        interpolated_z = griddata(plc_points_2d, original_z_values, new_v_2d, method='nearest')
+                    if np.isnan(interpolated_z): # Still NaN
+                        interpolated_z = centroid[2] # Fallback
+                    
+                    # Reconstruct 3D point using interpolated Z
+                    reconstructed_3d = centroid + new_v_2d[0] * basis[0] + new_v_2d[1] * basis[1]
+                    reconstructed_3d[2] = float(interpolated_z) # Ensure scalar float
+                    final_vertices_3d_list.append(reconstructed_3d)
+                except Exception as e_interp:
+                    logger.warning(f"Z-interpolation for Steiner point failed ({e_interp}), using centroid Z.")
+                    reconstructed_3d = centroid + new_v_2d[0] * basis[0] + new_v_2d[1] * basis[1]
+                    reconstructed_3d[2] = centroid[2]
+                    final_vertices_3d_list.append(reconstructed_3d)
     
-    logger.info(f"REFINEMENT COMPLETE: {len(intersection.points)} final points.")
-    logger.info(f"  Final Types: {_types_count}")
-    logger.info("==================================================")
-    
-    return intersection.points
+    elif original_3d_points_for_plc is not None and len(original_3d_points_for_plc) == len(plc_points_2d):
+        # This case means the input points were essentially 2D (e.g., Z=0) and no projection was needed.
+        # We map Z values from original_3d_points_for_plc if the new vertex matches one of them.
+        from scipy.spatial import KDTree
+        plc_kdtree = KDTree(plc_points_2d)
+        for new_v_2d in tri_vertices_2d_final:
+            dist, idx_in_plc = plc_kdtree.query(new_v_2d, k=1)
+            if dist < 1e-9:
+                final_vertices_3d_list.append(original_3d_points_for_plc[idx_in_plc])
+            else: # New Steiner point, assume Z=0 or average Z of original points
+                avg_z = np.mean(original_3d_points_for_plc[:,2]) if len(original_3d_points_for_plc) > 0 else 0.0
+                final_vertices_3d_list.append(np.array([new_v_2d[0], new_v_2d[1], avg_z]))
+    else:
+        # Fallback: if no projection or original 3D points for Z, assume Z=0 for all new 2D vertices
+        logger.warning("No projection parameters or original 3D points for Z reconstruction. Assuming Z=0 for new vertices.")
+        for v_2d in tri_vertices_2d_final:
+            final_vertices_3d_list.append(np.array([v_2d[0], v_2d[1], 0.0]))
+
+    final_vertices_3d = np.array(final_vertices_3d_list)
+    logger.info(f"Constrained triangulation resulted in {len(final_vertices_3d)} 3D vertices and {len(tri_triangles_indices_final)} triangles.")
+    return final_vertices_3d, tri_triangles_indices_final
