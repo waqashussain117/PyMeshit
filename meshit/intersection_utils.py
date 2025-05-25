@@ -3323,3 +3323,269 @@ def update_refinement_with_constraints(intersection, target_length: float, confi
         assign_point_types_and_sizes(refined_points, target_length)
     
     return refined_points
+
+def validate_surfaces_for_tetgen(datasets, config=None):
+    """
+    Validate constrained surfaces to ensure they are ready for tetgen tetrahedralization.
+    
+    This function performs comprehensive checks on triangulated surfaces to verify:
+    - Mesh quality and topology
+    - Proper constraint processing
+    - Surface intersection handling
+    - Tetgen compatibility requirements
+    
+    Args:
+        datasets: List of dataset dictionaries with triangulated surfaces
+        config: Configuration dictionary
+        
+    Returns:
+        Dict with validation results and recommendations
+    """
+    if config is None:
+        config = {}
+    
+    validation_results = {
+        'overall_status': 'UNKNOWN',
+        'ready_for_tetgen': False,
+        'surface_count': len(datasets),
+        'surfaces': [],
+        'issues': [],
+        'recommendations': [],
+        'statistics': {}
+    }
+    
+    logger.info("=== TETGEN SURFACE VALIDATION ===")
+    
+    total_vertices = 0
+    total_triangles = 0
+    valid_surfaces = 0
+    
+    for i, dataset in enumerate(datasets):
+        surface_name = dataset.get('name', f'Surface_{i}')
+        surface_result = {
+            'name': surface_name,
+            'index': i,
+            'status': 'UNKNOWN',
+            'vertices': 0,
+            'triangles': 0,
+            'issues': [],
+            'quality_metrics': {}
+        }
+        
+        logger.info(f"Validating surface: {surface_name}")
+        
+        # Check if surface has triangulation data
+        if 'constrained_vertices' not in dataset or 'constrained_triangles' not in dataset:
+            surface_result['status'] = 'MISSING_TRIANGULATION'
+            surface_result['issues'].append('No constrained triangulation data found')
+            validation_results['issues'].append(f'{surface_name}: Missing triangulation data')
+        else:
+            vertices = dataset['constrained_vertices']
+            triangles = dataset['constrained_triangles']
+            
+            surface_result['vertices'] = len(vertices)
+            surface_result['triangles'] = len(triangles)
+            total_vertices += len(vertices)
+            total_triangles += len(triangles)
+            
+            # 1. Basic topology checks
+            topology_issues = []
+            
+            # Check minimum requirements
+            if len(vertices) < 3:
+                topology_issues.append('Insufficient vertices (< 3)')
+            if len(triangles) < 1:
+                topology_issues.append('No triangles found')
+            
+            # Check triangle validity
+            invalid_triangles = 0
+            for tri in triangles:
+                if len(tri) != 3:
+                    invalid_triangles += 1
+                elif max(tri) >= len(vertices):
+                    invalid_triangles += 1
+            
+            if invalid_triangles > 0:
+                topology_issues.append(f'{invalid_triangles} invalid triangles (bad indices)')
+            
+            # 2. Mesh quality checks
+            quality_metrics = {}
+            
+            if len(vertices) > 0 and len(triangles) > 0:
+                try:
+                    import numpy as np
+                    vertices_np = np.array(vertices)
+                    
+                    # Calculate triangle areas and aspect ratios
+                    areas = []
+                    aspect_ratios = []
+                    min_angles = []
+                    
+                    for tri in triangles:
+                        if max(tri) < len(vertices):
+                            v1, v2, v3 = vertices_np[tri[0]], vertices_np[tri[1]], vertices_np[tri[2]]
+                            
+                            # Triangle area
+                            edge1 = v2 - v1
+                            edge2 = v3 - v1
+                            cross = np.cross(edge1, edge2)
+                            area = 0.5 * np.linalg.norm(cross)
+                            areas.append(area)
+                            
+                            # Edge lengths
+                            e1_len = np.linalg.norm(edge1)
+                            e2_len = np.linalg.norm(v3 - v2)
+                            e3_len = np.linalg.norm(edge2)
+                            
+                            # Aspect ratio (longest edge / shortest edge)
+                            edge_lengths = [e1_len, e2_len, e3_len]
+                            if min(edge_lengths) > 1e-12:
+                                aspect_ratio = max(edge_lengths) / min(edge_lengths)
+                                aspect_ratios.append(aspect_ratio)
+                            
+                            # Minimum angle (using law of cosines)
+                            if e1_len > 1e-12 and e2_len > 1e-12 and e3_len > 1e-12:
+                                # Angle at vertex 1
+                                cos_angle = (e1_len**2 + e3_len**2 - e2_len**2) / (2 * e1_len * e3_len)
+                                cos_angle = max(-1, min(1, cos_angle))  # Clamp to valid range
+                                angle = np.arccos(cos_angle) * 180 / np.pi
+                                min_angles.append(angle)
+                    
+                    if areas:
+                        quality_metrics['min_area'] = min(areas)
+                        quality_metrics['max_area'] = max(areas)
+                        quality_metrics['avg_area'] = sum(areas) / len(areas)
+                        
+                        # Check for degenerate triangles
+                        degenerate_count = sum(1 for area in areas if area < 1e-12)
+                        if degenerate_count > 0:
+                            topology_issues.append(f'{degenerate_count} degenerate triangles (area < 1e-12)')
+                    
+                    if aspect_ratios:
+                        quality_metrics['min_aspect_ratio'] = min(aspect_ratios)
+                        quality_metrics['max_aspect_ratio'] = max(aspect_ratios)
+                        quality_metrics['avg_aspect_ratio'] = sum(aspect_ratios) / len(aspect_ratios)
+                        
+                        # Check for poor quality triangles
+                        poor_quality_count = sum(1 for ar in aspect_ratios if ar > 10.0)
+                        if poor_quality_count > 0:
+                            topology_issues.append(f'{poor_quality_count} poor quality triangles (aspect ratio > 10)')
+                    
+                    if min_angles:
+                        quality_metrics['min_angle'] = min(min_angles)
+                        quality_metrics['max_angle'] = max(min_angles)
+                        quality_metrics['avg_min_angle'] = sum(min_angles) / len(min_angles)
+                        
+                        # Check for very small angles
+                        small_angle_count = sum(1 for angle in min_angles if angle < 5.0)
+                        if small_angle_count > 0:
+                            topology_issues.append(f'{small_angle_count} triangles with very small angles (< 5°)')
+                    
+                except Exception as e:
+                    topology_issues.append(f'Quality analysis failed: {str(e)}')
+            
+            # 3. Constraint processing validation
+            constraint_issues = []
+            
+            # Check if constraint processing was used
+            if 'constraint_processing_used' in dataset:
+                if dataset['constraint_processing_used']:
+                    logger.info(f'{surface_name}: Constraint processing was used ✓')
+                else:
+                    constraint_issues.append('Constraint processing was not used')
+            else:
+                constraint_issues.append('Constraint processing status unknown')
+            
+            # Check for intersection constraints
+            if 'intersection_constraints' in dataset:
+                intersection_count = len(dataset['intersection_constraints'])
+                if intersection_count > 0:
+                    logger.info(f'{surface_name}: {intersection_count} intersection constraints found ✓')
+                else:
+                    constraint_issues.append('No intersection constraints found')
+            
+            # 4. Tetgen compatibility checks
+            tetgen_issues = []
+            
+            # Check for manifold surface (each edge shared by at most 2 triangles)
+            if len(triangles) > 0:
+                edge_count = {}
+                for tri in triangles:
+                    if max(tri) < len(vertices):
+                        edges = [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]
+                        for edge in edges:
+                            edge_key = tuple(sorted(edge))
+                            edge_count[edge_key] = edge_count.get(edge_key, 0) + 1
+                
+                non_manifold_edges = sum(1 for count in edge_count.values() if count > 2)
+                if non_manifold_edges > 0:
+                    tetgen_issues.append(f'{non_manifold_edges} non-manifold edges (shared by > 2 triangles)')
+                
+                boundary_edges = sum(1 for count in edge_count.values() if count == 1)
+                quality_metrics['boundary_edges'] = boundary_edges
+                quality_metrics['total_edges'] = len(edge_count)
+            
+            # Combine all issues
+            all_issues = topology_issues + constraint_issues + tetgen_issues
+            surface_result['issues'] = all_issues
+            surface_result['quality_metrics'] = quality_metrics
+            
+            # Determine surface status
+            if not all_issues:
+                surface_result['status'] = 'READY'
+                valid_surfaces += 1
+                logger.info(f'{surface_name}: READY for tetgen ✓')
+            elif len(topology_issues) == 0 and len(tetgen_issues) == 0:
+                surface_result['status'] = 'WARNING'
+                logger.warning(f'{surface_name}: Has warnings but may work with tetgen')
+            else:
+                surface_result['status'] = 'ERROR'
+                logger.error(f'{surface_name}: Has critical issues, not ready for tetgen')
+            
+            # Log quality metrics
+            if quality_metrics:
+                logger.info(f'{surface_name} quality: vertices={len(vertices)}, triangles={len(triangles)}')
+                if 'avg_aspect_ratio' in quality_metrics:
+                    logger.info(f'  Aspect ratio: avg={quality_metrics["avg_aspect_ratio"]:.2f}, max={quality_metrics["max_aspect_ratio"]:.2f}')
+                if 'avg_min_angle' in quality_metrics:
+                    logger.info(f'  Min angles: avg={quality_metrics["avg_min_angle"]:.1f}°, min={quality_metrics["min_angle"]:.1f}°')
+        
+        validation_results['surfaces'].append(surface_result)
+    
+    # Overall validation summary
+    validation_results['statistics'] = {
+        'total_vertices': total_vertices,
+        'total_triangles': total_triangles,
+        'valid_surfaces': valid_surfaces,
+        'surfaces_with_warnings': sum(1 for s in validation_results['surfaces'] if s['status'] == 'WARNING'),
+        'surfaces_with_errors': sum(1 for s in validation_results['surfaces'] if s['status'] == 'ERROR')
+    }
+    
+    # Determine overall status
+    if valid_surfaces == len(datasets) and len(datasets) > 0:
+        validation_results['overall_status'] = 'READY'
+        validation_results['ready_for_tetgen'] = True
+        logger.info("=== ALL SURFACES READY FOR TETGEN ✓ ===")
+    elif valid_surfaces > 0:
+        validation_results['overall_status'] = 'PARTIAL'
+        validation_results['ready_for_tetgen'] = False
+        logger.warning(f"=== PARTIAL READINESS: {valid_surfaces}/{len(datasets)} surfaces ready ===")
+    else:
+        validation_results['overall_status'] = 'NOT_READY'
+        validation_results['ready_for_tetgen'] = False
+        logger.error("=== SURFACES NOT READY FOR TETGEN ===")
+    
+    # Generate recommendations
+    recommendations = []
+    if validation_results['statistics']['surfaces_with_errors'] > 0:
+        recommendations.append("Fix critical topology and manifold issues before tetgen")
+    if validation_results['statistics']['surfaces_with_warnings'] > 0:
+        recommendations.append("Review constraint processing warnings")
+    if total_vertices < 10:
+        recommendations.append("Consider refining surfaces for better tetgen results")
+    if validation_results['ready_for_tetgen']:
+        recommendations.append("Surfaces are ready for tetgen tetrahedralization")
+    
+    validation_results['recommendations'] = recommendations
+    
+    return validation_results

@@ -1106,6 +1106,33 @@ class MeshItWorkflowGUI(QMainWindow):
             self.compute_constrained_mesh_btn.clicked.connect(self._compute_constrained_meshes_action)
             compute_layout.addWidget(self.compute_constrained_mesh_btn)
             
+            # Add tetgen validation button
+            self.validate_for_tetgen_btn = QPushButton("Validate Surfaces for Tetgen")
+            self.validate_for_tetgen_btn.setToolTip(
+                "Check if constrained surfaces are ready for tetgen tetrahedralization.\n"
+                "Validates mesh quality, topology, and constraint processing."
+            )
+            self.validate_for_tetgen_btn.clicked.connect(self._validate_surfaces_for_tetgen)
+            self.validate_for_tetgen_btn.setEnabled(False)
+            self.validate_for_tetgen_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #4CAF50;
+                    color: white;
+                    font-weight: bold;
+                    padding: 8px;
+                    border: none;
+                    border-radius: 4px;
+                }
+                QPushButton:hover {
+                    background-color: #45a049;
+                }
+                QPushButton:disabled {
+                    background-color: #cccccc;
+                    color: #666666;
+                }
+            """)
+            compute_layout.addWidget(self.validate_for_tetgen_btn)
+            
             self.constrained_mesh_target_feature_size_input = QDoubleSpinBox()
             self.constrained_mesh_target_feature_size_input.setRange(0.1, 500.0)
             self.constrained_mesh_target_feature_size_input.setValue(20.0)
@@ -1597,7 +1624,7 @@ class MeshItWorkflowGUI(QMainWindow):
                         if (vertices_3d is not None and triangles is not None and 
                             len(vertices_3d) > 0 and len(triangles) > 0):
                             
-                            # Store result
+                            # Store result in constrained_meshes
                             self.constrained_meshes[dataset_idx] = {
                                 'vertices': vertices_3d,
                                 'triangles': triangles,
@@ -1605,6 +1632,12 @@ class MeshItWorkflowGUI(QMainWindow):
                                 'num_constraints': len(constraint_lines),
                                 'num_segments': len(deduplicated_segments)
                             }
+                            
+                            # Also store in dataset for validation
+                            self.datasets[dataset_idx]['constrained_vertices'] = vertices_3d
+                            self.datasets[dataset_idx]['constrained_triangles'] = triangles
+                            self.datasets[dataset_idx]['constraint_processing_used'] = True
+                            self.datasets[dataset_idx]['intersection_constraints'] = constraint_lines[1:]  # Exclude hull boundary
                             
                             logger.info(f"SUCCESS: C++ CONSTRAINED mesh for {dataset_name}: "
                                     f"{len(vertices_3d)} vertices, {len(triangles)} triangles "
@@ -1627,6 +1660,11 @@ class MeshItWorkflowGUI(QMainWindow):
         if success_count > 0:
             self.statusBar().showMessage(f"Generated {success_count}/{total_count} constrained meshes using C++ approach.")
             logger.info(f"Constrained meshing completed: {success_count}/{total_count} surfaces processed successfully.")
+            
+            # Enable the tetgen validation button after successful computation
+            if hasattr(self, 'validate_for_tetgen_btn'):
+                self.validate_for_tetgen_btn.setEnabled(True)
+                logger.info("Tetgen validation button enabled")
         else:
             self.statusBar().showMessage("No constrained meshes generated. Check constraints and parameters.")
 
@@ -7487,6 +7525,171 @@ segmentation, triangulation, and visualization.
         plotter.reset_camera()
         plotter.show(title="MeshIt Intersections 3D View")
         logger.info("Showing Intersection 3D View.")
+    
+    def _validate_surfaces_for_tetgen(self):
+        """Validate constrained surfaces for tetgen readiness"""
+        if not hasattr(self, 'datasets') or not self.datasets:
+            self.statusBar().showMessage("No datasets to validate.")
+            return
+        
+        # Check if we have constrained meshes
+        datasets_with_constrained_meshes = []
+        for dataset in self.datasets:
+            if 'constrained_vertices' in dataset and 'constrained_triangles' in dataset:
+                datasets_with_constrained_meshes.append(dataset)
+        
+        if not datasets_with_constrained_meshes:
+            self.statusBar().showMessage("No constrained meshes found. Please generate constrained surface meshes first.")
+            return
+        
+        # Import the validation function
+        try:
+            from meshit.intersection_utils import validate_surfaces_for_tetgen
+        except ImportError:
+            self.statusBar().showMessage("Validation function not available.")
+            return
+        
+        # Run validation
+        logger.info("Starting tetgen surface validation...")
+        self.statusBar().showMessage("Validating surfaces for tetgen...")
+        
+        try:
+            validation_results = validate_surfaces_for_tetgen(datasets_with_constrained_meshes)
+            
+            # Create detailed validation report dialog
+            self._show_validation_results_dialog(validation_results)
+            
+            # Update status bar based on results
+            if validation_results['ready_for_tetgen']:
+                self.statusBar().showMessage(f"✓ All {validation_results['surface_count']} surfaces are ready for tetgen!")
+            elif validation_results['overall_status'] == 'PARTIAL':
+                ready_count = validation_results['statistics']['valid_surfaces']
+                total_count = validation_results['surface_count']
+                self.statusBar().showMessage(f"⚠ {ready_count}/{total_count} surfaces ready for tetgen")
+            else:
+                self.statusBar().showMessage("✗ Surfaces not ready for tetgen - check validation report")
+                
+        except Exception as e:
+            logger.error(f"Validation failed: {str(e)}")
+            self.statusBar().showMessage(f"Validation failed: {str(e)}")
+    
+    def _show_validation_results_dialog(self, validation_results):
+        """Show detailed validation results in a dialog"""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTextEdit, QLabel, QPushButton, QTabWidget, QWidget, QTableWidget, QTableWidgetItem
+        from PyQt5.QtCore import Qt
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Tetgen Surface Validation Results")
+        dialog.setMinimumSize(800, 600)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Overall status header
+        status_label = QLabel()
+        if validation_results['ready_for_tetgen']:
+            status_label.setText("✅ ALL SURFACES READY FOR TETGEN")
+            status_label.setStyleSheet("color: green; font-weight: bold; font-size: 16px; padding: 10px;")
+        elif validation_results['overall_status'] == 'PARTIAL':
+            ready_count = validation_results['statistics']['valid_surfaces']
+            total_count = validation_results['surface_count']
+            status_label.setText(f"⚠️ PARTIAL READINESS: {ready_count}/{total_count} SURFACES READY")
+            status_label.setStyleSheet("color: orange; font-weight: bold; font-size: 16px; padding: 10px;")
+        else:
+            status_label.setText("❌ SURFACES NOT READY FOR TETGEN")
+            status_label.setStyleSheet("color: red; font-weight: bold; font-size: 16px; padding: 10px;")
+        
+        status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(status_label)
+        
+        # Create tabs for different views
+        tab_widget = QTabWidget()
+        
+        # Summary tab
+        summary_widget = QWidget()
+        summary_layout = QVBoxLayout(summary_widget)
+        
+        # Statistics
+        stats = validation_results['statistics']
+        summary_text = f"""
+VALIDATION SUMMARY:
+• Total Surfaces: {validation_results['surface_count']}
+• Ready for Tetgen: {stats['valid_surfaces']}
+• With Warnings: {stats['surfaces_with_warnings']}
+• With Errors: {stats['surfaces_with_errors']}
+• Total Vertices: {stats['total_vertices']:,}
+• Total Triangles: {stats['total_triangles']:,}
+
+RECOMMENDATIONS:
+"""
+        for rec in validation_results['recommendations']:
+            summary_text += f"• {rec}\n"
+        
+        summary_text_edit = QTextEdit()
+        summary_text_edit.setPlainText(summary_text)
+        summary_text_edit.setReadOnly(True)
+        summary_layout.addWidget(summary_text_edit)
+        
+        tab_widget.addTab(summary_widget, "Summary")
+        
+        # Detailed results tab
+        details_widget = QWidget()
+        details_layout = QVBoxLayout(details_widget)
+        
+        # Create table for surface details
+        table = QTableWidget()
+        table.setRowCount(len(validation_results['surfaces']))
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(['Surface', 'Status', 'Vertices', 'Triangles', 'Issues', 'Quality'])
+        
+        for i, surface in enumerate(validation_results['surfaces']):
+            # Surface name
+            table.setItem(i, 0, QTableWidgetItem(surface['name']))
+            
+            # Status with color coding
+            status_item = QTableWidgetItem(surface['status'])
+            if surface['status'] == 'READY':
+                status_item.setBackground(Qt.green)
+            elif surface['status'] == 'WARNING':
+                status_item.setBackground(Qt.yellow)
+            else:
+                status_item.setBackground(Qt.red)
+            table.setItem(i, 1, status_item)
+            
+            # Vertices and triangles
+            table.setItem(i, 2, QTableWidgetItem(str(surface['vertices'])))
+            table.setItem(i, 3, QTableWidgetItem(str(surface['triangles'])))
+            
+            # Issues
+            issues_text = "; ".join(surface['issues']) if surface['issues'] else "None"
+            table.setItem(i, 4, QTableWidgetItem(issues_text))
+            
+            # Quality metrics
+            quality = surface['quality_metrics']
+            quality_text = ""
+            if 'avg_aspect_ratio' in quality:
+                quality_text += f"AR: {quality['avg_aspect_ratio']:.2f} "
+            if 'avg_min_angle' in quality:
+                quality_text += f"Angle: {quality['avg_min_angle']:.1f}° "
+            table.setItem(i, 5, QTableWidgetItem(quality_text))
+        
+        table.resizeColumnsToContents()
+        details_layout.addWidget(table)
+        
+        tab_widget.addTab(details_widget, "Detailed Results")
+        
+        layout.addWidget(tab_widget)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        button_layout.addStretch()
+        button_layout.addWidget(close_button)
+        
+        layout.addLayout(button_layout)
+        
+        dialog.exec_()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
