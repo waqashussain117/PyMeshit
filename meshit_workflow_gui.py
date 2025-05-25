@@ -30,7 +30,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushBu
                             QActionGroup, QSpacerItem)
 from PyQt5.QtCore import Qt, QSize, pyqtSignal, QObject, QThread, QTimer, QSettings # Add QTimer and QSettings
 from PyQt5.QtGui import QFont, QIcon, QColor, QPalette, QPixmap
-
+# Add these imports at the top of meshit_workflow_gui.py
+from meshit.intersection_utils import run_constrained_triangulation_py
+from scipy.spatial.distance import pdist, squareform
 # Import PyVista for 3D visualization
 try:
     import pyvista as pv
@@ -1118,7 +1120,47 @@ class MeshItWorkflowGUI(QMainWindow):
             form_layout.addRow("Min Angle:", self.constrained_mesh_min_angle_input)
             compute_layout.addLayout(form_layout)
 
+            # -- Constraint Processing Controls --
+            constraint_group = QGroupBox("Constraint Processing (C++ MeshIt Logic)")
+            constraint_layout = QVBoxLayout(constraint_group)
+            
+            # Enable constraint processing checkbox
+            self.use_constraint_processing_checkbox = QCheckBox("Enable Constraint Processing")
+            self.use_constraint_processing_checkbox.setChecked(True)
+            self.use_constraint_processing_checkbox.setToolTip(
+                "Enable advanced constraint processing that replicates C++ MeshIt logic"
+            )
+            constraint_layout.addWidget(self.use_constraint_processing_checkbox)
+            
+            # Type-based sizing checkbox
+            self.type_based_sizing_checkbox = QCheckBox("Type-Based Sizing")
+            self.type_based_sizing_checkbox.setChecked(True)
+            self.type_based_sizing_checkbox.setToolTip(
+                "Assign different mesh sizes based on point types (TRIPLE_POINT, CORNER, etc.)"
+            )
+            constraint_layout.addWidget(self.type_based_sizing_checkbox)
+            
+            # Hierarchical constraints checkbox
+            self.hierarchical_constraints_checkbox = QCheckBox("Hierarchical Constraints")
+            self.hierarchical_constraints_checkbox.setChecked(True)
+            self.hierarchical_constraints_checkbox.setToolTip(
+                "Process constraints hierarchically as in C++ MeshIt"
+            )
+            constraint_layout.addWidget(self.hierarchical_constraints_checkbox)
+            
+            # Gradient control
+            self.constraint_gradient_input = QDoubleSpinBox()
+            self.constraint_gradient_input.setRange(1.0, 5.0)
+            self.constraint_gradient_input.setValue(2.0)
+            self.constraint_gradient_input.setSingleStep(0.1)
+            self.constraint_gradient_input.setToolTip("Gradient control for smooth size transitions")
+            
+            constraint_form_layout = QFormLayout()
+            constraint_form_layout.addRow("Gradient:", self.constraint_gradient_input)
+            constraint_layout.addLayout(constraint_form_layout)
+
             control_layout.addWidget(compute_group) # Add compute_group to control_panel's layout
+            control_layout.addWidget(constraint_group) # Add constraint_group to control_panel's layout
             control_layout.addStretch()
             
             # Add the control_panel to the main tab_layout
@@ -1169,145 +1211,525 @@ class MeshItWorkflowGUI(QMainWindow):
 
     # Action method for the button
     def _compute_constrained_meshes_action(self):
-        logger.info("Starting constrained surface meshing for all eligible datasets...")
-        self.statusBar().showMessage("Generating constrained surface meshes...")
-        
-        if not self.datasets:
-            QMessageBox.information(self, "No Data", "No datasets loaded.")
+        """Compute constrained meshes for surfaces using stored constraints from refinement step (C++ approach)"""
+        if not hasattr(self, 'datasets') or not self.datasets:
             self.statusBar().showMessage("Constrained meshing skipped: No datasets.")
             return
 
-        # Get triangulation parameters from the new tab's UI
-        config = {
-            'target_feature_size': self.constrained_mesh_target_feature_size_input.value(),
-            'min_angle': self.constrained_mesh_min_angle_input.value(),
-            # Add other parameters like gradient, uniform_meshing if you add those controls
-            'gradient': 2.0, # Example default
-            'uniform_meshing': True # Example default
-        }
+                # Check if we have stored constraints from refinement step
+        constraint_found = False
+        for dataset in self.datasets:
+            if 'stored_constraints' in dataset and dataset['stored_constraints']:
+                constraint_found = True
+                break
 
-        processed_count = 0
-        for i, dataset in enumerate(self.datasets):
-            dataset_name = dataset.get('name', f"Dataset {i+1}")
-            logger.info(f"Processing dataset: {dataset_name}")
+        if not constraint_found:
+            logger.warning("No stored constraint lines found. Please run 'Refine Intersection Lines' first.")
+            self.statusBar().showMessage("Please run 'Refine Intersection Lines' first to generate constraints.")
+            return
 
-            # Ensure refined hull_points and intersection data exist for this surface
-            if 'hull_points' not in dataset or dataset['hull_points'] is None:
-                logger.warning(f"Skipping {dataset_name}: Refined convex hull not found.")
+        # Convert stored constraints to expected format
+        self.stored_constraint_lines = {}
+        for dataset_idx, dataset in enumerate(self.datasets):
+            stored_constraints = dataset.get('stored_constraints', [])
+            if not stored_constraints:
                 continue
+                
+            constraint_lines = []
             
-            # Gather intersections involving this surface
-            # self.datasets_intersections is keyed by primary_dataset_idx
-            # We need to iterate through all lists in self.datasets_intersections
-            # and pick those where dataset_id1 or dataset_id2 matches `i`
-            intersections_for_this_surface = []
-            if hasattr(self, 'datasets_intersections'):
-                for _, int_list in self.datasets_intersections.items():
-                    for intersection_data in int_list:
-                        if intersection_data['dataset_id1'] == i or intersection_data['dataset_id2'] == i:
-                            # Check if this intersection line is already added (to avoid duplicates if both id1 and id2 match i, or if it's keyed under both)
-                            # A more robust way is to use a set of tuples (id1, id2, is_polyline_mesh)
-                            # For simplicity, we'll add it; duplicates in input to prepare_plc should be fine as it finds unique points.
-                            intersections_for_this_surface.append(intersection_data)
+            # Add hull boundary as first constraint line
+            hull_points = dataset.get('hull_points', [])
+            if hull_points is not None and hasattr(hull_points, '__len__') and len(hull_points) >= 3:
+                hull_coords = []
+                for hp in hull_points:
+                    if len(hp) >= 3:
+                        hull_coords.append([float(hp[0]), float(hp[1]), float(hp[2])])
+                if hull_coords:
+                    constraint_lines.append(hull_coords)
             
-            logger.info(f"Found {len(intersections_for_this_surface)} refined intersection lines for {dataset_name}.")
+            # Add intersection lines as additional constraint lines
+            for constraint in stored_constraints:
+                if constraint['type'] == 'intersection_line':
+                    constraint_lines.append(constraint['points'])
+            
+            if constraint_lines:
+                self.stored_constraint_lines[dataset_idx] = constraint_lines
+                logger.info(f"Converted {len(constraint_lines)} constraint lines for dataset {dataset_idx}")
 
+                # Get triangulation parameters from UI (with fallbacks if controls don't exist)
+        try:
+            target_feature_size = self.constrained_mesh_target_feature_size_input.value()
+        except AttributeError:
+            target_feature_size = 20.0  # Default target feature size
+            logger.warning("Using default target feature size (20.0) - UI control not found")
+        
+        try:
+            min_angle_deg = self.constrained_mesh_min_angle_input.value()
+        except AttributeError:
+            min_angle_deg = 20.0  # Default min angle
+            logger.warning("Using default min angle (20°) - UI control not found")
+        
+        # Calculate reasonable max area based on target feature size
+        # Use a much larger area to prevent over-refinement
+        max_area = (target_feature_size ** 2) * 2.0  # Larger area to reduce over-refinement
+
+        logger.info("Starting constrained surface meshing using stored constraints (C++ approach)...")
+        
+        success_count = 0
+        total_count = 0
+        
+        # Clear previous results
+        if not hasattr(self, 'constrained_meshes'):
+            self.constrained_meshes = {}
+        
+        # Process each dataset using stored constraints
+        for dataset_idx, dataset in enumerate(self.datasets):
+            dataset_name = dataset.get('name', f'Dataset_{dataset_idx}')
+            
+            # Skip if no stored constraints for this dataset
+            if dataset_idx not in self.stored_constraint_lines:
+                logger.warning(f"No stored constraints for {dataset_name}")
+                continue
+                
+            total_count += 1
+            
             try:
-                # 1. Prepare PLC data
-                # Ensure these are imported at the top of meshit_workflow_gui.py
-                # from meshit.intersection_utils import prepare_plc_for_surface_triangulation, run_constrained_triangulation_py
+                logger.info(f"Processing C++ CONSTRAINED triangulation for: {dataset_name}")
                 
-                plc_points_2d, plc_segments_indices, plc_holes_2d, unique_3d_points_for_plc = \
-                    prepare_plc_for_surface_triangulation(dataset, intersections_for_this_surface, config) # config from UI
+                # Get stored constraint lines for this dataset (C++ approach)
+                constraint_lines = self.stored_constraint_lines[dataset_idx]
                 
-                if plc_points_2d is None or plc_segments_indices is None:
-                    logger.warning(f"Could not prepare PLC for {dataset_name}. Skipping.")
+                # 1. Build simplified constraint approach - just use hull + intersection lines
+                all_points_3d = []
+                all_segments = []
+                
+                # A. First, add ALL original triangulation vertices to preserve internal structure
+                original_triangulation = self.datasets[dataset_idx].get('triangulation_result', {})
+                original_vertices = original_triangulation.get('vertices', [])
+                
+                # Also check alternative storage locations if not found
+                if original_vertices is None or len(original_vertices) == 0:
+                    # Try legacy triangulation storage
+                    legacy_triangulation = self.datasets[dataset_idx].get('triangulation', {})
+                    original_vertices = legacy_triangulation.get('vertices', [])
+                    
+                    # Try to get vertices from the triangles data structure
+                    if (original_vertices is None or len(original_vertices) == 0) and 'triangles' in self.datasets[dataset_idx]:
+                        triangles_data = self.datasets[dataset_idx]['triangles']
+                        if isinstance(triangles_data, dict) and 'vertices' in triangles_data:
+                            original_vertices = triangles_data['vertices']
+                        elif hasattr(triangles_data, 'vertices'):
+                            original_vertices = triangles_data.vertices
+                    
+                    # Try alternative storage locations
+                    if (original_vertices is None or len(original_vertices) == 0) and 'mesh' in self.datasets[dataset_idx]:
+                        mesh_data = self.datasets[dataset_idx]['mesh']
+                        if isinstance(mesh_data, dict) and 'vertices' in mesh_data:
+                            original_vertices = mesh_data['vertices']
+                
+                # C++ approach: Only use constraint boundaries, let Triangle generate internal points
+                # The C++ version relies on Triangle's internal point generation with proper area constraints
+                logger.info(f"Using C++ constraint-only approach for {dataset_name} - Triangle will generate internal points")
+                
+                # B. Add hull boundary
+                hull_line = constraint_lines[0]  # First line is always hull
+                logger.info(f"Adding hull boundary: {len(hull_line)} points")
+                
+                hull_indices = []
+                for pt in hull_line:
+                    all_points_3d.append(pt)
+                    hull_indices.append(len(all_points_3d) - 1)
+                
+                # Create hull segments (closed loop)
+                for j in range(len(hull_indices)):
+                    next_j = (j + 1) % len(hull_indices)
+                    all_segments.append([hull_indices[j], hull_indices[next_j]])
+                
+                # C. Add intersection lines as constraints (with basic duplicate checking)
+                for line_idx in range(1, len(constraint_lines)):
+                    intersection_line = constraint_lines[line_idx]
+                    logger.info(f"Adding intersection constraint {line_idx}: {len(intersection_line)} points")
+                    
+                    line_indices = []
+                    for pt in intersection_line:
+                        # Check if point already exists in all existing points (basic check)
+                        existing_idx = None
+                        for existing_pt_idx, existing_pt in enumerate(all_points_3d):
+                            if np.linalg.norm(np.array(pt) - np.array(existing_pt)) < 1e-6:
+                                existing_idx = existing_pt_idx
+                                break
+                        
+                        if existing_idx is None:
+                            all_points_3d.append(pt)
+                            line_indices.append(len(all_points_3d) - 1)
+                        else:
+                            line_indices.append(existing_idx)
+                    
+                    # Create intersection segments (open line)
+                    for j in range(len(line_indices) - 1):
+                        all_segments.append([line_indices[j], line_indices[j + 1]])
+
+                logger.info(f"C++ APPROACH: Using {len(constraint_lines)} constraint lines "
+                        f"(1 hull + {len(constraint_lines)-1} intersections) for {dataset_name}")
+                logger.info(f"TOTAL POINTS: {len(all_points_3d)} constraint boundary points (C++ approach)")
+                logger.info(f"C++ CONSTRAINT PROCESSING: {len(all_points_3d)} total points, {len(all_segments)} segments")
+                
+                # Safety checks
+                if len(all_segments) > 200:
+                    logger.warning(f"Too many constraint segments ({len(all_segments)}) for {dataset_name}. May cause hanging.")
+                    continue
+                
+                if len(all_points_3d) > 500:
+                    logger.warning(f"Too many constraint points ({len(all_points_3d)}) for {dataset_name}. Using simplified approach.")
+                    # Keep only constraint boundaries, not all original vertices
+                    all_points_3d = []
+                    all_segments = []
+                    
+                    # Re-add just the constraint boundaries
+                    for line_idx, constraint_line in enumerate(constraint_lines):
+                        line_indices = []
+                        for pt in constraint_line:
+                            all_points_3d.append(pt)
+                            line_indices.append(len(all_points_3d) - 1)
+                        
+                        if line_idx == 0:  # Hull - create closed loop
+                            for j in range(len(line_indices)):
+                                next_j = (j + 1) % len(line_indices)
+                                all_segments.append([line_indices[j], line_indices[next_j]])
+                        else:  # Intersection - create open line
+                            for j in range(len(line_indices) - 1):
+                                all_segments.append([line_indices[j], line_indices[j + 1]])
+                    
+                    logger.info(f"SIMPLIFIED: Using {len(all_points_3d)} constraint boundary points, {len(all_segments)} segments")
+                
+                # 2. Project to 2D with C++ duplicate removal approach  
+                projection_params = dataset.get('projection_params')
+                if not projection_params:
+                    logger.warning(f"No projection parameters for {dataset_name}. Skipping.")
                     continue
 
-                # Store unique_3d_points_for_plc for reconstruction if not already part of projection_params
-                # This helps if original surface was purely 2D and had no projection_params
-                original_points_for_plc_for_triangulation = None
-                if 'projection_params' in dataset and dataset['projection_params'] is not None:
-                    dataset['projection_params']['original_points_for_plc'] = unique_3d_points_for_plc
-                else:
-                    original_points_for_plc_for_triangulation = unique_3d_points_for_plc
+                centroid = np.array(projection_params['centroid'])
+                basis = np.array(projection_params['basis'])
 
-
-                # 2. Run constrained triangulation
-                final_vertices_3d, final_triangles = run_constrained_triangulation_py(
-                    plc_points_2d, 
-                    plc_segments_indices, 
-                    plc_holes_2d, 
-                    dataset.get('projection_params'), 
-                    original_points_for_plc_for_triangulation, # Pass this explicitly
-                    config # config from UI
-                )
+                all_points_3d_np = np.array(all_points_3d)
+                centered_points = all_points_3d_np - centroid
                 
-                if final_vertices_3d is not None and final_triangles is not None:
-                    # Store this as a new key, to distinguish from earlier 'triangulation_result'
-                    dataset['constrained_triangulation_result'] = {
-                        'vertices': final_vertices_3d,
-                        'triangles': final_triangles
-                    }
-                    # Optionally, you might want to update the main 'triangulation_result'
-                    # if this constrained one is meant to replace it for subsequent steps like TetGen.
-                    # dataset['triangulation_result'] = dataset['constrained_triangulation_result']
-
-                    logger.info(f"Successfully generated constrained mesh for {dataset_name} with {len(final_vertices_3d)} vertices and {len(final_triangles)} triangles.")
-                    processed_count += 1
+                # Fix dimension mismatch: ensure basis is 3x2 for projection
+                if basis.shape[0] == 2:
+                    # If basis is 2x2 or 2x3, we need to transpose it to 3x2 or create proper 3x2
+                    if basis.shape[1] == 2:
+                        # Create a 3x2 basis matrix
+                        basis_3x2 = np.zeros((3, 2))
+                        basis_3x2[:2, :] = basis
+                        basis_3x2[2, :] = [0, 0]  # Z maps to 0 in both 2D axes
+                    else:  # basis.shape[1] == 3, so transpose
+                        basis_3x2 = basis.T[:, :2]  # Take first 2 columns after transpose
+                elif basis.shape[0] >= 3:
+                    basis_3x2 = basis[:, :2]  # Take first 2 columns
                 else:
-                    logger.error(f"Constrained triangulation failed for {dataset_name}.")
+                    logger.error(f"Invalid basis shape: {basis.shape}")
+                    continue
+                
+                points_2d = centered_points @ basis_3x2
+                
+                # C++ APPROACH: Deduplicate points with tolerance 1e-24 (in local coordinates)
+                # Convert to local tolerance
+                local_tolerance = 1e-8  # More reasonable tolerance for our scale
+                
+                deduplicated_points_2d = []
+                deduplicated_segments = []
+                point_index_map = {}  # Maps old indices to new indices
+                
+                # Deduplicate points exactly like C++ (lines 1999-2017 in geometry.cpp)
+                for i, pt_2d in enumerate(points_2d):
+                    found_duplicate = False
+                    for j, existing_pt in enumerate(deduplicated_points_2d):
+                        if np.linalg.norm(pt_2d - existing_pt) < local_tolerance:
+                            point_index_map[i] = j
+                            found_duplicate = True
+                            break
+                    
+                    if not found_duplicate:
+                        point_index_map[i] = len(deduplicated_points_2d)
+                        deduplicated_points_2d.append(pt_2d)
+                
+                # Remap segments to deduplicated indices
+                for seg in all_segments:
+                    new_start = point_index_map[seg[0]]
+                    new_end = point_index_map[seg[1]]
+                    # Only add segment if it connects different points
+                    if new_start != new_end:
+                        deduplicated_segments.append([new_start, new_end])
+                
+                logger.info(f"C++ DEDUPLICATION: {len(all_points_3d)} -> {len(deduplicated_points_2d)} points, "
+                        f"{len(all_segments)} -> {len(deduplicated_segments)} segments")
+                
+                if len(deduplicated_segments) < 3 or len(deduplicated_points_2d) < 3:
+                    logger.warning(f"Too few points/segments after deduplication for {dataset_name}")
+                    continue
 
-            except Exception as e:
-                logger.error(f"Error processing constrained mesh for {dataset_name}: {e}", exc_info=True)
-                QMessageBox.warning(self, "Processing Error", f"Error during constrained meshing for {dataset_name}: {str(e)}")
+                # Apply scaling to avoid precision issues (like in logs)
+                points_2d_array = np.array(deduplicated_points_2d)
+                if points_2d_array.size > 0:
+                    scale_factor = 50.0 / max(np.ptp(points_2d_array[:, 0]), np.ptp(points_2d_array[:, 1]), 1e-10)
+                    points_2d_array *= scale_factor
+                    logger.info(f"SCALED 2D coordinates by factor {scale_factor:.6f} to avoid precision issues")
+                    logger.info(f"2D coordinate range: [{points_2d_array.min():.3f}, {points_2d_array.max():.3f}]")
 
-        self.statusBar().showMessage(f"Constrained surface meshing complete. Processed {processed_count} datasets.")
-        self._visualize_constrained_meshes() # New visualization method
+                logger.info(f"Projecting {len(deduplicated_points_2d)} constraint points to 2D for {dataset_name}")
+                logger.info(f"Running C++ triangulation with {len(deduplicated_segments)} constraint segments for {dataset_name}")
 
-    # Visualization for the new tab
-    def _visualize_constrained_meshes(self):
-        plotter = self.plotters.get('pre_tetramesh') # Or self.pre_tetramesh_plotter
-        if not plotter:
-            logger.warning("Pre-TetraMesh plotter not available for visualization.")
-            return
-        
-        plotter.clear()
-        plotter.set_background([0.2, 0.2, 0.25]) 
-
-        visible_datasets = [d for d in self.datasets if d.get('visible', True) and d.get('constrained_triangulation_result')]
-        
-        if not visible_datasets:
-            plotter.add_text("No constrained surface meshes to display. Compute them first.", position='upper_edge', color='white')
-            plotter.reset_camera()
-            return
-
-        logger.info(f"Visualizing {len(visible_datasets)} constrained surface meshes...")
-        
-        plotter_has_content = False
-        for dataset in visible_datasets:
-            result = dataset['constrained_triangulation_result']
-            vertices = result['vertices']
-            triangles = result['triangles']
-            color = dataset.get('color', '#E0E0E0') 
-            name = dataset.get('name', 'Unnamed Constrained Surface')
-
-            if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
+                # 3. NEW: Use the constraint processing approach instead of manual constraint building
+                import math
                 try:
-                    mesh = pv.PolyData(np.array(vertices), faces=np.hstack((np.full((len(triangles), 1), 3), np.array(triangles))))
-                    plotter.add_mesh(mesh, color=color, show_edges=True, edge_color='dimgray', line_width=0.5, label=name, opacity=0.9)
-                    plotter_has_content = True
+                    from meshit.intersection_utils import prepare_plc_for_surface_triangulation, run_constrained_triangulation_py
+                    from meshit.intersection_utils import Vector3D
+                    
+                    # Convert constraint lines to proper format for new constraint processing
+                    surface_data = {
+                        'hull_points': [],
+                        'size': target_feature_size,
+                        'projection_params': projection_params
+                    }
+                    
+                    intersections_on_surface_data = []
+                    
+                    # Convert constraint lines to Vector3D format
+                    for line_idx, constraint_line in enumerate(constraint_lines):
+                        if line_idx == 0:  # Hull boundary
+                            hull_points_vector3d = []
+                            for pt in constraint_line:
+                                v3d = Vector3D(pt[0], pt[1], pt[2])
+                                v3d.type = "DEFAULT"  # Hull points are DEFAULT type
+                                hull_points_vector3d.append(v3d)
+                            surface_data['hull_points'] = hull_points_vector3d
+                        else:  # Intersection lines
+                            intersection_points_vector3d = []
+                            for pt in constraint_line:
+                                v3d = Vector3D(pt[0], pt[1], pt[2])
+                                v3d.type = "INTERSECTION_POINT"  # Intersection points
+                                intersection_points_vector3d.append(v3d)
+                            
+                            intersections_on_surface_data.append({
+                                'points': intersection_points_vector3d,
+                                'size': target_feature_size * 0.7,  # Smaller size for intersections
+                                'type': 'INTERSECTION'
+                            })
+                    
+                    logger.info(f"NEW CONSTRAINT PROCESSING: Using {len(surface_data['hull_points'])} hull points, {len(intersections_on_surface_data)} intersection lines")
+                    
+                    # Use the new constraint processing approach
+                    config = {
+                        'target_feature_size': target_feature_size,
+                        'max_area': max_area,
+                        'min_angle': min_angle_deg,
+                        'gradient': 2.0,
+                        'uniform_meshing': True,
+                        'use_constraint_processing': True,  # FORCE enable constraint processing
+                        'type_based_sizing': self.type_based_sizing_checkbox.isChecked(),
+                        'hierarchical_constraints': self.hierarchical_constraints_checkbox.isChecked(),
+                        'preserve_constraints': True,
+                        'constraint_enforcement': 'strict',
+                        'use_cpp_exact_logic': True
+                    }
+                    
+                    # Use the new PLC preparation method
+                    plc_result = prepare_plc_for_surface_triangulation(surface_data, intersections_on_surface_data, config)
+                    
+                    if plc_result and len(plc_result) == 4:
+                        points_2d_new, segments_new, holes_2d_new, points_3d_new = plc_result
+                        
+                        if points_2d_new is not None and len(points_2d_new) > 0:
+                            logger.info(f"NEW CONSTRAINT PROCESSING SUCCESS: {len(points_2d_new)} points, {len(segments_new)} segments")
+                            
+                            # Use the new constraint processing result
+                            result = run_constrained_triangulation_py(
+                                points_2d_new,
+                                segments_new,
+                                holes_2d_new,
+                                projection_params,
+                                points_3d_new,
+                                config
+                            )
+                        else:
+                            logger.warning("New constraint processing returned empty result, falling back to manual approach")
+                            # Fall back to manual approach
+                            edge_length = math.sqrt(max_area * 4 / math.sqrt(3))
+                            deduplicated_points_3d = []
+                            for i in range(len(deduplicated_points_2d)):
+                                for orig_idx, mapped_idx in point_index_map.items():
+                                    if mapped_idx == i:
+                                        deduplicated_points_3d.append(all_points_3d[orig_idx])
+                                        break
+                            
+                            result = run_constrained_triangulation_py(
+                                points_2d_array,
+                                np.array(deduplicated_segments),
+                                [],  # holes
+                                projection_params,
+                                np.array(deduplicated_points_3d),
+                                config
+                            )
+                    else:
+                        logger.warning("New constraint processing failed, falling back to manual approach")
+                        # Fall back to manual approach
+                        edge_length = math.sqrt(max_area * 4 / math.sqrt(3))
+                        deduplicated_points_3d = []
+                        for i in range(len(deduplicated_points_2d)):
+                            for orig_idx, mapped_idx in point_index_map.items():
+                                if mapped_idx == i:
+                                    deduplicated_points_3d.append(all_points_3d[orig_idx])
+                                    break
+                        
+                        result = run_constrained_triangulation_py(
+                            points_2d_array,
+                            np.array(deduplicated_segments),
+                            [],  # holes
+                            projection_params,
+                            np.array(deduplicated_points_3d),
+                            config
+                        )
+                    
+                    if result is not None and len(result) == 2:
+                        vertices_3d, triangles = result
+                        
+                        # Additional safety checks
+                        if (vertices_3d is not None and triangles is not None and 
+                            len(vertices_3d) > 0 and len(triangles) > 0):
+                            
+                            # Store result
+                            self.constrained_meshes[dataset_idx] = {
+                                'vertices': vertices_3d,
+                                'triangles': triangles,
+                                'constraint_lines': constraint_lines,
+                                'num_constraints': len(constraint_lines),
+                                'num_segments': len(deduplicated_segments)
+                            }
+                            
+                            logger.info(f"SUCCESS: C++ CONSTRAINED mesh for {dataset_name}: "
+                                    f"{len(vertices_3d)} vertices, {len(triangles)} triangles "
+                                    f"using {len(constraint_lines)} constraint lines, {len(deduplicated_segments)} segments")
+                            success_count += 1
+                    else:
+                        logger.error(f"Failed to generate constrained mesh for {dataset_name}")
+                        
                 except Exception as e:
-                    logger.error(f"Error creating PyVista mesh for constrained visualization of '{name}': {e}")
+                    logger.error(f"Error during constrained triangulation for {dataset_name}: {str(e)}")
+                    continue
+                    
+            except Exception as e:
+                logger.error(f"Error processing constrained mesh for {dataset_name}: {str(e)}")
+                continue
+
+        # Update visualization
+        self._visualize_constrained_meshes()
         
-        if plotter_has_content:
-            plotter.add_legend(bcolor=None, face='circle', border=False, size=(0.15, 0.2)) # Slightly larger legend
-            plotter.add_axes()
-            plotter.enable_zoom_scaling() # Enable zoom scaling
-            plotter.reset_camera()
-        else: # Should not happen if visible_datasets is not empty and processing was successful
-            plotter.add_text("No valid constrained meshes to display.", position='upper_edge', color='white')
-            plotter.reset_camera()
+        if success_count > 0:
+            self.statusBar().showMessage(f"Generated {success_count}/{total_count} constrained meshes using C++ approach.")
+            logger.info(f"Constrained meshing completed: {success_count}/{total_count} surfaces processed successfully.")
+        else:
+            self.statusBar().showMessage("No constrained meshes generated. Check constraints and parameters.")
+
+    def _visualize_constrained_meshes(self):
+        """Visualize constrained meshes with highlighted constraint boundaries"""
+        if not hasattr(self, 'pre_tetramesh_plotter') or not self.pre_tetramesh_plotter:
+            return
+            
+        if not hasattr(self, 'constrained_meshes') or not self.constrained_meshes:
+            logger.info("No constrained meshes to visualize")
+            return
+
+        plotter = self.pre_tetramesh_plotter
+        plotter.clear()
+        
+        # Create visualization for each constrained mesh
+        for dataset_idx, mesh_data in self.constrained_meshes.items():
+            if dataset_idx >= len(self.datasets):
+                continue
+                
+            dataset = self.datasets[dataset_idx]
+            dataset_name = dataset.get('name', f'Dataset_{dataset_idx}')
+            dataset_color = dataset.get('color', [0.7, 0.7, 0.7])
+            
+            vertices = mesh_data['vertices']
+            triangles = mesh_data['triangles']
+            constraint_lines = mesh_data.get('constraint_lines', [])
+            
+            if len(vertices) == 0 or len(triangles) == 0:
+                continue
+                
+            # Convert to numpy arrays
+            vertices_np = np.array(vertices)
+            triangles_np = np.array(triangles)
+            
+            # Create PyVista mesh
+            import pyvista as pv
+            faces = []
+            for tri in triangles_np:
+                faces.extend([3, tri[0], tri[1], tri[2]])
+            
+            mesh = pv.PolyData(vertices_np, faces)
+            
+            # Add main mesh
+            plotter.add_mesh(
+                mesh,
+                color=dataset_color,
+                style='surface',
+                opacity=0.8,
+                name=f'constrained_mesh_{dataset_idx}',
+                show_edges=True,
+                edge_color='black',
+                line_width=1
+            )
+            
+            # Highlight constraint boundaries
+            for line_idx, constraint_line in enumerate(constraint_lines):
+                if len(constraint_line) < 2:
+                    continue
+                    
+                constraint_points = np.array(constraint_line)
+                
+                if line_idx == 0:  # Hull boundary
+                    # Close the loop for hull
+                    constraint_points_closed = np.vstack([constraint_points, constraint_points[0:1]])
+                    line_color = 'red'
+                    line_width = 4
+                    label = f'{dataset_name}_hull_boundary'
+                else:  # Intersection lines
+                    constraint_points_closed = constraint_points
+                    line_color = 'blue'
+                    line_width = 3
+                    label = f'{dataset_name}_intersection_{line_idx}'
+                
+                # Create line mesh
+                line_mesh = pv.PolyData(constraint_points_closed)
+                line_mesh.lines = np.hstack([[2, i, i+1] for i in range(len(constraint_points_closed)-1)])
+                
+                plotter.add_mesh(
+                    line_mesh,
+                    color=line_color,
+                    line_width=line_width,
+                    name=label,
+                    style='wireframe'
+                )
+        
+        # Add legend
+        legend_entries = []
+        for dataset_idx in self.constrained_meshes.keys():
+            if dataset_idx < len(self.datasets):
+                dataset_name = self.datasets[dataset_idx].get('name', f'Dataset_{dataset_idx}')
+                mesh_data = self.constrained_meshes[dataset_idx]
+                legend_entries.append([f"{dataset_name}: {len(mesh_data['vertices'])} vertices", 
+                                    self.datasets[dataset_idx].get('color', [0.7, 0.7, 0.7])])
+        
+        if legend_entries:
+            plotter.add_legend(legend_entries, bcolor='white', face='rectangle')
+        
+        # Set view
+        plotter.show_axes()
+        plotter.reset_camera()
+        
+        logger.info(f"Visualized {len(self.constrained_meshes)} constrained meshes with constraint boundaries")
 
     def _analyze_refinement_results(self):
         """Analyze refinement results and return a summary string focusing on special points and hull status."""
@@ -1848,7 +2270,47 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.error(f"Error during length-based refinement: {e}", exc_info=True)
             QMessageBox.warning(self, "Refinement Error", f"Error during length-based refinement: {str(e)}")
             return
-
+                # --- STEP: Store intersection lines as constraints (C++ approach) ---
+        logger.info("Storing intersection lines as constraints for each surface...")
+        
+        # Clear existing constraints
+        for dataset_idx in range(len(self.datasets)):
+            self.datasets[dataset_idx]['stored_constraints'] = []
+        
+        # Store intersection constraints for each surface
+        for intersection in temp_model.intersections:
+            original_id1 = temp_model.original_indices_map.get(intersection.id1)
+            original_id2 = temp_model.original_indices_map.get(intersection.id2)
+            
+            if original_id1 is not None and original_id1 < len(self.datasets):
+                # Store this intersection as constraint for surface 1
+                constraint_line = []
+                for pt in intersection.points:
+                    constraint_line.append([pt.x, pt.y, pt.z])
+                
+                if len(constraint_line) >= 2:  # Only store if it's a valid line
+                    self.datasets[original_id1]['stored_constraints'].append({
+                        'type': 'intersection_line',
+                        'points': constraint_line,
+                        'other_surface_id': original_id2
+                    })
+                    logger.info(f"Stored intersection constraint for surface {original_id1}: {len(constraint_line)} points")
+            
+            if original_id2 is not None and original_id2 < len(self.datasets) and original_id1 != original_id2:
+                # Store this intersection as constraint for surface 2
+                constraint_line = []
+                for pt in intersection.points:
+                    constraint_line.append([pt.x, pt.y, pt.z])
+                
+                if len(constraint_line) >= 2:  # Only store if it's a valid line
+                    self.datasets[original_id2]['stored_constraints'].append({
+                        'type': 'intersection_line', 
+                        'points': constraint_line,
+                        'other_surface_id': original_id1
+                    })
+                    logger.info(f"Stored intersection constraint for surface {original_id2}: {len(constraint_line)} points")
+        
+        logger.info("Constraint storage complete.")
         # --- Update main data structures and visualization ---
         self.datasets_intersections.clear() 
         self.refined_intersections_for_visualization = {}
@@ -6448,7 +6910,14 @@ segmentation, triangulation, and visualization.
         # --- Run the intersection workflow --- 
         try:
             logger.info("Calling run_intersection_workflow...")
-            model = run_intersection_workflow(model, progress_callback)
+            # Configure constraint processing for intersection workflow
+            intersection_config = {
+                'use_constraint_processing': True,
+                'type_based_sizing': True,
+                'hierarchical_constraints': True,
+                'gradient': 2.0
+            }
+            model = run_intersection_workflow(model, progress_callback, config=intersection_config)
             logger.info("run_intersection_workflow finished.")
         except Exception as e:
             error_msg = f"Error during run_intersection_workflow: {str(e)}"
