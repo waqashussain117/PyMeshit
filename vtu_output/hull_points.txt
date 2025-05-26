@@ -1,8 +1,0 @@
-# Format: x y
-Hull Point 1: -0.958831 0.939820
-Hull Point 2: -0.687963 -0.688011
-Hull Point 3: -0.390772 -0.804656
-Hull Point 4: 0.184829 -0.907099
-Hull Point 5: 0.664885 -0.575322
-Hull Point 6: 0.931264 0.616795
-Hull Point 7: -0.250920 0.901429

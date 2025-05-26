@@ -1571,10 +1571,10 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
         if len(intersection.points) < 1:
             continue
         
-        # Process first and last points of the intersection (like C++ version)
+        # Process first and last points of the intersection Taking points from the C ++ Version of Meshit
         points_to_process = []
         if len(intersection.points) == 1:
-            points_to_process = [(0, intersection.points[0])]
+            points_to_process = [(0, intersection.points[0])] # 0 represents the first point, -1 represents the last point
         else:
             points_to_process = [(0, intersection.points[0]), (-1, intersection.points[-1])]
         
@@ -1588,7 +1588,7 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
                 hull_pt_type = getattr(hull_pt, 'point_type', getattr(hull_pt, 'type', "DEFAULT"))
                 if hull_pt_type != "DEFAULT":
                     distance = (intersection_point - hull_pt).length()
-                    if distance < 1e-8:  # Very close to special point
+                    if distance < 1e-8:  # Very close to special point # 1e-8 means 0.00000001
                         # Snap intersection point to the special hull point
                         if point_idx_in_intersection == 0:
                             intersection.points[0] = hull_pt
@@ -2054,9 +2054,9 @@ def refine_intersection_line_by_length(intersection, target_length, min_angle_de
         if target_length < 1e-7:
             num_subdivisions = 1
         elif uniform_meshing:
-            num_subdivisions = max(1, round(segment_length / target_length))
+            num_subdivisions = max(1, round(segment_length / target_length)) # 1 means at least one subdivision
         else:
-            num_subdivisions = max(1, math.ceil(segment_length / target_length))
+            num_subdivisions = max(1, math.ceil(segment_length / target_length)) # 1 means at least one subdivision
         
         logger.debug(f"Segment {i}: length={segment_length:.3f}, subdivisions={num_subdivisions}")
         
