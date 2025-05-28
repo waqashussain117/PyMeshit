@@ -2081,6 +2081,8 @@ def refine_intersection_line_by_length(intersection, target_length, min_angle_de
         # Handle first point
         first_p = refined_points[0]
         fp_type = getattr(first_p, 'point_type', "DEFAULT")
+        if fp_type is None:
+            fp_type = "DEFAULT"
         if fp_type == "DEFAULT" or "START_POINT" not in fp_type:
             if fp_type == "DEFAULT":
                 first_p.point_type = "START_POINT"
@@ -2093,6 +2095,8 @@ def refine_intersection_line_by_length(intersection, target_length, min_angle_de
         if len(refined_points) > 1:
             last_p = refined_points[-1]
             lp_type = getattr(last_p, 'point_type', "DEFAULT")
+            if lp_type is None:
+                lp_type = "DEFAULT"
             if lp_type == "DEFAULT" or "END_POINT" not in lp_type:
                 if lp_type == "DEFAULT":
                     last_p.point_type = "END_POINT"

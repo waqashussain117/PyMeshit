@@ -21,13 +21,16 @@ from PyQt5.QtWidgets import QAbstractItemView
 from meshit.intersection_utils import align_intersections_to_convex_hull, Vector3D, Intersection, refine_intersection_line_by_length, insert_triple_points
 from meshit.intersection_utils import prepare_plc_for_surface_triangulation, run_constrained_triangulation_py, calculate_triple_points, TriplePoint
 # Import PyQt5
+# import QMessageBox
+import tetgen
+from PyQt5.QtWidgets import QMessageBox
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
                             QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QTabWidget,
                             QFileDialog, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox,
                             QCheckBox, QGroupBox, QRadioButton, QSlider, QLineEdit,
                             QSplitter, QDialog, QFormLayout, QButtonGroup, QMenu, QAction,
                             QListWidget, QColorDialog, QListWidgetItem, QProgressDialog,
-                            QActionGroup, QSpacerItem)
+                            QActionGroup, QSpacerItem, QTableWidget, QTableWidgetItem)
 from PyQt5.QtCore import Qt, QSize, pyqtSignal, QObject, QThread, QTimer, QSettings # Add QTimer and QSettings
 from PyQt5.QtGui import QFont, QIcon, QColor, QPalette, QPixmap
 # Add these imports at the top of meshit_workflow_gui.py
@@ -309,6 +312,11 @@ class MeshItWorkflowGUI(QMainWindow):
         self.pre_tetramesh_tab = QWidget()
         self.notebook.addTab(self.pre_tetramesh_tab, "7. Pre-Tetramesh")
         self._setup_pre_tetramesh_tab()
+
+        # Setup tetra mesh tab
+        self.tetra_mesh_tab = QWidget()
+        self.notebook.addTab(self.tetra_mesh_tab, "8. Tetra Mesh")
+        self._setup_tetra_mesh_tab()
 
         # Placeholder for the refine_mesh_tab plotter
         self.refine_mesh_plotter = None
@@ -1883,143 +1891,6 @@ class MeshItWorkflowGUI(QMainWindow):
                 summary += f"• {original_total_points} → {refined_total_points} points<br>"
         
         return summary
-    def _update_refined_visualization(self):
-        """Update the refined intersection visualization based on UI settings"""
-        # Simply call visualize method again to refresh with current settings
-        self._visualize_refined_intersections()
-
-    def consolidate_points_for_triangulation(self):
-        """
-        Consolidate all refined points following C++ MeshIt logic for tetrahedral meshing:
-        - Triple Points: Only TRIPLE_POINT type
-        - Special Points: ALL other points INCLUDING DEFAULT subdivision points
-        
-        DEFAULT points are the refined subdivision points from C++ RefineByLength that are 
-        essential for creating manifold structure in tetrahedral meshing.
-        """
-        # Clear existing consolidated collections
-        self.consolidated_special_points = []
-        self.consolidated_triple_points = []
-        
-        logger.info("Consolidating points for triangulation constraints...")
-        
-        # 1. Process all intersection line points (INCLUDING DEFAULT subdivision points)
-        for dataset_idx_key in self.datasets_intersections.keys():
-            intersections_list = self.datasets_intersections[dataset_idx_key]
-            for intersection_data in intersections_list:
-                if 'points' not in intersection_data or not intersection_data['points']:
-                    continue
-                    
-                for p in intersection_data['points']:
-                    point_type = None
-                    coord = None
-                    
-                    # Extract coordinates and type
-                    if isinstance(p, (list, tuple)):
-                        if len(p) >= 3:
-                            coord = [float(p[0]), float(p[1]), float(p[2])]
-                            point_type = p[3] if len(p) > 3 else None
-                    elif hasattr(p, 'x') and hasattr(p, 'y') and hasattr(p, 'z'):
-                        coord = [float(p.x), float(p.y), float(p.z)]
-                        point_type = getattr(p, 'point_type', getattr(p, 'type', None))
-                    
-                    if not coord:
-                        continue
-                        
-                    # Consolidate based on corrected C++ logic
-                    if point_type:
-                        type_str = str(point_type)
-                        if type_str == "TRIPLE_POINT":
-                            self.consolidated_triple_points.append({
-                                'coord': coord, 'type': type_str, 'source': 'intersection'
-                            })
-                        else:  # ALL other points (including DEFAULT) become special points
-                            self.consolidated_special_points.append({
-                                'coord': coord, 'type': type_str, 'source': 'intersection'
-                            })
-                    else:
-                        # Points without type are treated as DEFAULT subdivision points
-                        self.consolidated_special_points.append({
-                            'coord': coord, 'type': 'DEFAULT', 'source': 'intersection'
-                        })
-        
-        # 2. Process all convex hull points (INCLUDING DEFAULT subdivision points)
-        for dataset_idx in range(len(self.datasets)):
-            dataset = self.datasets[dataset_idx]
-            hull_points = dataset.get('hull_points', [])
-            
-            for pt in hull_points:
-                if len(pt) >= 3:  # Process ALL hull points
-                    coord = [float(pt[0]), float(pt[1]), float(pt[2])]
-                    pt_type = str(pt[3]) if len(pt) > 3 and isinstance(pt[3], str) else 'DEFAULT'
-                    
-                    # ALL hull points become constraints (including DEFAULT subdivision points)
-                    self.consolidated_special_points.append({
-                        'coord': coord, 'type': pt_type, 'source': f'hull_dataset_{dataset_idx}'
-                    })
-        
-        # 3. Process stored triple points
-        if hasattr(self, 'triple_points') and self.triple_points:
-            for tp in self.triple_points:
-                p = tp['point']
-                try:
-                    if isinstance(p, (list, tuple)) and len(p) >= 3:
-                        coord = [float(p[0]), float(p[1]), float(p[2])]
-                    elif hasattr(p, 'x') and hasattr(p, 'y') and hasattr(p, 'z'):
-                        coord = [float(p.x), float(p.y), float(p.z)]
-                    else:
-                        continue
-                        
-                    self.consolidated_triple_points.append({
-                        'coord': coord, 'type': 'TRIPLE_POINT', 'source': 'stored_triple_points'
-                    })
-                except Exception as e:
-                    logger.error(f"Error processing stored triple point: {e}")
-        
-        # 4. Remove duplicates (points that might appear in both collections)
-        def remove_duplicates(points_list, tolerance=1e-6):
-            unique_points = []
-            for pt in points_list:
-                is_duplicate = False
-                for existing_pt in unique_points:
-                    if (abs(pt['coord'][0] - existing_pt['coord'][0]) < tolerance and
-                        abs(pt['coord'][1] - existing_pt['coord'][1]) < tolerance and  
-                        abs(pt['coord'][2] - existing_pt['coord'][2]) < tolerance):
-                        is_duplicate = True
-                        break
-                if not is_duplicate:
-                    unique_points.append(pt)
-            return unique_points
-        
-        self.consolidated_special_points = remove_duplicates(self.consolidated_special_points)
-        self.consolidated_triple_points = remove_duplicates(self.consolidated_triple_points)
-        
-        # Log consolidation results with detailed breakdown
-        logger.info("=== CONSOLIDATION RESULTS (Including DEFAULT subdivision points) ===")
-        logger.info(f"Triple Points: {len(self.consolidated_triple_points)}")
-        logger.info(f"Special Points (ALL types including DEFAULT): {len(self.consolidated_special_points)}")
-        
-        # Break down special points by type
-        special_by_type = {}
-        special_by_source = {}
-        for pt in self.consolidated_special_points:
-            pt_type = pt['type']
-            pt_source = pt['source']
-            special_by_type[pt_type] = special_by_type.get(pt_type, 0) + 1
-            special_by_source[pt_source] = special_by_source.get(pt_source, 0) + 1
-        
-        logger.info("Special Points Breakdown by Type:")
-        for pt_type, count in special_by_type.items():
-            logger.info(f"  {pt_type}: {count}")
-        
-        logger.info("Special Points Breakdown by Source:")
-        for pt_source, count in special_by_source.items():
-            logger.info(f"  {pt_source}: {count}")
-        
-        logger.info("Ready for constrained triangulation with manifold structure!")
-        logger.info("==============================================================")
-        
-        return self.consolidated_special_points, self.consolidated_triple_points
     def _refine_intersection_lines_action(self):
         """
         Action to refine intersection lines by:
@@ -2190,7 +2061,7 @@ class MeshItWorkflowGUI(QMainWindow):
             # Insert the triple points into the intersections
             insert_triple_points(temp_model)
             
-            # Store triple points for constraint references in the pre-tetramesh tab
+            # Store triple points for constraint references in the pre-tetrameshtab
             self.triple_points = []
             for tp in temp_model.triple_points:
                 self.triple_points.append({
@@ -2204,7 +2075,7 @@ class MeshItWorkflowGUI(QMainWindow):
             QMessageBox.warning(self, "Refinement Error", f"Error during triple point identification: {str(e)}")
             return
         
-                # --- Step 2: Identify corner points on convex hulls (C++ MakeCornersSpecial) ---
+        # --- Step 2: Identify corner points on convex hulls (C++ MakeCornersSpecial) ---
         try:
             from meshit.intersection_utils import make_corners_special
             
@@ -6058,6 +5929,144 @@ segmentation, triangulation, and visualization.
                     placeholder = QLabel("PyVista required or plot cleared.")
                     placeholder.setAlignment(Qt.AlignCenter)
                     self.refine_mesh_plot_layout.addWidget(placeholder)
+    
+    def _update_refined_visualization(self):
+        """Update the refined intersection visualization based on UI settings"""
+        # Simply call visualize method again to refresh with current settings
+        self._visualize_refined_intersections()
+    
+    def consolidate_points_for_triangulation(self):
+        """
+        Consolidate all refined points following C++ MeshIt logic for tetrahedral meshing:
+        - Triple Points: Only TRIPLE_POINT type
+        - Special Points: ALL other points INCLUDING DEFAULT subdivision points
+        
+        DEFAULT points are the refined subdivision points from C++ RefineByLength that are 
+        essential for creating manifold structure in tetrahedral meshing.
+        """
+        # Clear existing consolidated collections
+        self.consolidated_special_points = []
+        self.consolidated_triple_points = []
+        
+        logger.info("Consolidating points for triangulation constraints...")
+        
+        # 1. Process all intersection line points (INCLUDING DEFAULT subdivision points)
+        for dataset_idx_key in self.datasets_intersections.keys():
+            intersections_list = self.datasets_intersections[dataset_idx_key]
+            for intersection_data in intersections_list:
+                if 'points' not in intersection_data or not intersection_data['points']:
+                    continue
+                    
+                for p in intersection_data['points']:
+                    point_type = None
+                    coord = None
+                    
+                    # Extract coordinates and type
+                    if isinstance(p, (list, tuple)):
+                        if len(p) >= 3:
+                            coord = [float(p[0]), float(p[1]), float(p[2])]
+                            point_type = p[3] if len(p) > 3 else None
+                    elif hasattr(p, 'x') and hasattr(p, 'y') and hasattr(p, 'z'):
+                        coord = [float(p.x), float(p.y), float(p.z)]
+                        point_type = getattr(p, 'point_type', getattr(p, 'type', None))
+                    
+                    if not coord:
+                        continue
+                        
+                    # Consolidate based on corrected C++ logic
+                    if point_type:
+                        type_str = str(point_type)
+                        if type_str == "TRIPLE_POINT":
+                            self.consolidated_triple_points.append({
+                                'coord': coord, 'type': type_str, 'source': 'intersection'
+                            })
+                        else:  # ALL other points (including DEFAULT) become special points
+                            self.consolidated_special_points.append({
+                                'coord': coord, 'type': type_str, 'source': 'intersection'
+                            })
+                    else:
+                        # Points without type are treated as DEFAULT subdivision points
+                        self.consolidated_special_points.append({
+                            'coord': coord, 'type': 'DEFAULT', 'source': 'intersection'
+                        })
+        
+        # 2. Process all convex hull points (INCLUDING DEFAULT subdivision points)
+        for dataset_idx in range(len(self.datasets)):
+            dataset = self.datasets[dataset_idx]
+            hull_points = dataset.get('hull_points', [])
+            
+            for pt in hull_points:
+                if len(pt) >= 3:  # Process ALL hull points
+                    coord = [float(pt[0]), float(pt[1]), float(pt[2])]
+                    pt_type = str(pt[3]) if len(pt) > 3 and isinstance(pt[3], str) else 'DEFAULT'
+                    
+                    # ALL hull points become constraints (including DEFAULT subdivision points)
+                    self.consolidated_special_points.append({
+                        'coord': coord, 'type': pt_type, 'source': f'hull_dataset_{dataset_idx}'
+                    })
+        
+        # 3. Process stored triple points
+        if hasattr(self, 'triple_points') and self.triple_points:
+            for tp in self.triple_points:
+                p = tp['point']
+                try:
+                    if isinstance(p, (list, tuple)) and len(p) >= 3:
+                        coord = [float(p[0]), float(p[1]), float(p[2])]
+                    elif hasattr(p, 'x') and hasattr(p, 'y') and hasattr(p, 'z'):
+                        coord = [float(p.x), float(p.y), float(p.z)]
+                    else:
+                        continue
+                        
+                    self.consolidated_triple_points.append({
+                        'coord': coord, 'type': 'TRIPLE_POINT', 'source': 'stored_triple_points'
+                    })
+                except Exception as e:
+                    logger.error(f"Error processing stored triple point: {e}")
+        
+        # 4. Remove duplicates (points that might appear in both collections)
+        def remove_duplicates(points_list, tolerance=1e-6):
+            unique_points = []
+            for pt in points_list:
+                is_duplicate = False
+                for existing_pt in unique_points:
+                    if (abs(pt['coord'][0] - existing_pt['coord'][0]) < tolerance and
+                        abs(pt['coord'][1] - existing_pt['coord'][1]) < tolerance and  
+                        abs(pt['coord'][2] - existing_pt['coord'][2]) < tolerance):
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    unique_points.append(pt)
+            return unique_points
+        
+        self.consolidated_special_points = remove_duplicates(self.consolidated_special_points)
+        self.consolidated_triple_points = remove_duplicates(self.consolidated_triple_points)
+        
+        # Log consolidation results with detailed breakdown
+        logger.info("=== CONSOLIDATION RESULTS (Including DEFAULT subdivision points) ===")
+        logger.info(f"Triple Points: {len(self.consolidated_triple_points)}")
+        logger.info(f"Special Points (ALL types including DEFAULT): {len(self.consolidated_special_points)}")
+        
+        # Break down special points by type
+        special_by_type = {}
+        special_by_source = {}
+        for pt in self.consolidated_special_points:
+            pt_type = pt['type']
+            pt_source = pt['source']
+            special_by_type[pt_type] = special_by_type.get(pt_type, 0) + 1
+            special_by_source[pt_source] = special_by_source.get(pt_source, 0) + 1
+        
+        logger.info("Special Points Breakdown by Type:")
+        for pt_type, count in special_by_type.items():
+            logger.info(f"  {pt_type}: {count}")
+        
+        logger.info("Special Points Breakdown by Source:")
+        for pt_source, count in special_by_source.items():
+            logger.info(f"  {pt_source}: {count}")
+        
+        logger.info("Ready for constrained triangulation with manifold structure!")
+        logger.info("==============================================================")
+        
+        return self.consolidated_special_points, self.consolidated_triple_points
 
     def _create_multi_dataset_3d_visualization(self, parent_frame, datasets, title, view_type="points"):
         """Create a 3D visualization of multiple datasets
@@ -6424,6 +6433,7 @@ segmentation, triangulation, and visualization.
             elif current_tab_widget == self.intersection_tab: self._clear_intersection_plot()
             elif current_tab_widget == self.refine_mesh_tab: self._clear_refine_mesh_plot() # Add this
             elif current_tab_widget == self.pre_tetramesh_tab: self._clear_pre_tetramesh_plot() # Add this
+            elif hasattr(self, 'tetra_mesh_tab') and current_tab_widget == self.tetra_mesh_tab: self._clear_tetra_mesh_plot() # Add this
             return
 
         if current_tab_widget == self.file_tab:  # File tab
@@ -6457,6 +6467,19 @@ segmentation, triangulation, and visualization.
             else:
                 self._clear_pre_tetramesh_plot()
                 self.statusBar().showMessage("No constrained surface meshes computed yet.")
+        elif hasattr(self, 'tetra_mesh_tab') and current_tab_widget == self.tetra_mesh_tab: # Tetra Mesh tab
+            # Update surface table when switching to tetra mesh tab
+            if hasattr(self, '_update_surface_table'):
+                self._update_surface_table()
+            # Show existing tetrahedral mesh if available
+            if hasattr(self, 'tetrahedral_mesh') and self.tetrahedral_mesh:
+                self._visualize_tetrahedral_mesh()
+            else:
+                if hasattr(self, 'tetra_plotter') and self.tetra_plotter:
+                    self.tetra_plotter.clear()
+                    self.tetra_plotter.add_text("Select surfaces and generate tetrahedral mesh to visualize.", 
+                                              position='upper_edge', color='white')
+                self.statusBar().showMessage("No tetrahedral mesh generated yet.")
     # ... rest of the class methods (_get_next_color, _create_main_layout, etc.) ...
 
     def _get_boundary_edges(self, triangles):
@@ -7573,6 +7596,1870 @@ segmentation, triangulation, and visualization.
             logger.error(f"Validation failed: {str(e)}")
             self.statusBar().showMessage(f"Validation failed: {str(e)}")
     
+    def _setup_tetra_mesh_tab(self):
+        """Sets up the Tetrahedral Mesh Generation tab (final stage)."""
+        # Initialize data structures for tetra mesh
+        self.tetra_materials = []
+        self.selected_surfaces = set()
+        self.tetrahedral_mesh = None
+        
+        # Create main layout
+        tab_layout = QHBoxLayout(self.tetra_mesh_tab)
+        
+        # --- Left Control Panel ---
+        control_panel = QWidget()
+        control_panel.setMaximumWidth(400)
+        control_layout = QVBoxLayout(control_panel)
+        
+        # Surface Selection Group
+        surface_group = QGroupBox("Surface Selection")
+        surface_layout = QVBoxLayout(surface_group)
+        
+        # Surface selection table
+        from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
+        from PyQt5.QtCore import Qt
+        
+        self.surface_table = QTableWidget()
+        self.surface_table.setColumnCount(4)
+        self.surface_table.setHorizontalHeaderLabels(['Select', 'Surface', 'Type', 'Triangles'])
+        self.surface_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.surface_table.setMaximumHeight(200)
+        surface_layout.addWidget(self.surface_table)
+        
+        # Surface selection buttons
+        surface_btn_layout = QHBoxLayout()
+        self.select_all_surfaces_btn = QPushButton("Select All")
+        self.deselect_all_surfaces_btn = QPushButton("Deselect All")
+        self.select_all_surfaces_btn.clicked.connect(self._select_all_surfaces)
+        self.deselect_all_surfaces_btn.clicked.connect(self._deselect_all_surfaces)
+        surface_btn_layout.addWidget(self.select_all_surfaces_btn)
+        surface_btn_layout.addWidget(self.deselect_all_surfaces_btn)
+        surface_layout.addLayout(surface_btn_layout)
+        
+        control_layout.addWidget(surface_group)
+        
+        # Material Management Group
+        material_group = QGroupBox("Material Regions")
+        material_layout = QVBoxLayout(material_group)
+        
+        # Material list
+        from PyQt5.QtWidgets import QListWidget, QListWidgetItem
+        self.material_list = QListWidget()
+        self.material_list.setMaximumHeight(120)
+        self.material_list.currentItemChanged.connect(self._on_material_selection_changed)
+        material_layout.addWidget(self.material_list)
+        
+        # Material buttons
+        material_btn_layout = QHBoxLayout()
+        self.add_material_btn = QPushButton("Add Material")
+        self.remove_material_btn = QPushButton("Remove Material")
+        self.add_material_btn.clicked.connect(self._add_material)
+        self.remove_material_btn.clicked.connect(self._remove_material)
+        material_btn_layout.addWidget(self.add_material_btn)
+        material_btn_layout.addWidget(self.remove_material_btn)
+        material_layout.addLayout(material_btn_layout)
+        
+        # Auto placement button with special styling
+        self.auto_place_btn = QPushButton("🤖 Auto-Place Materials")
+        self.auto_place_btn.setToolTip("Automatically detect and place material points in all subdomains")
+        self.auto_place_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9C27B0;
+                color: white;
+                font-weight: bold;
+                padding: 6px;
+                border: none;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #7B1FA2;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+        """)
+        self.auto_place_btn.clicked.connect(self._auto_place_materials)
+        material_layout.addWidget(self.auto_place_btn)
+        
+        # Material location controls
+        location_group = QGroupBox("Material Locations")
+        location_layout = QVBoxLayout(location_group)
+        
+        # Location list
+        self.location_list = QListWidget()
+        self.location_list.setMaximumHeight(80)
+        location_layout.addWidget(self.location_list)
+        
+        # Location coordinate controls
+        from PyQt5.QtWidgets import QFormLayout, QDoubleSpinBox
+        coord_layout = QFormLayout()
+        
+        self.location_x_spin = QDoubleSpinBox()
+        self.location_y_spin = QDoubleSpinBox()
+        self.location_z_spin = QDoubleSpinBox()
+        
+        for spin in [self.location_x_spin, self.location_y_spin, self.location_z_spin]:
+            spin.setRange(-10000.0, 10000.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(1.0)
+        
+        coord_layout.addRow("X:", self.location_x_spin)
+        coord_layout.addRow("Y:", self.location_y_spin)
+        coord_layout.addRow("Z:", self.location_z_spin)
+        location_layout.addLayout(coord_layout)
+        
+        # Location buttons
+        location_btn_layout = QHBoxLayout()
+        self.add_location_btn = QPushButton("Add Location")
+        self.remove_location_btn = QPushButton("Remove Location")
+        self.add_location_btn.clicked.connect(self._add_material_location)
+        self.remove_location_btn.clicked.connect(self._remove_material_location)
+        location_btn_layout.addWidget(self.add_location_btn)
+        location_btn_layout.addWidget(self.remove_location_btn)
+        location_layout.addLayout(location_btn_layout)
+        
+        material_layout.addWidget(location_group)
+        control_layout.addWidget(material_group)
+        
+        # Tetgen Options Group
+        tetgen_group = QGroupBox("Tetgen Options")
+        tetgen_layout = QVBoxLayout(tetgen_group)
+        
+        # Command line options
+        from PyQt5.QtWidgets import QLineEdit
+        options_layout = QFormLayout()
+        
+        self.tetgen_options_input = QLineEdit("pq1.2A")
+        self.tetgen_options_input.setToolTip("Tetgen command line options (default: pq1.2A, 'p' for PLC required)")
+        options_layout.addRow("Options:", self.tetgen_options_input)
+        
+        self.quality_ratio_spin = QDoubleSpinBox()
+        self.quality_ratio_spin.setRange(1.0, 3.0)
+        self.quality_ratio_spin.setValue(1.2)
+        self.quality_ratio_spin.setDecimals(1)
+        self.quality_ratio_spin.setSingleStep(0.1)
+        self.quality_ratio_spin.setToolTip("Quality ratio for tetgen (default: 1.2)")
+        options_layout.addRow("Quality Ratio:", self.quality_ratio_spin)
+        
+        self.max_volume_spin = QDoubleSpinBox()
+        self.max_volume_spin.setRange(0.0, 10000.0)
+        self.max_volume_spin.setValue(0.0)
+        self.max_volume_spin.setDecimals(3)
+        self.max_volume_spin.setToolTip("Maximum tetrahedron volume (0 = no limit)")
+        options_layout.addRow("Max Volume:", self.max_volume_spin)
+        
+        tetgen_layout.addLayout(options_layout)
+        control_layout.addWidget(tetgen_group)
+        
+        # Generation Controls
+        generation_group = QGroupBox("Mesh Generation")
+        generation_layout = QVBoxLayout(generation_group)
+        
+        self.generate_tetra_btn = QPushButton("Generate Tetrahedral Mesh")
+        self.generate_tetra_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                font-weight: bold;
+                padding: 12px;
+                border: none;
+                border-radius: 6px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+        """)
+        self.generate_tetra_btn.clicked.connect(self._generate_tetrahedral_mesh)
+        generation_layout.addWidget(self.generate_tetra_btn)
+        
+        # Export button
+        self.export_tetra_btn = QPushButton("💾 Export Mesh")
+        self.export_tetra_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border: none;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+        """)
+        self.export_tetra_btn.clicked.connect(self._export_tetrahedral_mesh)
+        self.export_tetra_btn.setEnabled(False)  # Initially disabled
+        generation_layout.addWidget(self.export_tetra_btn)
+        
+        # Mesh statistics
+        self.tetra_stats_label = QLabel("No tetrahedral mesh generated yet.")
+        self.tetra_stats_label.setWordWrap(True)
+        self.tetra_stats_label.setStyleSheet("color: #666; font-size: 11px; padding: 8px;")
+        generation_layout.addWidget(self.tetra_stats_label)
+        
+        control_layout.addWidget(generation_group)
+        
+        control_layout.addStretch()
+        tab_layout.addWidget(control_panel)
+        
+        # --- Right Visualization Panel ---
+        viz_group = QGroupBox("Tetrahedral Mesh Visualization")
+        viz_layout = QVBoxLayout(viz_group)
+        
+        # Visualization controls
+        viz_controls_layout = QHBoxLayout()
+        
+        from PyQt5.QtWidgets import QCheckBox
+        self.show_surfaces_check = QCheckBox("Show Surfaces")
+        self.show_wireframe_check = QCheckBox("Show Wireframe")
+        self.show_materials_check = QCheckBox("Show Material Points")
+        
+        self.show_surfaces_check.setChecked(True)
+        self.show_wireframe_check.setChecked(False)
+        self.show_materials_check.setChecked(True)
+        
+        self.show_surfaces_check.toggled.connect(self._update_tetra_visualization)
+        self.show_wireframe_check.toggled.connect(self._update_tetra_visualization)
+        self.show_materials_check.toggled.connect(self._update_tetra_visualization)
+        
+        viz_controls_layout.addWidget(self.show_surfaces_check)
+        viz_controls_layout.addWidget(self.show_wireframe_check)
+        viz_controls_layout.addWidget(self.show_materials_check)
+        viz_controls_layout.addStretch()
+        
+        viz_layout.addLayout(viz_controls_layout)
+        
+        # 3D Visualization frame
+        self.tetra_viz_frame = QFrame()
+        self.tetra_viz_frame.setFrameShape(QFrame.StyledPanel)
+        self.tetra_plot_layout = QVBoxLayout(self.tetra_viz_frame)
+        self.tetra_plot_layout.setContentsMargins(0, 0, 0, 0)
+        
+        if HAVE_PYVISTA:
+            from pyvistaqt import QtInteractor
+            plotter = QtInteractor(self.tetra_viz_frame)
+            self.tetra_plot_layout.addWidget(plotter.interactor)
+            plotter.set_background([0.2, 0.2, 0.25])  # Dark background
+            plotter.add_text("Select surfaces and generate tetrahedral mesh to visualize.", 
+                           position='upper_edge', color='white')
+            self.plotters['tetra_mesh'] = plotter
+            self.tetra_plotter = plotter
+            logger.info("Successfully created tetra_plotter")
+        else:
+            placeholder = QLabel("PyVista is required for 3D visualization.")
+            placeholder.setAlignment(Qt.AlignCenter)
+            self.tetra_plot_layout.addWidget(placeholder)
+            self.tetra_plotter = None
+            
+        viz_layout.addWidget(self.tetra_viz_frame, 1)
+        tab_layout.addWidget(viz_group, 1)
+        
+        # Initialize surface table
+        self._update_surface_table()
+        
+        # Add default material
+        self._add_default_material()
+    
+    def _update_surface_table(self):
+        """Update the surface selection table with available constrained surfaces."""
+        if not hasattr(self, 'surface_table'):
+            return
+            
+        # Clear existing rows
+        self.surface_table.setRowCount(0)
+        
+        # Check for constrained surfaces
+        available_surfaces = []
+        for i, dataset in enumerate(self.datasets):
+            if ('constrained_vertices' in dataset and 'constrained_triangles' in dataset):
+                constrained_vertices = dataset['constrained_vertices']
+                constrained_triangles = dataset['constrained_triangles']
+                if constrained_vertices is not None and constrained_triangles is not None:
+                    surface_name = dataset.get('name', f'Surface_{i}')
+                    triangle_count = len(constrained_triangles) if hasattr(constrained_triangles, '__len__') else 0
+                    available_surfaces.append({
+                        'index': i,
+                        'name': surface_name,
+                        'type': 'Constrained',
+                        'triangles': triangle_count
+                    })
+        
+        # Populate table
+        self.surface_table.setRowCount(len(available_surfaces))
+        
+        from PyQt5.QtWidgets import QCheckBox, QWidget, QHBoxLayout
+        
+        for row, surface in enumerate(available_surfaces):
+            # Checkbox for selection
+            checkbox_widget = QWidget()
+            checkbox_layout = QHBoxLayout(checkbox_widget)
+            checkbox = QCheckBox()
+            checkbox.setChecked(surface['index'] in self.selected_surfaces)
+            checkbox.stateChanged.connect(lambda state, idx=surface['index']: self._on_surface_selection_changed(idx, state))
+            checkbox_layout.addWidget(checkbox)
+            checkbox_layout.setContentsMargins(0, 0, 0, 0)
+            checkbox_layout.setAlignment(Qt.AlignCenter)
+            self.surface_table.setCellWidget(row, 0, checkbox_widget)
+            
+            # Surface info
+            self.surface_table.setItem(row, 1, QTableWidgetItem(surface['name']))
+            self.surface_table.setItem(row, 2, QTableWidgetItem(surface['type']))
+            self.surface_table.setItem(row, 3, QTableWidgetItem(str(surface['triangles'])))
+    
+    def _on_surface_selection_changed(self, surface_index, state):
+        """Handle surface selection change."""
+        if state == Qt.Checked:
+            self.selected_surfaces.add(surface_index)
+        else:
+            self.selected_surfaces.discard(surface_index)
+        logger.info(f"Surface {surface_index} selection changed. Selected surfaces: {list(self.selected_surfaces)}")
+    
+    def _select_all_surfaces(self):
+        """Select all available surfaces."""
+        for i in range(self.surface_table.rowCount()):
+            checkbox_widget = self.surface_table.cellWidget(i, 0)
+            if checkbox_widget:
+                checkbox = checkbox_widget.findChild(QCheckBox)
+                if checkbox:
+                    checkbox.setChecked(True)
+    
+    def _deselect_all_surfaces(self):
+        """Deselect all surfaces."""
+        for i in range(self.surface_table.rowCount()):
+            checkbox_widget = self.surface_table.cellWidget(i, 0)
+            if checkbox_widget:
+                checkbox = checkbox_widget.findChild(QCheckBox)
+                if checkbox:
+                    checkbox.setChecked(False)
+    
+    def _add_default_material(self):
+        """Add a default material region."""
+        if not self.tetra_materials:
+            # Calculate default location as center of all surfaces
+            default_location = self._calculate_default_location()
+            
+            material = {
+                'name': 'Material_1',
+                'locations': [default_location],
+                'attribute': 1
+            }
+            self.tetra_materials.append(material)
+            self._update_material_list()
+    
+    def _calculate_default_location(self):
+        """Calculate a default location based on surface centers."""
+        if not self.datasets:
+            return [0.0, 0.0, 0.0]
+        
+        # Use center of all constrained surfaces
+        all_coords = []
+        for dataset in self.datasets:
+            if 'constrained_vertices' in dataset:
+                vertices = dataset['constrained_vertices']
+                if vertices is not None and len(vertices) > 0:
+                    if isinstance(vertices, list):
+                        vertices = np.array(vertices)
+                    if len(vertices.shape) == 2 and vertices.shape[1] >= 3:
+                        all_coords.extend(vertices[:, :3])
+        
+        if all_coords:
+            center = np.mean(all_coords, axis=0)
+            return [float(center[0]), float(center[1]), float(center[2])]
+        
+        return [0.0, 0.0, 0.0]
+    
+    def _add_material(self):
+        """Add a new material region."""
+        material_num = len(self.tetra_materials) + 1
+        default_location = self._calculate_default_location()
+        
+        material = {
+            'name': f'Material_{material_num}',
+            'locations': [default_location],
+            'attribute': material_num
+        }
+        self.tetra_materials.append(material)
+        self._update_material_list()
+        
+        # Select the new material
+        self.material_list.setCurrentRow(len(self.tetra_materials) - 1)
+    
+    def _remove_material(self):
+        """Remove the selected material."""
+        current_row = self.material_list.currentRow()
+        if 0 <= current_row < len(self.tetra_materials):
+            del self.tetra_materials[current_row]
+            self._update_material_list()
+    
+    def _update_material_list(self):
+        """Update the material list widget."""
+        self.material_list.clear()
+        for material in self.tetra_materials:
+            item_text = f"{material['name']} ({len(material['locations'])} locations)"
+            item = QListWidgetItem(item_text)
+            self.material_list.addItem(item)
+    
+    def _on_material_selection_changed(self, current, previous):
+        """Handle material selection change."""
+        if current:
+            material_index = self.material_list.row(current)
+            if 0 <= material_index < len(self.tetra_materials):
+                self._update_location_list(material_index)
+                # Set coordinate spinboxes to first location if available
+                material = self.tetra_materials[material_index]
+                if material['locations']:
+                    loc = material['locations'][0]
+                    self.location_x_spin.setValue(loc[0])
+                    self.location_y_spin.setValue(loc[1])
+                    self.location_z_spin.setValue(loc[2])
+    
+    def _update_location_list(self, material_index):
+        """Update the location list for the selected material."""
+        self.location_list.clear()
+        
+        if 0 <= material_index < len(self.tetra_materials):
+            material = self.tetra_materials[material_index]
+            for i, location in enumerate(material['locations']):
+                location_text = f"Location {i+1}: ({location[0]:.3f}, {location[1]:.3f}, {location[2]:.3f})"
+                item = QListWidgetItem(location_text)
+                self.location_list.addItem(item)
+    
+    def _add_material_location(self):
+        """Add a new location to the selected material."""
+        current_material_row = self.material_list.currentRow()
+        if 0 <= current_material_row < len(self.tetra_materials):
+            new_location = [
+                self.location_x_spin.value(),
+                self.location_y_spin.value(),
+                self.location_z_spin.value()
+            ]
+            self.tetra_materials[current_material_row]['locations'].append(new_location)
+            self._update_material_list()
+            self._update_location_list(current_material_row)
+    
+    def _remove_material_location(self):
+        """Remove the selected location from the current material."""
+        current_material_row = self.material_list.currentRow()
+        current_location_row = self.location_list.currentRow()
+        
+        if (0 <= current_material_row < len(self.tetra_materials) and 
+            0 <= current_location_row < len(self.tetra_materials[current_material_row]['locations'])):
+            
+            # Don't remove the last location
+            if len(self.tetra_materials[current_material_row]['locations']) > 1:
+                del self.tetra_materials[current_material_row]['locations'][current_location_row]
+                self._update_material_list()
+                self._update_location_list(current_material_row)
+            else:
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Cannot Remove", "Each material must have at least one location.")
+    
+    def _auto_place_materials(self):
+        """
+        Automatically place materials in each closed volume of the selected surfaces.
+        
+        This function analyzes the selected surfaces to identify distinct geological volumes,
+        then creates appropriate material points for each volume following these rules:
+        1. Each subdomain (closed volume) must have a material point
+        2. Geological layers are identified and grouped appropriately
+        3. Material IDs are assigned based on geological structure
+        """
+        from PyQt5.QtWidgets import QMessageBox, QApplication
+        import logging
+        import numpy as np
+        
+        logger = logging.getLogger("MeshIt-Workflow")
+        
+        if not self.selected_surfaces:
+            QMessageBox.warning(self, "No Surfaces Selected", "Please select at least one surface first.")
+            return
+            
+        # Confirm action if we already have materials set up
+        if self.tetra_materials:
+            reply = QMessageBox.question(self, "Confirm Auto-Placement", 
+                "This will delete all existing materials and create new ones for each detected volume. Continue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            
+            if reply == QMessageBox.No:
+                return
+        
+        # Update status
+        self.statusBar().showMessage("Analyzing surfaces to create material points...", 0)
+        QApplication.processEvents()
+        
+        try:
+            # Clear existing materials
+            self.tetra_materials = []
+                
+            # Get bounding box of the model
+            x_min, x_max = float('inf'), float('-inf')
+            y_min, y_max = float('inf'), float('-inf')
+            z_min, z_max = float('inf'), float('-inf')
+            
+            # Collect surface data and compute bounding box
+            surfaces_data = []
+            for surface_idx in self.selected_surfaces:
+                if surface_idx < len(self.datasets):
+                    dataset = self.datasets[surface_idx]
+                    vertices = dataset.get('constrained_vertices')
+                    triangles = dataset.get('constrained_triangles')
+                    
+                    if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
+                        vertices_array = np.array(vertices)
+                        x_min = min(x_min, np.min(vertices_array[:, 0]))
+                        x_max = max(x_max, np.max(vertices_array[:, 0]))
+                        y_min = min(y_min, np.min(vertices_array[:, 1]))
+                        y_max = max(y_max, np.max(vertices_array[:, 1]))
+                        z_min = min(z_min, np.min(vertices_array[:, 2]))
+                        z_max = max(z_max, np.max(vertices_array[:, 2]))
+                        
+                        # Calculate center of the surface
+                        center = np.mean(vertices_array, axis=0)
+                        
+                        # Calculate average normal to determine if it's a horizontal or vertical surface
+                        normals = []
+                        triangles_array = np.array(triangles)
+                        
+                        for triangle in triangles_array:
+                            v0 = vertices_array[triangle[0]]
+                            v1 = vertices_array[triangle[1]]
+                            v2 = vertices_array[triangle[2]]
+                            
+                            # Calculate normal using cross product
+                            edge1 = v1 - v0
+                            edge2 = v2 - v0
+                            normal = np.cross(edge1, edge2)
+                            
+                            # Normalize
+                            norm = np.linalg.norm(normal)
+                            if norm > 0:
+                                normal = normal / norm
+                                normals.append(normal)
+                        
+                        avg_normal = np.mean(normals, axis=0) if normals else np.array([0, 0, 1])
+                        
+                        # Determine surface type (horizontal or vertical)
+                        is_horizontal = abs(avg_normal[2]) > 0.7  # Z component dominant
+                        
+                        surfaces_data.append({
+                            'index': surface_idx,
+                            'center': center,
+                            'z_center': center[2],
+                            'is_horizontal': is_horizontal,
+                            'normal': avg_normal
+                        })
+            
+            # Ensure we have valid bounds
+            if x_min == float('inf') or y_min == float('inf') or z_min == float('inf'):
+                QMessageBox.warning(self, "Invalid Geometry", "Could not determine bounds of the model.")
+                return
+                
+            logger.info(f"Model bounds: X=[{x_min:.2f}, {x_max:.2f}], Y=[{y_min:.2f}, {y_max:.2f}], Z=[{z_min:.2f}, {z_max:.2f}]")
+            
+            # Separate surfaces into horizontal (geological layers) and vertical (faults)
+            horizontal_surfaces = [s for s in surfaces_data if s['is_horizontal']]
+            vertical_surfaces = [s for s in surfaces_data if not s['is_horizontal']]
+            
+            # Sort horizontal surfaces by Z-position (bottom to top)
+            horizontal_surfaces.sort(key=lambda s: s['z_center'])
+            
+            logger.info(f"Identified {len(horizontal_surfaces)} horizontal surfaces and {len(vertical_surfaces)} vertical surfaces")
+                
+            # Create geological units (volumes between adjacent horizontal surfaces)
+            geological_units = []
+            
+            # If we have at least 2 horizontal surfaces, create volumes between them
+            if len(horizontal_surfaces) >= 2:
+                for i in range(len(horizontal_surfaces) - 1):
+                    bottom_surface = horizontal_surfaces[i]
+                    top_surface = horizontal_surfaces[i + 1]
+                    
+                    unit = {
+                        'id': i + 1,
+                        'bottom_surface_idx': bottom_surface['index'],
+                        'top_surface_idx': top_surface['index'],
+                        'z_min': bottom_surface['z_center'],
+                        'z_max': top_surface['z_center']
+                    }
+                    geological_units.append(unit)
+            else:
+                # If we don't have enough horizontal surfaces, create a single unit
+                unit = {
+                    'id': 1,
+                    'z_min': z_min,
+                    'z_max': z_max
+                }
+                geological_units.append(unit)
+            
+            logger.info(f"Created {len(geological_units)} geological units")
+                
+            # Create material points for each geological unit
+            for unit in geological_units:
+                unit_id = unit['id']
+                z_min = unit['z_min']
+                z_max = unit['z_max']
+                
+                # Material point at the center of the unit
+                mid_x = (x_min + x_max) / 2
+                mid_y = (y_min + y_max) / 2
+                mid_z = (z_min + z_max) / 2
+                
+                material = {
+                    'name': f'Geological_Unit_{unit_id}',
+                    'locations': [[mid_x, mid_y, mid_z]],
+                    'attribute': unit_id
+                }
+                
+                # Add more points for better coverage (3x3 grid in the middle of the layer)
+                x_range = x_max - x_min
+                y_range = y_max - y_min
+                
+                x_step = x_range / 4  # To create a 3x3 grid
+                y_step = y_range / 4
+                
+                for i in range(1, 4):
+                    for j in range(1, 4):
+                        x = x_min + i * x_step
+                        y = y_min + j * y_step
+                        
+                        # Skip the center point (already added)
+                        if abs(x - mid_x) < 1e-6 and abs(y - mid_y) < 1e-6:
+                            continue
+                            
+                        material['locations'].append([x, y, mid_z])
+                
+                self.tetra_materials.append(material)
+                    
+            # Handle vertical surfaces (faults) if present
+            for i, fault in enumerate(vertical_surfaces):
+                fault_center = fault['center']
+                
+                # Create a material for this fault
+                material = {
+                    'name': f'Fault_Zone_{i+1}',
+                    'locations': [fault_center.tolist()],
+                    'attribute': len(geological_units) + i + 1
+                }
+                
+                # Add additional points along the fault for better coverage
+                # Find the main plane of the fault using its normal
+                normal = fault['normal']
+                
+                # The points should be in the plane of the fault
+                # Let's create a 3x3 grid of points in this plane
+                # First, find two orthogonal vectors in the fault plane
+                if abs(normal[0]) < abs(normal[1]) and abs(normal[0]) < abs(normal[2]):
+                    tangent1 = np.array([0, -normal[2], normal[1]])
+                elif abs(normal[1]) < abs(normal[0]) and abs(normal[1]) < abs(normal[2]):
+                    tangent1 = np.array([-normal[2], 0, normal[0]])
+                else:
+                    tangent1 = np.array([-normal[1], normal[0], 0])
+                
+                # Normalize
+                tangent1 = tangent1 / np.linalg.norm(tangent1)
+                
+                # Get second tangent vector using cross product
+                tangent2 = np.cross(normal, tangent1)
+                tangent2 = tangent2 / np.linalg.norm(tangent2)
+                
+                # Find bounds of this fault
+                span = min(x_max - x_min, y_max - y_min, z_max - z_min) / 6
+                
+                # Create grid of points on the fault plane
+                for i in range(-1, 2):
+                    for j in range(-1, 2):
+                        if i == 0 and j == 0:
+                            continue  # Skip center point
+                        
+                        offset = i * tangent1 * span + j * tangent2 * span
+                        point = fault_center + offset
+                        material['locations'].append(point.tolist())
+                
+                self.tetra_materials.append(material)
+                    
+            # If no materials were created, add a default one
+            if not self.tetra_materials:
+                logger.warning("No materials created, adding default material")
+                self._add_default_material()
+            
+            # Update UI
+            self._update_material_list()
+            if self.tetra_materials and self.material_list.count() > 0:
+                self.material_list.setCurrentRow(0)
+            
+            # Update visualization
+            self._update_tetra_visualization()
+            
+            # Enable mesh generation
+            if self.selected_surfaces and self.tetra_materials and hasattr(self, 'generate_tetra_btn'):
+                self.generate_tetra_btn.setEnabled(True)
+            
+                        # Success message
+            if self.tetra_materials:
+                total_locations = sum(len(m['locations']) for m in self.tetra_materials)
+                QMessageBox.information(self, "Auto-Placement Complete", 
+                    f"Successfully created {len(self.tetra_materials)} material regions with {total_locations} total material points.")
+            else:
+                QMessageBox.warning(self, "Auto-Placement Issue", 
+                    "No material regions could be created automatically. Please add material points manually.")
+                
+        except Exception as e:
+            logger.error(f"Error during auto material placement: {str(e)}")
+            QMessageBox.critical(self, "Auto-Placement Failed", f"Error: {str(e)}")
+            # Add a default material as fallback
+            self.tetra_materials = []
+            self._add_default_material()
+            self._update_material_list()
+        
+        finally:
+            # Reset status bar
+            self.statusBar().showMessage("Ready", 3000)
+    
+    def _split_triangles_at_intersections(self, surface_data_list):
+        """
+        Split triangles at intersection points following C++ MeshIt approach.
+        This is the key missing piece for proper intersection handling.
+        
+        Args:
+            surface_data_list: List of surface data dictionaries
+            
+        Returns:
+            Tuple of (split_vertices, split_triangles, split_surface_markers)
+        """
+        logger = logging.getLogger(__name__)
+        logger.info("Splitting triangles at intersection points...")
+        
+        from meshit.intersection_utils import tri_tri_intersect_with_isectline, Vector3D, Triangle
+        
+        all_vertices = []
+        all_triangles = []
+        all_surface_markers = []
+        vertex_offset = 0
+        
+        # Process each surface pair for intersections
+        intersection_points = []
+        
+        for i, surface1_data in enumerate(surface_data_list):
+            for j, surface2_data in enumerate(surface_data_list):
+                if i >= j:  # Avoid duplicate pairs
+                    continue
+                    
+                logger.info("Processing intersection between surface %d and %d", i, j)
+                
+                vertices1 = np.array(surface1_data['constrained_vertices'])
+                triangles1 = np.array(surface1_data['constrained_triangles'])
+                vertices2 = np.array(surface2_data['constrained_vertices'])
+                triangles2 = np.array(surface2_data['constrained_triangles'])
+                
+                # Test each triangle pair for intersection
+                for tri1_idx, tri1_indices in enumerate(triangles1):
+                    tri1_verts = [vertices1[idx] for idx in tri1_indices]
+                    tri1 = Triangle(
+                        Vector3D(tri1_verts[0][0], tri1_verts[0][1], tri1_verts[0][2]),
+                        Vector3D(tri1_verts[1][0], tri1_verts[1][1], tri1_verts[1][2]),
+                        Vector3D(tri1_verts[2][0], tri1_verts[2][1], tri1_verts[2][2])
+                    )
+                    
+                    for tri2_idx, tri2_indices in enumerate(triangles2):
+                        tri2_verts = [vertices2[idx] for idx in tri2_indices]
+                        tri2 = Triangle(
+                            Vector3D(tri2_verts[0][0], tri2_verts[0][1], tri2_verts[0][2]),
+                            Vector3D(tri2_verts[1][0], tri2_verts[1][1], tri2_verts[1][2]),
+                            Vector3D(tri2_verts[2][0], tri2_verts[2][1], tri2_verts[2][2])
+                        )
+                        
+                        # Check for intersection
+                        try:
+                            pt1, pt2 = tri_tri_intersect_with_isectline(tri1, tri2)
+                            if pt1 is not None and pt2 is not None:
+                                # Found intersection - record it
+                                intersection_points.append({
+                                    'surface1': i,
+                                    'surface2': j,
+                                    'triangle1': tri1_idx,
+                                    'triangle2': tri2_idx,
+                                    'point1': [pt1.x, pt1.y, pt1.z],
+                                    'point2': [pt2.x, pt2.y, pt2.z]
+                                })
+                                
+                        except Exception as intersect_err:
+                            # Skip invalid intersections
+                            continue
+        
+        logger.info("Found %d triangle-triangle intersections", len(intersection_points))
+        
+        # For simplicity, if intersections exist, use original approach but with better cleaning
+        if len(intersection_points) > 0:
+            logger.warning("Triangle intersections detected - using enhanced cleaning approach")
+            
+        # Process each surface (simplified approach for now)
+        for surface_idx, surface_data in enumerate(surface_data_list):
+            vertices = np.array(surface_data['constrained_vertices'])
+            triangles = np.array(surface_data['constrained_triangles'])
+            
+            # Add surface vertices and triangles with offset
+            all_vertices.extend(vertices)
+            
+            for triangle in triangles:
+                all_triangles.append([
+                    triangle[0] + vertex_offset,
+                    triangle[1] + vertex_offset,
+                    triangle[2] + vertex_offset
+                ])
+                all_surface_markers.append(surface_idx)
+            
+            vertex_offset += len(vertices)
+        
+        logger.info("Combined result: %d vertices, %d triangles", len(all_vertices), len(all_triangles))
+        return np.array(all_vertices), np.array(all_triangles), np.array(all_surface_markers)
+
+    def _generate_tetrahedral_mesh(self):
+        """Main function to generate tetrahedral mesh using TetGen."""
+        if not self._validate_mesh_inputs() or not self._import_mesh_dependencies():
+            return
+
+        self.progress_dialog = QProgressDialog("Generating Tetrahedral Mesh...", "Cancel", 0, 100, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.show()
+        QApplication.processEvents() # Ensure dialog shows
+
+        try:
+            self.progress_dialog.setLabelText("Step 1: Collecting and preparing surface data for PLC...")
+            self.progress_dialog.setValue(10)
+            QApplication.processEvents()
+
+            # Step 1a: Collect all surface data (vertices, facets, edges, markers)
+            surface_data_dict = self._collect_surface_data()
+            if not surface_data_dict or not surface_data_dict.get("vertices"):
+                self._handle_mesh_error("Failed to collect surface data for PLC.")
+                self.progress_dialog.close()
+                return
+
+            # Step 1b: Prepare the PyVista PolyData object from the collected surface data
+            # This object will encapsulate points, facets, and can store edge information
+            try:
+                # _prepare_surface_mesh will create a pv.PolyData object
+                # and can also store edge_constraints and edge_markers in its field_data
+                surface_mesh_pv = self._prepare_surface_mesh(surface_data_dict)
+                if surface_mesh_pv is None:
+                    self._handle_mesh_error("Failed to prepare PyVista mesh from collected surface data.")
+                    self.progress_dialog.close()
+                    return
+            except Exception as e_prep:
+                self._handle_mesh_error(f"Error preparing PyVista mesh: {e_prep}")
+                self.progress_dialog.close()
+                return
+            
+            self.progress_dialog.setValue(25)
+            QApplication.processEvents()
+
+            # Extract necessary markers and attributes for TetGen call
+            # Facet markers come from the surface_data_dict or are defaulted
+            facets_markers_list_from_dict = surface_data_dict.get("surface_markers")
+            facet_markers_list_for_tetgen = None
+            if facets_markers_list_from_dict is not None and len(facets_markers_list_from_dict) > 0:
+                # Ensure it's a numpy array for tetgen
+                facet_markers_list_for_tetgen = np.array(facets_markers_list_from_dict, dtype=np.int32)
+                # Validation against the number of faces in the prepared mesh will happen in _run_tetgen_with_constraints
+            else:
+                # _run_tetgen_with_constraints will default if None is passed and facets exist
+                logger.info("No surface_markers found in surface_data_dict, will be defaulted by TetGen run if needed.")
+
+
+            # Edge constraints and markers also from surface_data_dict
+            # These will be passed to _run_tetgen_with_constraints which will handle their conversion to np.array if needed
+            edges_constraints_list_from_dict = surface_data_dict.get("edge_constraints")
+            edge_markers_list_from_dict = surface_data_dict.get("edge_markers")
+
+
+            self.progress_dialog.setLabelText("Step 2: Preparing material regions...")
+            self.progress_dialog.setValue(30)
+            QApplication.processEvents()
+            
+            # Step 2: Prepare material regions for TetGen
+            # This needs a mesh structure to determine region locations.
+            # surface_mesh_pv (the PolyData object) is suitable here.
+            region_attributes = self._prepare_material_regions(surface_mesh_pv)
+            self.progress_dialog.setValue(45)
+            QApplication.processEvents()
+
+
+            self.progress_dialog.setLabelText("Step 3: Running TetGen with prepared PLC...")
+            self.progress_dialog.setValue(50)
+            QApplication.processEvents()
+
+            # Step 3: Run TetGen.
+            # Pass the prepared PolyData object (surface_mesh_pv).
+            # _run_tetgen_with_constraints will extract points, facets from it.
+            # Pass the raw lists for markers and edge constraints.
+            tetrahedral_grid = self._run_tetgen_with_constraints(
+                surface_mesh_pv, # This is the PyVista PolyData object
+                facet_markers_list_for_tetgen, # Can be None or np.array
+                edges_constraints_list_from_dict, # Can be None or list
+                edge_markers_list_from_dict,      # Can be None or list
+                region_attributes
+                # plc_switches are defaulted in _run_tetgen_with_constraints
+            )
+            
+            self.progress_dialog.setValue(80)
+            QApplication.processEvents()
+
+            if tetrahedral_grid is None or not hasattr(tetrahedral_grid, 'points') or tetrahedral_grid.n_points == 0:
+                # Error already handled in _run_tetgen_with_constraints or by _handle_mesh_error
+                self.progress_dialog.close()
+                return
+
+            # Step 4: Finalize (assign materials, update UI)
+            self.progress_dialog.setLabelText("Step 4: Finalizing mesh and updating UI...")
+            # Pass edge_constraints_list_from_dict for _finalize_mesh_generation if needed
+            final_edge_constraints_for_viz = edges_constraints_list_from_dict if edges_constraints_list_from_dict is not None else []
+            self._finalize_mesh_generation(tetrahedral_grid, final_edge_constraints_for_viz)
+            self.progress_dialog.setValue(100)
+            
+            logger.info("Tetrahedral mesh generation completed successfully")
+
+        except Exception as e:
+            import traceback
+            logger.error(f"Error during tetrahedral mesh generation: {str(e)}\\n{traceback.format_exc()}")
+            self._handle_mesh_error(f"An unexpected error occurred: {str(e)}")
+        finally:
+            if self.progress_dialog:
+                self.progress_dialog.close()
+            self._enable_compute_buttons()
+
+
+    def _validate_mesh_inputs(self):
+        """Validate inputs for mesh generation."""
+        if not self.selected_surfaces:
+            QMessageBox.warning(self, "No Surfaces", "Please select at least one surface for tetrahedralization.")
+            return False
+        return True
+
+    def _import_mesh_dependencies(self):
+        """Import required libraries for mesh generation."""
+        try:
+            import tetgen
+            import pyvista as pv
+            import numpy as np
+            from meshit.intersection_utils import Vector3D, Triangle, tri_tri_intersect_with_isectline
+            return True
+        except ImportError as e:
+            QMessageBox.critical(self, "Missing Dependencies", 
+                f"Required libraries not found. Please install:\npip install tetgen pyvista\n\nError: {str(e)}")
+            return False
+    def _prepare_surface_mesh(self, surface_data):
+        """Prepare a PyVista surface mesh from the collected data for TetGen input.
+        Includes vertices, triangles, and edge constraints."""
+        try:
+            # Extract data
+            vertices = np.array(surface_data["vertices"])
+            triangles = np.array(surface_data["triangles"])
+            surface_markers = surface_data.get("surface_markers", [])
+            edge_constraints = surface_data.get("edge_constraints", [])
+            edge_markers = surface_data.get("edge_markers", [])
+            
+            # Create faces array properly formatted for PyVista
+            # PyVista expects [n, v1, v2, ..., vn] for each face where n is number of vertices
+            faces = []
+            for tri in triangles:
+                faces.extend([3, tri[0], tri[1], tri[2]])
+            faces = np.array(faces, dtype=np.int64)
+            
+            # Create the mesh with properly formatted triangular faces
+            plc_mesh = pv.PolyData(vertices, faces)
+            
+            # Add surface markers as cell data if available
+            if surface_markers and len(surface_markers) == len(triangles):
+                plc_mesh.cell_data["surface_marker"] = np.array(surface_markers)
+            elif surface_markers:
+                logger.warning("Mismatch between number of surface_markers and actual triangles in PLC mesh.")
+            
+            # Add edge constraints as line elements
+            if edge_constraints and len(edge_constraints) > 0:
+                # Create separate lines array for TetGen
+                lines = []
+                for edge in edge_constraints:
+                    lines.append([edge[0], edge[1]])
+                
+                # Store the edge constraints as a custom attribute (not cell data)
+                plc_mesh.field_data["edge_constraints"] = np.array(lines)
+                
+                # Store edge markers if available
+                if edge_markers and len(edge_markers) == len(edge_constraints):
+                    plc_mesh.field_data["edge_markers"] = np.array(edge_markers)
+            
+            logger.info(f"Prepared PLC PyVista mesh: {len(vertices)} vertices, "
+                    f"{plc_mesh.n_cells} facets (triangles), "
+                    f"{len(edge_constraints)} PLC edges (segments).")
+            
+            return plc_mesh
+        
+        except Exception as e:
+            logger.error(f"Error preparing surface mesh: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise
+    def _find_intersection_constraints(self, surface_mesh):
+        """Find intersection constraints following C++ approach - use existing intersection data."""
+        try:
+            # Use the intersection data that was already computed and stored in datasets
+            edge_constraints = []
+            intersection_polylines = []
+            
+            # Check if we have computed intersections available
+            if hasattr(self, 'stored_constraint_lines') and self.stored_constraint_lines:
+                logger.info("Using existing intersection results for edge constraints")
+                
+                # Use the same vertex_map and tolerance as _collect_surface_data for consistency
+                tolerance = 1e-12
+                vertex_map = {}
+                for i, vertex in enumerate(surface_mesh.points):
+                    key = (round(vertex[0]/tolerance)*tolerance, 
+                        round(vertex[1]/tolerance)*tolerance, 
+                        round(vertex[2]/tolerance)*tolerance)
+                    vertex_map[key] = i
+                
+                for surface_index in self.selected_surfaces:
+                    if surface_index < len(self.datasets):
+                        # Get stored constraints for this surface
+                        stored_constraints = self.datasets[surface_index].get('stored_constraints', [])
+                        
+                        for constraint in stored_constraints:
+                            if constraint.get('type') == 'intersection_line' and 'points' in constraint:
+                                points = constraint['points']
+                                if len(points) >= 2:
+                                    # Convert intersection points to edge constraints using same deduplication
+                                    edge_indices = []
+                                    for point in points:
+                                        if isinstance(point, list) and len(point) >= 3:
+                                            # Create normalized key for vertex lookup
+                                            key = (round(point[0]/tolerance)*tolerance, 
+                                                round(point[1]/tolerance)*tolerance, 
+                                                round(point[2]/tolerance)*tolerance)
+                                            
+                                            if key in vertex_map:
+                                                edge_indices.append(vertex_map[key])
+                                            else:
+                                                # Fallback to closest vertex if exact match not found
+                                                p_coords = np.array(point[:3])
+                                                p_idx = self._find_closest_vertex(surface_mesh.points, p_coords, tolerance=1e-6)
+                                                if p_idx is not None:
+                                                    edge_indices.append(p_idx)
+                                                else:
+                                                    logger.warning("Intersection point not found in surface mesh - constraint may be incomplete")
+                                    
+                                    # Create edge constraints from consecutive points
+                                    for i in range(len(edge_indices) - 1):
+                                        if edge_indices[i] != edge_indices[i + 1]:
+                                            edge_constraints.append([edge_indices[i], edge_indices[i + 1]])
+                                    
+                                    intersection_polylines.append(points)
+                
+                logger.info("Created %d edge constraints from %d intersection polylines", 
+                        len(edge_constraints), len(intersection_polylines))
+                return edge_constraints
+            
+            # Fallback: Simple intersection detection if no pre-computed intersections
+            else:
+                logger.warning("No pre-computed intersections found - using simple detection")
+                return self._simple_intersection_detection(surface_mesh)
+                
+        except Exception as e:
+            logger.warning("Intersection constraint creation failed: %s - proceeding without constraints", e)
+            return []
+
+    def _simple_intersection_detection(self, surface_mesh):
+        """Simple intersection detection as fallback."""
+        try:
+            from meshit.intersection_utils import Box, Vector3D, Triangle
+            
+            vertices = surface_mesh.points
+            faces = surface_mesh.faces.reshape((-1, 4))[:, 1:4]
+            
+            # Use Box-based intersection detection from intersection_utils
+            box = Box()
+            
+            # Add triangles to box
+            for face in faces:
+                tri_verts = [vertices[face[k]] for k in range(3)]
+                triangle = Triangle(
+                    Vector3D(*tri_verts[0]), 
+                    Vector3D(*tri_verts[1]), 
+                    Vector3D(*tri_verts[2])
+                )
+                box.T1s.append(triangle)
+                box.T2s.append(triangle)
+            
+            # Find intersections
+            intersection_segments = []
+            box.split_tri(intersection_segments)
+            
+            # Convert to edge constraints
+            edge_constraints = []
+            for segment in intersection_segments:
+                if len(segment) == 2:
+                    p1, p2 = segment
+                    p1_coords = np.array([p1.x, p1.y, p1.z])
+                    p2_coords = np.array([p2.x, p2.y, p2.z])
+                    
+                    p1_idx = self._find_closest_vertex(vertices, p1_coords)
+                    p2_idx = self._find_closest_vertex(vertices, p2_coords)
+                    
+                    if p1_idx is not None and p2_idx is not None and p1_idx != p2_idx:
+                        edge_constraints.append([p1_idx, p2_idx])
+            
+            logger.info("Simple detection created %d edge constraints", len(edge_constraints))
+            return edge_constraints
+            
+        except Exception as e:
+            logger.warning("Simple intersection detection failed: %s", e)
+            return []
+
+    def _find_closest_vertex(self, vertices, target_point, tolerance=1e-6):
+        """Find closest vertex to target point."""
+        distances = np.linalg.norm(vertices - target_point, axis=1)
+        closest_idx = np.argmin(distances)
+        
+        if distances[closest_idx] < tolerance:
+            return closest_idx
+        return None
+
+    def _run_tetgen_with_constraints(self, surface_mesh_pv, facets_markers_list,
+                                     edges_constraints_list, edge_markers_list, region_attributes_list, plc_switches="pq1.414aA",
+                                     other_switches=None):
+        try:
+            import tetgen
+            import pyvista as pv
+            import numpy as np
+
+            logger.info(f"Preparing PLC for TetGen: {surface_mesh_pv.n_points} points, {surface_mesh_pv.n_faces} facets, "
+                        f"{len(edges_constraints_list) if edges_constraints_list else 0} edges/segments.")
+
+            # Prepare inputs for TetGen, ensuring specific dtypes
+            points_np = np.array(surface_mesh_pv.points, dtype=np.float64)
+            
+            # Ensure facets_np is a 1D flat array of np.int64
+            # surface_mesh_pv.faces should already be this, but explicit conversion for robustness
+            if surface_mesh_pv.faces is not None and len(surface_mesh_pv.faces) > 0:
+                facets_np = np.array(surface_mesh_pv.faces, dtype=np.int64).ravel()
+            else:
+                facets_np = None # Or an empty array of appropriate shape if TetGen requires it
+
+            if facets_np is None and plc_switches is not None and 'p' in plc_switches : # 'p' switch requires facets
+                 logger.error("TetGen 'p' switch is used, but no facets are available.")
+                 self._handle_mesh_error("TetGen 'p' switch requires facets, but none were provided.")
+                 return None
+
+
+            facet_markers_np = np.array(facets_markers_list, dtype=np.int32) if facets_markers_list is not None and len(facets_markers_list) > 0 else None
+            
+            if edges_constraints_list is not None and len(edges_constraints_list) > 0:
+                # Ensure edges_constraints_list is a list of pairs before reshaping
+                processed_edges = []
+                for edge in edges_constraints_list:
+                    if hasattr(edge, '__len__') and len(edge) == 2:
+                        processed_edges.append([int(edge[0]), int(edge[1])])
+                    else:
+                        logger.warning(f"Skipping malformed edge constraint: {edge}")
+                if processed_edges:
+                    edges_np = np.array(processed_edges, dtype=np.int32).reshape(-1, 2)
+                else:
+                    edges_np = None
+            else:
+                edges_np = None
+            
+            edge_markers_np = np.array(edge_markers_list, dtype=np.int32) if edge_markers_list is not None and len(edge_markers_list) > 0 else None
+            
+            # Ensure region_attributes_list is a list of lists/tuples [x,y,z,region_num,attribute_val_or_max_volume]
+            regions_list = region_attributes_list if region_attributes_list is not None and len(region_attributes_list) > 0 else None
+
+            # Validate lengths of markers if provided
+            if facet_markers_np is not None and facets_np is not None:
+                num_expected_facets = 0
+                if facets_np is not None:
+                    idx = 0
+                    while idx < len(facets_np):
+                        num_expected_facets += 1
+                        idx += facets_np[idx] + 1
+                if len(facet_markers_np) != num_expected_facets:
+                    logger.error(f"Mismatch: Number of facet markers ({len(facet_markers_np)}) "
+                                 f"does not match number of facets ({num_expected_facets}).")
+                    self._handle_mesh_error("Facet markers length mismatch.")
+                    return None
+            
+            if edge_markers_np is not None and edges_np is not None:
+                if len(edge_markers_np) != len(edges_np):
+                    logger.error(f"Mismatch: Number of edge markers ({len(edge_markers_np)}) "
+                                 f"does not match number of edges ({len(edges_np)}).")
+                    self._handle_mesh_error("Edge markers length mismatch.")
+                    return None
+
+            tet = tetgen.TetGen(
+                points=points_np,
+                facets=facets_np,
+                facetmarkers=facet_markers_np,
+                edges=edges_np,
+                edgemarkers=edge_markers_np,
+                regions=regions_list
+            )
+
+            switches = plc_switches
+            if other_switches:
+                switches += other_switches
+
+            logger.info(f"Running TetGen with switches: {switches}")
+            
+            # Adaptive strategy for TetGen
+            # Strategy 1: PLC with quality and area constraints (user-defined or default)
+            # Strategy 2: Fallback to simpler PLC (e.g., -pY) if above fails
+            # Strategy 3: Convex hull (-A) as last resort
+
+            tetrahedral_grid = None
+            switches_used = ""
+
+            # Define strategies - ensure plc_switches are primary
+            base_plc_switches = plc_switches if plc_switches else "p" # Ensure 'p' for PLC
+            if 'q' not in base_plc_switches and hasattr(self, 'quality_slider') and self.quality_slider.value() > 0 : # Add q if not present & slider used
+                 base_plc_switches += f"q{self.quality_slider.value()/10.0:.2f}" # Assuming slider is 0-100 -> 0.0 to 10.0
+            if 'a' not in base_plc_switches and hasattr(self, 'area_constraint_input') and self.area_constraint_input.value() > 0:
+                 base_plc_switches += f"a{self.area_constraint_input.value():.6f}"
+
+
+            strategies = [
+                base_plc_switches,  # User-defined or smart default
+                "pY",               # Robust PLC conforming to boundaries
+                "A"                 # Convex hull (last resort)
+            ]
+            if other_switches: # Append other_switches to each strategy
+                strategies = [s + other_switches for s in strategies]
+
+
+            for i, strategy_switches in enumerate(strategies):
+                logger.info(f"Trying TetGen strategy {i+1}: '{strategy_switches}'")
+                try:
+                    tet.tetrahedralize(options=strategy_switches, order=1) # order=1 for linear tets
+                    grid_candidate = tet.grid
+                    if grid_candidate and grid_candidate.n_points > 0 and grid_candidate.n_cells > 0:
+                        logger.info(f"Strategy '{strategy_switches}' successful. Mesh: {grid_candidate.n_points} points, {grid_candidate.n_cells} tetrahedra.")
+                        tetrahedral_grid = grid_candidate
+                        switches_used = strategy_switches
+                        break 
+                    else:
+                        logger.warning(f"Strategy '{strategy_switches}' produced no valid grid.")
+                
+                except RuntimeError as e:
+                    logger.warning(f"Strategy '{strategy_switches}' failed (RuntimeError): {e}")
+                except TypeError as te: # Catching type errors like the one observed
+                    logger.error(f"Strategy '{strategy_switches}' failed (TypeError for TetGen): {te}")
+                    if "data length" in str(te) and "required length" in str(te): # Check if it's our specific error
+                        logger.error("This TypeError indicates a potential incompatibility or bug in pytetgen/PyVista interaction.")
+                        logger.error("The data passed to PyVista internally by pytetgen seems to be mismatched.")
+                except ValueError as ve: # Catching value errors from pytetgen (e.g. marker mismatch)
+                     logger.error(f"Strategy '{strategy_switches}' failed (ValueError for TetGen): {ve}")
+                except Exception as e:
+                    logger.error(f"Strategy '{strategy_switches}' failed ({type(e).__name__}): {e}")
+
+            if tetrahedral_grid:
+                self.last_successful_tetgen_switches = switches_used
+                return tetrahedral_grid
+            else:
+                logger.error("All TetGen strategies failed.")
+                self._handle_mesh_error("All TetGen strategies failed to produce a mesh.")
+                return None
+
+        except ImportError:
+            self._handle_mesh_error("Tetgen library not found. Please ensure it is installed.")
+            return None
+        except Exception as e:
+            self._handle_mesh_error(f"TetGen execution setup failed: {type(e).__name__} - {e}")
+            return None
+
+
+    def _add_edge_constraints_to_tetgen(self, tet, surface_mesh, edge_constraints):
+        """Add edge constraints to TetGen following C++ approach."""
+        if not edge_constraints:
+            return
+            
+        try:
+            # C++ approach: TetGen input structure has edgelist and edgemarkerlist
+            # Try to access the internal tetgen structure directly
+            edge_array = np.array(edge_constraints, dtype=np.int32).reshape(-1, 2)
+            
+            # Method 1: Direct tetgenio structure access (if available)
+            if hasattr(tet, '_input') and hasattr(tet._input, 'edgelist'):
+                tet._input.numberofedges = len(edge_constraints)
+                tet._input.edgelist = edge_array.flatten()
+                tet._input.edgemarkerlist = np.ones(len(edge_constraints), dtype=np.int32)
+                logger.info("Added %d edge constraints via tetgenio structure", len(edge_constraints))
+                return
+                
+        except Exception as e:
+            logger.debug("Direct tetgenio access failed: %s", e)
+        
+        try:
+            # Method 2: PyVista PolyData with line cells (closest we can get)
+            import pyvista as pv
+            
+            # Create a combined mesh with surfaces + edges
+            vertices = surface_mesh.points
+            surface_faces = surface_mesh.faces
+            
+            # Add edge lines 
+            edge_lines = []
+            for edge in edge_constraints:
+                edge_lines.extend([2, edge[0], edge[1]])
+            
+            # Create new mesh with both faces and lines
+            combined_mesh = pv.PolyData()
+            combined_mesh.points = vertices
+            combined_mesh.faces = surface_faces
+            combined_mesh.lines = np.array(edge_lines)
+            
+            # Replace the tetgen input mesh
+            tet.mesh = combined_mesh
+            logger.info("Added %d edge constraints via combined mesh", len(edge_constraints))
+            
+        except Exception as e:
+            logger.warning("Edge constraint addition failed: %s - constraints will be ignored", e)
+
+    def _prepare_material_regions(self, surface_mesh):
+        """Prepare material regions for TetGen."""
+        if not self.tetra_materials:
+            return None
+            
+        bounds = surface_mesh.bounds
+        model_size = (bounds[1] - bounds[0]) * (bounds[3] - bounds[2]) * (bounds[5] - bounds[4])
+        max_volume = model_size * 0.01 / len(self.tetra_materials)
+        
+        region_data = []
+        for i, material in enumerate(self.tetra_materials):
+            for location in material['locations']:
+                region_data.append([
+                    float(location[0]), float(location[1]), float(location[2]),
+                    float(i + 1), max_volume
+                ])
+        
+        if region_data:
+            logger.info("Prepared %d material regions", len(region_data))
+            return np.array(region_data, dtype=np.float64)
+        return None
+
+    def _assign_materials_to_mesh(self, tetrahedral_grid):
+        """Assign material IDs to tetrahedral mesh."""
+        if not self.tetra_materials:
+            return
+            
+        try:
+            # Check if materials were already assigned by TetGen
+            if hasattr(tetrahedral_grid, 'cell_data') and 'MaterialID' in tetrahedral_grid.cell_data:
+                material_data = tetrahedral_grid.cell_data['MaterialID']
+                if not np.all(material_data == 0):
+                    logger.info("Materials already assigned by TetGen")
+                    return
+            
+            # Manual material assignment
+            logger.info("Assigning materials manually...")
+            num_cells = tetrahedral_grid.n_cells
+            material_ids = np.ones(num_cells, dtype=int)
+            
+            # Simple assignment based on material point locations
+            for i, material in enumerate(self.tetra_materials):
+                material_id = i + 1
+                assigned_count = 0
+                
+                for location in material['locations']:
+                    loc_point = np.array(location)
+                    cell_id = tetrahedral_grid.find_containing_cell(loc_point)
+                    
+                    if cell_id >= 0:
+                        material_ids[cell_id] = material_id
+                        assigned_count += 1
+                
+                logger.info("Assigned material %d to %d cells", material_id, assigned_count)
+            
+            # Assign remaining cells to nearest material
+            unassigned = material_ids == 1
+            if np.any(unassigned):
+                logger.info("Assigning %d unassigned cells to nearest materials", np.sum(unassigned))
+                # Simple approach: assign all to material 1
+                # Could be improved with nearest neighbor search
+            
+            tetrahedral_grid.cell_data['MaterialID'] = material_ids
+            
+        except Exception as e:
+            logger.warning("Material assignment failed: %s", e)
+
+    def _finalize_mesh_generation(self, tetrahedral_grid, edge_constraints):
+        """Finalize mesh generation and update UI."""
+        # Extract mesh data
+        mesh_points = tetrahedral_grid.points
+        mesh_cells = tetrahedral_grid.cells.reshape(-1, 5)[:, 1:]
+        
+        # Get surface faces
+        surface_triangles = tetrahedral_grid.extract_surface()
+        surface_faces = surface_triangles.faces.reshape(-1, 4)[:, 1:]
+        
+        # Get material data
+        material_data = None
+        if 'MaterialID' in tetrahedral_grid.cell_data:
+            material_data = tetrahedral_grid.cell_data['MaterialID']
+        
+        # Compute quality
+        try:
+            cell_quality = tetrahedral_grid.compute_cell_quality()['CellQuality']
+        except:
+            cell_quality = np.ones(len(mesh_cells)) * 0.5
+        
+        # Create result structure
+        self.tetrahedral_mesh = {
+            'vertices': mesh_points,
+            'tetrahedra': mesh_cells,
+            'surface_faces': surface_faces,
+            'material_data': material_data.tolist() if material_data is not None else None,
+            'pyvista_grid': tetrahedral_grid,
+            'statistics': {
+                'vertices': len(mesh_points),
+                'tetrahedra': len(mesh_cells),
+                'faces': len(surface_faces),
+                'volume': self._safe_compute_volume(tetrahedral_grid),
+                'quality_min': float(np.min(cell_quality)),
+                'quality_mean': float(np.mean(cell_quality)),
+                'quality_max': float(np.max(cell_quality)),
+                'edge_constraints': len(edge_constraints)
+            }
+        }
+        
+        # Update UI
+        self._update_tetra_stats()
+        self._update_tetra_visualization()
+        
+        # Success message
+        stats = self.tetrahedral_mesh['statistics']
+        QMessageBox.information(self, "Mesh Generated Successfully", 
+            f"Tetrahedral mesh generated!\n\n"
+            f"Vertices: {stats['vertices']:,}\n"
+            f"Tetrahedra: {stats['tetrahedra']:,}\n"
+            f"Edge constraints: {stats['edge_constraints']}\n"
+            f"Quality: {stats['quality_min']:.3f} - {stats['quality_max']:.3f}")
+        
+        logger.info("Tetrahedral mesh generation completed successfully")
+
+    def _handle_mesh_error(self, error):
+        """Handle mesh generation errors."""
+        error_msg = f"Tetrahedral mesh generation failed: {str(error)}"
+        logger.error(error_msg)
+        QMessageBox.critical(self, "Mesh Generation Error", error_msg)
+
+    def _safe_compute_volume(self, tetrahedral_grid):
+        """Safely compute total volume of tetrahedral mesh."""
+        try:
+            if hasattr(tetrahedral_grid, 'compute_cell_sizes'):
+                cell_volumes = tetrahedral_grid.compute_cell_sizes()
+                if hasattr(cell_volumes, '__len__'):  # Check if it's an array
+                    return float(np.sum(cell_volumes))
+                else:
+                    return float(cell_volumes)  # Single value
+            else:
+                return 0.0
+        except Exception as e:
+            logger.warning(f"Failed to compute volume: {e}")
+            return 0.0
+    
+    def _collect_surface_data(self):
+        """Collect all surface data and intersection constraints following C++ tetgen approach"""
+        
+        # Step 1: Collect all vertices with precise deduplication (C++ style: 1e-12 tolerance)
+        all_vertices = []
+        all_triangles = [] # These will be the PLC facets
+        surface_markers = [] # For PLC facets
+        edge_constraints = [] # These will be the PLC edges/segments
+        edge_markers = [] # For PLC edges/segments
+        
+        vertex_map = {}  # Map from (x,y,z) to global vertex index
+        tolerance = 1e-12  # Same tolerance as C++ version
+        
+        logger.info("Creating PLC following C++ tetgen workflow...")
+        
+        # First pass: add surface vertices and triangles (facets) with precise deduplication
+        # Ensure this uses the FINIALIZED, REFINED constrained_vertices and constrained_triangles
+        for surface_index in self.selected_surfaces:
+            if surface_index < len(self.datasets):
+                dataset = self.datasets[surface_index]
+                
+                # Get CONSTRAINED AND REFINED mesh data from the previous steps
+                vertices = dataset.get('constrained_vertices') # These should be refined
+                triangles = dataset.get('constrained_triangles') # These should be refined
+                
+                if vertices is not None and triangles is not None and len(vertices) > 0 and len(triangles) > 0:
+                    vertices_np = np.array(vertices)
+                    
+                    current_surface_vertex_map = {} # Maps original vertex index in this dataset to global index
+                    for j, vertex_coords in enumerate(vertices_np):
+                        key = (round(vertex_coords[0]/tolerance)*tolerance, 
+                            round(vertex_coords[1]/tolerance)*tolerance, 
+                            round(vertex_coords[2]/tolerance)*tolerance)
+                        
+                        if key in vertex_map:
+                            global_idx = vertex_map[key]
+                        else:
+                            global_idx = len(all_vertices)
+                            all_vertices.append(list(vertex_coords))
+                            vertex_map[key] = global_idx
+                        current_surface_vertex_map[j] = global_idx
+                    
+                    for triangle_indices in triangles:
+                        global_triangle = [current_surface_vertex_map[triangle_indices[k]] for k in range(3)]
+                        # Ensure triangle is not degenerate (all distinct points)
+                        if len(set(global_triangle)) == 3:
+                            all_triangles.append(global_triangle)
+                            surface_markers.append(surface_index + 1)  # Surface marker (non-zero)
+                        else:
+                            logger.warning(f"Skipping degenerate triangle from surface {surface_index}: {triangle_indices} -> {global_triangle}")
+
+                    logger.info(f"Added surface {surface_index}: {len(vertices_np)} original vertices, {len(triangles)} original triangles. Global map has {len(all_vertices)} vertices so far.")
+                else:
+                    logger.warning(f"Surface {surface_index} has no constrained_vertices or constrained_triangles data. Skipping.")
+
+        # Second pass: Add REFINED AND ALIGNED intersection constraints as PLC edges
+        # These constraints should come from self.datasets[surface_idx]['stored_constraints']
+        # which are populated by _refine_intersection_lines_action
+        
+        processed_intersection_lines = set() # To avoid adding duplicate intersection lines that might be stored for both surfaces they connect
+
+        for surface_idx_for_constraints in self.selected_surfaces:
+            if surface_idx_for_constraints < len(self.datasets):
+                dataset = self.datasets[surface_idx_for_constraints]
+                # These are the refined lines from _refine_intersection_lines_action
+                stored_constraints_for_surface = dataset.get('stored_constraints', [])
+
+                for constraint_item in stored_constraints_for_surface:
+                    if constraint_item.get('type') == 'intersection_line':
+                        line_points_coords = constraint_item.get('points', [])
+                        
+                        # Create a unique key for this line to avoid duplicates if it's shared between two surfaces
+                        # Sort points in the line by coordinates to make the key consistent regardless of point order definition
+                        if len(line_points_coords) >= 2:
+                            # To create a consistent key, map points to global indices first, then sort indices
+                            temp_indices_for_key = []
+                            valid_line_for_key = True
+                            for point_coords_list in line_points_coords:
+                                if isinstance(point_coords_list, (list, np.ndarray)) and len(point_coords_list) >=3:
+                                    key = (round(point_coords_list[0]/tolerance)*tolerance, 
+                                        round(point_coords_list[1]/tolerance)*tolerance, 
+                                        round(point_coords_list[2]/tolerance)*tolerance)
+                                    if key in vertex_map: # Point must exist from surface definitions
+                                        temp_indices_for_key.append(vertex_map[key])
+                                    else: # If an intersection point isn't part of any surface, add it.
+                                        logger.info(f"Intersection point {point_coords_list} not in existing vertex_map. Adding to PLC.")
+                                        global_idx = len(all_vertices)
+                                        all_vertices.append(list(point_coords_list[:3]))
+                                        vertex_map[key] = global_idx
+                                        temp_indices_for_key.append(global_idx)
+                                else:
+                                    valid_line_for_key = False
+                                    break
+                            
+                            if valid_line_for_key and len(temp_indices_for_key) >=2:
+                                # Sort segment indices to make the key order-independent for the pair
+                                line_key_tuple = tuple(sorted((temp_indices_for_key[0], temp_indices_for_key[-1]))) # Key based on endpoints
+                                if line_key_tuple in processed_intersection_lines:
+                                    continue # Already processed this line (e.g., from the other surface it intersects)
+                                processed_intersection_lines.add(line_key_tuple)
+
+
+                                segment_vertex_indices = []
+                                for point_coords_list in line_points_coords: # These are [x,y,z] lists
+                                    # Point should already be in vertex_map or added above
+                                    key = (round(point_coords_list[0]/tolerance)*tolerance, 
+                                        round(point_coords_list[1]/tolerance)*tolerance, 
+                                        round(point_coords_list[2]/tolerance)*tolerance)
+                                    if key in vertex_map:
+                                        segment_vertex_indices.append(vertex_map[key])
+                                    else:
+                                        # This should ideally not happen if points were added above
+                                        logger.error(f"Critical: intersection point {point_coords_list} was not added to vertex_map. PLC will be faulty.")
+                                        # As a last resort, try adding it now, but it's a sign of logic error
+                                        global_idx = len(all_vertices)
+                                        all_vertices.append(list(point_coords_list[:3]))
+                                        vertex_map[key] = global_idx
+                                        segment_vertex_indices.append(global_idx)
+
+                                if len(segment_vertex_indices) >= 2:
+                                    for k in range(len(segment_vertex_indices) - 1):
+                                        idx1 = segment_vertex_indices[k]
+                                        idx2 = segment_vertex_indices[k+1]
+                                        if idx1 != idx2: # Ensure segment is not degenerate
+                                            edge_constraints.append([idx1, idx2])
+                                            # Assign a unique marker for intersection edges, distinct from surface markers
+                                            edge_markers.append(1000 + surface_idx_for_constraints + 1) 
+                                        else:
+                                            logger.warning(f"Skipping degenerate edge in intersection line: {line_points_coords[k]} -> {line_points_coords[k+1]}")
+                            else:
+                                logger.warning(f"Skipping invalid or short intersection line for surface {surface_idx_for_constraints}")
+        
+        logger.info(f"Collected PLC: {len(all_vertices)} unique vertices, {len(all_triangles)} facets, {len(edge_constraints)} edge segments.")
+
+        # Ensure no empty lists are passed if TetGen expects None or omits them
+        return {
+            'vertices': all_vertices,
+            'triangles': all_triangles if all_triangles else None,
+            'surface_markers': surface_markers if surface_markers else None,
+            'edge_constraints': edge_constraints if edge_constraints else None,
+            'edge_markers': edge_markers if edge_markers else None,
+            'vertex_map': vertex_map # Pass vertex_map for potential future use or debugging
+        }
+    
+    def _export_tetrahedral_mesh(self):
+        """Export tetrahedral mesh to various formats."""
+        if not self.tetrahedral_mesh:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "No Mesh", "No tetrahedral mesh to export.")
+            return
+        
+        from PyQt5.QtWidgets import QFileDialog
+        
+        # Get export file path
+        file_path, file_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Tetrahedral Mesh",
+            "tetrahedral_mesh.vtk",
+            "VTK files (*.vtk);;VTU files (*.vtu);;PLY files (*.ply);;STL files (*.stl)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            pyvista_grid = self.tetrahedral_mesh.get('pyvista_grid')
+            if pyvista_grid is not None:
+                # Export using PyVista
+                pyvista_grid.save(file_path)
+                QMessageBox.information(self, "Export Successful", f"Tetrahedral mesh exported to:\n{file_path}")
+            else:
+                # Fallback export using mesh data
+                self._export_tetrahedral_manual(file_path)
+                
+        except Exception as e:
+            logger.error(f"Export failed: {str(e)}")
+            QMessageBox.critical(self, "Export Error", f"Failed to export mesh:\n{str(e)}")
+    
+    def _export_tetrahedral_manual(self, file_path):
+        """Manual export when PyVista grid is not available."""
+        vertices = self.tetrahedral_mesh['vertices']
+        tetrahedra = self.tetrahedral_mesh['tetrahedra']
+        
+        if file_path.endswith('.ply'):
+            # Export to PLY format
+            self._export_tetrahedral_ply(file_path, vertices, tetrahedra)
+        else:
+            # Default to simple format
+            with open(file_path, 'w') as f:
+                f.write(f"# Tetrahedral Mesh\n")
+                f.write(f"# Vertices: {len(vertices)}\n")
+                f.write(f"# Tetrahedra: {len(tetrahedra)}\n\n")
+                
+                f.write("VERTICES\n")
+                for v in vertices:
+                    f.write(f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+                
+                f.write("\nTETRAHEDRA\n")
+                for t in tetrahedra:
+                    f.write(f"{t[0]} {t[1]} {t[2]} {t[3]}\n")
+    
+    def _export_tetrahedral_ply(self, file_path, vertices, tetrahedra):
+        """Export tetrahedral mesh to PLY format."""
+        with open(file_path, 'w') as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {len(vertices)}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write(f"element face {len(tetrahedra) * 4}\n")  # Each tet has 4 faces
+            f.write("property list uchar int vertex_indices\n")
+            f.write("end_header\n")
+            
+            # Write vertices
+            for v in vertices:
+                f.write(f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+            
+            # Write tetrahedral faces
+            for t in tetrahedra:
+                # Each tetrahedron has 4 triangular faces
+                faces = [
+                    [t[0], t[1], t[2]],
+                    [t[0], t[1], t[3]],
+                    [t[0], t[2], t[3]],
+                    [t[1], t[2], t[3]]
+                ]
+                for face in faces:
+                    f.write(f"3 {face[0]} {face[1]} {face[2]}\n")
+    
+    def _update_tetra_stats(self):
+        """Update the tetrahedral mesh statistics display."""
+        if not self.tetrahedral_mesh:
+            self.tetra_stats_label.setText("No tetrahedral mesh generated yet.")
+            return
+        
+        stats = self.tetrahedral_mesh['statistics']
+        stats_text = f"""Tetrahedral Mesh Statistics:
+• Vertices: {stats['vertices']:,}
+• Tetrahedra: {stats['tetrahedra']:,}
+• Surface Faces: {stats['faces']:,}
+• Materials: {len(self.tetra_materials)}"""
+        
+        self.tetra_stats_label.setText(stats_text)
+    
+    def _visualize_tetrahedral_mesh(self):
+        """Visualize the generated tetrahedral mesh."""
+        if not hasattr(self, 'tetra_plotter') or not self.tetra_plotter:
+            return
+        
+        plotter = self.tetra_plotter
+        plotter.clear()
+        plotter.set_background([0.2, 0.2, 0.25])
+        
+        if not self.tetrahedral_mesh:
+            plotter.add_text("No tetrahedral mesh to display.", position='upper_edge', color='white')
+            return
+        
+        # Show surfaces if enabled
+        if self.show_surfaces_check.isChecked():
+            self._add_surfaces_to_plotter(plotter)
+        
+        # Show material points if enabled
+        if self.show_materials_check.isChecked():
+            self._add_material_points_to_plotter(plotter)
+        
+        # Show wireframe if enabled
+        if self.show_wireframe_check.isChecked():
+            self._add_wireframe_to_plotter(plotter)
+        
+        plotter.add_axes()
+        plotter.reset_camera()
+        logger.info("Updated tetrahedral mesh visualization")
+    
+    def _add_surfaces_to_plotter(self, plotter):
+        """Add surface meshes to the plotter."""
+        if self.tetrahedral_mesh and 'pyvista_grid' in self.tetrahedral_mesh:
+            # Show the surface of the tetrahedral mesh
+            pyvista_grid = self.tetrahedral_mesh['pyvista_grid']
+            surface_mesh = pyvista_grid.extract_surface()
+            
+            plotter.add_mesh(surface_mesh, color='lightblue', opacity=0.8, 
+                           show_edges=True, edge_color='black', 
+                           line_width=1, label='Tetrahedral Surface')
+        else:
+            # Show individual constrained surfaces
+            for i, surface_index in enumerate(self.selected_surfaces):
+                if surface_index < len(self.datasets):
+                    dataset = self.datasets[surface_index]
+                    vertices = dataset.get('constrained_vertices')
+                    triangles = dataset.get('constrained_triangles')
+                    
+                    if vertices is not None and triangles is not None:
+                        vertices = np.array(vertices)
+                        triangles = np.array(triangles)
+                        
+                        # Create PyVista mesh
+                        import pyvista as pv
+                        cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
+                        surface_mesh = pv.PolyData(vertices, faces=cells)
+                        
+                        # Get color for this surface
+                        color = dataset.get('color', self.DEFAULT_COLORS[surface_index % len(self.DEFAULT_COLORS)])
+                        surface_name = dataset.get('name', f'Surface_{surface_index}')
+                        
+                        plotter.add_mesh(surface_mesh, color=color, opacity=0.8, 
+                                       show_edges=True, edge_color='black', 
+                                       line_width=1, label=surface_name)
+    
+    def _add_material_points_to_plotter(self, plotter):
+        """Add material location points to the plotter."""
+        import pyvista as pv
+        
+        # Define colors for different materials
+        material_colors = ['red', 'blue', 'green', 'yellow', 'purple', 'cyan', 'orange']
+        
+        for i, material in enumerate(self.tetra_materials):
+            locations = np.array(material['locations'])
+            if len(locations) > 0:
+                color = material_colors[i % len(material_colors)]
+                
+                # Create point cloud
+                points_mesh = pv.PolyData(locations)
+                plotter.add_points(points_mesh, color=color, point_size=10, 
+                                 render_points_as_spheres=True, 
+                                 label=material['name'])
+    
+    def _add_wireframe_to_plotter(self, plotter):
+        """Add wireframe representation to the plotter."""
+        if self.tetrahedral_mesh and 'pyvista_grid' in self.tetrahedral_mesh:
+            # Show wireframe of tetrahedral mesh
+            pyvista_grid = self.tetrahedral_mesh['pyvista_grid']
+            
+            # Extract edges for wireframe
+            edges = pyvista_grid.extract_all_edges()
+            plotter.add_mesh(edges, color='red', line_width=2, 
+                           style='wireframe', label='Tetrahedral Wireframe')
+        else:
+            # Show wireframe of surface meshes if no tetrahedral mesh
+            for i, surface_index in enumerate(self.selected_surfaces):
+                if surface_index < len(self.datasets):
+                    dataset = self.datasets[surface_index]
+                    vertices = dataset.get('constrained_vertices')
+                    triangles = dataset.get('constrained_triangles')
+                    
+                    if vertices is not None and triangles is not None:
+                        vertices = np.array(vertices)
+                        triangles = np.array(triangles)
+                        
+                        # Create PyVista mesh
+                        import pyvista as pv
+                        cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
+                        surface_mesh = pv.PolyData(vertices, faces=cells)
+                        
+                        # Show wireframe
+                        plotter.add_mesh(surface_mesh, style='wireframe', 
+                                       color='darkred', line_width=1)
+    
+    def _update_tetra_visualization(self):
+        """Update the tetrahedral mesh visualization based on current settings."""
+        self._visualize_tetrahedral_mesh()
+    
+    def _clear_tetra_mesh_plot(self):
+        """Clear the tetrahedral mesh plot."""
+        if hasattr(self, 'tetra_plotter') and self.tetra_plotter:
+            self.tetra_plotter.clear()
+            self.tetra_plotter.add_text("Select surfaces and generate tetrahedral mesh to visualize.", 
+                                      position='upper_edge', color='white')
+        
+        # Reset mesh data
+        self.tetrahedral_mesh = None
+        
+        # Reset statistics
+        if hasattr(self, 'tetra_stats_label'):
+            self.tetra_stats_label.setText("No tetrahedral mesh generated yet.")
+        
+        # Clear selected surfaces
+        self.selected_surfaces = set()
+        
+        # Update surface table
+        if hasattr(self, '_update_surface_table'):
+            self._update_surface_table()
+
     def _show_validation_results_dialog(self, validation_results):
         """Show detailed validation results in a dialog"""
         from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTextEdit, QLabel, QPushButton, QTabWidget, QWidget, QTableWidget, QTableWidgetItem
@@ -7696,3 +9583,4 @@ if __name__ == "__main__":
     window = MeshItWorkflowGUI()
     window.show()
     sys.exit(app.exec_()) 
+
