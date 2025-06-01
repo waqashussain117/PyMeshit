@@ -8091,6 +8091,13 @@ segmentation, triangulation, and visualization.
         return fault_indices
     def _get_surface_type(self, surface_index):
         """Get the type of a surface (BORDER, UNIT, FAULT) like C++ version."""
+        # Check for manual override first
+        if surface_index < len(self.datasets):
+            manual_type = self.datasets[surface_index].get('manual_surface_type')
+            if manual_type and manual_type in ['BORDER', 'UNIT', 'FAULT', 'UNKNOWN']:
+                return manual_type
+        
+        # Use automatic detection based on index lists
         if surface_index in self.border_surface_indices:
             return "BORDER"
         elif surface_index in self.fault_surface_indices:
@@ -8355,184 +8362,117 @@ segmentation, triangulation, and visualization.
             
         except Exception as e:
             logger.error(f"Failed to add surface {surface_index} to plotter: {e}")
-    
+
     def _add_convex_hull_to_plotter(self, surface_idx, hull_points):
-        """Add convex hull with selectable parts."""
-        import pyvista as pv
-        from scipy.spatial import ConvexHull
-        
-        logger.debug(f"Adding convex hull for surface {surface_idx}")
-        logger.debug(f"Hull points type: {type(hull_points)}")
-        logger.debug(f"Hull points shape: {hull_points.shape if hasattr(hull_points, 'shape') else 'no shape'}")
-        logger.debug(f"Hull points dtype: {hull_points.dtype if hasattr(hull_points, 'dtype') else 'no dtype'}")
-        
-        # Extract coordinates (handle type information if present)
-        if hull_points.dtype == object:  # Contains type info
-            logger.debug("Hull points contain type info (dtype=object)")
-            coords = np.array([[p[0], p[1], p[2]] for p in hull_points])
-            point_types = [p[3] if len(p) > 3 else 'DEFAULT' for p in hull_points]
-        else:
-            logger.debug("Hull points are numeric array")
-            coords = hull_points[:, :3]
-            point_types = ['DEFAULT'] * len(coords)
-        
-        logger.debug(f"Extracted coordinates shape: {coords.shape}")
-        logger.debug(f"Point types: {point_types[:5]}...")  # Show first 5 types
-        
-        # Create convex hull with robust handling for degenerate cases
+        """Add convex hull as simple boundary lines - SIMPLIFIED like pre-tetramesh."""
         try:
-            # First attempt: standard ConvexHull
-            try:
-                hull = ConvexHull(coords)
-                logger.debug(f"Created ConvexHull with {len(hull.vertices)} vertices and {len(hull.simplices)} simplices")
-                
-                # Create hull mesh
-                hull_faces = []
-                for simplex in hull.simplices:
-                    hull_faces.extend([3, simplex[0], simplex[1], simplex[2]])
-                
-                hull_mesh = pv.PolyData(coords, faces=hull_faces)
-                
-            except Exception as qhull_error:
-                logger.warning(f"Standard ConvexHull failed for surface {surface_idx}: {qhull_error}")
-                
-                # Fallback 1: Try with QJ option (joggle input to avoid precision issues)
-                try:
-                    # Use scipy's ConvexHull with QJ option via qhull_options
-                    hull = ConvexHull(coords, qhull_options='QJ')  # QJ = joggle input
-                    logger.debug(f"Created joggled ConvexHull with {len(hull.vertices)} vertices")
-                    
-                    # Create hull mesh with faces
-                    hull_faces = []
-                    for simplex in hull.simplices:
-                        hull_faces.extend([3, simplex[0], simplex[1], simplex[2]])
-                    
-                    hull_mesh = pv.PolyData(coords, faces=hull_faces)
-                    
-                except Exception as qj_error:
-                    logger.warning(f"QJ ConvexHull failed: {qj_error}")
-                    
-                    # Fallback 2: Manual jittering with small noise
-                    try:
-                        # Add very small random noise to break degeneracies
-                        noise_scale = np.mean(np.ptp(coords, axis=0)) * 1e-10  # Very small relative to data scale
-                        coords_jittered = coords + np.random.normal(0, noise_scale, coords.shape)
-                        hull = ConvexHull(coords_jittered)
-                        logger.debug(f"Created manually jittered ConvexHull with {len(hull.vertices)} vertices")
-                        
-                        # Create hull mesh using original coordinates but jittered topology
-                        hull_faces = []
-                        for simplex in hull.simplices:
-                            hull_faces.extend([3, simplex[0], simplex[1], simplex[2]])
-                        
-                        # Use original coordinates for the mesh
-                        hull_mesh = pv.PolyData(coords, faces=hull_faces)
-                    
-                    except Exception as jitter_error:
-                        logger.warning(f"Manual jittering ConvexHull failed: {jitter_error}")
-                    
-                    # Fallback 2: Handle degenerate cases with 2D projection
-                    try:
-                        logger.info(f"Using 2D projection fallback for surface {surface_idx}")
-                        
-                        # Check which dimension has the least variance (is nearly constant)
-                        ranges = np.ptp(coords, axis=0)  # peak-to-peak (max - min)
-                        min_range_dim = np.argmin(ranges)
-                        
-                        if ranges[min_range_dim] < 1e-6:  # Nearly planar
-                            logger.debug(f"Surface {surface_idx} is nearly planar in dimension {min_range_dim}")
-                            
-                            # Create 2D projection by removing the constant dimension
-                            if min_range_dim == 0:  # x is constant
-                                coords_2d = coords[:, [1, 2]]  # use y, z
-                            elif min_range_dim == 1:  # y is constant
-                                coords_2d = coords[:, [0, 2]]  # use x, z
-                            else:  # z is constant
-                                coords_2d = coords[:, [0, 1]]  # use x, y
-                            
-                            # Compute 2D convex hull
-                            try:
-                                from scipy.spatial import ConvexHull
-                                hull_2d = ConvexHull(coords_2d)
-                                
-                                # Create wireframe from 2D hull boundary
-                                hull_vertices = hull_2d.vertices
-                                lines = []
-                                for i in range(len(hull_vertices)):
-                                    lines.extend([2, hull_vertices[i], hull_vertices[(i + 1) % len(hull_vertices)]])
-                                
-                                hull_mesh = pv.PolyData(coords, lines=lines)
-                                logger.debug(f"Created 2D projected hull with {len(hull_vertices)} boundary vertices")
-                                
-                            except Exception as hull_2d_error:
-                                logger.warning(f"2D ConvexHull failed: {hull_2d_error}")
-                                # Fallback 3: Simple boundary wireframe without internal connections
-                                logger.info(f"Using simple boundary wireframe for surface {surface_idx}")
-                                
-                                # Just create a boundary loop without internal connections
-                                n_points = len(coords)
-                                lines = []
-                                for i in range(n_points):
-                                    lines.extend([2, i, (i + 1) % n_points])
-                                
-                                hull_mesh = pv.PolyData(coords, lines=lines)
-                        else:
-                            # All dimensions have significant variance - use point cloud
-                            logger.info(f"Using point cloud fallback for surface {surface_idx}")
-                            hull_mesh = pv.PolyData(coords)
-                            
-                    except Exception as fallback_error:
-                        logger.error(f"All fallbacks failed: {fallback_error}")
-                        # Final fallback: Just show the points
-                        hull_mesh = pv.PolyData(coords)
+            import pyvista as pv
+            from scipy.spatial import ConvexHull
+        except Exception as e:
+            logger.error(f"Failed to import pyvista or scipy: {e}")
+            return
+        
+        logger.debug(f"Adding simple convex hull for surface {surface_idx}")
+        
+        if len(hull_points) < 3:
+            logger.warning(f"Not enough points ({len(hull_points)}) for convex hull")
+            return
             
-            # Add metadata to the mesh
-            hull_mesh['surface_id'] = np.full(len(coords), surface_idx)
-            hull_mesh['element_type'] = ['hull'] * len(coords)
-            hull_mesh['point_types'] = point_types
+        plotter = self.tetra_plotter
+        if not plotter:
+            logger.error("No plotter available for convex hull visualization")
+            return
+        
+        # Extract coordinates (handle type information if present) 
+        if hasattr(hull_points, 'dtype') and hull_points.dtype == object:
+            coords = np.array([[p[0], p[1], p[2]] for p in hull_points])
+        else:
+            coords = np.array(hull_points)[:, :3]
+        
+        try:
+            # Simple approach: get convex hull vertices and create boundary line loop (like pre-tetramesh)
+            hull = ConvexHull(coords)
+            hull_boundary_points = coords[hull.vertices]
             
-            # Add hull wireframe
-            self.tetra_plotter.add_mesh(
-                hull_mesh,
-                style='wireframe',
+            # Close the loop by adding first point at the end
+            hull_boundary_closed = np.vstack([hull_boundary_points, hull_boundary_points[0:1]])
+            
+            # Create simple line mesh (just like pre-tetramesh does)
+            line_mesh = pv.PolyData(hull_boundary_closed)
+            lines = []
+            for i in range(len(hull_boundary_closed) - 1):
+                lines.extend([2, i, i + 1])
+            line_mesh.lines = np.array(lines)
+            
+            # Add to plotter with simple red lines
+            plotter.add_mesh(
+                line_mesh,
                 color='red',
-                line_width=2,
-                pickable=True,
-                name=f'hull_{surface_idx}'
+                line_width=3,
+                style='wireframe',
+                name=f'convex_hull_{surface_idx}',
+                pickable=True
             )
             
-            logger.info(f"Successfully added convex hull wireframe for surface {surface_idx}")
+            logger.info(f"Successfully added simple convex hull boundary for surface {surface_idx}")
             
-            # Add special points (TRIPLE_POINT, CORNER, etc.)
-            special_points = []
-            special_types = []
-            for i, ptype in enumerate(point_types):
-                if ptype in ['TRIPLE_POINT', 'CORNER', 'BOUNDARY']:
-                    special_points.append(coords[i])
-                    special_types.append(ptype)
-            
-            if special_points:
-                logger.debug(f"Adding {len(special_points)} special points")
-                special_mesh = pv.PolyData(np.array(special_points))
-                special_mesh['point_types'] = special_types
-                special_mesh['surface_id'] = np.full(len(special_points), surface_idx)
-                
-                self.tetra_plotter.add_mesh(
-                    special_mesh,
-                    color='orange',
-                    point_size=8,
-                    render_points_as_spheres=True,
-                    pickable=True,
-                    name=f'special_points_{surface_idx}'
-                )
-                logger.debug(f"Added {len(special_points)} special points for surface {surface_idx}")
-            else:
-                logger.debug(f"No special points found for surface {surface_idx}")
-                
         except Exception as e:
-            logger.warning(f"Could not create convex hull for surface {surface_idx}: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.warning(f"Standard ConvexHull failed for surface {surface_idx}: {e}")
+            
+            # Fallback 1: Try with QJ option (joggle input to avoid precision issues)
+            try:
+                hull = ConvexHull(coords, qhull_options='QJ')
+                hull_boundary_points = coords[hull.vertices]
+                
+                # Close the loop by adding first point at the end
+                hull_boundary_closed = np.vstack([hull_boundary_points, hull_boundary_points[0:1]])
+                
+                # Create simple line mesh
+                line_mesh = pv.PolyData(hull_boundary_closed)
+                lines = []
+                for i in range(len(hull_boundary_closed) - 1):
+                    lines.extend([2, i, i + 1])
+                line_mesh.lines = np.array(lines)
+                
+                plotter.add_mesh(
+                    line_mesh,
+                    color='red',
+                    line_width=3,
+                    style='wireframe',
+                    name=f'convex_hull_{surface_idx}',
+                    pickable=True
+                )
+                
+                logger.info(f"Successfully added simple QJ convex hull boundary for surface {surface_idx}")
+                
+            except Exception as e2:
+                logger.warning(f"QJ ConvexHull also failed for surface {surface_idx}: {e2}")
+                
+                # Final fallback: Use all points as a wireframe mesh
+                try:
+                    # Create a simple point cloud and connect nearest neighbors
+                    line_mesh = pv.PolyData(coords)
+                    
+                    # Create lines connecting consecutive points (simple boundary)
+                    lines = []
+                    n_points = len(coords)
+                    for i in range(n_points):
+                        lines.extend([2, i, (i + 1) % n_points])
+                    line_mesh.lines = np.array(lines)
+                    
+                    plotter.add_mesh(
+                        line_mesh,
+                        color='orange',
+                        line_width=1,
+                        style='wireframe',
+                        name=f'convex_hull_{surface_idx}',
+                        pickable=True
+                    )
+                    
+                    logger.info(f"Added fallback wireframe for surface {surface_idx}")
+                    
+                except Exception as e3:
+                    logger.error(f"All hull methods failed for surface {surface_idx}: {e3}")
 
     def _on_mesh_picked(self, mesh_data):
         """Handle mesh picking events."""
@@ -9319,7 +9259,7 @@ segmentation, triangulation, and visualization.
         # Populate table
         self.surface_table.setRowCount(len(available_surfaces))
         
-        from PyQt5.QtWidgets import QCheckBox, QWidget, QHBoxLayout
+        from PyQt5.QtWidgets import QCheckBox, QWidget, QHBoxLayout, QComboBox
         from PyQt5.QtGui import QColor
         from PyQt5.QtCore import Qt
         
@@ -9338,18 +9278,28 @@ segmentation, triangulation, and visualization.
                 
                 # Surface info with type coloring
                 name_item = QTableWidgetItem(surface['name'])
-                type_item = QTableWidgetItem(surface['type'])
                 
-                # Color code by surface type
-                if 'BORDER' in surface['type']:
-                    type_item.setBackground(QColor(173, 216, 230))  # Light blue
-                elif 'FAULT' in surface['type']:
-                    type_item.setBackground(QColor(255, 182, 193))  # Light pink
-                elif 'UNIT' in surface['type']:
-                    type_item.setBackground(QColor(144, 238, 144))  # Light green
+                # Create combobox for surface type
+                type_combobox = QComboBox()
+                type_combobox.addItems(['BORDER', 'UNIT', 'FAULT', 'UNKNOWN'])
+                
+                # Extract base type from the surface type string (remove modifiers like "(Refined)")
+                base_type = surface['type'].split(' ')[0]
+                if base_type in ['BORDER', 'UNIT', 'FAULT', 'UNKNOWN']:
+                    type_combobox.setCurrentText(base_type)
+                else:
+                    type_combobox.setCurrentText('UNKNOWN')
+                
+                # Set combobox style based on type
+                self._style_type_combobox(type_combobox, base_type)
+                
+                # Connect change signal
+                type_combobox.currentTextChanged.connect(
+                    lambda new_type, idx=surface['index']: self._on_surface_type_changed(idx, new_type)
+                )
                 
                 self.surface_table.setItem(row, 1, name_item)
-                self.surface_table.setItem(row, 2, type_item)
+                self.surface_table.setCellWidget(row, 2, type_combobox)
                 self.surface_table.setItem(row, 3, QTableWidgetItem(str(surface['triangles'])))
                 self.surface_table.setItem(row, 4, QTableWidgetItem(f"{surface['quality']:.3f}"))
                 self.surface_table.setItem(row, 5, QTableWidgetItem(str(surface['constraints'])))
@@ -9371,6 +9321,60 @@ segmentation, triangulation, and visualization.
         
         # Update the plotter visualization
         self._add_selectable_elements_to_plotter()
+
+    def _style_type_combobox(self, combobox, surface_type):
+        """Apply color styling to surface type combobox based on type."""
+        from PyQt5.QtWidgets import QComboBox
+        
+        # Set background color based on surface type
+        if surface_type == 'BORDER':
+            combobox.setStyleSheet("QComboBox { background-color: rgb(173, 216, 230); }")  # Light blue
+        elif surface_type == 'FAULT':
+            combobox.setStyleSheet("QComboBox { background-color: rgb(255, 182, 193); }")  # Light pink
+        elif surface_type == 'UNIT':
+            combobox.setStyleSheet("QComboBox { background-color: rgb(144, 238, 144); }")  # Light green
+        else:  # UNKNOWN
+            combobox.setStyleSheet("QComboBox { background-color: rgb(211, 211, 211); }")  # Light gray
+
+    def _on_surface_type_changed(self, surface_index, new_type):
+        """Handle manual surface type changes from the dropdown."""
+        try:
+            # Update the surface type in the appropriate index list
+            old_type = self._get_surface_type(surface_index)
+            
+            # Remove from old type lists
+            if surface_index in self.border_surface_indices:
+                self.border_surface_indices.remove(surface_index)
+            if surface_index in self.unit_surface_indices:
+                self.unit_surface_indices.remove(surface_index)
+            if surface_index in self.fault_surface_indices:
+                self.fault_surface_indices.remove(surface_index)
+            
+            # Add to new type list
+            if new_type == 'BORDER':
+                self.border_surface_indices.append(surface_index)
+            elif new_type == 'UNIT':
+                self.unit_surface_indices.append(surface_index)
+            elif new_type == 'FAULT':
+                self.fault_surface_indices.append(surface_index)
+            # For UNKNOWN, don't add to any list
+            
+            # Update combobox styling
+            sender = self.sender()
+            if sender and isinstance(sender, QComboBox):
+                self._style_type_combobox(sender, new_type)
+            
+            # Store the manual override in the dataset
+            if surface_index < len(self.datasets):
+                self.datasets[surface_index]['manual_surface_type'] = new_type
+            
+            logger.info(f"Surface {surface_index} type changed from {old_type} to {new_type}")
+            
+            # Update visualization if needed
+            self._update_unified_visualization(filter_changed=True)
+            
+        except Exception as e:
+            logger.error(f"Error changing surface type for surface {surface_index}: {e}")
 
     
     def _update_unified_visualization(self, filter_changed=False, display_mode_changed=False, 
@@ -9985,26 +9989,41 @@ segmentation, triangulation, and visualization.
             surface_type = self._get_surface_type(surface_index)
             color = self._get_surface_color(surface_type)
             
-            # Create hull faces
+            # Create boundary edges only (no internal triangulation for wireframe)
+            boundary_edges = set()
+            for simplex in hull.simplices:
+                # Add each edge of the triangle to the boundary edge set
+                edges = [(simplex[0], simplex[1]), (simplex[1], simplex[2]), (simplex[2], simplex[0])]
+                for edge in edges:
+                    # Sort edge vertices to ensure consistent representation
+                    sorted_edge = tuple(sorted(edge))
+                    boundary_edges.add(sorted_edge)
+            
+            # Create hull faces for solid display mode
             hull_faces = []
             for simplex in hull.simplices:
                 hull_faces.extend([3, simplex[0], simplex[1], simplex[2]])
             
-            # Create PyVista mesh
-            hull_mesh = pv.PolyData(validated_points, faces=hull_faces)
+            # Create line connectivity for wireframe display
+            lines = []
+            for edge in boundary_edges:
+                lines.extend([2, edge[0], edge[1]])
+            
+            # Create meshes for different display modes
+            hull_mesh_faces = pv.PolyData(validated_points, faces=hull_faces)
+            hull_mesh_lines = pv.PolyData(validated_points, lines=lines)
             
             # Add to plotter based on display mode
             if display_mode == "faces":
                 self.tetra_plotter.add_mesh(
-                    hull_mesh,
+                    hull_mesh_faces,
                     color=color,
                     opacity=0.7,
                     name=f'hull_faces_{surface_index}'
                 )
             elif display_mode == "wireframe":
                 self.tetra_plotter.add_mesh(
-                    hull_mesh,
-                    style='wireframe',
+                    hull_mesh_lines,
                     color=color,
                     line_width=2,
                     name=f'hull_wireframe_{surface_index}'
@@ -10012,15 +10031,14 @@ segmentation, triangulation, and visualization.
             elif display_mode == "both":
                 # Add faces
                 self.tetra_plotter.add_mesh(
-                    hull_mesh,
+                    hull_mesh_faces,
                     color=color,
                     opacity=0.5,
                     name=f'hull_faces_{surface_index}'
                 )
-                # Add wireframe
+                # Add wireframe (boundary edges only)
                 self.tetra_plotter.add_mesh(
-                    hull_mesh,
-                    style='wireframe',
+                    hull_mesh_lines,
                     color='black',
                     line_width=1,
                     name=f'hull_wireframe_{surface_index}'
