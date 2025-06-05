@@ -7516,16 +7516,16 @@ segmentation, triangulation, and visualization.
             self.statusBar().showMessage(f"Validation failed: {str(e)}")
     
     def _setup_tetra_mesh_tab(self):
-        """Sets up the Tetrahedral Mesh Generation tab with C++ MeshIt-style advanced selection."""
-        # Initialize data structures
+        """Sets up the Tetrahedral Mesh Generation tab with visualization only."""
+        # Initialize minimal data structures needed for visualization
         self.tetra_materials = []
         self.selected_surfaces = set()
-        self.selected_surface_parts = {}  # Store selected parts of each surface
+        self.selected_surface_parts = {}
         self.tetrahedral_mesh = None
         self.surface_quality_data = {}
         self.interactive_selection_enabled = False
         
-        # Border recognition - identify border files by name patterns
+        # Border recognition - identify border files by name patterns (needed for visualization)
         self.border_surface_indices = self._identify_border_surfaces()
         self.unit_surface_indices = self._identify_unit_surfaces()
         self.fault_surface_indices = self._identify_fault_surfaces()
@@ -7533,306 +7533,22 @@ segmentation, triangulation, and visualization.
         # Create main layout
         tab_layout = QHBoxLayout(self.tetra_mesh_tab)
         
-        # --- Left Control Panel ---
-        control_panel = QWidget()
-        control_panel.setMaximumWidth(500)  # Wider for more controls
-        control_layout = QVBoxLayout(control_panel)
-        
-        # === Advanced Selection System (C++ MeshIt Style) ===
-        selection_group = QGroupBox("Advanced Surface Selection (C++ MeshIt Style)")
-        selection_layout = QVBoxLayout(selection_group)
-        
-        # Surface type filters (like C++ version)
-        type_filter_layout = QHBoxLayout()
-        type_filter_label = QLabel("Surface Type Filter:")
-        self.surface_type_filter = QComboBox()
-        self.surface_type_filter.addItems([
-            "All Surfaces",
-            "Units Only", 
-            "Faults Only",
-            "Borders Only",
-            "Selected Types"
-        ])
-        self.surface_type_filter.currentTextChanged.connect(self._on_surface_type_filter_changed)
-        
-        type_filter_layout.addWidget(type_filter_label)
-        type_filter_layout.addWidget(self.surface_type_filter)
-        selection_layout.addLayout(type_filter_layout)
-        
-        # Selection mode controls
-        mode_layout = QHBoxLayout()
-        mode_label = QLabel("Selection Mode:")
-        self.selection_mode_combo = QComboBox()
-        self.selection_mode_combo.addItems([
-            "Whole Surfaces", 
-            "Surface Parts", 
-            "Convex Hull Parts",
-            "Intersection Lines",
-            "Constraints Only"
-        ])
-        self.selection_mode_combo.currentTextChanged.connect(self._on_selection_mode_changed)
-        
-        mode_layout.addWidget(mode_label)
-        mode_layout.addWidget(self.selection_mode_combo)
-        selection_layout.addLayout(mode_layout)
-        
-        # Interactive selection controls
-        interactive_layout = QHBoxLayout()
-        self.enable_mouse_selection_btn = QPushButton("🖱️ Enable Mouse Selection")
-        self.enable_mouse_selection_btn.setCheckable(True)
-        self.enable_mouse_selection_btn.toggled.connect(lambda enabled: self._toggle_mouse_selection(enabled))
-        self.enable_mouse_selection_btn.setToolTip("Enable direct mouse selection in 3D view (C++ style)")
-        
-        self.clear_selection_btn = QPushButton("Clear Selection")
-        self.clear_selection_btn.clicked.connect(self._clear_current_selection)
-        
-        interactive_layout.addWidget(self.enable_mouse_selection_btn)
-        interactive_layout.addWidget(self.clear_selection_btn)
-        selection_layout.addLayout(interactive_layout)
-        
-        # Selection summary
-        self.selection_summary_label = QLabel("No elements selected")
-        self.selection_summary_label.setStyleSheet("color: #555; font-size: 10px; font-style: italic;")
-        selection_layout.addWidget(self.selection_summary_label)
-        
-        # Border handling info
-        border_info_layout = QVBoxLayout()
-        border_count = len(self.border_surface_indices)
-        unit_count = len(self.unit_surface_indices) 
-        fault_count = len(self.fault_surface_indices)
-        
-        self.surface_type_info = QLabel(
-            f"Detected: {unit_count} Units, {fault_count} Faults, {border_count} Borders"
-        )
-        self.surface_type_info.setStyleSheet("color: #666; font-size: 10px; font-weight: bold;")
-        
-        if border_count > 0:
-            border_names = [self.datasets[i]['name'] for i in self.border_surface_indices]
-            self.border_list_info = QLabel(f"Borders: {', '.join(border_names)}")
-            self.border_list_info.setStyleSheet("color: #2E7D32; font-size: 9px;")
-            border_info_layout.addWidget(self.border_list_info)
-        
-        border_info_layout.addWidget(self.surface_type_info)
-        selection_layout.addLayout(border_info_layout)
-        
-        # Display options
-        display_layout = QVBoxLayout()
-        
-        # First row: Element visibility options
-        elements_layout = QHBoxLayout()
-        self.show_convex_hulls_check = QCheckBox("Show Convex Hulls")
-        self.show_constraints_check = QCheckBox("Show Constraints")
-        self.show_intersections_check = QCheckBox("Show Intersections")
-        self.highlight_selected_check = QCheckBox("Highlight Selected")
-        
-        self.show_convex_hulls_check.setChecked(True)
-        self.show_constraints_check.setChecked(True)
-        self.show_intersections_check.setChecked(True)
-        self.highlight_selected_check.setChecked(True)
-        
-        # Connect display option changes
-        self.show_convex_hulls_check.toggled.connect(self._on_hulls_visibility_changed)
-        self.show_constraints_check.toggled.connect(self._on_constraints_visibility_changed)
-        self.show_intersections_check.toggled.connect(self._on_intersections_visibility_changed)
-        self.highlight_selected_check.toggled.connect(self._on_highlighting_changed)
-        
-        elements_layout.addWidget(self.show_convex_hulls_check)
-        elements_layout.addWidget(self.show_constraints_check)
-        elements_layout.addWidget(self.show_intersections_check)
-        elements_layout.addWidget(self.highlight_selected_check)
-        
-        # Second row: Surface display options
-        surface_layout = QHBoxLayout()
-        surface_group = QGroupBox("Surface Display")
-        surface_group_layout = QHBoxLayout(surface_group)
-        
-        self.show_faces_radio = QRadioButton("Show Faces")
-        self.show_wireframe_radio = QRadioButton("Show Wireframe")
-        self.show_both_radio = QRadioButton("Show Both")
-        
-        self.show_faces_radio.setChecked(True)  # Default to faces
-        
-        # Connect surface display changes
-        self.show_faces_radio.toggled.connect(self._on_surface_display_changed)
-        self.show_wireframe_radio.toggled.connect(self._on_surface_display_changed)
-        self.show_both_radio.toggled.connect(self._on_surface_display_changed)
-        
-        surface_group_layout.addWidget(self.show_faces_radio)
-        surface_group_layout.addWidget(self.show_wireframe_radio)
-        surface_group_layout.addWidget(self.show_both_radio)
-        
-        surface_layout.addWidget(surface_group)
-        surface_layout.addStretch()
-        
-        display_layout.addLayout(elements_layout)
-        display_layout.addLayout(surface_layout)
-        selection_layout.addLayout(display_layout)
-        
-        control_layout.addWidget(selection_group)
-
-        # === Surface Table (Enhanced for C++ compatibility) ===
-        table_group = QGroupBox("Surface Selection")
-        table_layout = QVBoxLayout(table_group)
-        
-        # Create surface table
-        self.surface_table = QTableWidget()
-        self.surface_table.setColumnCount(6)
-        self.surface_table.setHorizontalHeaderLabels(['Select', 'Surface', 'Type', 'Triangles', 'Quality', 'Constraints'])
-        self.surface_table.horizontalHeader().setStretchLastSection(True)
-        self.surface_table.setMaximumHeight(200)
-        table_layout.addWidget(self.surface_table)
-        
-        # Selection action buttons
-        table_actions_layout = QHBoxLayout()
-        self.select_all_btn = QPushButton("Select All")
-        self.deselect_all_btn = QPushButton("Deselect All")
-        self.auto_select_quality_btn = QPushButton("Auto-Select Quality")
-        self.validate_selection_btn = QPushButton("Validate Selection")
-        
-        self.select_all_btn.clicked.connect(self._select_all_surfaces)
-        self.deselect_all_btn.clicked.connect(self._deselect_all_surfaces)
-        self.auto_select_quality_btn.clicked.connect(self._auto_select_by_quality)
-        self.validate_selection_btn.clicked.connect(self._validate_surface_selection)
-        self.tetra_mesh_generator = None
-        self.materials = []  # Initialize materials list
-        table_actions_layout.addWidget(self.select_all_btn)
-        table_actions_layout.addWidget(self.deselect_all_btn)
-        table_actions_layout.addWidget(self.auto_select_quality_btn)
-        table_actions_layout.addWidget(self.validate_selection_btn)
-        table_layout.addLayout(table_actions_layout)
-        
-        # Selection statistics
-        self.selection_stats_label = QLabel("No surfaces selected")
-        self.selection_stats_label.setStyleSheet("color: #333; font-weight: bold; padding: 5px; background-color: #f0f0f0; border-radius: 3px;")
-        table_layout.addWidget(self.selection_stats_label)
-        
-        control_layout.addWidget(table_group)
-        
-        # === Hierarchical Selection Tree ===
-        tree_group = QGroupBox("Hierarchical Selection")
-        tree_layout = QVBoxLayout(tree_group)
-        
-        self.selection_tree = QTreeWidget()
-        self.selection_tree.setHeaderLabels(['Element', 'Type', 'Status', 'Count', 'Quality'])
-        self.selection_tree.setMaximumHeight(150)
-        tree_layout.addWidget(self.selection_tree)
-        
-        control_layout.addWidget(tree_group)
-        
-        # === Material Assignment ===
-        material_group = QGroupBox("Material Regions")
-        material_layout = QVBoxLayout(material_group)
-        # Quality threshold controls
-        quality_controls_layout = QHBoxLayout()
-        quality_label = QLabel("Quality Threshold:")
-        self.quality_threshold = QDoubleSpinBox()
-        self.quality_threshold.setRange(0.0, 1.0)
-        self.quality_threshold.setSingleStep(0.1)
-        self.quality_threshold.setValue(0.5)  # Default threshold
-        self.quality_threshold.setDecimals(2)
-        quality_controls_layout.addWidget(quality_label)
-        quality_controls_layout.addWidget(self.quality_threshold)
-        quality_controls_layout.addStretch()
-        table_layout.addLayout(quality_controls_layout)
-        # Material list
-        material_list_layout = QHBoxLayout()
-        self.material_list = QListWidget()
-        self.material_list.setMaximumHeight(100)
-        self.material_list.currentRowChanged.connect(self._on_material_selection_changed)
-        
-        material_buttons_layout = QVBoxLayout()
-        self.add_material_btn = QPushButton("➕ Add")
-        self.remove_material_btn = QPushButton("➖ Remove")
-        self.auto_place_materials_btn = QPushButton("🎯 Auto-Place")
-        
-        self.add_material_btn.clicked.connect(self._add_material)
-        self.remove_material_btn.clicked.connect(self._remove_material)
-        self.auto_place_materials_btn.clicked.connect(self._auto_place_materials)
-        
-        material_buttons_layout.addWidget(self.add_material_btn)
-        material_buttons_layout.addWidget(self.remove_material_btn)
-        material_buttons_layout.addWidget(self.auto_place_materials_btn)
-        
-        material_list_layout.addWidget(self.material_list)
-        material_list_layout.addLayout(material_buttons_layout)
-        material_layout.addLayout(material_list_layout)
-        
-        # Material locations
-        location_label = QLabel("Material Locations:")
-        material_layout.addWidget(location_label)
-        
-        location_list_layout = QHBoxLayout()
-        self.material_location_list = QListWidget()
-        self.material_location_list.setMaximumHeight(80)
-        
-        location_buttons_layout = QVBoxLayout()
-        self.add_location_btn = QPushButton("➕")
-        self.remove_location_btn = QPushButton("➖")
-        
-        self.add_location_btn.clicked.connect(self._add_material_location)
-        self.remove_location_btn.clicked.connect(self._remove_material_location)
-        
-        location_buttons_layout.addWidget(self.add_location_btn)
-        location_buttons_layout.addWidget(self.remove_location_btn)
-        
-        location_list_layout.addWidget(self.material_location_list)
-        location_list_layout.addLayout(location_buttons_layout)
-        material_layout.addLayout(location_list_layout)
-        
-        control_layout.addWidget(material_group)
-        
-        # === Mesh Generation ===
-        generation_group = QGroupBox("Tetrahedral Mesh Generation")
-        generation_layout = QVBoxLayout(generation_group)
-        
-        # TetGen options
-        tetgen_options_layout = QHBoxLayout()
-        tetgen_label = QLabel("TetGen Switches:")
-        self.tetgen_switches_input = QLineEdit("pq1.414aA")
-        self.tetgen_switches_input.setToolTip("TetGen command line switches")
-        
-        tetgen_options_layout.addWidget(tetgen_label)
-        tetgen_options_layout.addWidget(self.tetgen_switches_input)
-        generation_layout.addLayout(tetgen_options_layout)
-        
-        # Generation buttons
-        generation_buttons_layout = QHBoxLayout()
-        self.validate_for_tetgen_btn = QPushButton("🔍 Validate for TetGen")
-        self.generate_tetra_mesh_btn = QPushButton("⚡ Generate Mesh")
-        self.export_tetra_mesh_btn = QPushButton("💾 Export Mesh")
-        
-        self.validate_for_tetgen_btn.clicked.connect(self._validate_surfaces_for_tetgen)
-        self.generate_tetra_mesh_btn.clicked.connect(self._generate_tetrahedral_mesh)
-        self.export_tetra_mesh_btn.clicked.connect(self._export_tetrahedral_mesh)
-        
-        generation_buttons_layout.addWidget(self.validate_for_tetgen_btn)
-        generation_buttons_layout.addWidget(self.generate_tetra_mesh_btn)
-        generation_buttons_layout.addWidget(self.export_tetra_mesh_btn)
-        generation_layout.addLayout(generation_buttons_layout)
-        
-        # Mesh statistics
-        self.mesh_stats_label = QLabel("No mesh generated")
-        self.mesh_stats_label.setStyleSheet("color: #666; font-size: 10px;")
-        generation_layout.addWidget(self.mesh_stats_label)
-        
-        control_layout.addWidget(generation_group)
-        control_layout.addStretch()
-        
-        tab_layout.addWidget(control_panel)
-        
-        # === Right Visualization Panel ===
-        viz_group = QGroupBox("3D Visualization with Selection")
+        # === Visualization Panel Only ===
+        viz_group = QGroupBox("3D Visualization")
         viz_layout = QVBoxLayout(viz_group)
         
         self._setup_interactive_3d_viewer(viz_group, viz_layout)
         
         tab_layout.addWidget(viz_group, 1)
         
-        # Initialize default material and populate table
-        self._add_default_material()
-        self._update_surface_table()
+        # Initialize visualization
+        border_count = len(self.border_surface_indices)
+        unit_count = len(self.unit_surface_indices) 
+        fault_count = len(self.fault_surface_indices)
         
-        logger.info(f"Tetra mesh tab initialized with border recognition: {border_count} borders, {unit_count} units, {fault_count} faults")        # Add this to ensure visualization is loaded
+        logger.info(f"Tetra mesh tab initialized (visualization only) with border recognition: {border_count} borders, {unit_count} units, {fault_count} faults")
+        
+        # Add visualization elements
         QTimer.singleShot(100, self._add_selectable_elements_to_plotter)  # Delayed to ensure UI is ready
 
     def _identify_border_surfaces(self):
