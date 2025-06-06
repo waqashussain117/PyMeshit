@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushBu
                             QSplitter, QDialog, QFormLayout, QButtonGroup, QMenu, QAction,
                             QListWidget, QColorDialog, QListWidgetItem, QProgressDialog,
                             QActionGroup, QSpacerItem, QTableWidget, QTableWidgetItem,
-                            QTreeWidget, QTreeWidgetItem)
+                            QTreeWidget, QTreeWidgetItem, QScrollArea)
 from PyQt5.QtCore import Qt, QSize, pyqtSignal, QObject, QThread, QTimer, QSettings # Add QTimer and QSettings
 from PyQt5.QtGui import QFont, QIcon, QColor, QPalette, QPixmap
 # Add these imports at the top of meshit_workflow_gui.py
@@ -4220,6 +4220,10 @@ segmentation, triangulation, and visualization.
             self.current_dataset_index = 0
         else:
             self.current_dataset_index = -1
+            
+        # Update surface visibility checkboxes if the widget exists
+        if hasattr(self, 'surface_checkboxes_layout'):
+            self._populate_surface_checkboxes()
     
     def _rename_dataset(self, dataset_index):
         """Rename a dataset"""
@@ -5927,13 +5931,7 @@ segmentation, triangulation, and visualization.
         logger.info(f"Convex hulls visibility changed: {checked}")
         self._update_unified_visualization(hulls_changed=True)
     
-    def _on_constraints_visibility_changed(self, checked):
-        """Handle constraints visibility changes dynamically."""
-        if not hasattr(self, 'tetra_plotter') or not self.tetra_plotter:
-            return
-            
-        logger.info(f"Constraints visibility changed: {checked}")
-        self._update_unified_visualization(constraints_changed=True)
+
     
     def _on_intersections_visibility_changed(self, checked):
         """Handle intersections visibility changes dynamically."""
@@ -6004,32 +6002,9 @@ segmentation, triangulation, and visualization.
         except Exception as e:
             logger.error(f"Error removing convex hulls: {e}")
     
-    def _add_constraints_to_plotter(self):
-        """Add constraints to the plotter."""
-        try:
-            self._add_all_constraints_to_plotter()
-            logger.info("Added constraints to visualization")
-        except Exception as e:
-            logger.error(f"Error adding constraints: {e}")
+
     
-    def _remove_constraints_from_plotter(self):
-        """Remove constraints from the plotter."""
-        try:
-            # Remove all constraint-related actors
-            actors_to_remove = []
-            for actor_name in self.tetra_plotter.renderer.actors:
-                if 'constraint' in actor_name.lower():
-                    actors_to_remove.append(actor_name)
-            
-            for actor_name in actors_to_remove:
-                try:
-                    self.tetra_plotter.remove_actor(actor_name)
-                except:
-                    pass
-                    
-            logger.info("Removed constraints from visualization")
-        except Exception as e:
-            logger.error(f"Error removing constraints: {e}")
+
     
     def _add_intersections_to_plotter(self):
         """Add intersections to the plotter."""
@@ -7516,10 +7491,9 @@ segmentation, triangulation, and visualization.
             self.statusBar().showMessage(f"Validation failed: {str(e)}")
     
     def _setup_tetra_mesh_tab(self):
-        """Sets up the Tetrahedral Mesh Generation tab with visualization only."""
+        """Sets up the Tetrahedral Mesh Generation tab with complete visualization."""
         # Initialize minimal data structures needed for visualization
         self.tetra_materials = []
-        self.selected_surfaces = set()
         self.selected_surface_parts = {}
         self.tetrahedral_mesh = None
         self.surface_quality_data = {}
@@ -7533,7 +7507,15 @@ segmentation, triangulation, and visualization.
         # Create main layout
         tab_layout = QHBoxLayout(self.tetra_mesh_tab)
         
-        # === Visualization Panel Only ===
+        # === Control Panel ===
+        control_group = QGroupBox("Visualization Controls")
+        control_layout = QVBoxLayout(control_group)
+        
+        self._setup_tetra_visualization_controls(control_layout)
+        
+        tab_layout.addWidget(control_group, 0)
+        
+        # === Visualization Panel ===
         viz_group = QGroupBox("3D Visualization")
         viz_layout = QVBoxLayout(viz_group)
         
@@ -7546,10 +7528,174 @@ segmentation, triangulation, and visualization.
         unit_count = len(self.unit_surface_indices) 
         fault_count = len(self.fault_surface_indices)
         
-        logger.info(f"Tetra mesh tab initialized (visualization only) with border recognition: {border_count} borders, {unit_count} units, {fault_count} faults")
+        logger.info(f"Tetra mesh tab initialized with complete visualization: {border_count} borders, {unit_count} units, {fault_count} faults")
         
-        # Add visualization elements
-        QTimer.singleShot(100, self._add_selectable_elements_to_plotter)  # Delayed to ensure UI is ready
+        # Initialize surface visibility checkboxes
+        QTimer.singleShot(200, self._populate_surface_checkboxes)
+        
+        # Add visualization elements with default settings
+        QTimer.singleShot(100, self._initialize_tetra_visualization)  # Delayed to ensure UI is ready
+
+    def _initialize_tetra_visualization(self):
+        """Initialize the tetra mesh tab visualization with default settings."""
+        try:
+            # Set default visualization options
+            if hasattr(self, 'show_convex_hulls_check'):
+                self.show_convex_hulls_check.setChecked(True)
+            if hasattr(self, 'show_intersections_check'):
+                self.show_intersections_check.setChecked(True)
+
+            if hasattr(self, 'highlight_selected_check'):
+                self.highlight_selected_check.setChecked(True)
+            
+            # Add all visualization elements
+            self._add_selectable_elements_to_plotter()
+            
+            logger.info("Tetra mesh visualization initialized with default settings")
+        except Exception as e:
+            logger.error(f"Error initializing tetra visualization: {e}")
+
+    def _setup_tetra_visualization_controls(self, layout):
+        """Set up visualization controls for the tetrahedral mesh tab."""
+        from PyQt5.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout, QCheckBox, 
+                                     QComboBox, QLabel, QPushButton, QRadioButton, 
+                                     QButtonGroup, QFrame)
+        
+        # Surface Visibility Controls
+        visibility_group = QGroupBox("Surface Visibility")
+        visibility_layout = QVBoxLayout(visibility_group)
+        
+        # Create scroll area for surface checkboxes
+        scroll_area = QScrollArea()
+        scroll_widget = QWidget()
+        self.surface_checkboxes_layout = QVBoxLayout(scroll_widget)
+        
+        # Dictionary to store surface visibility checkboxes
+        self.surface_visibility_checkboxes = {}
+        
+        # Add control buttons
+        control_buttons_layout = QHBoxLayout()
+        show_all_btn = QPushButton("Show All")
+        hide_all_btn = QPushButton("Hide All")
+        
+        show_all_btn.clicked.connect(self._show_all_surfaces)
+        hide_all_btn.clicked.connect(self._hide_all_surfaces)
+        
+        control_buttons_layout.addWidget(show_all_btn)
+        control_buttons_layout.addWidget(hide_all_btn)
+        
+        visibility_layout.addLayout(control_buttons_layout)
+        
+        scroll_area.setWidget(scroll_widget)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setMaximumHeight(200)  # Limit height
+        
+        visibility_layout.addWidget(scroll_area)
+        layout.addWidget(visibility_group)
+        
+        # Display Mode
+        display_group = QGroupBox("Display Mode")
+        display_layout = QVBoxLayout(display_group)
+        
+        self.display_mode_group = QButtonGroup()
+        self.show_faces_radio = QRadioButton("Faces")
+        self.show_wireframe_radio = QRadioButton("Wireframe") 
+        self.show_both_radio = QRadioButton("Both")
+        
+        self.show_faces_radio.setChecked(True)  # Default
+        
+        self.display_mode_group.addButton(self.show_faces_radio, 0)
+        self.display_mode_group.addButton(self.show_wireframe_radio, 1)
+        self.display_mode_group.addButton(self.show_both_radio, 2)
+        
+        self.display_mode_group.buttonClicked.connect(self._on_display_mode_changed)
+        
+        display_layout.addWidget(self.show_faces_radio)
+        display_layout.addWidget(self.show_wireframe_radio)
+        display_layout.addWidget(self.show_both_radio)
+        layout.addWidget(display_group)
+        
+        # Visualization Options
+        options_group = QGroupBox("Visualization Options")
+        options_layout = QVBoxLayout(options_group)
+        
+        self.show_convex_hulls_check = QCheckBox("Show Convex Hulls")
+        self.show_convex_hulls_check.stateChanged.connect(self._on_hulls_visibility_changed)
+        
+
+        
+        self.show_intersections_check = QCheckBox("Show Intersections")
+        self.show_intersections_check.stateChanged.connect(self._on_intersections_visibility_changed)
+        
+
+        
+        options_layout.addWidget(self.show_convex_hulls_check)
+        options_layout.addWidget(self.show_intersections_check)
+        layout.addWidget(options_group)
+        
+
+        
+        # Mesh Generation
+        mesh_group = QGroupBox("Mesh Generation")
+        mesh_layout = QVBoxLayout(mesh_group)
+        
+        self.generate_mesh_btn = QPushButton("🔧 Generate Tetrahedral Mesh")
+        self.generate_mesh_btn.clicked.connect(self._generate_tetrahedral_mesh)
+        self.generate_mesh_btn.setEnabled(True)  # Always enabled since we use visible surfaces
+        
+        self.export_mesh_btn = QPushButton("💾 Export Mesh")
+        self.export_mesh_btn.clicked.connect(self._export_tetrahedral_mesh)
+        self.export_mesh_btn.setEnabled(False)  # Enable after mesh generation
+        
+        mesh_layout.addWidget(self.generate_mesh_btn)
+        mesh_layout.addWidget(self.export_mesh_btn)
+        
+        layout.addWidget(mesh_group)
+
+    def _on_display_mode_changed(self):
+        """Handle display mode changes."""
+        logger.info("Display mode changed in tetra mesh tab")
+        self._update_unified_visualization(display_mode_changed=True)
+
+    def _on_hulls_visibility_changed(self, state):
+        """Handle convex hulls visibility changes."""
+        logger.info(f"Convex hulls visibility changed: {state == 2}")
+        self._update_unified_visualization(hulls_changed=True)
+
+
+
+    def _on_intersections_visibility_changed(self, state):
+        """Handle intersections visibility changes."""
+        logger.info(f"Intersections visibility changed: {state == 2}")
+        self._update_unified_visualization(intersections_changed=True)
+
+
+
+
+
+    def _has_valid_visualization_data(self, dataset):
+        """Check if dataset has valid data for visualization."""
+        # Check for constrained mesh data first
+        if ('constrained_vertices' in dataset and 'constrained_triangles' in dataset):
+            vertices = dataset.get('constrained_vertices')
+            triangles = dataset.get('constrained_triangles')
+            if self._has_valid_array_data(vertices) and self._has_valid_array_data(triangles):
+                return True
+        
+        # Check for triangulated data
+        if ('triangulated_vertices' in dataset and 'triangulated_triangles' in dataset):
+            vertices = dataset.get('triangulated_vertices')
+            triangles = dataset.get('triangulated_triangles')
+            if self._has_valid_array_data(vertices) and self._has_valid_array_data(triangles):
+                return True
+        
+        # Check for hull data
+        if 'hull_points' in dataset:
+            hull_points = dataset.get('hull_points')
+            if self._has_valid_array_data(hull_points):
+                return True
+        
+        return False
 
     def _identify_border_surfaces(self):
         """Identify which datasets are borders based on naming patterns (like C++ version)."""
@@ -7568,22 +7714,7 @@ segmentation, triangulation, and visualization.
         logger.info(f"Found {len(border_indices)} border surfaces: {border_indices}")
         return border_indices
     
-    def _on_surface_selection_changed(self, surface_index, state):
-        """Handle surface selection checkbox changes."""
-        try:
-            if state == Qt.Checked:
-                self.selected_surfaces.add(surface_index)
-                logger.info(f"Selected surface {surface_index}")
-            else:
-                self.selected_surfaces.discard(surface_index)
-                logger.info(f"Deselected surface {surface_index}")
-            
-            # Update visualization and statistics
-            self._update_selection_statistics()
-            self._update_unified_visualization(highlighting_changed=True)
-            
-        except Exception as e:
-            logger.error(f"Error handling surface selection change: {e}")
+
     def _export_tetrahedral_mesh(self):
         """Export tetrahedral mesh using the utility module."""
         if not hasattr(self, 'tetra_mesh_generator') or not self.tetrahedral_mesh:
@@ -7634,15 +7765,21 @@ segmentation, triangulation, and visualization.
         return unit_indices
     def _generate_tetrahedral_mesh(self):
         """Generate tetrahedral mesh using the new utility module."""
-        if not self.selected_surfaces:
-            QMessageBox.warning(self, "No Selection", "Please select surfaces for mesh generation.")
+        # Get visible surfaces instead of selected surfaces
+        visible_surfaces = set()
+        for i, dataset in enumerate(self.datasets):
+            if dataset.get('visible', True):
+                visible_surfaces.add(i)
+        
+        if not visible_surfaces:
+            QMessageBox.warning(self, "No Visible Surfaces", "Please make some surfaces visible for mesh generation.")
             return
         
         try:
             # Create tetrahedral mesh generator
             generator = TetrahedralMeshGenerator(
                 datasets=self.datasets,
-                selected_surfaces=self.selected_surfaces,
+                selected_surfaces=visible_surfaces,
                 border_surface_indices=self.border_surface_indices,
                 unit_surface_indices=self.unit_surface_indices,
                 fault_surface_indices=self.fault_surface_indices,
@@ -7695,20 +7832,7 @@ segmentation, triangulation, and visualization.
         if hasattr(self, 'status_bar') and self.status_bar:
             self.status_bar.showMessage(f"Selection mode: {mode}", 3000)
 
-    def _on_checkbox_changed(self, surface_index, checked):
-        """Handle checkbox state changes in surface table."""
-        if checked:
-            self.selected_surfaces.add(surface_index)
-        else:
-            self.selected_surfaces.discard(surface_index)
-        
-        # Update visualization
-        self._update_surface_selection_visual(surface_index, checked)
-        
-        # Update statistics
-        self._update_selection_statistics()
-        
-        logger.info(f"Surface {surface_index} {'selected' if checked else 'deselected'}")
+
 
     def _update_surface_selection_visual(self, surface_index, selected):
         """Update visual representation of surface selection."""
@@ -7840,11 +7964,13 @@ segmentation, triangulation, and visualization.
         
         self.reset_view_btn = QPushButton("🔄 Reset View")
         self.fit_view_btn = QPushButton("📐 Fit All")
+        self.enable_mouse_selection_btn = QPushButton("🖱️ Enable Mouse Selection")
         self.selection_info_label = QLabel("Click elements to select")
         self.selection_info_label.setStyleSheet("color: #666; font-style: italic;")
         
         viewer_controls.addWidget(self.reset_view_btn)
         viewer_controls.addWidget(self.fit_view_btn)
+        viewer_controls.addWidget(self.enable_mouse_selection_btn)
         viewer_controls.addStretch()
         viewer_controls.addWidget(self.selection_info_label)
         
@@ -7864,22 +7990,28 @@ segmentation, triangulation, and visualization.
             # Configure for interactive selection
             self.tetra_plotter.set_background([0.2, 0.2, 0.25])
             
-            # Only enable mesh picking (not both mesh and point picking)
-            self.tetra_plotter.enable_mesh_picking(callback=self._on_mesh_picked, show=False)
+            # Initialize color cycle for surfaces
+            self.color_cycle = ['lightblue', 'lightgreen', 'lightcoral', 'lightyellow', 
+                              'lightpink', 'lightcyan', 'lightgray', 'wheat', 'plum', 'khaki']
             
-            # Add selection visualization data
-            self._add_selectable_elements_to_plotter()
+            # Connect mouse selection button
+            self.enable_mouse_selection_btn.clicked.connect(
+                lambda: self._toggle_mouse_selection(not self.interactive_selection_enabled)
+            )
             
-            # Connect mouse events
+            # Connect view controls
             self.reset_view_btn.clicked.connect(self.tetra_plotter.reset_camera)
             self.fit_view_btn.clicked.connect(lambda: self.tetra_plotter.reset_camera(render=True))
             
-            logger.info("Interactive 3D viewer with selection enabled")
+            logger.info("Interactive 3D viewer with selection capability setup completed")
         else:
             placeholder = QLabel("PyVista is required for interactive selection.")
             placeholder.setAlignment(Qt.AlignCenter)
             self.tetra_plot_layout.addWidget(placeholder)
             self.tetra_plotter = None
+            
+            # Disable selection button
+            self.enable_mouse_selection_btn.setEnabled(False)
         
         layout.addWidget(self.tetra_viz_frame, 1)
 
@@ -7935,91 +8067,7 @@ segmentation, triangulation, and visualization.
         except Exception as e:
             logger.warning(f"Failed to add intersection lines: {e}")
 
-    def _add_all_constraints_to_plotter(self):
-        """Add all constraint lines to the plotter."""
-        try:
-            import pyvista as pv
-            import numpy as np
-            
-            all_constraint_points = []
-            all_constraint_lines = []
-            line_start_idx = 0
-            
-            for dataset_idx, dataset in enumerate(self.datasets):
-                # Check for stored constraints from intersection processing
-                stored_constraints = dataset.get('stored_constraints', [])
-                
-                for constraint in stored_constraints:
-                    if constraint.get('type') == 'intersection_line' and 'points' in constraint:
-                        points = constraint['points']
-                        
-                        if len(points) >= 2:
-                            # Add points to global list
-                            constraint_points = np.array([[p[0], p[1], p[2]] for p in points])
-                            all_constraint_points.extend(constraint_points)
-                            
-                            # Create line connectivity
-                            for i in range(len(points) - 1):
-                                all_constraint_lines.extend([2, line_start_idx + i, line_start_idx + i + 1])
-                            
-                            line_start_idx += len(points)
-                
-                # Check for constraint_lines in constrained meshes
-                if 'constraint_lines' in dataset:
-                    constraint_lines = dataset.get('constraint_lines', [])
-                    
-                    for line in constraint_lines:
-                        if len(line) >= 2:
-                            # Add points to global list
-                            constraint_points = np.array([[p[0], p[1], p[2]] for p in line])
-                            all_constraint_points.extend(constraint_points)
-                            
-                            # Create line connectivity
-                            for i in range(len(line) - 1):
-                                all_constraint_lines.extend([2, line_start_idx + i, line_start_idx + i + 1])
-                            
-                            line_start_idx += len(line)
-                
-                # Check for intersection constraints from constraint processing
-                if 'intersection_constraints' in dataset:
-                    intersection_constraints = dataset.get('intersection_constraints', [])
-                    
-                    for constraint in intersection_constraints:
-                        if hasattr(constraint, 'points') and len(constraint.points) >= 2:
-                            # Convert Vector3D points to list format
-                            points = []
-                            for pt in constraint.points:
-                                if hasattr(pt, 'x') and hasattr(pt, 'y') and hasattr(pt, 'z'):
-                                    points.append([pt.x, pt.y, pt.z])
-                                elif isinstance(pt, (list, tuple)) and len(pt) >= 3:
-                                    points.append([pt[0], pt[1], pt[2]])
-                            
-                            if len(points) >= 2:
-                                # Add points to global list
-                                constraint_points = np.array(points)
-                                all_constraint_points.extend(constraint_points)
-                                
-                                # Create line connectivity
-                                for i in range(len(points) - 1):
-                                    all_constraint_lines.extend([2, line_start_idx + i, line_start_idx + i + 1])
-                                
-                                line_start_idx += len(points)
-            
-            if all_constraint_points and all_constraint_lines:
-                constraint_mesh = pv.PolyData(np.array(all_constraint_points), lines=all_constraint_lines)
-                
-                self.tetra_plotter.add_mesh(
-                    constraint_mesh,
-                    color='blue',
-                    line_width=2,
-                    render_lines_as_tubes=False,
-                    name='constraint_lines'
-                )
-                
-                logger.info(f"Added {len(all_constraint_points)} constraint points")
-                
-        except Exception as e:
-            logger.warning(f"Failed to add constraint lines: {e}")
+
 
 
     def _add_surface_to_plotter(self, surface_index, vertices, triangles):
@@ -8078,6 +8126,84 @@ segmentation, triangulation, and visualization.
             
         except Exception as e:
             logger.error(f"Failed to add surface {surface_index} to plotter: {e}")
+
+    def _add_surface_with_display_mode(self, surface_index, vertices, triangles, display_mode):
+        """Add a surface with the specified display mode."""
+        if not self.tetra_plotter:
+            return
+            
+        try:
+            import pyvista as pv
+            import numpy as np
+            
+            # Convert to numpy arrays
+            vertices_array = np.array(vertices)
+            
+            # Ensure 3D coordinates
+            if vertices_array.shape[1] == 2:
+                temp_vertices = np.zeros((vertices_array.shape[0], 3))
+                temp_vertices[:, :2] = vertices_array
+                vertices_array = temp_vertices
+            
+            # Create faces array for PyVista (prepend face size)
+            faces = []
+            for tri in triangles:
+                faces.extend([3, tri[0], tri[1], tri[2]])
+            
+            # Create mesh
+            surface_mesh = pv.PolyData(vertices_array, faces)
+            
+            # Add surface metadata
+            surface_mesh.field_data['surface_id'] = np.array([surface_index])
+            surface_mesh.field_data['element_type'] = np.array(['surface'], dtype='U10')
+            
+            # Get surface type for coloring
+            surface_type = self._get_surface_type(surface_index)
+            color = self._get_surface_color(surface_type)
+            
+            # Apply display mode
+            if display_mode == "faces":
+                self.tetra_plotter.add_mesh(
+                    surface_mesh,
+                    color=color,
+                    opacity=0.7,
+                    show_edges=False,
+                    name=f'surface_faces_{surface_index}',
+                    pickable=True
+                )
+            elif display_mode == "wireframe":
+                self.tetra_plotter.add_mesh(
+                    surface_mesh,
+                    color=color,
+                    style='wireframe',
+                    line_width=2,
+                    name=f'surface_wireframe_{surface_index}',
+                    pickable=True
+                )
+            elif display_mode == "both":
+                # Add faces with transparency
+                self.tetra_plotter.add_mesh(
+                    surface_mesh,
+                    color=color,
+                    opacity=0.5,
+                    show_edges=False,
+                    name=f'surface_faces_{surface_index}',
+                    pickable=True
+                )
+                # Add wireframe
+                self.tetra_plotter.add_mesh(
+                    surface_mesh,
+                    color='black',
+                    style='wireframe',
+                    line_width=1,
+                    name=f'surface_wireframe_{surface_index}',
+                    pickable=True
+                )
+            
+            logger.debug(f"Added surface {surface_index} with display mode '{display_mode}': {len(vertices)} vertices, {len(triangles)} triangles")
+            
+        except Exception as e:
+            logger.error(f"Failed to add surface {surface_index} with display mode '{display_mode}': {e}")
 
     def _add_convex_hull_to_plotter(self, surface_idx, hull_points):
         """Add convex hull as simple boundary lines - SIMPLIFIED like pre-tetramesh."""
@@ -8197,15 +8323,52 @@ segmentation, triangulation, and visualization.
         
         try:
             # Get picked mesh info
-            if hasattr(mesh_data, 'field_data'):
-                surface_id = mesh_data['surface_id'][0] if 'surface_id' in mesh_data.array_names else None
-                element_type = mesh_data['element_type'][0] if 'element_type' in mesh_data.array_names else 'unknown'
+            if hasattr(mesh_data, 'field_data') and mesh_data.field_data:
+                surface_id = None
+                element_type = 'unknown'
+                
+                # Try to get surface_id from field_data
+                if 'surface_id' in mesh_data.field_data:
+                    surface_id = mesh_data.field_data['surface_id'][0]
+                
+                # Try to get element_type from field_data
+                if 'element_type' in mesh_data.field_data:
+                    element_type = mesh_data.field_data['element_type'][0]
+                    if isinstance(element_type, bytes):
+                        element_type = element_type.decode('utf-8')
                 
                 if surface_id is not None:
-                    self._handle_element_selection(surface_id, element_type, mesh_data)
+                    self._handle_tetra_element_selection(surface_id, element_type, mesh_data)
+                else:
+                    # Try to identify surface by mesh properties
+                    surface_id = self._identify_clicked_surface(mesh_data)
+                    if surface_id is not None:
+                        self._handle_tetra_element_selection(surface_id, 'surface', mesh_data)
                     
         except Exception as e:
             logger.warning(f"Error in mesh picking: {e}")
+
+    def _handle_tetra_element_selection(self, surface_id, element_type, mesh_data):
+        """Handle selection of a specific element in tetra mesh tab."""
+        try:
+            # Toggle surface selection
+            if surface_id in self.selected_surfaces:
+                self.selected_surfaces.remove(surface_id)
+                action = "deselected"
+            else:
+                self.selected_surfaces.add(surface_id)
+                action = "selected"
+                
+            logger.info(f"Surface {surface_id} {action} in tetra mesh tab")
+            
+            # Update visualization and UI
+            self._update_tetra_selection_stats()
+            self._update_unified_visualization(highlighting_changed=True)
+            
+            # Generate button is always enabled since we use visible surfaces
+                
+        except Exception as e:
+            logger.error(f"Error handling tetra element selection: {e}")
 
     def _handle_element_selection(self, surface_id, element_type, mesh_data):
         """Handle selection of a specific element."""
@@ -9094,16 +9257,14 @@ segmentation, triangulation, and visualization.
 
     
     def _update_unified_visualization(self, filter_changed=False, display_mode_changed=False, 
-                                     hulls_changed=False, constraints_changed=False, 
-                                     intersections_changed=False, highlighting_changed=False):
+                                     hulls_changed=False, intersections_changed=False):
         """Unified visualization update that coordinates all visualization aspects."""
         if not hasattr(self, 'tetra_plotter') or not self.tetra_plotter:
             return
             
         logger.info("Updating unified visualization...")
         
-        # Get current state
-        current_filter = self.surface_type_filter.currentText() if hasattr(self, 'surface_type_filter') else "All Surfaces"
+        # Get current state - no longer using filter dropdown
         
         # Determine current display mode
         if hasattr(self, 'show_faces_radio') and self.show_faces_radio.isChecked():
@@ -9117,12 +9278,11 @@ segmentation, triangulation, and visualization.
         
         # Get visibility states
         show_hulls = hasattr(self, 'show_convex_hulls_check') and self.show_convex_hulls_check.isChecked()
-        show_constraints = hasattr(self, 'show_constraints_check') and self.show_constraints_check.isChecked()
         show_intersections = hasattr(self, 'show_intersections_check') and self.show_intersections_check.isChecked()
-        show_highlighting = hasattr(self, 'highlight_selected_check') and self.highlight_selected_check.isChecked()
+
         
-        # Determine which surfaces should be shown based on filter
-        surfaces_to_show = self._get_filtered_surface_indices(current_filter)
+        # Determine which surfaces should be shown based on visibility checkboxes
+        surfaces_to_show = self._get_visible_surface_indices()
         
         # Clear and rebuild only if major changes
         if filter_changed or display_mode_changed:
@@ -9134,12 +9294,8 @@ segmentation, triangulation, and visualization.
             # Add all optional elements based on current state
             if show_hulls:
                 self._add_filtered_convex_hulls(surfaces_to_show)
-            if show_constraints:
-                self._add_filtered_constraints(surfaces_to_show)
             if show_intersections:
                 self._add_filtered_intersections(surfaces_to_show)
-            if show_highlighting:
-                self._apply_filtered_highlighting(surfaces_to_show)
                 
         else:
             # Minor changes - only update specific elements
@@ -9148,58 +9304,35 @@ segmentation, triangulation, and visualization.
                 if show_hulls:
                     self._add_filtered_convex_hulls(surfaces_to_show)
                     
-            if constraints_changed:
-                self._remove_constraints_from_plotter()
-                if show_constraints:
-                    self._add_filtered_constraints(surfaces_to_show)
-                    
             if intersections_changed:
                 self._remove_intersections_from_plotter()
                 if show_intersections:
                     self._add_filtered_intersections(surfaces_to_show)
-                    
-            if highlighting_changed:
-                if show_highlighting:
-                    self._apply_filtered_highlighting(surfaces_to_show)
-                else:
-                    self._remove_selection_highlighting()
         
         # Reset camera if major rebuild
         if filter_changed or display_mode_changed:
             if surfaces_to_show:
                 self.tetra_plotter.reset_camera()
             else:
-                # Show message when no surfaces match filter
+                # Show message when no surfaces are visible
                 try:
                     import pyvista as pv
-                    text_mesh = pv.Text3D(f"No surfaces match filter: {current_filter}", depth=0.1)
+                    text_mesh = pv.Text3D("No surfaces visible", depth=0.1)
                     self.tetra_plotter.add_mesh(text_mesh, color='red')
                 except:
                     pass
         
-        logger.info(f"Unified visualization updated - Filter: {current_filter}, Display: {display_mode}, Surfaces: {len(surfaces_to_show)}")
+        logger.info(f"Unified visualization updated - Display: {display_mode}, Visible surfaces: {len(surfaces_to_show)}")
     
-    def _get_filtered_surface_indices(self, filter_type):
-        """Get list of surface indices that match the current filter."""
+    def _get_visible_surface_indices(self):
+        """Get list of surface indices that are currently set to visible."""
         surfaces_to_show = []
         
         for i, dataset in enumerate(self.datasets):
-            surface_type = self._get_surface_type(i)
+            # Check if surface is marked as visible
+            is_visible = dataset.get('visible', True)  # Default to visible
             
-            # Determine if this surface should be shown
-            show_surface = False
-            if filter_type == "All Surfaces":
-                show_surface = True
-            elif filter_type == "Units Only":
-                show_surface = surface_type == "UNIT"
-            elif filter_type == "Faults Only":
-                show_surface = surface_type == "FAULT"
-            elif filter_type == "Borders Only":
-                show_surface = surface_type == "BORDER"
-            elif filter_type == "Selected Types":
-                show_surface = i in self.selected_surfaces
-            
-            if show_surface:
+            if is_visible:
                 surfaces_to_show.append(i)
         
         return surfaces_to_show
@@ -9215,10 +9348,6 @@ segmentation, triangulation, and visualization.
                     
                     if self._has_valid_array_data(vertices) and self._has_valid_array_data(triangles):
                         self._add_surface_with_display_mode(surface_index, vertices, triangles, display_mode)
-                        
-                        # Update selection highlighting if surface is selected
-                        if surface_index in self.selected_surfaces:
-                            self._highlight_surface_in_plotter(surface_index)
                             
         except Exception as e:
             logger.error(f"Error adding filtered surfaces: {e}")
@@ -9249,304 +9378,161 @@ segmentation, triangulation, and visualization.
             logger.error(f"Error validating hull points: {e}")
             return None
     def _add_filtered_convex_hulls(self, surface_indices):
-        """Add convex hulls only for filtered surfaces."""
-        try:
-            logger.info(f"Adding convex hulls for surface indices: {surface_indices}")
-            
-            for i in surface_indices:
-                dataset = self.datasets[i]
-                hull_points = dataset.get('hull_points')
-                
-                # Detailed debugging of what's actually in the dataset
-                logger.debug(f"Surface {i}: Dataset keys = {list(dataset.keys())}")
-                logger.debug(f"Surface {i}: hull_points type = {type(hull_points)}")
-                
-                if hull_points is not None:
-                    logger.debug(f"Surface {i}: hull_points shape = {hull_points.shape if hasattr(hull_points, 'shape') else 'no shape'}")
-                    logger.debug(f"Surface {i}: hull_points length = {len(hull_points) if hull_points is not None else 'None'}")
-                    logger.debug(f"Surface {i}: hull_points dtype = {hull_points.dtype if hasattr(hull_points, 'dtype') else 'no dtype'}")
-                    
-                    # Enhanced debugging - show actual content
-                    if hasattr(hull_points, '__len__') and len(hull_points) > 0:
-                        logger.debug(f"Surface {i}: First hull point = {hull_points[0]}")
-                        logger.debug(f"Surface {i}: First hull point type = {type(hull_points[0])}")
-                        if len(hull_points) > 1:
-                            logger.debug(f"Surface {i}: Second hull point = {hull_points[1]}")
-                    
-                    # Check what _has_valid_array_data returns
-                    is_valid = self._has_valid_array_data(hull_points)
-                    logger.debug(f"Surface {i}: _has_valid_array_data result = {is_valid}")
-                    
-                    # If not valid, let's see why
-                    if not is_valid:
-                        logger.debug(f"Surface {i}: hull_points content sample = {hull_points[:3] if hasattr(hull_points, '__len__') and len(hull_points) > 0 else 'empty or no len'}")
-                    
-                    # If not valid, let's see why
-                    if not is_valid:
-                        logger.debug(f"Surface {i}: hull_points content sample = {hull_points[:3] if hasattr(hull_points, '__len__') and len(hull_points) > 0 else 'empty or no len'}")
-                        
-                else:
-                    logger.debug(f"Surface {i}: No hull_points found in dataset")
-                    # Let's check if hull data might be stored under a different key
-                    potential_keys = ['convex_hull', 'hull', 'hull_data', 'convex_hull_points']
-                    for key in potential_keys:
-                        if key in dataset:
-                            logger.debug(f"Surface {i}: Found potential hull data under key '{key}': {type(dataset[key])}")
-                
-                # Try to display hull - bypass validation if data exists
-                if hull_points is not None:
-                    # Try validation first
-                    is_valid = self._has_valid_array_data(hull_points)
-                    
-                    if is_valid:
-                        logger.info(f"Adding convex hull for surface {i}")
-                        self._add_convex_hull_to_plotter(i, hull_points)
-                        logger.debug(f"Added convex hull for surface {i}")
-                    else:
-                        # Hull data exists but validation failed - try to force it anyway
-                        logger.warning(f"Hull validation failed for surface {i}, attempting anyway...")
-                        logger.debug(f"Surface {i}: hull_points shape = {getattr(hull_points, 'shape', 'no shape')}")
-                        logger.debug(f"Surface {i}: hull_points dtype = {getattr(hull_points, 'dtype', 'no dtype')}")
-                        logger.debug(f"Surface {i}: First element = {hull_points[0] if hasattr(hull_points, '__len__') and len(hull_points) > 0 else 'empty'}")
-                        
-                        try:
-                            self._add_convex_hull_to_plotter(i, hull_points)
-                            logger.info(f"Successfully forced hull display for surface {i}")
-                        except Exception as e:
-                            logger.error(f"Failed to force hull display for surface {i}: {e}")
-                            logger.warning(f"Skipping convex hull for surface {i}: {e}")
-                else:
-                    # Check for hull data under different keys
-                    potential_keys = ['convex_hull', 'hull', 'hull_data', 'convex_hull_points']
-                    found_hull = False
-                    for key in potential_keys:
-                        if key in dataset:
-                            logger.debug(f"Surface {i}: Found potential hull data under key '{key}'")
-                            try:
-                                self._add_convex_hull_to_plotter(i, dataset[key])
-                                logger.info(f"Successfully added hull from key '{key}' for surface {i}")
-                                found_hull = True
-                                break
-                            except Exception as e:
-                                logger.debug(f"Failed to use hull data from key '{key}': {e}")
-                    
-                    if not found_hull:
-                        logger.warning(f"No valid hull data found for surface {i}")
-                            
-        except Exception as e:
-            logger.error(f"Error adding filtered convex hulls: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-
-    def _parse_hull_points_manually(self, hull_points, surface_index):
-        """Manually parse hull points with specific handling for different formats."""
-        try:
-            import numpy as np
-            import ast
-            import re
-            
-            logger.debug(f"Manually parsing hull points for surface {surface_index}")
-            
-            # Convert to numpy array first
-            if not isinstance(hull_points, np.ndarray):
-                hull_points = np.array(hull_points)
-            
-            # Handle different data types
-            if hull_points.dtype == object:
-                logger.debug("Hull points are object dtype, extracting...")
-                extracted_points = []
-                
-                for item in hull_points.flat:
-                    logger.debug(f"Processing hull point item: {type(item)}, value: {item}")
-                    
-                    if isinstance(item, str):
-                        # Try to parse string representation
-                        try:
-                            # Remove any brackets and split by common delimiters
-                            cleaned = str(item).strip('[]() ')
-                            # Try different parsing methods
-                            if ',' in cleaned:
-                                coords = [float(x.strip()) for x in cleaned.split(',') if x.strip()]
-                                extracted_points.append(coords)
-                            elif ' ' in cleaned:
-                                coords = [float(x.strip()) for x in cleaned.split() if x.strip()]
-                                extracted_points.append(coords)
-                            else:
-                                # Try regex to extract numbers
-                                numbers = re.findall(r'-?\d+\.?\d*(?:[eE][+-]?\d+)?', cleaned)
-                                if len(numbers) >= 2:
-                                    coords = [float(n) for n in numbers[:3]]  # Take up to 3 coordinates
-                                    if len(coords) == 2:
-                                        coords.append(0.0)  # Add z=0 for 2D points
-                                    extracted_points.append(coords)
-                        except Exception as e:
-                            logger.debug(f"Failed to parse hull point string '{item}': {e}")
-                            
-                    elif isinstance(item, (list, tuple)):
-                        try:
-                            coords = [float(x) for x in item]
-                            if len(coords) == 2:
-                                coords.append(0.0)  # Add z=0 for 2D points
-                            if len(coords) >= 3:
-                                extracted_points.append(coords[:3])
-                        except Exception as e:
-                            logger.debug(f"Failed to parse hull point list/tuple '{item}': {e}")
-                            
-                    elif isinstance(item, (int, float)):
-                        # Single number - might be part of a coordinate
-                        try:
-                            extracted_points.append([float(item)])
-                        except:
-                            pass
-                
-                if extracted_points:
-                    # Convert to numpy array
-                    try:
-                        points_array = np.array(extracted_points)
-                        if points_array.ndim == 1:
-                            # Flatten and reshape
-                            flat_points = points_array.flatten()
-                            if len(flat_points) % 3 == 0:
-                                points_array = flat_points.reshape(-1, 3)
-                            elif len(flat_points) % 2 == 0:
-                                points_2d = flat_points.reshape(-1, 2)
-                                points_array = np.column_stack((points_2d, np.zeros(len(points_2d))))
-                            else:
-                                logger.warning(f"Invalid number of coordinates for hull points: {len(flat_points)}")
-                                return None
-                        elif points_array.shape[1] == 2:
-                            # 2D points, add z=0
-                            points_array = np.column_stack((points_array, np.zeros(len(points_array))))
-                        
-                        if points_array.shape[1] >= 3:
-                            logger.info(f"Successfully parsed {len(points_array)} hull points for surface {surface_index}")
-                            return points_array[:, :3].astype(np.float64)
-                            
-                    except Exception as e:
-                        logger.debug(f"Failed to convert extracted hull points to array: {e}")
-            
-            elif hull_points.dtype.kind in ['U', 'S']:
-                logger.debug("Hull points are string dtype")
-                # Handle string arrays
-                extracted_points = []
-                for item in hull_points.flat:
-                    try:
-                        item_str = str(item).strip('[]() ')
-                        if ',' in item_str:
-                            coords = [float(x.strip()) for x in item_str.split(',') if x.strip()]
-                        else:
-                            coords = [float(x.strip()) for x in item_str.split() if x.strip()]
-                        
-                        if len(coords) == 2:
-                            coords.append(0.0)  # Add z=0 for 2D points
-                        if len(coords) >= 3:
-                            extracted_points.append(coords[:3])
-                    except Exception as e:
-                        logger.debug(f"Failed to parse string hull point '{item}': {e}")
-                
-                if extracted_points:
-                    try:
-                        points_array = np.array(extracted_points, dtype=np.float64)
-                        logger.info(f"Successfully parsed {len(points_array)} string hull points for surface {surface_index}")
-                        return points_array
-                    except Exception as e:
-                        logger.debug(f"Failed to convert string hull points to array: {e}")
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error manually parsing hull points for surface {surface_index}: {e}")
-            return None
-    def _add_filtered_constraints(self, surface_indices):
-        """Add constraints only for filtered surfaces."""
-        try:
-            # First try constrained constraints from pre-tetramesh
-            for i in surface_indices:
-                dataset = self.datasets[i]
-                if 'constrained_constraints' in dataset:
-                    constraints = dataset.get('constrained_constraints')
-                    if constraints is not None and self._has_valid_array_data(constraints):
-                        self._add_constraints_to_plotter(i, constraints)
-                elif 'constraints' in dataset:
-                    # Fall back to original constraints
-                    constraints = dataset.get('constraints')
-                    if constraints is not None and self._has_valid_array_data(constraints):
-                        self._add_constraints_to_plotter(i, constraints)
-                        
-                # Also check for constraint lines from pre-tetramesh
-                if 'constraint_lines' in dataset:
-                    constraint_lines = dataset.get('constraint_lines', [])
-                    for line_idx, line in enumerate(constraint_lines):
-                        if line is not None and self._has_valid_array_data(line):
-                            self._add_constraint_line_to_plotter(i, line_idx, line)
-        except Exception as e:
-            logger.error(f"Error adding filtered constraints: {e}")
-
-    def _add_constraint_line_to_plotter(self, surface_index, line_idx, points):
-        """Add a constraint line to the plotter with proper validation."""
+        """Add convex hulls using the simple approach from pre-tetra mesh tab."""
         try:
             import pyvista as pv
             import numpy as np
             
-            # Validate and convert points
-            validated_points = self._validate_and_convert_points(points, f"constraint_line_{surface_index}_{line_idx}")
-            if validated_points is None:
-                logger.warning(f"Invalid constraint line points for surface {surface_index}, line {line_idx}")
-                return
+            for i in surface_indices:
+                dataset = self.datasets[i]
+                dataset_name = dataset.get('name', f'Dataset_{i}')
                 
-            # Create line cells
-            n_points = len(validated_points)
-            if n_points < 2:
-                return
+                # Get hull points from dataset (like pre-tetra mesh tab does)
+                hull_points = dataset.get('hull_points')
+                if hull_points is None or len(hull_points) == 0:
+                    logger.warning(f"No hull_points found for surface {i}")
+                    continue
                 
-            cells = np.full((n_points - 1, 3), 2, dtype=np.int32)  # 2 points per line
-            cells[:, 1] = np.arange(n_points - 1, dtype=np.int32)
-            cells[:, 2] = np.arange(1, n_points, dtype=np.int32)
-            cells = cells.ravel()
-            
-            # Create line mesh
-            line = pv.UnstructuredGrid({pv.CellType.LINE: cells}, validated_points)
-            
-            # Add to plotter with unique name
-            actor_name = f"constraint_line_{surface_index}_{line_idx}"
-            self.tetra_plotter.add_mesh(line, color='blue', line_width=2, name=actor_name)
+                # Convert hull points to numpy array, handling different formats safely
+                try:
+                    # First, let's see what we're dealing with
+                    if len(hull_points) == 0:
+                        continue
+                    
+                    # Handle [x,y,z,type] format where type might be string
+                    if isinstance(hull_points[0], (list, tuple, np.ndarray)) and len(hull_points[0]) >= 3:
+                        # Extract just the numeric x,y,z coordinates (ignore type at index 3)
+                        constraint_points = []
+                        for pt in hull_points:
+                            try:
+                                # Convert first 3 elements to float, ignore the rest
+                                x, y, z = float(pt[0]), float(pt[1]), float(pt[2])
+                                constraint_points.append([x, y, z])
+                            except (ValueError, TypeError, IndexError) as e:
+                                logger.debug(f"Skipping invalid point {pt}: {e}")
+                                continue
+                        constraint_points = np.array(constraint_points, dtype=np.float64)
+                    else:
+                        # Try direct conversion for simple numeric arrays
+                        constraint_points = np.array(hull_points, dtype=np.float64)
+                except Exception as e:
+                    logger.warning(f"Failed to convert hull_points for surface {i}: {e}")
+                    continue
+                
+                if len(constraint_points) < 2:
+                    continue
+                
+                # Close the loop for hull (exactly like pre-tetra mesh tab does)
+                constraint_points_closed = np.vstack([constraint_points, constraint_points[0:1]])
+                
+                # Create line mesh exactly like pre-tetra mesh tab
+                line_mesh = pv.PolyData(constraint_points_closed)
+                line_mesh.lines = np.hstack([[2, i, i+1] for i in range(len(constraint_points_closed)-1)])
+                
+                # Add to plotter with same styling as pre-tetra mesh tab
+                self.tetra_plotter.add_mesh(
+                    line_mesh,
+                    color='red',  # Hull boundary color from pre-tetra mesh tab
+                    line_width=4,  # Hull boundary width from pre-tetra mesh tab
+                    name=f'{dataset_name}_hull_boundary',
+                    style='wireframe'
+                )
+                
+                logger.info(f"Added simple convex hull for surface {i} with {len(constraint_points)} points")
             
         except Exception as e:
-            logger.error(f"Error adding constraint line to plotter: {e}")
+            logger.error(f"Error adding convex hulls: {e}")
+
+
+
+    def _removed_boundary_hull_method(self, surface_index, coords):
+        """UNUSED - Create a simple boundary wireframe when convex hull fails."""
+        # This method is no longer used - the new simple convex hull approach works better
+        return
+        try:
+            import pyvista as pv
+            import numpy as np
+            
+            # Find boundary points by taking every Nth point to create a rough boundary
+            if len(coords) > 20:
+                # Sample points for large datasets
+                step = max(1, len(coords) // 20)
+                boundary_coords = coords[::step]
+            else:
+                boundary_coords = coords
+            
+            # Create lines connecting consecutive boundary points
+            lines = []
+            n_points = len(boundary_coords)
+            for i in range(n_points):
+                lines.extend([2, i, (i + 1) % n_points])
+            
+            # Create simple boundary mesh
+            boundary_mesh = pv.PolyData(boundary_coords)
+            if lines:
+                boundary_mesh.lines = np.array(lines, dtype=np.int32)
+            
+            # Add to tetra plotter
+            self.tetra_plotter.add_mesh(
+                boundary_mesh,
+                color='orange',  # Different color to indicate it's a simple boundary
+                line_width=2,
+                style='wireframe',
+                name=f'convex_hull_{surface_index}',
+                pickable=True
+            )
+            
+            logger.info(f"Added simple boundary wireframe for surface {surface_index}")
+            
+        except Exception as e:
+            logger.error(f"Even simple boundary failed for surface {surface_index}: {e}")
+
+    def _parse_hull_points_manually(self, hull_points, surface_index):
+        """Simplified hull points parsing that skips problematic data."""
+        try:
+            import numpy as np
+            
+            # Skip parsing complex object arrays for now to avoid errors
+            if isinstance(hull_points, np.ndarray) and hull_points.dtype == object:
+                logger.debug(f"Skipping object dtype hull data for surface {surface_index} to avoid parsing issues")
+                return None
+            
+            # For simple numeric arrays, try basic conversion
+            if isinstance(hull_points, (list, tuple, np.ndarray)):
+                try:
+                    points_array = np.array(hull_points, dtype=np.float64)
+                    
+                    # Ensure it's a 2D array
+                    if points_array.ndim == 1:
+                        if len(points_array) % 2 == 0:
+                            points_array = points_array.reshape(-1, 2)
+                        else:
+                            return None
+                    
+                    # Add z=0 if only 2D coordinates
+                    if points_array.shape[1] == 2:
+                        z_column = np.zeros((points_array.shape[0], 1))
+                        points_array = np.hstack([points_array, z_column])
+                    
+                    if points_array.shape[1] >= 3 and len(points_array) >= 3:
+                        logger.info(f"Successfully parsed {len(points_array)} hull points for surface {surface_index}")
+                        return points_array[:, :3]
+                        
+                except Exception as e:
+                    logger.debug(f"Failed basic hull parsing for surface {surface_index}: {e}")
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Error parsing hull points for surface {surface_index}: {e}")
+            return None
+
+
+
 
                 
     
-    def _add_constraints_to_plotter(self, surface_index, constraints):
-        """Add constraints for a surface to the plotter with proper validation."""
-        try:
-            import pyvista as pv
-            import numpy as np
-            
-            # Validate and convert constraints
-            validated_constraints = self._validate_and_convert_points(constraints, f"constraints_{surface_index}")
-            if validated_constraints is None:
-                logger.warning(f"Invalid constraints for surface {surface_index}")
-                return
-                
-            # Create line cells for each constraint segment
-            n_points = len(validated_constraints)
-            if n_points < 2:
-                return
-                
-            cells = np.full((n_points - 1, 3), 2, dtype=np.int32)  # 2 points per line
-            cells[:, 1] = np.arange(n_points - 1, dtype=np.int32)
-            cells[:, 2] = np.arange(1, n_points, dtype=np.int32)
-            cells = cells.ravel()
-            
-            # Create line mesh
-            line = pv.UnstructuredGrid({pv.CellType.LINE: cells}, validated_constraints)
-            
-            # Add to plotter with unique name
-            actor_name = f"constraints_{surface_index}"
-            self.tetra_plotter.add_mesh(line, color='blue', line_width=2, name=actor_name)
-            
-        except Exception as e:
-            logger.error(f"Error adding constraints to plotter: {e}")
+
 
         
     def _add_filtered_intersections(self, surface_indices):
@@ -9687,6 +9673,78 @@ segmentation, triangulation, and visualization.
                     self._update_surface_selection_visual(surface_index, True)
         except Exception as e:
             logger.error(f"Error applying filtered highlighting: {e}")
+
+    def _remove_convex_hulls_from_plotter(self):
+        """Remove all convex hulls from the plotter."""
+        if not self.tetra_plotter:
+            return
+            
+        try:
+            # Remove all convex hull actors (both old and new naming patterns)
+            actors_to_remove = []
+            for actor_name in self.tetra_plotter.renderer.actors:
+                actor_str = str(actor_name)
+                if ('convex_hull' in actor_str or 
+                    'hull_boundary' in actor_str or 
+                    'hull_wireframe' in actor_str or 
+                    'hull_faces' in actor_str):
+                    actors_to_remove.append(actor_name)
+            
+            for actor_name in actors_to_remove:
+                try:
+                    self.tetra_plotter.remove_actor(actor_name)
+                except:
+                    pass
+            
+            logger.info(f"Removed {len(actors_to_remove)} convex hull actors from plotter")
+        except Exception as e:
+            logger.error(f"Error removing convex hulls: {e}")
+
+
+
+    def _remove_intersections_from_plotter(self):
+        """Remove all intersections from the plotter."""
+        if not self.tetra_plotter:
+            return
+            
+        try:
+            # Remove all intersection actors
+            actors_to_remove = []
+            for actor_name in self.tetra_plotter.renderer.actors:
+                if 'intersection' in str(actor_name) or 'triple_points' in str(actor_name):
+                    actors_to_remove.append(actor_name)
+            
+            for actor_name in actors_to_remove:
+                try:
+                    self.tetra_plotter.remove_actor(actor_name)
+                except:
+                    pass
+            
+            logger.debug("Removed intersections from plotter")
+        except Exception as e:
+            logger.error(f"Error removing intersections: {e}")
+
+    def _remove_selection_highlighting(self):
+        """Remove all selection highlighting from the plotter."""
+        if not self.tetra_plotter:
+            return
+            
+        try:
+            # Remove all highlighting actors
+            actors_to_remove = []
+            for actor_name in self.tetra_plotter.renderer.actors:
+                if 'highlight' in str(actor_name):
+                    actors_to_remove.append(actor_name)
+            
+            for actor_name in actors_to_remove:
+                try:
+                    self.tetra_plotter.remove_actor(actor_name)
+                except:
+                    pass
+            
+            logger.debug("Removed selection highlighting from plotter")
+        except Exception as e:
+            logger.error(f"Error removing selection highlighting: {e}")
     
     def _add_hull_surface_to_plotter_with_mode(self, surface_index, hull_points, display_mode):
         """Add hull surface to plotter with specified display mode."""
@@ -10044,43 +10102,68 @@ segmentation, triangulation, and visualization.
     
     
 
-    def _on_surface_type_filter_changed(self, filter_type):
-        """Handle surface type filter changes - actually filter what's displayed."""
-        logger.info(f"Surface type filter changed to: {filter_type}")
-        
-        # Show/hide rows based on filter
-        for i in range(self.surface_table.rowCount()):
-            type_item = self.surface_table.item(i, 2)  # Type column
-            show_row = True
+    def _show_all_surfaces(self):
+        """Show all surfaces by checking all visibility checkboxes."""
+        for checkbox in self.surface_visibility_checkboxes.values():
+            checkbox.setChecked(True)
+        logger.info("Showing all surfaces")
+    
+    def _hide_all_surfaces(self):
+        """Hide all surfaces by unchecking all visibility checkboxes."""
+        for checkbox in self.surface_visibility_checkboxes.values():
+            checkbox.setChecked(False)
+        logger.info("Hiding all surfaces")
+    
+    def _on_surface_visibility_changed(self, surface_index, is_visible):
+        """Handle individual surface visibility changes."""
+        if 0 <= surface_index < len(self.datasets):
+            # Store visibility state in dataset
+            self.datasets[surface_index]['visible'] = is_visible
+            surface_name = self.datasets[surface_index].get('name', f'Surface_{surface_index}')
+            logger.info(f"Surface '{surface_name}' visibility changed to: {is_visible}")
             
-            if type_item:
-                type_text = type_item.text().upper()
-                
-                if filter_type == "Units Only":
-                    show_row = "UNIT" in type_text
-                elif filter_type == "Faults Only":
-                    show_row = "FAULT" in type_text
-                elif filter_type == "Borders Only":
-                    show_row = "BORDER" in type_text
-                elif filter_type == "All Surfaces":
-                    show_row = True
-                elif filter_type == "Selected Types":
-                    # Show only selected surfaces
-                    name_item = self.surface_table.item(i, 1)
-                    if name_item:
-                        # Find corresponding surface index
-                        surface_name = name_item.text()
-                        surface_index = None
-                        for idx, dataset in enumerate(self.datasets):
-                            if dataset.get('name', f'Surface_{idx}') == surface_name:
-                                surface_index = idx
-                                break
-                        show_row = surface_index in self.selected_surfaces if surface_index is not None else False
-            
-            self.surface_table.setRowHidden(i, not show_row)
+                         # Update visualization
+            self._update_unified_visualization(filter_changed=True)
+    
+    def _populate_surface_checkboxes(self):
+        """Populate surface visibility checkboxes based on current datasets."""
+        # Clear existing checkboxes
+        for checkbox in self.surface_visibility_checkboxes.values():
+            checkbox.deleteLater()
+        self.surface_visibility_checkboxes.clear()
         
-        # Update visualization using unified system that respects current display mode
-        self._update_unified_visualization(filter_changed=True)
+        # Clear layout
+        while self.surface_checkboxes_layout.count():
+            child = self.surface_checkboxes_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        
+        # Add checkbox for each dataset
+        for i, dataset in enumerate(self.datasets):
+            surface_name = dataset.get('name', f'Surface_{i}')
+            
+            # Create checkbox
+            checkbox = QCheckBox(surface_name)
+            
+            # Set initial state (default to visible)
+            is_visible = dataset.get('visible', True)
+            checkbox.setChecked(is_visible)
+            
+            # Connect to handler with lambda to capture index
+            checkbox.stateChanged.connect(
+                lambda state, idx=i: self._on_surface_visibility_changed(idx, state == 2)
+            )
+            
+            # Store reference
+            self.surface_visibility_checkboxes[i] = checkbox
+            
+            # Add to layout
+            self.surface_checkboxes_layout.addWidget(checkbox)
+        
+        # Add stretch to push checkboxes to top
+        self.surface_checkboxes_layout.addStretch()
+        
+        logger.info(f"Populated {len(self.datasets)} surface visibility checkboxes")
 
 
 
@@ -10303,8 +10386,9 @@ segmentation, triangulation, and visualization.
         if hasattr(self, 'tetra_stats_label'):
             self.tetra_stats_label.setText("No tetrahedral mesh generated yet.")
         
-        # Clear selected surfaces
-        self.selected_surfaces = set()
+        # Reset surface visibility to default
+        for dataset in self.datasets:
+            dataset['visible'] = True
         
         # Update surface table
         if hasattr(self, '_update_surface_table'):
