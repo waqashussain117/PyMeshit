@@ -234,6 +234,168 @@ class ComputationWorker(QObject):
         logger.info(f"Worker: Global intersection task finished. Success: {success}. Elapsed: {elapsed_time:.2f}s.")
 
 
+class SurfaceConstraintManager:
+    """Manages surface subdivision into selectable constraint segments"""
+    
+    def __init__(self):
+        self.surface_constraints = {}  # surface_id -> list of constraint segments
+        self.constraint_rgb_map = {}   # RGB tuple -> (surface_id, constraint_id)
+        self.constraint_states = {}    # (surface_id, constraint_id) -> "SEGMENTS"/"UNDEFINED"/"HOLES"
+        self.next_rgb_color = [1, 0, 0]  # Start with red
+        
+    def generate_constraints_from_pre_tetra_data(self, datasets):
+        """Generate selectable constraints from pre-tetra mesh tab data"""
+        for surface_idx, dataset in enumerate(datasets):
+            if not self._has_constrained_mesh_data(dataset):
+                continue
+                
+            constraints = []
+            
+            # 1. Hull boundary constraints (like C++ ConvexHull.Ns segments)
+            hull_points = dataset.get('hull_points', [])
+            if len(hull_points) > 2:
+                hull_constraint = self._create_hull_constraint(hull_points, surface_idx)
+                constraints.append(hull_constraint)
+            
+            # 2. Intersection line constraints (like C++ Intersections)
+            intersection_constraints = dataset.get('intersection_constraints', [])
+            for intersection_line in intersection_constraints:
+                if len(intersection_line) >= 2:
+                    intersection_constraint = self._create_intersection_constraint(
+                        intersection_line, surface_idx
+                    )
+                    constraints.append(intersection_constraint)
+            
+            # Store constraints for this surface
+            self.surface_constraints[surface_idx] = constraints
+            
+            # Initialize all constraints as "UNDEFINED" (unselected)
+            for i, constraint in enumerate(constraints):
+                constraint_key = (surface_idx, i)
+                self.constraint_states[constraint_key] = "UNDEFINED"
+                
+        logger.info(f"Generated constraints for {len(self.surface_constraints)} surfaces")
+    
+    def _has_constrained_mesh_data(self, dataset):
+        """Check if dataset has constrained mesh data"""
+        constrained_vertices = dataset.get('constrained_vertices')
+        constrained_triangles = dataset.get('constrained_triangles')
+        return (constrained_vertices is not None and constrained_triangles is not None and 
+                len(constrained_vertices) > 0 and len(constrained_triangles) > 0)
+    
+    def _create_hull_constraint(self, hull_points, surface_idx):
+        """Create constraint from hull boundary"""
+        # Split hull into segments at special points (like C++ logic)
+        segments = []
+        current_segment = [hull_points[0]]
+        
+        for i in range(1, len(hull_points)):
+            point = hull_points[i]
+            current_segment.append(point)
+            
+            # Check if this is a special point (end of segment)
+            point_type = point[3] if len(point) > 3 else "DEFAULT"
+            if point_type != "DEFAULT" or i == len(hull_points) - 1:
+                if len(current_segment) >= 2:
+                    rgb_color = self._get_next_rgb_color()
+                    segments.append({
+                        'points': current_segment.copy(),
+                        'type': 'HULL_BOUNDARY',
+                        'rgb': rgb_color,
+                        'surface_id': surface_idx
+                    })
+                    self.constraint_rgb_map[tuple(rgb_color)] = (surface_idx, len(segments)-1)
+                current_segment = [point]  # Start new segment
+        
+        return {
+            'type': 'HULL_BOUNDARY',
+            'segments': segments,
+            'total_points': len(hull_points)
+        }
+    
+    def _create_intersection_constraint(self, intersection_line, surface_idx):
+        """Create constraint from intersection line"""
+        segments = []
+        current_segment = [intersection_line[0]]
+        
+        for i in range(1, len(intersection_line)):
+            point = intersection_line[i]
+            current_segment.append(point)
+            
+            # Check for special points to break segments
+            point_type = point[3] if len(point) > 3 else "DEFAULT"
+            if point_type != "DEFAULT" or i == len(intersection_line) - 1:
+                if len(current_segment) >= 2:
+                    rgb_color = self._get_next_rgb_color()
+                    segments.append({
+                        'points': current_segment.copy(),
+                        'type': 'INTERSECTION_LINE',
+                        'rgb': rgb_color,
+                        'surface_id': surface_idx
+                    })
+                    self.constraint_rgb_map[tuple(rgb_color)] = (surface_idx, len(segments)-1)
+                current_segment = [point]
+        
+        return {
+            'type': 'INTERSECTION_LINE', 
+            'segments': segments,
+            'total_points': len(intersection_line)
+        }
+    
+    def _get_next_rgb_color(self):
+        """Generate unique RGB color for constraint identification (like C++ logic)"""
+        color = self.next_rgb_color.copy()
+        
+        # Increment RGB like C++: R->G->B->R+1
+        self.next_rgb_color[0] += 1
+        if self.next_rgb_color[0] > 255:
+            self.next_rgb_color[0] = 0
+            self.next_rgb_color[1] += 1
+            if self.next_rgb_color[1] > 255:
+                self.next_rgb_color[1] = 0
+                self.next_rgb_color[2] += 1
+                if self.next_rgb_color[2] > 255:
+                    self.next_rgb_color[2] = 0
+        
+        return color
+    
+    def get_selected_surfaces(self):
+        """Get surfaces that have at least one constraint marked as SEGMENTS"""
+        selected_surfaces = []
+        for surface_idx, constraints in self.surface_constraints.items():
+            has_selected_constraints = False
+            for constraint_idx, constraint in enumerate(constraints):
+                constraint_key = (surface_idx, constraint_idx)
+                if self.constraint_states.get(constraint_key) == "SEGMENTS":
+                    has_selected_constraints = True
+                    break
+            
+            if has_selected_constraints:
+                selected_surfaces.append(surface_idx)
+        
+        return selected_surfaces
+    
+    def get_constraint_summary(self):
+        """Get summary of constraint selection states"""
+        total_constraints = 0
+        selected_constraints = 0
+        hole_constraints = 0
+        
+        for constraint_key, state in self.constraint_states.items():
+            total_constraints += 1
+            if state == "SEGMENTS":
+                selected_constraints += 1
+            elif state == "HOLES":
+                hole_constraints += 1
+        
+        return {
+            'total': total_constraints,
+            'selected': selected_constraints,
+            'holes': hole_constraints,
+            'undefined': total_constraints - selected_constraints - hole_constraints
+        }
+
+
 class MeshItWorkflowGUI(QMainWindow):
     # Define a color cycle for datasets
     DEFAULT_COLORS = [
@@ -7491,15 +7653,21 @@ segmentation, triangulation, and visualization.
             self.statusBar().showMessage(f"Validation failed: {str(e)}")
     
     def _setup_tetra_mesh_tab(self):
-        """Sets up the Tetrahedral Mesh Generation tab with complete visualization."""
-        # Initialize minimal data structures needed for visualization
+        """Enhanced tetra mesh tab with advanced constraint selection capabilities"""
+        
+        # Initialize data structures
         self.tetra_materials = []
         self.selected_surface_parts = {}
         self.tetrahedral_mesh = None
         self.surface_quality_data = {}
         self.interactive_selection_enabled = False
+        self.constraint_selection_enabled = False
+        self.constraint_visualization_mode = "NORMAL"  # "NORMAL" or "SELECTION"
         
-        # Border recognition - identify border files by name patterns (needed for visualization)
+        # Initialize constraint manager
+        self.constraint_manager = SurfaceConstraintManager()
+        
+        # Border recognition
         self.border_surface_indices = self._identify_border_surfaces()
         self.unit_surface_indices = self._identify_unit_surfaces()
         self.fault_surface_indices = self._identify_fault_surfaces()
@@ -7507,34 +7675,712 @@ segmentation, triangulation, and visualization.
         # Create main layout
         tab_layout = QHBoxLayout(self.tetra_mesh_tab)
         
-        # === Control Panel ===
-        control_group = QGroupBox("Visualization Controls")
-        control_layout = QVBoxLayout(control_group)
+        # === Control Panel (Left) ===
+        control_panel = QWidget()
+        control_panel.setMaximumWidth(400)
+        control_layout = QVBoxLayout(control_panel)
         
-        self._setup_tetra_visualization_controls(control_layout)
+        # --- Advanced Selection Group ---
+        selection_group = QGroupBox("Advanced Constraint Selection")
+        selection_layout = QVBoxLayout(selection_group)
         
-        tab_layout.addWidget(control_group, 0)
+        # Selection tools (like C++ SelectionTool enum)
+        self.selection_tool_combo = QComboBox()
+        self.selection_tool_combo.addItems([
+            "SINGLE - Click individual constraints",
+            "MULTI - Rectangle selection", 
+            "BUCKET - Flood fill selection",
+            "POLYGON - Polygon selection",
+            "ALL - Select all constraints"
+        ])
+        selection_layout.addWidget(QLabel("Selection Tool:"))
+        selection_layout.addWidget(self.selection_tool_combo)
         
-        # === Visualization Panel ===
-        viz_group = QGroupBox("3D Visualization")
-        viz_layout = QVBoxLayout(viz_group)
+        # Selection modes (like C++ SelectionMode enum)
+        self.selection_mode_combo = QComboBox()
+        self.selection_mode_combo.addItems([
+            "MARK - Add to selection",
+            "UNMARK - Remove from selection", 
+            "HOLE - Mark as holes",
+            "INVERT - Toggle selection"
+        ])
+        selection_layout.addWidget(QLabel("Selection Mode:"))
+        selection_layout.addWidget(self.selection_mode_combo)
         
-        self._setup_interactive_3d_viewer(viz_group, viz_layout)
+        # Selection target
+        self.selection_target_combo = QComboBox()
+        self.selection_target_combo.addItems([
+            "Surface Constraints",
+            "Hull Boundaries", 
+            "Intersection Lines",
+            "All Elements"
+        ])
+        selection_layout.addWidget(QLabel("Select:"))
+        selection_layout.addWidget(self.selection_target_combo)
         
-        tab_layout.addWidget(viz_group, 1)
+        # Enable/disable constraint selection
+        self.enable_constraint_selection_btn = QPushButton("🎯 Enable Constraint Selection")
+        self.enable_constraint_selection_btn.setCheckable(True)
+        self.enable_constraint_selection_btn.clicked.connect(self._toggle_constraint_selection)
+        selection_layout.addWidget(self.enable_constraint_selection_btn)
         
-        # Initialize visualization
-        border_count = len(self.border_surface_indices)
-        unit_count = len(self.unit_surface_indices) 
-        fault_count = len(self.fault_surface_indices)
+        # Generate constraints button
+        self.generate_constraints_btn = QPushButton("🔗 Generate Constraints from Pre-Tetra Data")
+        self.generate_constraints_btn.clicked.connect(self._generate_constraints_from_data)
+        selection_layout.addWidget(self.generate_constraints_btn)
         
-        logger.info(f"Tetra mesh tab initialized with complete visualization: {border_count} borders, {unit_count} units, {fault_count} faults")
+        # View mode selection
+        view_mode_layout = QHBoxLayout()
+        self.view_mode_label = QLabel("View Mode:")
+        self.show_all_surfaces_btn = QPushButton("Show All")
+        self.show_selected_only_btn = QPushButton("Selected Only")
         
-        # Initialize surface visibility checkboxes
-        QTimer.singleShot(200, self._populate_surface_checkboxes)
+        self.show_all_surfaces_btn.clicked.connect(self._on_show_all_surfaces)
+        self.show_selected_only_btn.clicked.connect(self._on_show_selected_only)
         
-        # Add visualization elements with default settings
-        QTimer.singleShot(100, self._initialize_tetra_visualization)  # Delayed to ensure UI is ready
+        # Make buttons toggleable style
+        self.show_all_surfaces_btn.setCheckable(True)
+        self.show_selected_only_btn.setCheckable(True)
+        self.show_selected_only_btn.setChecked(True)  # Default to selected only
+        self.show_all_surfaces_btn.setEnabled(False)  # Initially disabled
+        self.show_selected_only_btn.setEnabled(False)
+        
+        view_mode_layout.addWidget(self.view_mode_label)
+        view_mode_layout.addWidget(self.show_all_surfaces_btn)
+        view_mode_layout.addWidget(self.show_selected_only_btn)
+        selection_layout.addLayout(view_mode_layout)
+        
+        # Selection summary
+        self.constraint_selection_summary = QLabel("No constraints generated yet")
+        self.constraint_selection_summary.setWordWrap(True)
+        self.constraint_selection_summary.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc;")
+        selection_layout.addWidget(self.constraint_selection_summary)
+        
+        control_layout.addWidget(selection_group)
+        
+        # --- Surface & Constraint Tree ---
+        surface_list_group = QGroupBox("Surfaces & Constraints")
+        surface_list_layout = QVBoxLayout(surface_list_group)
+        
+        self.surface_constraint_tree = QTreeWidget()
+        self.surface_constraint_tree.setHeaderLabels(["Element", "Type", "State", "Details"])
+        self.surface_constraint_tree.itemChanged.connect(self._on_constraint_tree_item_changed)
+        surface_list_layout.addWidget(self.surface_constraint_tree)
+        
+        # Tree control buttons
+        tree_control_layout = QHBoxLayout()
+        select_all_constraints_btn = QPushButton("Select All")
+        unselect_all_constraints_btn = QPushButton("Unselect All")
+        select_all_constraints_btn.clicked.connect(self._select_all_constraints)
+        unselect_all_constraints_btn.clicked.connect(self._unselect_all_constraints)
+        tree_control_layout.addWidget(select_all_constraints_btn)
+        tree_control_layout.addWidget(unselect_all_constraints_btn)
+        surface_list_layout.addLayout(tree_control_layout)
+        
+        control_layout.addWidget(surface_list_group)
+        
+        # Visualization controls removed - using only constraint selection viewer
+        
+        # --- Generation Controls ---
+        generate_group = QGroupBox("Tetrahedral Mesh Generation")
+        generate_layout = QVBoxLayout(generate_group)
+        
+        self.generate_tetra_mesh_btn = QPushButton("🔧 Generate Tetrahedral Mesh")
+        self.generate_tetra_mesh_btn.clicked.connect(self._generate_tetrahedral_mesh_action)
+        generate_layout.addWidget(self.generate_tetra_mesh_btn)
+        
+        self.export_mesh_btn = QPushButton("💾 Export Mesh")
+        self.export_mesh_btn.clicked.connect(self._export_tetrahedral_mesh)
+        self.export_mesh_btn.setEnabled(False)
+        generate_layout.addWidget(self.export_mesh_btn)
+        
+        control_layout.addWidget(generate_group)
+        
+        tab_layout.addWidget(control_panel)
+        
+        # === 3D Viewer (Right) ===
+        viewer_group = QGroupBox("3D Viewer - Constraint Selection")
+        viewer_layout = QVBoxLayout(viewer_group)
+        
+        # Setup enhanced 3D viewer with constraint visualization
+        self._setup_constraint_3d_viewer(viewer_group, viewer_layout)
+        
+        tab_layout.addWidget(viewer_group, 1)
+        
+        # Initialize
+        logger.info("Enhanced tetra mesh tab with constraint selection initialized")
+        
+        # Initialize with delay
+        QTimer.singleShot(200, self._initialize_tetra_visualization)
+
+    def _on_show_all_surfaces(self):
+        """Handle show all surfaces button"""
+        self.show_all_surfaces_btn.setChecked(True)
+        self.show_selected_only_btn.setChecked(False)
+        self._visualize_constraints(selection_mode=self.constraint_selection_enabled)
+        logger.info("Switched to show all surfaces mode")
+
+    def _on_show_selected_only(self):
+        """Handle show selected only button"""
+        self.show_selected_only_btn.setChecked(True)
+        self.show_all_surfaces_btn.setChecked(False)
+        self._visualize_selected_surfaces_only()
+        logger.info("Switched to show selected surfaces only mode")
+
+    def _setup_constraint_3d_viewer(self, parent_group, layout):
+        """Setup 3D viewer with constraint selection capabilities"""
+        
+        if HAVE_PYVISTA:
+            from pyvistaqt import QtInteractor
+            
+            self.constraint_plotter = QtInteractor(parent_group)
+            layout.addWidget(self.constraint_plotter.interactor)
+            
+            self.constraint_plotter.set_background([0.15, 0.15, 0.2])
+            
+            logger.info("Constraint selection 3D viewer initialized")
+        else:
+            placeholder = QLabel("PyVista required for constraint selection")
+            placeholder.setAlignment(Qt.AlignCenter)
+            layout.addWidget(placeholder)
+            self.constraint_plotter = None
+
+    def _generate_constraints_from_data(self):
+        """Generate constraints from pre-tetra mesh data"""
+        if not self.datasets:
+            QMessageBox.warning(self, "No Data", "No datasets loaded. Load data first.")
+            return
+        
+        try:
+            self.constraint_manager.generate_constraints_from_pre_tetra_data(self.datasets)
+            self._populate_constraint_tree()
+            self._update_constraint_summary()
+            
+            # Start with no visualization (user needs to select constraints first)
+            self.constraint_plotter.clear()
+            self.constraint_plotter.add_text("Constraints generated!\nSelect constraints in the tree to visualize them.", 
+                                            position='upper_edge', font_size=12)
+            
+            # Enable constraint selection if constraints were generated
+            if self.constraint_manager.surface_constraints:
+                self.enable_constraint_selection_btn.setEnabled(True)
+                self.generate_tetra_mesh_btn.setEnabled(True)
+                self.show_all_surfaces_btn.setEnabled(True)
+                self.show_selected_only_btn.setEnabled(True)
+                logger.info("Constraints generated successfully from pre-tetra mesh data")
+            else:
+                QMessageBox.warning(self, "No Constraints", 
+                                  "No constraints could be generated. Ensure pre-tetra mesh tab is completed first.")
+                
+        except Exception as e:
+            logger.error(f"Error generating constraints: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to generate constraints: {str(e)}")
+
+    def _toggle_constraint_selection(self, enabled):
+        """Toggle constraint selection mode"""
+        
+        self.constraint_selection_enabled = enabled
+        
+        if enabled:
+            self.enable_constraint_selection_btn.setText("🎯 Constraint Selection ON")
+            self.enable_constraint_selection_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+            # Use current view mode setting
+            if self.show_all_surfaces_btn.isChecked():
+                self._visualize_constraints(selection_mode=True)
+            else:
+                self._visualize_selected_surfaces_only()
+            logger.info("Constraint selection mode enabled")
+        else:
+            self.enable_constraint_selection_btn.setText("🎯 Enable Constraint Selection")
+            self.enable_constraint_selection_btn.setStyleSheet("")
+            # Use current view mode setting
+            if self.show_all_surfaces_btn.isChecked():
+                self._visualize_constraints(selection_mode=False)
+            else:
+                self._visualize_selected_surfaces_only()
+            logger.info("Constraint selection mode disabled")
+
+    def _visualize_constraints(self, selection_mode=False):
+        """Visualize constraints with color-coded selection capability"""
+        
+        if not self.constraint_plotter:
+            return
+            
+        self.constraint_plotter.clear()
+        
+        # Set visualization mode
+        self.constraint_visualization_mode = "SELECTION" if selection_mode else "NORMAL"
+        
+        for surface_idx, constraints in self.constraint_manager.surface_constraints.items():
+            dataset = self.datasets[surface_idx] if surface_idx < len(self.datasets) else None
+            if not dataset:
+                continue
+                
+            surface_name = dataset.get('name', f'Surface_{surface_idx}')
+            
+            # Visualize constrained triangulated surface (background)
+            self._add_surface_mesh_to_constraint_plotter(surface_idx, dataset)
+            
+            # Visualize constraint segments
+            for constraint_idx, constraint in enumerate(constraints):
+                self._add_constraint_to_plotter(
+                    surface_idx, constraint_idx, constraint, selection_mode
+                )
+        
+        # Setup picking callback for selection mode
+        if selection_mode:
+            try:
+                self.constraint_plotter.enable_mesh_picking(
+                    callback=self._on_constraint_picked,
+                    show=False
+                )
+            except Exception as e:
+                logger.warning(f"Could not enable mesh picking: {e}")
+        else:
+            try:
+                self.constraint_plotter.disable_picking()
+            except:
+                pass
+        
+        self.constraint_plotter.reset_camera()
+
+    def _visualize_single_surface_constraints(self, surface_idx, update_summary=False):
+        """Efficiently visualize only a specific surface and its constraints"""
+        
+        if not self.constraint_plotter:
+            return
+        
+        # Get the dataset for this surface
+        dataset = self.datasets[surface_idx] if surface_idx < len(self.datasets) else None
+        if not dataset:
+            return
+        
+        # Clear only actors related to this surface
+        self._clear_surface_actors(surface_idx)
+        
+        # Add surface mesh as background
+        self._add_surface_mesh_to_constraint_plotter(surface_idx, dataset)
+        
+        # Add constraint segments for this surface only
+        constraints = self.constraint_manager.surface_constraints.get(surface_idx, [])
+        for constraint_idx, constraint in enumerate(constraints):
+            self._add_constraint_to_plotter(
+                surface_idx, constraint_idx, constraint, self.constraint_selection_enabled
+            )
+        
+        # Update summary if requested
+        if update_summary:
+            self._update_constraint_summary()
+        
+        # Don't reset camera for single surface updates to maintain view
+        logger.debug(f"Updated visualization for surface {surface_idx} only")
+
+    def _clear_surface_actors(self, surface_idx):
+        """Clear only the actors related to a specific surface"""
+        if not self.constraint_plotter:
+            return
+        
+        # Remove surface mesh
+        surface_actor_name = f"surface_{surface_idx}"
+        if surface_actor_name in self.constraint_plotter.actors:
+            self.constraint_plotter.remove_actor(surface_actor_name)
+        
+        # Remove constraint actors for this surface
+        actors_to_remove = []
+        for actor_name in self.constraint_plotter.actors.keys():
+            if actor_name.startswith(f"constraint_{surface_idx}_"):
+                actors_to_remove.append(actor_name)
+        
+        for actor_name in actors_to_remove:
+            self.constraint_plotter.remove_actor(actor_name)
+
+    def _visualize_selected_surfaces_only(self):
+        """Visualize only surfaces that have selected constraints (very efficient)"""
+        try:
+            if not self.constraint_plotter:
+                return
+            
+            self.constraint_plotter.clear()
+            
+            # Get surfaces with selected constraints
+            selected_surfaces = self.constraint_manager.get_selected_surfaces()
+            
+            if not selected_surfaces:
+                # Show message when nothing is selected
+                self.constraint_plotter.add_text("No constraints selected.\nUse the tree or selection mode to select constraints.", 
+                                               position='upper_edge', font_size=12)
+                return
+            
+            # Only visualize selected surfaces
+            for surface_idx in selected_surfaces:
+                dataset = self.datasets[surface_idx] if surface_idx < len(self.datasets) else None
+                if not dataset:
+                    continue
+                
+                # Add surface mesh as background
+                self._add_surface_mesh_to_constraint_plotter(surface_idx, dataset)
+                
+                # Add constraint segments for this surface
+                constraints = self.constraint_manager.surface_constraints.get(surface_idx, [])
+                for constraint_idx, constraint in enumerate(constraints):
+                    self._add_constraint_to_plotter(
+                        surface_idx, constraint_idx, constraint, self.constraint_selection_enabled
+                    )
+            
+            # Setup picking if in selection mode
+            if self.constraint_selection_enabled:
+                try:
+                    self.constraint_plotter.enable_mesh_picking(
+                        callback=self._on_constraint_picked,
+                        show=False
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not enable mesh picking: {e}")
+            
+            self.constraint_plotter.reset_camera()
+            logger.info(f"Visualizing {len(selected_surfaces)} selected surfaces only")
+            
+        except Exception as e:
+            logger.error(f"Error in _visualize_selected_surfaces_only: {e}")
+            return
+
+    def _add_surface_mesh_to_constraint_plotter(self, surface_idx, dataset):
+        """Add surface mesh as background to constraint plotter"""
+        constrained_vertices = dataset.get('constrained_vertices')
+        constrained_triangles = dataset.get('constrained_triangles')
+        
+        if (constrained_vertices is not None and constrained_triangles is not None and 
+            len(constrained_vertices) > 0 and len(constrained_triangles) > 0):
+            
+            import numpy as np
+            vertices_array = np.array(constrained_vertices)
+            triangles_array = np.array(constrained_triangles)
+            
+            # Create faces array for PyVista
+            faces = []
+            for tri in triangles_array:
+                faces.extend([3, tri[0], tri[1], tri[2]])
+            
+            mesh = pv.PolyData(vertices_array, faces=faces)
+            
+            # Add as semi-transparent background
+            surface_type = self._get_surface_type(surface_idx)
+            color = self._get_surface_color(surface_type)
+            
+            self.constraint_plotter.add_mesh(
+                mesh,
+                name=f"surface_{surface_idx}",
+                color=color,
+                opacity=0.3,
+                style='surface',
+                pickable=False
+            )
+
+    def _add_constraint_to_plotter(self, surface_idx, constraint_idx, constraint, selection_mode):
+        """Add individual constraint segments to plotter"""
+        
+        constraint_key = (surface_idx, constraint_idx)
+        constraint_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
+        
+        for segment_idx, segment in enumerate(constraint['segments']):
+            points = np.array([[p[0], p[1], p[2]] for p in segment['points']])
+            
+            if len(points) < 2:
+                continue
+                
+            # Create line mesh
+            line_mesh = pv.PolyData(points)
+            line_mesh.lines = np.hstack([[2, i, i+1] for i in range(len(points)-1)])
+            
+            # Color and style based on mode and state
+            if selection_mode:
+                # Selection mode: use RGB color for picking
+                rgb_color = segment['rgb']
+                color = [c/255.0 for c in rgb_color]  # Normalize to [0,1]
+                line_width = 3
+                opacity = 1.0
+            else:
+                # Normal mode: color by constraint state (like C++ makeConstraints)
+                if constraint_state == "SEGMENTS":
+                    color = 'blue'     # Selected constraints
+                    line_width = 5
+                elif constraint_state == "HOLES":
+                    color = 'red'      # Hole constraints
+                    line_width = 5
+                else:  # "UNDEFINED"
+                    color = 'white'    # Unselected constraints
+                    line_width = 3
+                opacity = 0.9
+            
+            # Add to plotter
+            actor_name = f"constraint_{surface_idx}_{constraint_idx}_{segment_idx}"
+            self.constraint_plotter.add_mesh(
+                line_mesh,
+                name=actor_name,
+                color=color,
+                line_width=line_width,
+                opacity=opacity,
+                style='wireframe',
+                pickable=selection_mode
+            )
+
+    def _on_constraint_picked(self, mesh):
+        """Handle constraint selection via mouse picking (like C++ findSelection)"""
+        
+        if not self.constraint_selection_enabled:
+            return
+        
+        # Extract RGB from mesh (simplified - in practice you'd use a more robust method)
+        # For now, we'll use mesh bounds and actor name to identify the constraint
+        try:
+            # Get the actor name to identify which constraint was picked
+            actor_name = None
+            for actor in self.constraint_plotter.renderer.actors.values():
+                if hasattr(actor, 'GetMapper') and actor.GetMapper():
+                    mapper = actor.GetMapper()
+                    if hasattr(mapper, 'GetInput') and mapper.GetInput() == mesh:
+                        # Found the actor, extract name from our naming convention
+                        # constraint_{surface_idx}_{constraint_idx}_{segment_idx}
+                        for name, mesh_obj in self.constraint_plotter.actors.items():
+                            if mesh_obj == mesh:
+                                actor_name = name
+                                break
+                        break
+            
+            if actor_name and actor_name.startswith("constraint_"):
+                parts = actor_name.split("_")
+                if len(parts) >= 4:
+                    surface_idx = int(parts[1])
+                    constraint_idx = int(parts[2])
+                    
+                    # Apply selection based on current mode
+                    selection_mode = self.selection_mode_combo.currentText().split(" - ")[0]
+                    constraint_key = (surface_idx, constraint_idx)
+                    
+                    if selection_mode == "MARK":
+                        self.constraint_manager.constraint_states[constraint_key] = "SEGMENTS"
+                    elif selection_mode == "UNMARK":
+                        self.constraint_manager.constraint_states[constraint_key] = "UNDEFINED"
+                    elif selection_mode == "HOLE":
+                        self.constraint_manager.constraint_states[constraint_key] = "HOLES"
+                    elif selection_mode == "INVERT":
+                        current_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
+                        new_state = "SEGMENTS" if current_state == "UNDEFINED" else "UNDEFINED"
+                        self.constraint_manager.constraint_states[constraint_key] = new_state
+                    
+                    # Update visualization and UI
+                    self._visualize_constraints(selection_mode=False)  # Switch back to normal mode to see colors
+                    self._update_constraint_tree()
+                    self._update_constraint_summary()
+                    
+                    new_state = self.constraint_manager.constraint_states[constraint_key]
+                    logger.info(f"Constraint {surface_idx}_{constraint_idx} marked as {new_state}")
+                    
+                    # Switch back to selection mode after brief normal view
+                    QTimer.singleShot(500, lambda: self._visualize_constraints(selection_mode=True))
+        
+        except Exception as e:
+            logger.warning(f"Error processing constraint selection: {e}")
+
+    def _populate_constraint_tree(self):
+        """Populate the constraint tree widget with surface and constraint information"""
+        
+        self.surface_constraint_tree.clear()
+        
+        for surface_idx, constraints in self.constraint_manager.surface_constraints.items():
+            dataset = self.datasets[surface_idx] if surface_idx < len(self.datasets) else None
+            if not dataset:
+                continue
+                
+            surface_name = dataset.get('name', f'Surface_{surface_idx}')
+            surface_item = QTreeWidgetItem([surface_name, "Surface", "Container", f"{len(constraints)} constraints"])
+            surface_item.setData(0, Qt.UserRole, ('surface', surface_idx))
+            
+            for constraint_idx, constraint in enumerate(constraints):
+                constraint_key = (surface_idx, constraint_idx)
+                constraint_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
+                
+                constraint_name = f"{constraint['type']} {constraint_idx}"
+                segment_count = len(constraint['segments'])
+                
+                constraint_item = QTreeWidgetItem([
+                    constraint_name, 
+                    constraint['type'], 
+                    constraint_state, 
+                    f"{segment_count} segments"
+                ])
+                constraint_item.setData(0, Qt.UserRole, ('constraint', surface_idx, constraint_idx))
+                constraint_item.setFlags(constraint_item.flags() | Qt.ItemIsUserCheckable)
+                
+                # Set checkbox state based on constraint state
+                if constraint_state == "SEGMENTS":
+                    constraint_item.setCheckState(0, Qt.Checked)
+                else:
+                    constraint_item.setCheckState(0, Qt.Unchecked)
+                
+                surface_item.addChild(constraint_item)
+            
+            self.surface_constraint_tree.addTopLevelItem(surface_item)
+        
+        self.surface_constraint_tree.expandAll()
+
+    def _on_constraint_tree_item_changed(self, item, column):
+        """Handle changes in constraint tree checkboxes"""
+        item_data = item.data(0, Qt.UserRole)
+        if item_data and item_data[0] == 'constraint':
+            surface_idx, constraint_idx = item_data[1], item_data[2]
+            constraint_key = (surface_idx, constraint_idx)
+            
+            # Update constraint state based on checkbox
+            if item.checkState(0) == Qt.Checked:
+                self.constraint_manager.constraint_states[constraint_key] = "SEGMENTS"
+            else:
+                self.constraint_manager.constraint_states[constraint_key] = "UNDEFINED"
+            
+            # Update state text in tree
+            item.setText(2, self.constraint_manager.constraint_states[constraint_key])
+            
+            # Only visualize the specific surface that was changed (much more efficient)
+            self._visualize_single_surface_constraints(surface_idx, update_summary=True)
+
+    def _update_constraint_summary(self):
+        """Update the constraint selection summary display"""
+        summary = self.constraint_manager.get_constraint_summary()
+        
+        if summary['total'] == 0:
+            text = "No constraints generated yet"
+        else:
+            text = f"Constraints: {summary['total']} total\n"
+            text += f"• {summary['selected']} selected (SEGMENTS)\n"
+            text += f"• {summary['holes']} holes\n"
+            text += f"• {summary['undefined']} undefined"
+            
+            selected_surfaces = len(self.constraint_manager.get_selected_surfaces())
+            text += f"\n\nSelected surfaces: {selected_surfaces}"
+        
+        self.constraint_selection_summary.setText(text)
+
+    def _select_all_constraints(self):
+        """Select all constraints as SEGMENTS"""
+        for constraint_key in self.constraint_manager.constraint_states:
+            self.constraint_manager.constraint_states[constraint_key] = "SEGMENTS"
+        
+        self._populate_constraint_tree()
+        self._update_constraint_summary()
+        self._visualize_selected_surfaces_only()  # Only show selected surfaces
+
+    def _unselect_all_constraints(self):
+        """Unselect all constraints (set to UNDEFINED)"""
+        for constraint_key in self.constraint_manager.constraint_states:
+            self.constraint_manager.constraint_states[constraint_key] = "UNDEFINED"
+        
+        self._populate_constraint_tree()
+        self._update_constraint_summary()
+        # Clear visualization when nothing is selected
+        self.constraint_plotter.clear()
+        self.constraint_plotter.add_text("All constraints unselected.\nSelect constraints to visualize them.", 
+                                            position='upper_edge', font_size=12)
+
+    def _generate_tetrahedral_mesh_action(self):
+        """Generate tetrahedral mesh using selected constraints"""
+        
+        # First, ensure constraints are generated from pre-tetra mesh data
+        if not hasattr(self, 'constraint_manager') or not self.constraint_manager.surface_constraints:
+            QMessageBox.information(self, "Generate Constraints", 
+                                  "Please generate constraints from pre-tetra data first.")
+            return
+        
+        # Get selected surfaces (only those with SEGMENTS constraints)
+        selected_surfaces = self.constraint_manager.get_selected_surfaces()
+        
+        if not selected_surfaces:
+            QMessageBox.warning(self, "No Selection", 
+                              "No constraints marked as SEGMENTS. Please select constraints first.")
+            return
+        
+        # Generate mesh using existing TetrahedralMeshGenerator with selected surfaces
+        try:
+            from meshit.tetra_mesh_utils import TetrahedralMeshGenerator
+            
+            generator = TetrahedralMeshGenerator(
+                datasets=self.datasets,
+                selected_surfaces=selected_surfaces  # Only selected surfaces
+            )
+            
+            # Get TetGen switches
+            tetgen_switches = "pq1.414aA"  # Default switches
+            
+            result = generator.generate_tetrahedral_mesh(tetgen_switches)
+            
+            if result:
+                self.tetrahedral_mesh = result
+                self._visualize_tetrahedral_result(result)
+                self.export_mesh_btn.setEnabled(True)
+                logger.info(f"Generated tetrahedral mesh using {len(selected_surfaces)} surfaces with selected constraints")
+                QMessageBox.information(self, "Success", 
+                                      f"Tetrahedral mesh generated successfully using {len(selected_surfaces)} selected surfaces!")
+            else:
+                QMessageBox.warning(self, "Generation Failed", "Failed to generate tetrahedral mesh.")
+                
+        except Exception as e:
+            logger.error(f"Error generating tetrahedral mesh: {e}")
+            QMessageBox.critical(self, "Error", f"Generation failed: {str(e)}")
+
+    def _visualize_tetrahedral_result(self, result):
+        """Visualize the generated tetrahedral mesh"""
+        if not self.constraint_plotter or not result:
+            return
+        
+        try:
+            # Clear current visualization
+            self.constraint_plotter.clear()
+            
+            # Get mesh data
+            vertices = result.get('vertices')
+            tetrahedra = result.get('tetrahedra')
+            
+            if vertices is not None and tetrahedra is not None:
+                # Create PyVista unstructured grid
+                import pyvista as pv
+                import numpy as np
+                
+                vertices_array = np.array(vertices)
+                tetrahedra_array = np.array(tetrahedra)
+                
+                # Create cells array for PyVista (tetrahedra)
+                cells = []
+                for tet in tetrahedra_array:
+                    cells.extend([4, tet[0], tet[1], tet[2], tet[3]])
+                
+                # Create unstructured grid
+                cell_types = [pv.CellType.TETRA] * len(tetrahedra_array)
+                mesh = pv.UnstructuredGrid(cells, cell_types, vertices_array)
+                
+                # Visualize edges of tetrahedra
+                edges = mesh.extract_all_edges()
+                self.constraint_plotter.add_mesh(
+                    edges,
+                    name="tetrahedral_mesh",
+                    color='cyan',
+                    line_width=1,
+                    style='wireframe'
+                )
+                
+                # Also show surface
+                surface = mesh.extract_surface()
+                self.constraint_plotter.add_mesh(
+                    surface,
+                    name="tetrahedral_surface",
+                    color='lightblue',
+                    opacity=0.6,
+                    style='surface'
+                )
+                
+                self.constraint_plotter.reset_camera()
+                logger.info(f"Visualized tetrahedral mesh: {len(vertices)} vertices, {len(tetrahedra)} tetrahedra")
+            
+        except Exception as e:
+            logger.error(f"Error visualizing tetrahedral mesh: {e}")
 
     def _initialize_tetra_visualization(self):
         """Initialize the tetra mesh tab visualization with default settings."""
@@ -7555,119 +8401,9 @@ segmentation, triangulation, and visualization.
         except Exception as e:
             logger.error(f"Error initializing tetra visualization: {e}")
 
-    def _setup_tetra_visualization_controls(self, layout):
-        """Set up visualization controls for the tetrahedral mesh tab."""
-        from PyQt5.QtWidgets import (QGroupBox, QVBoxLayout, QHBoxLayout, QCheckBox, 
-                                     QComboBox, QLabel, QPushButton, QRadioButton, 
-                                     QButtonGroup, QFrame)
-        
-        # Surface Visibility Controls
-        visibility_group = QGroupBox("Surface Visibility")
-        visibility_layout = QVBoxLayout(visibility_group)
-        
-        # Create scroll area for surface checkboxes
-        scroll_area = QScrollArea()
-        scroll_widget = QWidget()
-        self.surface_checkboxes_layout = QVBoxLayout(scroll_widget)
-        
-        # Dictionary to store surface visibility checkboxes
-        self.surface_visibility_checkboxes = {}
-        
-        # Add control buttons
-        control_buttons_layout = QHBoxLayout()
-        show_all_btn = QPushButton("Show All")
-        hide_all_btn = QPushButton("Hide All")
-        
-        show_all_btn.clicked.connect(self._show_all_surfaces)
-        hide_all_btn.clicked.connect(self._hide_all_surfaces)
-        
-        control_buttons_layout.addWidget(show_all_btn)
-        control_buttons_layout.addWidget(hide_all_btn)
-        
-        visibility_layout.addLayout(control_buttons_layout)
-        
-        scroll_area.setWidget(scroll_widget)
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setMaximumHeight(200)  # Limit height
-        
-        visibility_layout.addWidget(scroll_area)
-        layout.addWidget(visibility_group)
-        
-        # Display Mode
-        display_group = QGroupBox("Display Mode")
-        display_layout = QVBoxLayout(display_group)
-        
-        self.display_mode_group = QButtonGroup()
-        self.show_faces_radio = QRadioButton("Faces")
-        self.show_wireframe_radio = QRadioButton("Wireframe") 
-        self.show_both_radio = QRadioButton("Both")
-        
-        self.show_faces_radio.setChecked(True)  # Default
-        
-        self.display_mode_group.addButton(self.show_faces_radio, 0)
-        self.display_mode_group.addButton(self.show_wireframe_radio, 1)
-        self.display_mode_group.addButton(self.show_both_radio, 2)
-        
-        self.display_mode_group.buttonClicked.connect(self._on_display_mode_changed)
-        
-        display_layout.addWidget(self.show_faces_radio)
-        display_layout.addWidget(self.show_wireframe_radio)
-        display_layout.addWidget(self.show_both_radio)
-        layout.addWidget(display_group)
-        
-        # Visualization Options
-        options_group = QGroupBox("Visualization Options")
-        options_layout = QVBoxLayout(options_group)
-        
-        self.show_convex_hulls_check = QCheckBox("Show Convex Hulls")
-        self.show_convex_hulls_check.stateChanged.connect(self._on_hulls_visibility_changed)
-        
+    # _setup_tetra_visualization_controls removed - using only constraint selection viewer
 
-        
-        self.show_intersections_check = QCheckBox("Show Intersections")
-        self.show_intersections_check.stateChanged.connect(self._on_intersections_visibility_changed)
-        
-
-        
-        options_layout.addWidget(self.show_convex_hulls_check)
-        options_layout.addWidget(self.show_intersections_check)
-        layout.addWidget(options_group)
-        
-
-        
-        # Mesh Generation
-        mesh_group = QGroupBox("Mesh Generation")
-        mesh_layout = QVBoxLayout(mesh_group)
-        
-        self.generate_mesh_btn = QPushButton("🔧 Generate Tetrahedral Mesh")
-        self.generate_mesh_btn.clicked.connect(self._generate_tetrahedral_mesh)
-        self.generate_mesh_btn.setEnabled(True)  # Always enabled since we use visible surfaces
-        
-        self.export_mesh_btn = QPushButton("💾 Export Mesh")
-        self.export_mesh_btn.clicked.connect(self._export_tetrahedral_mesh)
-        self.export_mesh_btn.setEnabled(False)  # Enable after mesh generation
-        
-        mesh_layout.addWidget(self.generate_mesh_btn)
-        mesh_layout.addWidget(self.export_mesh_btn)
-        
-        layout.addWidget(mesh_group)
-
-    def _on_display_mode_changed(self):
-        """Handle display mode changes."""
-        logger.info("Display mode changed in tetra mesh tab")
-        self._update_unified_visualization(display_mode_changed=True)
-
-    def _on_hulls_visibility_changed(self, state):
-        """Handle convex hulls visibility changes."""
-        logger.info(f"Convex hulls visibility changed: {state == 2}")
-        self._update_unified_visualization(hulls_changed=True)
-
-
-
-    def _on_intersections_visibility_changed(self, state):
-        """Handle intersections visibility changes."""
-        logger.info(f"Intersections visibility changed: {state == 2}")
-        self._update_unified_visualization(intersections_changed=True)
+    # Display mode and visualization options handlers removed - using only constraint selection viewer
 
 
 
@@ -9258,99 +9994,10 @@ segmentation, triangulation, and visualization.
     
     def _update_unified_visualization(self, filter_changed=False, display_mode_changed=False, 
                                      hulls_changed=False, intersections_changed=False):
-        """Unified visualization update that coordinates all visualization aspects."""
-        if not hasattr(self, 'tetra_plotter') or not self.tetra_plotter:
-            return
-            
-        logger.info("Updating unified visualization...")
-        
-        # Get current state - no longer using filter dropdown
-        
-        # Determine current display mode
-        if hasattr(self, 'show_faces_radio') and self.show_faces_radio.isChecked():
-            display_mode = "faces"
-        elif hasattr(self, 'show_wireframe_radio') and self.show_wireframe_radio.isChecked():
-            display_mode = "wireframe"
-        elif hasattr(self, 'show_both_radio') and self.show_both_radio.isChecked():
-            display_mode = "both"
-        else:
-            display_mode = "faces"  # default
-        
-        # Get visibility states
-        show_hulls = hasattr(self, 'show_convex_hulls_check') and self.show_convex_hulls_check.isChecked()
-        show_intersections = hasattr(self, 'show_intersections_check') and self.show_intersections_check.isChecked()
-
-        
-        # Determine which surfaces should be shown based on visibility checkboxes
-        surfaces_to_show = self._get_visible_surface_indices()
-        
-        # Clear and rebuild only if major changes
-        if filter_changed or display_mode_changed:
-            self.tetra_plotter.clear()
-            
-            # Add main surfaces with current display mode
-            self._add_filtered_surfaces_to_plotter(surfaces_to_show, display_mode)
-            
-            # Add all optional elements based on current state
-            if show_hulls:
-                self._add_filtered_convex_hulls(surfaces_to_show)
-            if show_intersections:
-                self._add_filtered_intersections(surfaces_to_show)
-                
-        else:
-            # Minor changes - only update specific elements
-            if hulls_changed:
-                self._remove_convex_hulls_from_plotter()
-                if show_hulls:
-                    self._add_filtered_convex_hulls(surfaces_to_show)
-                    
-            if intersections_changed:
-                self._remove_intersections_from_plotter()
-                if show_intersections:
-                    self._add_filtered_intersections(surfaces_to_show)
-        
-        # Reset camera if major rebuild
-        if filter_changed or display_mode_changed:
-            if surfaces_to_show:
-                self.tetra_plotter.reset_camera()
-            else:
-                # Show message when no surfaces are visible
-                try:
-                    import pyvista as pv
-                    text_mesh = pv.Text3D("No surfaces visible", depth=0.1)
-                    self.tetra_plotter.add_mesh(text_mesh, color='red')
-                except:
-                    pass
-        
-        logger.info(f"Unified visualization updated - Display: {display_mode}, Visible surfaces: {len(surfaces_to_show)}")
+        """Stub function since visualization controls have been removed - using only constraint selection viewer"""
+        logger.debug("Unified visualization update bypassed - using only constraint selection viewer")
     
-    def _get_visible_surface_indices(self):
-        """Get list of surface indices that are currently set to visible."""
-        surfaces_to_show = []
-        
-        for i, dataset in enumerate(self.datasets):
-            # Check if surface is marked as visible
-            is_visible = dataset.get('visible', True)  # Default to visible
-            
-            if is_visible:
-                surfaces_to_show.append(i)
-        
-        return surfaces_to_show
-    
-    def _add_filtered_surfaces_to_plotter(self, surface_indices, display_mode):
-        """Add filtered surfaces to plotter with specified display mode."""
-        try:
-            for surface_index in surface_indices:
-                if surface_index < len(self.datasets):
-                    dataset = self.datasets[surface_index]
-                    vertices = dataset.get('constrained_vertices')
-                    triangles = dataset.get('constrained_triangles')
-                    
-                    if self._has_valid_array_data(vertices) and self._has_valid_array_data(triangles):
-                        self._add_surface_with_display_mode(surface_index, vertices, triangles, display_mode)
-                            
-        except Exception as e:
-            logger.error(f"Error adding filtered surfaces: {e}")
+    # Visualization helper functions removed - using only constraint selection viewer
     def _validate_hull_points(self, hull_points):
         """Validate and convert hull points to proper numeric format."""
         try:
@@ -10102,68 +10749,7 @@ segmentation, triangulation, and visualization.
     
     
 
-    def _show_all_surfaces(self):
-        """Show all surfaces by checking all visibility checkboxes."""
-        for checkbox in self.surface_visibility_checkboxes.values():
-            checkbox.setChecked(True)
-        logger.info("Showing all surfaces")
-    
-    def _hide_all_surfaces(self):
-        """Hide all surfaces by unchecking all visibility checkboxes."""
-        for checkbox in self.surface_visibility_checkboxes.values():
-            checkbox.setChecked(False)
-        logger.info("Hiding all surfaces")
-    
-    def _on_surface_visibility_changed(self, surface_index, is_visible):
-        """Handle individual surface visibility changes."""
-        if 0 <= surface_index < len(self.datasets):
-            # Store visibility state in dataset
-            self.datasets[surface_index]['visible'] = is_visible
-            surface_name = self.datasets[surface_index].get('name', f'Surface_{surface_index}')
-            logger.info(f"Surface '{surface_name}' visibility changed to: {is_visible}")
-            
-                         # Update visualization
-            self._update_unified_visualization(filter_changed=True)
-    
-    def _populate_surface_checkboxes(self):
-        """Populate surface visibility checkboxes based on current datasets."""
-        # Clear existing checkboxes
-        for checkbox in self.surface_visibility_checkboxes.values():
-            checkbox.deleteLater()
-        self.surface_visibility_checkboxes.clear()
-        
-        # Clear layout
-        while self.surface_checkboxes_layout.count():
-            child = self.surface_checkboxes_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-        
-        # Add checkbox for each dataset
-        for i, dataset in enumerate(self.datasets):
-            surface_name = dataset.get('name', f'Surface_{i}')
-            
-            # Create checkbox
-            checkbox = QCheckBox(surface_name)
-            
-            # Set initial state (default to visible)
-            is_visible = dataset.get('visible', True)
-            checkbox.setChecked(is_visible)
-            
-            # Connect to handler with lambda to capture index
-            checkbox.stateChanged.connect(
-                lambda state, idx=i: self._on_surface_visibility_changed(idx, state == 2)
-            )
-            
-            # Store reference
-            self.surface_visibility_checkboxes[i] = checkbox
-            
-            # Add to layout
-            self.surface_checkboxes_layout.addWidget(checkbox)
-        
-        # Add stretch to push checkboxes to top
-        self.surface_checkboxes_layout.addStretch()
-        
-        logger.info(f"Populated {len(self.datasets)} surface visibility checkboxes")
+    # Surface visibility functions removed - using only constraint selection viewer
 
 
 
