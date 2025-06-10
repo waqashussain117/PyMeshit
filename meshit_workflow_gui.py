@@ -7873,12 +7873,24 @@ segmentation, triangulation, and visualization.
         
         # Tree control buttons
         tree_control_layout = QHBoxLayout()
+        
+        # Selection buttons
         select_all_constraints_btn = QPushButton("Select All")
         unselect_all_constraints_btn = QPushButton("Unselect All")
         select_all_constraints_btn.clicked.connect(self._select_all_constraints)
         unselect_all_constraints_btn.clicked.connect(self._unselect_all_constraints)
+        
+        # Expansion control buttons
+        expand_all_btn = QPushButton("Expand All")
+        collapse_all_btn = QPushButton("Collapse All")
+        expand_all_btn.clicked.connect(self._expand_all_tree_items)
+        collapse_all_btn.clicked.connect(self._collapse_all_tree_items)
+        
+        # Add buttons to layout
         tree_control_layout.addWidget(select_all_constraints_btn)
         tree_control_layout.addWidget(unselect_all_constraints_btn)
+        tree_control_layout.addWidget(expand_all_btn)
+        tree_control_layout.addWidget(collapse_all_btn)
         surface_list_layout.addLayout(tree_control_layout)
         
         control_layout.addWidget(surface_list_group)
@@ -8407,7 +8419,8 @@ segmentation, triangulation, and visualization.
             
             self.surface_constraint_tree.addTopLevelItem(surface_item)
         
-        self.surface_constraint_tree.expandAll()
+        # Default expansion: Expand surfaces and parent categories, but not individual segments
+        self._set_default_expansion_state()
 
     def _on_constraint_tree_item_changed(self, item, column):
         """Handle changes in constraint tree checkboxes - EFFICIENT VERSION"""
@@ -8791,6 +8804,42 @@ segmentation, triangulation, and visualization.
         # Update tree and summary
         self._populate_constraint_tree()
         self._update_constraint_summary()
+
+    def _expand_all_tree_items(self):
+        """Expand all items in the constraint tree"""
+        self.surface_constraint_tree.expandAll()
+        logger.info("Expanded all tree items")
+
+    def _collapse_all_tree_items(self):
+        """Collapse all items in the constraint tree"""
+        self.surface_constraint_tree.collapseAll()
+        logger.info("Collapsed all tree items")
+
+    def _set_default_expansion_state(self):
+        """Set a smart default expansion state for the tree"""
+        # Expand all top-level surface items
+        for i in range(self.surface_constraint_tree.topLevelItemCount()):
+            surface_item = self.surface_constraint_tree.topLevelItem(i)
+            surface_item.setExpanded(True)
+            
+            # Expand parent categories (Hull Boundary, Intersection Lines) 
+            # but keep individual segments collapsed for cleaner view
+            for j in range(surface_item.childCount()):
+                parent_item = surface_item.child(j)
+                parent_data = parent_item.data(0, Qt.UserRole)
+                
+                if parent_data and parent_data[0] == 'parent':
+                    # Expand parent categories
+                    parent_item.setExpanded(True)
+                    
+                    # If a parent has few children (<=3), expand those too
+                    if parent_item.childCount() <= 3:
+                        for k in range(parent_item.childCount()):
+                            child_item = parent_item.child(k)
+                            child_item.setExpanded(True)
+                    # Otherwise keep children collapsed for cleaner view
+        
+        logger.info("Set default expansion state: surfaces and categories expanded")
 
     def _generate_tetrahedral_mesh_action(self):
         """Generate tetrahedral mesh using selected constraints"""
