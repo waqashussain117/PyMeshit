@@ -244,27 +244,27 @@ class SurfaceConstraintManager:
         self.next_rgb_color = [1, 0, 0]  # Start with red
         
     def generate_constraints_from_pre_tetra_data(self, datasets):
-        """Generate selectable constraints from pre-tetra mesh tab data"""
+        """Generate hierarchical selectable constraints from pre-tetra mesh tab data"""
         for surface_idx, dataset in enumerate(datasets):
             if not self._has_constrained_mesh_data(dataset):
                 continue
                 
             constraints = []
             
-            # 1. Hull boundary constraints (like C++ ConvexHull.Ns segments)
+            # 1. Hull boundary constraints - split into individual segments at special points
             hull_points = dataset.get('hull_points', [])
             if len(hull_points) > 2:
-                hull_constraint = self._create_hull_constraint(hull_points, surface_idx)
-                constraints.append(hull_constraint)
+                hull_segments = self._create_detailed_hull_constraints(hull_points, surface_idx)
+                constraints.extend(hull_segments)
             
-            # 2. Intersection line constraints (like C++ Intersections)
+            # 2. Intersection line constraints - split into individual segments  
             intersection_constraints = dataset.get('intersection_constraints', [])
-            for intersection_line in intersection_constraints:
+            for line_idx, intersection_line in enumerate(intersection_constraints):
                 if len(intersection_line) >= 2:
-                    intersection_constraint = self._create_intersection_constraint(
-                        intersection_line, surface_idx
+                    intersection_segments = self._create_detailed_intersection_constraints(
+                        intersection_line, surface_idx, line_idx
                     )
-                    constraints.append(intersection_constraint)
+                    constraints.extend(intersection_segments)
             
             # Store constraints for this surface
             self.surface_constraints[surface_idx] = constraints
@@ -283,64 +283,164 @@ class SurfaceConstraintManager:
         return (constrained_vertices is not None and constrained_triangles is not None and 
                 len(constrained_vertices) > 0 and len(constrained_triangles) > 0)
     
-    def _create_hull_constraint(self, hull_points, surface_idx):
-        """Create constraint from hull boundary"""
-        # Split hull into segments at special points (like C++ logic)
-        segments = []
-        current_segment = [hull_points[0]]
+    def _create_detailed_hull_constraints(self, hull_points, surface_idx):
+        """Create individual constraint segments from hull boundary split at special points"""
+        constraints = []
         
-        for i in range(1, len(hull_points)):
-            point = hull_points[i]
+        # Split hull at special points (like C++ split_line_at_special_points)
+        segments = self._split_points_at_special_locations(hull_points)
+        
+        for segment_idx, segment_points in enumerate(segments):
+            if len(segment_points) >= 2:
+                rgb_color = self._get_next_rgb_color()
+                
+                # Create individual constraint for this segment
+                constraint = {
+                    'type': 'HULL_SEGMENT',
+                    'parent_type': 'HULL_BOUNDARY', 
+                    'segment_id': segment_idx,
+                    'segments': [{
+                        'points': segment_points,
+                        'type': 'HULL_SEGMENT',
+                        'rgb': rgb_color,
+                        'surface_id': surface_idx,
+                        'segment_id': segment_idx
+                    }],
+                    'total_points': len(segment_points)
+                }
+                
+                constraints.append(constraint)
+                
+                # Map RGB to constraint for picking
+                constraint_idx = len(constraints) - 1
+                self.constraint_rgb_map[tuple(rgb_color)] = (surface_idx, constraint_idx)
+        
+        return constraints
+    
+    def _create_detailed_intersection_constraints(self, intersection_line, surface_idx, line_idx):
+        """Create individual constraint segments from intersection line split at special points"""
+        constraints = []
+        
+        # Split intersection line at special points
+        segments = self._split_points_at_special_locations(intersection_line)
+        
+        for segment_idx, segment_points in enumerate(segments):
+            if len(segment_points) >= 2:
+                rgb_color = self._get_next_rgb_color()
+                
+                # Create individual constraint for this segment
+                constraint = {
+                    'type': 'INTERSECTION_SEGMENT',
+                    'parent_type': 'INTERSECTION_LINE',
+                    'line_id': line_idx,
+                    'segment_id': segment_idx, 
+                    'segments': [{
+                        'points': segment_points,
+                        'type': 'INTERSECTION_SEGMENT',
+                        'rgb': rgb_color,
+                        'surface_id': surface_idx,
+                        'line_id': line_idx,
+                        'segment_id': segment_idx
+                    }],
+                    'total_points': len(segment_points)
+                }
+                
+                constraints.append(constraint)
+                
+                # Map RGB to constraint for picking
+                constraint_idx = len(constraints) - 1
+                self.constraint_rgb_map[tuple(rgb_color)] = (surface_idx, constraint_idx)
+        
+        return constraints
+    
+    def _split_points_at_special_locations(self, points):
+        """Split point list at special points (non-DEFAULT types) following C++ logic"""
+        if len(points) < 2:
+            return [points] if points else []
+        
+        segments = []
+        current_segment = [points[0]]
+        
+        for i in range(1, len(points)):
+            point = points[i]
             current_segment.append(point)
             
             # Check if this is a special point (end of segment)
-            point_type = point[3] if len(point) > 3 else "DEFAULT"
-            if point_type != "DEFAULT" or i == len(hull_points) - 1:
+            # Handle different point formats: Vector3D objects, lists with type, or simple coordinates
+            point_type = "DEFAULT"
+            
+            if hasattr(point, 'type'):
+                # Vector3D object with type attribute
+                point_type = point.type
+            elif hasattr(point, 'point_type'):
+                # Vector3D object with point_type attribute  
+                point_type = point.point_type
+            elif isinstance(point, (list, tuple)) and len(point) > 3:
+                # List/tuple format [x, y, z, type]
+                point_type = point[3] if point[3] != "DEFAULT" else "DEFAULT"
+            else:
+                # Simple coordinate format [x, y, z] - use geometric analysis to detect special points
+                point_type = self._detect_special_point_geometrically(point, points, i)
+            
+            # Split at special points or at the end of the line
+            if point_type != "DEFAULT" or i == len(points) - 1:
                 if len(current_segment) >= 2:
-                    rgb_color = self._get_next_rgb_color()
-                    segments.append({
-                        'points': current_segment.copy(),
-                        'type': 'HULL_BOUNDARY',
-                        'rgb': rgb_color,
-                        'surface_id': surface_idx
-                    })
-                    self.constraint_rgb_map[tuple(rgb_color)] = (surface_idx, len(segments)-1)
+                    segments.append(current_segment.copy())
                 current_segment = [point]  # Start new segment
         
-        return {
-            'type': 'HULL_BOUNDARY',
-            'segments': segments,
-            'total_points': len(hull_points)
-        }
+        # Handle case where no special points were found - create reasonable segments
+        if not segments and len(points) >= 2:
+            # For intersection lines without explicit special points, split into smaller segments
+            # This creates more granular selection as desired
+            segment_size = max(2, len(points) // 3)  # Create roughly 3 segments per line
+            for start_idx in range(0, len(points) - 1, segment_size - 1):
+                end_idx = min(start_idx + segment_size, len(points))
+                if end_idx > start_idx + 1:  # Ensure segment has at least 2 points
+                    segments.append(points[start_idx:end_idx])
+        
+        return segments
     
-    def _create_intersection_constraint(self, intersection_line, surface_idx):
-        """Create constraint from intersection line"""
-        segments = []
-        current_segment = [intersection_line[0]]
+    def _detect_special_point_geometrically(self, point, all_points, point_index):
+        """Detect special points based on geometric properties when type info is not available"""
+        # For now, split at regular intervals or based on significant direction changes
+        # This creates the granular segmentation you want for intersection lines
         
-        for i in range(1, len(intersection_line)):
-            point = intersection_line[i]
-            current_segment.append(point)
-            
-            # Check for special points to break segments
-            point_type = point[3] if len(point) > 3 else "DEFAULT"
-            if point_type != "DEFAULT" or i == len(intersection_line) - 1:
-                if len(current_segment) >= 2:
-                    rgb_color = self._get_next_rgb_color()
-                    segments.append({
-                        'points': current_segment.copy(),
-                        'type': 'INTERSECTION_LINE',
-                        'rgb': rgb_color,
-                        'surface_id': surface_idx
-                    })
-                    self.constraint_rgb_map[tuple(rgb_color)] = (surface_idx, len(segments)-1)
-                current_segment = [point]
+        if point_index == 0 or point_index == len(all_points) - 1:
+            return "ENDPOINT"
         
-        return {
-            'type': 'INTERSECTION_LINE', 
-            'segments': segments,
-            'total_points': len(intersection_line)
-        }
+        # Check for significant direction change (indicating a corner or special point)
+        if point_index > 0 and point_index < len(all_points) - 1:
+            try:
+                p1 = np.array(all_points[point_index - 1][:3])
+                p2 = np.array(point[:3])
+                p3 = np.array(all_points[point_index + 1][:3])
+                
+                v1 = p2 - p1
+                v2 = p3 - p2
+                
+                # Normalize vectors
+                v1_norm = np.linalg.norm(v1)
+                v2_norm = np.linalg.norm(v2)
+                
+                if v1_norm > 1e-10 and v2_norm > 1e-10:
+                    v1 = v1 / v1_norm
+                    v2 = v2 / v2_norm
+                    
+                    # Calculate angle between vectors
+                    dot_product = np.clip(np.dot(v1, v2), -1, 1)
+                    angle = np.arccos(dot_product)
+                    
+                    # If angle is significant (> 30 degrees), consider it a corner
+                    if angle > np.pi / 6:  # 30 degrees
+                        return "CORNER"
+            except:
+                pass
+        
+        # Split at regular intervals for fine-grained control
+        if point_index % 3 == 0:  # Every 3rd point is a potential split
+            return "SPLIT_POINT"
+        
+        return "DEFAULT"
     
     def _get_next_rgb_color(self):
         """Generate unique RGB color for constraint identification (like C++ logic)"""
@@ -7856,19 +7956,22 @@ segmentation, triangulation, and visualization.
             self._populate_constraint_tree()
             self._update_constraint_summary()
             
-            # Start with no visualization (user needs to select constraints first)
-            self.constraint_plotter.clear()
-            self.constraint_plotter.add_text("Constraints generated!\nSelect constraints in the tree to visualize them.", 
-                                            position='upper_edge', font_size=12)
-            
-            # Enable constraint selection if constraints were generated
+            # Initialize visualization with all constraints in "Show All" mode
+            # This ensures all actors exist for efficient updates later
             if self.constraint_manager.surface_constraints:
+                logger.info("Initializing constraint visualization...")
+                self._visualize_constraints(selection_mode=False)  # Show all constraints initially
+                
                 self.enable_constraint_selection_btn.setEnabled(True)
                 self.generate_tetra_mesh_btn.setEnabled(True)
                 self.show_all_surfaces_btn.setEnabled(True)
                 self.show_selected_only_btn.setEnabled(True)
                 logger.info("Constraints generated successfully from pre-tetra mesh data")
             else:
+                # Start with no visualization only if no constraints were generated
+                self.constraint_plotter.clear()
+                self.constraint_plotter.add_text("Constraints generated!\nSelect constraints in the tree to visualize them.", 
+                                                position='upper_edge', font_size=12)
                 QMessageBox.warning(self, "No Constraints", 
                                   "No constraints could be generated. Ensure pre-tetra mesh tab is completed first.")
                 
@@ -8183,7 +8286,7 @@ segmentation, triangulation, and visualization.
             logger.warning(f"Error processing constraint selection: {e}")
 
     def _populate_constraint_tree(self):
-        """Populate the constraint tree widget with surface and constraint information"""
+        """Populate the constraint tree widget with hierarchical surface and constraint information"""
         
         self.surface_constraint_tree.clear()
         
@@ -8193,39 +8296,95 @@ segmentation, triangulation, and visualization.
                 continue
                 
             surface_name = dataset.get('name', f'Surface_{surface_idx}')
-            surface_item = QTreeWidgetItem([surface_name, "Surface", "Container", f"{len(constraints)} constraints"])
+            surface_item = QTreeWidgetItem([surface_name, "Surface", "Container", f"{len(constraints)} constraint segments"])
             surface_item.setData(0, Qt.UserRole, ('surface', surface_idx))
             
+            # Group constraints by parent type for hierarchical display
+            hull_segments = []
+            intersection_groups = {}  # line_id -> list of segments
+            
             for constraint_idx, constraint in enumerate(constraints):
-                constraint_key = (surface_idx, constraint_idx)
-                constraint_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
+                if constraint['type'] == 'HULL_SEGMENT':
+                    hull_segments.append((constraint_idx, constraint))
+                elif constraint['type'] == 'INTERSECTION_SEGMENT':
+                    line_id = constraint.get('line_id', 0)
+                    if line_id not in intersection_groups:
+                        intersection_groups[line_id] = []
+                    intersection_groups[line_id].append((constraint_idx, constraint))
+            
+            # Add Hull Boundary parent with individual segments as children
+            if hull_segments:
+                hull_parent = QTreeWidgetItem(["Hull Boundary", "HULL_BOUNDARY", "Container", f"{len(hull_segments)} segments"])
+                hull_parent.setData(0, Qt.UserRole, ('parent', 'HULL_BOUNDARY'))
                 
-                constraint_name = f"{constraint['type']} {constraint_idx}"
-                segment_count = len(constraint['segments'])
+                for constraint_idx, constraint in hull_segments:
+                    constraint_key = (surface_idx, constraint_idx)
+                    constraint_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
+                    
+                    segment_id = constraint.get('segment_id', constraint_idx)
+                    segment_name = f"Hull Segment {segment_id}"
+                    
+                    segment_item = QTreeWidgetItem([
+                        segment_name, 
+                        "HULL_SEGMENT", 
+                        constraint_state, 
+                        f"{constraint['total_points']} points"
+                    ])
+                    segment_item.setData(0, Qt.UserRole, ('constraint', surface_idx, constraint_idx))
+                    segment_item.setFlags(segment_item.flags() | Qt.ItemIsUserCheckable)
+                    
+                    # Set checkbox state based on constraint state
+                    if constraint_state == "SEGMENTS":
+                        segment_item.setCheckState(0, Qt.Checked)
+                    else:
+                        segment_item.setCheckState(0, Qt.Unchecked)
+                    
+                    hull_parent.addChild(segment_item)
                 
-                constraint_item = QTreeWidgetItem([
-                    constraint_name, 
-                    constraint['type'], 
-                    constraint_state, 
-                    f"{segment_count} segments"
+                surface_item.addChild(hull_parent)
+            
+            # Add Intersection Lines with individual segments as children
+            for line_id, line_segments in intersection_groups.items():
+                intersection_parent = QTreeWidgetItem([
+                    f"Intersection Line {line_id}", 
+                    "INTERSECTION_LINE", 
+                    "Container", 
+                    f"{len(line_segments)} segments"
                 ])
-                constraint_item.setData(0, Qt.UserRole, ('constraint', surface_idx, constraint_idx))
-                constraint_item.setFlags(constraint_item.flags() | Qt.ItemIsUserCheckable)
+                intersection_parent.setData(0, Qt.UserRole, ('parent', 'INTERSECTION_LINE', line_id))
                 
-                # Set checkbox state based on constraint state
-                if constraint_state == "SEGMENTS":
-                    constraint_item.setCheckState(0, Qt.Checked)
-                else:
-                    constraint_item.setCheckState(0, Qt.Unchecked)
+                for constraint_idx, constraint in line_segments:
+                    constraint_key = (surface_idx, constraint_idx)
+                    constraint_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
+                    
+                    segment_id = constraint.get('segment_id', 0)
+                    segment_name = f"Intersection Segment {segment_id}"
+                    
+                    segment_item = QTreeWidgetItem([
+                        segment_name, 
+                        "INTERSECTION_SEGMENT", 
+                        constraint_state, 
+                        f"{constraint['total_points']} points"
+                    ])
+                    segment_item.setData(0, Qt.UserRole, ('constraint', surface_idx, constraint_idx))
+                    segment_item.setFlags(segment_item.flags() | Qt.ItemIsUserCheckable)
+                    
+                    # Set checkbox state based on constraint state
+                    if constraint_state == "SEGMENTS":
+                        segment_item.setCheckState(0, Qt.Checked)
+                    else:
+                        segment_item.setCheckState(0, Qt.Unchecked)
+                    
+                    intersection_parent.addChild(segment_item)
                 
-                surface_item.addChild(constraint_item)
+                surface_item.addChild(intersection_parent)
             
             self.surface_constraint_tree.addTopLevelItem(surface_item)
         
         self.surface_constraint_tree.expandAll()
 
     def _on_constraint_tree_item_changed(self, item, column):
-        """Handle changes in constraint tree checkboxes"""
+        """Handle changes in constraint tree checkboxes - EFFICIENT VERSION"""
         item_data = item.data(0, Qt.UserRole)
         if item_data and item_data[0] == 'constraint':
             surface_idx, constraint_idx = item_data[1], item_data[2]
@@ -8240,8 +8399,121 @@ segmentation, triangulation, and visualization.
             # Update state text in tree
             item.setText(2, self.constraint_manager.constraint_states[constraint_key])
             
-            # Only visualize the specific surface that was changed (much more efficient)
-            self._visualize_single_surface_constraints(surface_idx, update_summary=True)
+            # EFFICIENT UPDATE: Only change the visual properties of this specific constraint
+            self._update_constraint_appearance(surface_idx, constraint_idx)
+            
+            # Update summary without full re-render
+            self._update_constraint_summary()
+
+    def _update_constraint_appearance(self, surface_idx, constraint_idx):
+        """EFFICIENTLY update only the visual appearance of a specific constraint without re-rendering"""
+        if not self.constraint_plotter:
+            return
+        
+        try:
+            # Get constraint data
+            constraints = self.constraint_manager.surface_constraints.get(surface_idx, [])
+            if constraint_idx >= len(constraints):
+                return
+            
+            constraint = constraints[constraint_idx]
+            constraint_key = (surface_idx, constraint_idx)
+            constraint_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
+            
+            # Update each segment of this constraint
+            for segment_idx, segment in enumerate(constraint.get('segments', [])):
+                actor_name = f"constraint_{surface_idx}_{constraint_idx}_{segment_idx}"
+                
+                # Check if actor exists in the plotter
+                if actor_name in self.constraint_plotter.actors:
+                    actor = self.constraint_plotter.actors[actor_name]
+                    
+                    # Update visual properties based on state WITHOUT recreating the mesh
+                    if constraint_state == "SEGMENTS":
+                        # Selected: blue color, thick line
+                        actor.GetProperty().SetColor(0, 0, 1)  # Blue
+                        actor.GetProperty().SetLineWidth(5)
+                        actor.GetProperty().SetOpacity(0.9)
+                    elif constraint_state == "HOLES":
+                        # Holes: red color, thick line
+                        actor.GetProperty().SetColor(1, 0, 0)  # Red
+                        actor.GetProperty().SetLineWidth(5)
+                        actor.GetProperty().SetOpacity(0.9)
+                    else:  # "UNDEFINED"
+                        # Unselected: white color, thin line
+                        actor.GetProperty().SetColor(1, 1, 1)  # White
+                        actor.GetProperty().SetLineWidth(3)
+                        actor.GetProperty().SetOpacity(0.7)
+                    
+                    # Force update of the actor
+                    actor.Modified()
+            
+            # Only render once after updating all segments of this constraint
+            self.constraint_plotter.render()
+            
+        except Exception as e:
+            logger.error(f"Error updating constraint appearance: {e}")
+            # Fallback to full update only if the efficient method fails
+            self._visualize_single_surface_constraints(surface_idx, update_summary=False)
+
+    def _batch_update_all_constraint_appearances(self, target_state):
+        """EFFICIENTLY update all constraint appearances in a single batch operation"""
+        if not self.constraint_plotter:
+            return
+        
+        try:
+            # Check if we have any actors at all - if not, need to visualize first
+            total_actors = len([name for name in self.constraint_plotter.actors.keys() 
+                              if name.startswith("constraint_")])
+            
+            if total_actors == 0:
+                logger.info("No constraint actors found, initializing visualization first...")
+                self._visualize_constraints(selection_mode=False)
+            
+            # Get visual properties for the target state
+            if target_state == "SEGMENTS":
+                color = (0, 0, 1)  # Blue
+                line_width = 5
+                opacity = 0.9
+            elif target_state == "HOLES":
+                color = (1, 0, 0)  # Red
+                line_width = 5
+                opacity = 0.9
+            else:  # "UNDEFINED"
+                color = (1, 1, 1)  # White
+                line_width = 3
+                opacity = 0.7
+            
+            # Update all constraint actors in one go
+            updated_count = 0
+            for surface_idx, constraints in self.constraint_manager.surface_constraints.items():
+                for constraint_idx, constraint in enumerate(constraints):
+                    for segment_idx, segment in enumerate(constraint.get('segments', [])):
+                        actor_name = f"constraint_{surface_idx}_{constraint_idx}_{segment_idx}"
+                        
+                        if actor_name in self.constraint_plotter.actors:
+                            actor = self.constraint_plotter.actors[actor_name]
+                            
+                            # Update visual properties
+                            actor.GetProperty().SetColor(*color)
+                            actor.GetProperty().SetLineWidth(line_width)
+                            actor.GetProperty().SetOpacity(opacity)
+                            actor.Modified()
+                            updated_count += 1
+            
+            # Single render call for all updates
+            self.constraint_plotter.render()
+            
+            logger.info(f"Batch updated {updated_count} constraint actors to state: {target_state}")
+            
+        except Exception as e:
+            logger.error(f"Error in batch update: {e}")
+            # Fallback to full visualization if batch update fails
+            logger.info("Falling back to full visualization...")
+            if target_state == "UNDEFINED":
+                self._visualize_constraints(selection_mode=False)  # Show all in white
+            else:
+                self._visualize_constraints(selection_mode=False)  # Show all with proper colors
 
     def _update_constraint_summary(self):
         """Update the constraint selection summary display"""
@@ -8261,25 +8533,30 @@ segmentation, triangulation, and visualization.
         self.constraint_selection_summary.setText(text)
 
     def _select_all_constraints(self):
-        """Select all constraints as SEGMENTS"""
+        """Select all constraints as SEGMENTS - EFFICIENT BATCH UPDATE"""
+        # Update all states first
         for constraint_key in self.constraint_manager.constraint_states:
             self.constraint_manager.constraint_states[constraint_key] = "SEGMENTS"
         
+        # Batch update all visual properties without individual renders
+        self._batch_update_all_constraint_appearances("SEGMENTS")
+        
+        # Update tree and summary
         self._populate_constraint_tree()
         self._update_constraint_summary()
-        self._visualize_selected_surfaces_only()  # Only show selected surfaces
 
     def _unselect_all_constraints(self):
-        """Unselect all constraints (set to UNDEFINED)"""
+        """Unselect all constraints (set to UNDEFINED) - EFFICIENT BATCH UPDATE"""
+        # Update all states first
         for constraint_key in self.constraint_manager.constraint_states:
             self.constraint_manager.constraint_states[constraint_key] = "UNDEFINED"
         
+        # Batch update all visual properties without individual renders
+        self._batch_update_all_constraint_appearances("UNDEFINED")
+        
+        # Update tree and summary
         self._populate_constraint_tree()
         self._update_constraint_summary()
-        # Clear visualization when nothing is selected
-        self.constraint_plotter.clear()
-        self.constraint_plotter.add_text("All constraints unselected.\nSelect constraints to visualize them.", 
-                                            position='upper_edge', font_size=12)
 
     def _generate_tetrahedral_mesh_action(self):
         """Generate tetrahedral mesh using selected constraints"""
