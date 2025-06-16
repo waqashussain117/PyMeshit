@@ -9076,56 +9076,77 @@ segmentation, triangulation, and visualization.
         # Default expansion: Expand surfaces and parent categories, but not individual segments
         self._set_default_expansion_state()
 
+        # ------------------------------------------------------------------ #
+    # tree-widget callback                                               #
+    # ------------------------------------------------------------------ #
     def _on_constraint_tree_item_changed(self, item, column):
-        """Handle changes in constraint tree checkboxes - EFFICIENT VERSION"""
+        """
+        Called when the user toggles any checkbox in the surface /
+        constraint tree.
+
+        • surface items (top-level) act as *exclusive* visibility toggles:
+          checking one surface automatically hides all others.
+        • parent items (“Hull Boundary”, “Intersection Line n”) forward the
+          state to their children.
+        • leaf items (individual constraints) update only their own
+          appearance.
+        """
         item_data = item.data(0, Qt.UserRole)
-        
-        if item_data and item_data[0] == 'surface':
-            # Handle surface visibility change
+        if not item_data:
+            return
+
+        # ------------------------------------------------------------------
+        # 1)  SURFACE visibility  (independent, no auto-hiding)
+        # ------------------------------------------------------------------
+        if item_data[0] == 'surface':
             surface_idx = item_data[1]
-            is_visible = item.checkState(0) == Qt.Checked
+            is_visible  = item.checkState(0) == Qt.Checked
+
+            # store & apply
             self.constraint_manager.surface_visibility[surface_idx] = is_visible
-            
-            # Update surface visibility in 3D view
             self._update_surface_visibility(surface_idx, is_visible)
-            
-            # Update state text in tree
             item.setText(2, "Visible" if is_visible else "Hidden")
-            
-        elif item_data and item_data[0] == 'parent':
-            # Handle parent-level selection (Hull Boundary or Intersection Line)
-            if len(item_data) >= 3:
-                parent_type = item_data[1]
-                surface_idx = item_data[2]
-                
-                if parent_type == 'HULL_BOUNDARY':
-                    self._handle_hull_parent_selection(item, surface_idx)
-                elif parent_type == 'INTERSECTION_LINE' and len(item_data) >= 4:
-                    line_id = item_data[3]
-                    self._handle_intersection_parent_selection(item, surface_idx, line_id)
-                    
-        elif item_data and item_data[0] == 'constraint':
-            # Handle constraint selection change
+            return
+
+        # ------------------------------------------------------------------
+        # 2)  PARENT level (Hull Boundary / Intersection Line)
+        # ------------------------------------------------------------------
+        if item_data[0] == 'parent':
+            parent_type  = item_data[1]
+            surface_idx  = item_data[2]
+            if parent_type == 'HULL_BOUNDARY':
+                self._handle_hull_parent_selection(item, surface_idx)
+            elif parent_type == 'INTERSECTION_LINE' and len(item_data) >= 4:
+                line_id = item_data[3]
+                self._handle_intersection_parent_selection(item, surface_idx, line_id)
+            return
+
+        # ------------------------------------------------------------------
+        # 3)  CONSTRAINT (leaf)                                             #
+        # ------------------------------------------------------------------
+        if item_data[0] == 'constraint':
             surface_idx, constraint_idx = item_data[1], item_data[2]
             constraint_key = (surface_idx, constraint_idx)
-            
-            # Update constraint state based on checkbox
+
+            # update state
             if item.checkState(0) == Qt.Checked:
                 self.constraint_manager.constraint_states[constraint_key] = "SEGMENTS"
             else:
                 self.constraint_manager.constraint_states[constraint_key] = "UNDEFINED"
-            
-            # Update state text in tree
+
+            # update label in tree
             item.setText(2, self.constraint_manager.constraint_states[constraint_key])
-            
-            # EFFICIENT UPDATE: Only change the visual properties of this specific constraint
-            logger.info(f"Updating constraint appearance: Surface {surface_idx}, Constraint {constraint_idx}, State: {self.constraint_manager.constraint_states[constraint_key]}")
+
+            # visual appearance – update only this constraint
+            logger.info(f"Updating constraint appearance: "
+                        f"Surface {surface_idx}, Constraint {constraint_idx}, "
+                        f"State: {self.constraint_manager.constraint_states[constraint_key]}")
             self._update_constraint_appearance(surface_idx, constraint_idx)
-            
-            # Update parent checkbox state based on children
+
+            # refresh parent checkbox
             self._update_parent_checkbox_state(item)
-            
-            # Update summary without full re-render
+
+            # refresh summary text
             self._update_constraint_summary()
 
     def _handle_hull_parent_selection(self, parent_item, surface_idx):
@@ -9279,12 +9300,18 @@ segmentation, triangulation, and visualization.
                 actor.SetVisibility(is_visible)
                 actor.Modified()
             
-            # Update all constraint actors for this surface
+             # -------- constraint actors for this surface ---------------
             constraints = self.constraint_manager.surface_constraints.get(surface_idx, [])
             for constraint_idx, constraint in enumerate(constraints):
-                for segment_idx, segment in enumerate(constraint.get('segments', [])):
+                # new format: each constraint *is* one segment
+                # old format (if any): constraint['segments'] → list[…]
+                if 'segments' in constraint:
+                    seg_iter = constraint['segments']
+                else:
+                    seg_iter = [constraint]
+
+                for segment_idx, _unused in enumerate(seg_iter):
                     actor_name = f"constraint_{surface_idx}_{constraint_idx}_{segment_idx}"
-                    
                     if actor_name in self.constraint_plotter.actors:
                         actor = self.constraint_plotter.actors[actor_name]
                         actor.SetVisibility(is_visible)
@@ -9464,29 +9491,62 @@ segmentation, triangulation, and visualization.
         self.constraint_selection_summary.setText(text)
 
     def _select_all_constraints(self):
-        """Select all constraints as SEGMENTS - EFFICIENT BATCH UPDATE"""
-        # Update all states first
-        for constraint_key in self.constraint_manager.constraint_states:
-            self.constraint_manager.constraint_states[constraint_key] = "SEGMENTS"
-        
-        # Batch update all visual properties without individual renders
+        """Check every surface + every constraint → SEGMENTS & Visible"""
+        # block signals while we tick check-boxes
+        self.surface_constraint_tree.blockSignals(True)
+        try:
+            # iterate tree – tick every leaf & every surface
+            for i in range(self.surface_constraint_tree.topLevelItemCount()):
+                surface_item = self.surface_constraint_tree.topLevelItem(i)
+                surface_idx  = surface_item.data(0, Qt.UserRole)[1]
+                surface_item.setCheckState(0, Qt.Checked)
+                surface_item.setText(2, "Visible")
+                self.constraint_manager.surface_visibility[surface_idx] = True
+                self._update_surface_visibility(surface_idx, True)
+
+                # tick every descendant
+                def _tick_children(parent):
+                    for j in range(parent.childCount()):
+                        child = parent.child(j)
+                        child.setCheckState(0, Qt.Checked)
+                        _tick_children(child)
+                _tick_children(surface_item)
+        finally:
+            self.surface_constraint_tree.blockSignals(False)
+
+        # set every constraint state to SEGMENTS
+        for key in self.constraint_manager.constraint_states:
+            self.constraint_manager.constraint_states[key] = "SEGMENTS"
+
+        # fast appearance update
         self._batch_update_all_constraint_appearances("SEGMENTS")
-        
-        # Update tree and summary
-        self._populate_constraint_tree()
         self._update_constraint_summary()
 
     def _unselect_all_constraints(self):
-        """Unselect all constraints (set to UNDEFINED) - EFFICIENT BATCH UPDATE"""
-        # Update all states first
-        for constraint_key in self.constraint_manager.constraint_states:
-            self.constraint_manager.constraint_states[constraint_key] = "UNDEFINED"
-        
-        # Batch update all visual properties without individual renders
+        """Uncheck every surface + every constraint → UNDEFINED & Hidden"""
+        self.surface_constraint_tree.blockSignals(True)
+        try:
+            for i in range(self.surface_constraint_tree.topLevelItemCount()):
+                surface_item = self.surface_constraint_tree.topLevelItem(i)
+                surface_idx  = surface_item.data(0, Qt.UserRole)[1]
+                surface_item.setCheckState(0, Qt.Unchecked)
+                surface_item.setText(2, "Hidden")
+                self.constraint_manager.surface_visibility[surface_idx] = False
+                self._update_surface_visibility(surface_idx, False)
+
+                def _untick(parent):
+                    for j in range(parent.childCount()):
+                        child = parent.child(j)
+                        child.setCheckState(0, Qt.Unchecked)
+                        _untick(child)
+                _untick(surface_item)
+        finally:
+            self.surface_constraint_tree.blockSignals(False)
+
+        for key in self.constraint_manager.constraint_states:
+            self.constraint_manager.constraint_states[key] = "UNDEFINED"
+
         self._batch_update_all_constraint_appearances("UNDEFINED")
-        
-        # Update tree and summary
-        self._populate_constraint_tree()
         self._update_constraint_summary()
 
     def _expand_all_tree_items(self):
