@@ -283,74 +283,240 @@ class SurfaceConstraintManager:
         # mark every surface “visible” by default (GUI uses this flag)
         self.surface_visibility = {idx: True for idx in range(len(datasets))}
 
-    # REAL worker ------------------------------------------------------- #
+        # ------------------------------------------------------------------ #
+    # build GUI-constraints from the datasets (hull + intersections)     #
+    # ------------------------------------------------------------------ #
     def build_constraints_from_datasets(self, datasets):
+        """
+        Creates the per-surface constraint lists.
+
+        1)   adds the surface’s own hull boundary             (closed   loop)
+        2)   adds every intersection poly-line exactly once   (open     line)
+
+        Resulting order inside each surface’s list:
+            – all hull segments   (ctype = "hull", "hull_1", …)
+            – all intersection segments                       ("intersection_*")
+        """
+        # ---------- reset internal state --------------------------------
         self.surface_constraints.clear()
         self.constraint_rgb_map.clear()
         self.constraint_states.clear()
         self.next_rgb_color = self.DEFAULT_RGB_START.copy()
 
-        # 1) triple-points
+        # ---------- map triple-points first -----------------------------
         self._build_triple_point_lookup(datasets)
 
-        # 2) global intersection network  (with provenance)
+        # ---------- global intersection list (with provenance) ----------
         global_lines = self._reconstruct_global_intersection_network(datasets)
 
-        # 3) per surface
+        # ---------- build constraints surface by surface ----------------
         for surf_idx, ds in enumerate(datasets):
             constraints = []
 
-            # ---- hull --------------------------------------------------
-            for hull in self._extract_hull_boundary_from_constrained_mesh(ds, surf_idx):
+            # ---- 1) HULL boundary  -------------------------------------
+            hull_lines = self._extract_hull_boundary_from_constrained_mesh(
+                ds, surf_idx
+            )
+            for k, hull in enumerate(hull_lines):
+                ctype = "hull" if k == 0 else f"hull_{k}"
                 constraints.extend(
                     self._segment_open_or_closed_line(
-                        hull, self._triple_points_global,
-                        surf_idx, "hull", is_closed=True
+                        hull,                       # poly-line
+                        extras=[],                  # no triple points on hull
+                        surf_idx=surf_idx,
+                        ctype=ctype,
+                        is_closed=True              # closed loop
                     )
                 )
 
-            # ---- intersections ----------------------------------------
-            for g in self._filter_lines_for_surface(global_lines, ds):
-                key   = (g['dataset_idx'], g['intersection_id'])
-                tp_for_this_line = self._triple_lookup.get(key, [])
+            # ---- 2) INTERSECTIONS  -------------------------------------
+            for g in self._filter_lines_for_surface(global_lines,
+                                                    ds, surf_idx):
+                key = (g['dataset_idx'], g['intersection_id'])
+                tp_for_line = self._triple_lookup.get(key, [])
                 constraints.extend(
                     self._segment_open_or_closed_line(
-                        g['line'], tp_for_this_line,
-                        surf_idx, f"intersection_{len(constraints)}",  # name just needs to be unique
-                        is_closed=False
+                        g['line'],                 # poly-line
+                        tp_for_line,               # triple-points mapped earlier
+                        surf_idx=surf_idx,
+                        ctype=f"intersection_{len(constraints)}",
+                        is_closed=False            # open line
                     )
                 )
 
+            # store the finished list for this surface
             self.surface_constraints[surf_idx] = constraints
-
-    # ------------------------------------------------------------------ #
-    # triple-point organisation                                          #
     # ------------------------------------------------------------------ #
     def _build_triple_point_lookup(self, datasets):
         """
-        Key is now  (dataset_idx, intersection_id)  so we can
-        recover the correct triple-points later, regardless of how
-        intersection lines are re-enumerated globally.
+        Build  self._triple_lookup : (dataset_idx, intersection_id) → [tp]
+               self._triple_points_global : list[[x,y,z], …]
+        Works whether triple-points are stored per dataset or only on the
+        parent GUI, and whether intersection IDs already match or not.
         """
+        import numpy as np
+
         self._triple_lookup.clear()
         self._triple_points_global.clear()
 
+        # -------------------------------------------------------------- #
+        # helper: return numeric xyz from any vertex representation
+        # -------------------------------------------------------------- #
+        def _xyz(pt):
+            if hasattr(pt, "x"):
+                return [float(pt.x), float(pt.y), float(pt.z)]
+            elif isinstance(pt, (list, tuple)) and len(pt) >= 3:
+                return [float(pt[0]), float(pt[1]), float(pt[2])]
+            raise ValueError("Cannot extract xyz from vertex")
+
+        # -------------------------------------------------------------- #
+        # 1) collect every triple-point we can find
+        # -------------------------------------------------------------- #
+        raw_tp_items = []               # [(coord, ids), …]
+
+        def _add_raw(tp_obj):
+            if tp_obj is None:
+                return
+            if isinstance(tp_obj, dict):
+                coord = tp_obj.get("point")
+                ids   = tp_obj.get("intersection_ids") or tp_obj.get("intersections") or []
+            else:
+                coord = getattr(tp_obj, "point", None)
+                ids   = getattr(tp_obj, "intersection_ids", [])
+            if coord is None:
+                return
+            coord = _xyz(coord)
+            raw_tp_items.append((coord, list(ids)))
+
+        # a) stored inside each dataset
+        for ds in datasets:
+            for tp in ds.get("triple_points", []):
+                _add_raw(tp)
+        # b) global list on the parent GUI
+        if hasattr(self, "_parent_gui"):
+            for tp in getattr(self._parent_gui, "triple_points", []):
+                _add_raw(tp)
+
+        # deduplicate (1 e-8 tolerance)
+        def _norm(p): return tuple(round(float(c), 8) for c in p)
+        seen, uniq_tp_items = set(), []
+        for c, ids in raw_tp_items:
+            k = _norm(c)
+            if k not in seen:
+                seen.add(k)
+                uniq_tp_items.append((c, ids))
+
+        # -------------------------------------------------------------- #
+        # 2) fast, id-based assignment  (works if ids already match)
+        # -------------------------------------------------------------- #
+                # 2) fast, id-based assignment – two passes
+        #    a) TP stored inside each dataset           (old behaviour)
+        #    b) TP stored only on the parent GUI list   (NEW)
+        # -------------------------------------------------------------- #
+        id_hit = False
+
+        # a) local copies inside each dataset
         for ds_idx, ds in enumerate(datasets):
             for tp in ds.get("triple_points", []):
-                pt = tp["point"]                           # [x,y,z]
-                for iid in tp["intersection_ids"]:
-                    key = (ds_idx, iid)
-                    self._triple_lookup.setdefault(key, []).append(pt)
+                coord = _xyz(tp["point"])
+                ids   = tp.get("intersection_ids", [])
+                for iid in ids:
+                    self._triple_lookup.setdefault((ds_idx, iid), []).append(coord)
+                if _norm(coord) not in {_norm(p) for p in self._triple_points_global}:
+                    self._triple_points_global.append(coord)
+                id_hit = True
 
-                # keep one global copy (for hull insertion only)
-                tup = tuple(round(float(c), 8) for c in pt)
-                if tup not in {tuple(round(float(c), 8) for c in q)
-                                for q in self._triple_points_global}:
-                    self._triple_points_global.append(pt)
+        # b) global list on the parent GUI
+        if hasattr(self, "_parent_gui"):
+            for tp in getattr(self._parent_gui, "triple_points", []):
+                coord = _xyz(tp["point"])
+                ids   = tp.get("intersection_ids", [])
+                for ds_idx, ds in enumerate(datasets):
+                    max_iid = len(ds.get("intersection_constraints", [])) - 1
+                    for iid in ids:
+                        if 0 <= iid <= max_iid:      # id exists in this dataset
+                            self._triple_lookup.setdefault((ds_idx, iid), []).append(coord)
+                            id_hit = True
+                if _norm(coord) not in {_norm(p) for p in self._triple_points_global}:
+                    self._triple_points_global.append(coord)
 
-    # ------------------------------------------------------------------ #
-    # hull boundary extraction                                           #
-    # ------------------------------------------------------------------ #
+        if id_hit:
+            return                                  # done                            # done
+
+        # -------------------------------------------------------------- #
+        # 3) geometric fall-back – map every triple-point to the
+        #    intersection polylines it truly lies on
+        # -------------------------------------------------------------- #
+        # pre-extract NUMERIC versions of all intersection lines
+        intersection_lines = {
+            ds_idx: [[_xyz(v) for v in line]
+                     for line in ds.get("intersection_constraints", [])]
+            for ds_idx, ds in enumerate(datasets)
+        }
+
+        # fast helpers
+        def _pt_seg_distance(p, a, b):
+            pa, ba = p - a, b - a
+            l2 = np.dot(ba, ba)
+            if l2 == 0.0:
+                return np.linalg.norm(pa)
+            t = np.clip(np.dot(pa, ba) / l2, 0.0, 1.0)
+            proj = a + t * ba
+            return np.linalg.norm(p - proj)
+
+        tol = 1e-3       # absolute lower bound (model units ≈ mm)
+
+        for coord, _unused_ids in uniq_tp_items:
+            p_np = np.asarray(coord, dtype=float)
+
+            for ds_idx, lines in intersection_lines.items():
+                for int_id, line in enumerate(lines):
+                    if len(line) < 2:
+                        continue
+                    l_np = np.asarray(line, dtype=float)
+
+                    # quick bounding-box reject
+                    if not ((l_np.min(axis=0) - tol <= p_np).all() and
+                            (p_np <= l_np.max(axis=0) + tol).all()):
+                        continue
+
+                    # adaptive tolerance: 1 % of total poly-line length
+                    line_len = np.sum(
+                        np.linalg.norm(l_np[1:] - l_np[:-1], axis=1)
+                    )
+                    adaptive_tol = max(tol, 0.01 * line_len)
+
+                    # (a) distance to any segment
+                    on_seg = any(
+                        _pt_seg_distance(p_np, l_np[i], l_np[i + 1]) < adaptive_tol
+                        for i in range(len(l_np) - 1)
+                    )
+
+                    # (b) OR distance to any existing vertex
+                    to_vertex = np.min(
+                        np.linalg.norm(l_np - p_np, axis=1)
+                    ) < adaptive_tol
+
+                    if on_seg or to_vertex:
+                        self._triple_lookup.setdefault(
+                            (ds_idx, int_id), []
+                        ).append(coord)
+
+            # keep a global copy for hull handling
+            if _norm(coord) not in {_norm(p) for p in self._triple_points_global}:
+                self._triple_points_global.append(coord)
+        # -------------------------------------------------------------- #
+        # DEBUG summary – how many TP per intersection?
+        # -------------------------------------------------------------- #
+        log = logging.getLogger("MeshIt-Workflow")
+        for (ds_i, int_i), pts in sorted(self._triple_lookup.items()):
+            log.info(f"TP lookup  ds={ds_i}  int={int_i}  count={len(pts)}")
+        # -------------------------------------------------------------- #
+        # INFO summary – how many TP per intersection?
+        # -------------------------------------------------------------- #
+        log = logging.getLogger("MeshIt-Workflow")
+        for (ds_i, int_i), pts in sorted(self._triple_lookup.items()):
+            log.info(f"TP lookup  ds={ds_i}  int={int_i}  count={len(pts)}")
     def _extract_hull_boundary_from_constrained_mesh(self, dataset, surf_id):
         """
         Re-implements the original Python logic:
@@ -441,76 +607,208 @@ class SurfaceConstraintManager:
         return global_lines
 
     # ------------------------------------------------------------------ #
-    # quick heuristic: line ↔ surface relevance                           #
+        # ------------------------------------------------------------------ #
+    # decide which global lines belong to this surface                   #
     # ------------------------------------------------------------------ #
-    def _filter_lines_for_surface(self, global_lines, dataset):
+    def _filter_lines_for_surface(self, global_lines, dataset, surf_idx):
         """
-        Very light geometric heuristic to decide whether a global
-        intersection line belongs to *this* surface.
-        Returns the *same* dictionary objects it received, for every
-        relevant line.
-        """
-        relevant = []
-        orig_lines = dataset.get("intersection_constraints", [])
-        if not orig_lines:
-            return relevant
+        Return global intersection lines that
 
+        (a) originate from *this* dataset (g['dataset_idx'] == surf_idx)
+        (b) are actually on / very near this surface (KD-tree test)
+        (c) are not geometric duplicates of another accepted line
+            (same points, maybe reversed order)
+
+        Result: each real intersection appears only once in the GUI.
+        """
         import numpy as np
-        all_pts = np.asarray([p for l in orig_lines for p in l])
-        if all_pts.size == 0:
-            return relevant
+        from scipy.spatial import cKDTree as KD
 
-        try:
-            from scipy.spatial import cKDTree as KD
-            tree = KD(all_pts)
-        except Exception:
-            tree = None
+        # ---- build a KD-tree of this surface’s own points -------------
+        own_xyz = [
+            [_pt[:3] if isinstance(_pt, (list, tuple))
+             else [float(_pt.x), float(_pt.y), float(_pt.z)]
+             for _pt in line]
+            for line in dataset.get("intersection_constraints", [])
+        ]
+        if not own_xyz:
+            return []
+
+        all_pts = np.asarray([p for l in own_xyz for p in l], dtype=float)
+        tree = KD(all_pts)
+
+        # ---- helper: geometric equality test -------------------------
+        def _same_poly(a, b, eps=1e-5):
+            """
+            True if the two polylines have the same vertices (within eps),
+            either in identical order or completely reversed order.
+            """
+            if len(a) != len(b):
+                return False
+            a_np = np.asarray(a)
+            b_np = np.asarray(b)
+            if np.allclose(a_np, b_np, atol=eps):
+                return True
+            if np.allclose(a_np, b_np[::-1], atol=eps):
+                return True
+            return False
 
         eps = 1e-2
-        for g in global_lines:
-            pts = g['line']
-            if len(pts) < 2:
-                continue
-            if tree is None:
-                relevant.append(g)
-                continue
-            hits = sum(tree.query(p, k=1)[0] < eps for p in pts)
-            if hits / len(pts) >= 0.5:
-                relevant.append(g)
-        return relevant
+        accepted = []           # will hold dicts from global_lines
 
-    # ------------------------------------------------------------------ #
-    # line segmentation                                                  #
+        for g in global_lines:
+            # keep only the copy that belongs to THIS dataset
+            if g['dataset_idx'] != surf_idx:
+                continue
+
+            pts_xyz = [p[:3] if isinstance(p, (list, tuple))
+                       else [p.x, p.y, p.z] for p in g['line']]
+            # (b) – proximity test
+            hits = sum(tree.query(p, k=1)[0] < eps for p in pts_xyz)
+            if hits / len(pts_xyz) < 0.5:
+                continue
+
+            # (c) – duplicate-geometry test
+            if any(_same_poly(pts_xyz, a['xyz']) for a in accepted):
+                continue
+
+            g_copy = g.copy()
+            g_copy['xyz'] = pts_xyz        # cache for next comparisons
+            accepted.append(g_copy)
+
+        # strip helper key before returning
+        for d in accepted:
+            d.pop('xyz', None)
+        return accepted
+        # ------------------------------------------------------------------ #
+    # line segmentation  (keeps geometry, honours triple-points)         #
     # ------------------------------------------------------------------ #
     def _segment_open_or_closed_line(self, pts, extras,
                                      surf_idx, ctype, is_closed):
+        """
+        Split a poly-line into selectable GUI segments while preserving the
+        original geometry.
+
+        • pts      original vertex list (never modified)
+        • extras   triple-point coordinates that must act as splitters
+        • ctype    “hull”, “intersection_*”, etc.
+        • is_closed   True  → wrap-around (hull)   |  False → open line
+        """
+        import numpy as np
+        from scipy.spatial.distance import cdist
+        log = logging.getLogger("MeshIt-Workflow")
+
         if len(pts) < 2:
             return []
 
-        aug = self._insert_points_preserving_order(pts, extras)
+        # helper: np.array([x,y,z]) regardless of representation
+        def _np_xyz(v):
+            if hasattr(v, "x"):
+                return np.asarray([v.x, v.y, v.z], dtype=float)
+            elif isinstance(v, (list, tuple)):
+                return np.asarray(v[:3], dtype=float)
+            raise ValueError("Bad vertex type")
 
-        # build split indices
-        splits = list(range(len(aug)))
+        log.info(f"SEGMENT  surf={surf_idx}  ctype={ctype}  TP={len(extras or [])}")
+
+        # ------------------------------------------------------------------
+        # 1) working copy – insert projected triple-points
+        # ------------------------------------------------------------------
+        line = pts.copy()
+
+        # adaptive tolerance: 1 % of total length, minimum 1 mm
+        seg_lens = [np.linalg.norm(_np_xyz(line[i + 1]) - _np_xyz(line[i]))
+                    for i in range(len(line) - 1)]
+        line_len = sum(seg_lens) if seg_lens else 0.0
+        tol = max(1e-3, 0.01 * line_len)
+
+        inserted_split = set()          # indices created by TP insertion
+
+        def _project(p, a, b):
+            p, a, b = map(_np_xyz, (p, a, b))
+            ab = b - a
+            l2 = np.dot(ab, ab)
+            if l2 == 0.0:
+                return a.copy(), np.linalg.norm(p - a)
+            t = np.clip(np.dot(p - a, ab) / l2, 0.0, 1.0)
+            proj = a + t * ab
+            return proj, np.linalg.norm(p - proj)
+
+        for tp in extras or []:
+            tp_coord = [tp.x, tp.y, tp.z] if hasattr(tp, "x") else tp[:3]
+
+            best_i, best_d, best_proj = None, float("inf"), None
+            for i in range(len(line) - 1):
+                proj, dist = _project(tp_coord, line[i], line[i + 1])
+                if dist < best_d:
+                    best_i, best_d, best_proj = i, dist, proj
+
+            if best_i is None:
+                continue
+
+            if best_d < tol:
+                # insert only if truly between the two vertices
+                if (not np.allclose(best_proj, _np_xyz(line[best_i]),     atol=1e-9) and
+                    not np.allclose(best_proj, _np_xyz(line[best_i + 1]), atol=1e-9)):
+                    line.insert(best_i + 1, best_proj.tolist())
+                    inserted_split.add(best_i + 1)
+            else:
+                # logical split at nearest existing vertex
+                dists = cdist([tp_coord], [_np_xyz(v) for v in line])[0]
+                inserted_split.add(int(np.argmin(dists)))
+
+        log.info(f"  inserted TP indices {sorted(inserted_split)}")
+
+        # ------------------------------------------------------------------
+        # 2) extra splits at refined vertices (type != DEFAULT)
+        # ------------------------------------------------------------------
+        refined_split = {
+            idx for idx, v in enumerate(line)
+            if ((isinstance(v, (list, tuple)) and len(v) > 3 and
+                 str(v[3]).upper() != 'DEFAULT') or
+                (hasattr(v, 'point_type') and str(v.point_type).upper() != 'DEFAULT') or
+                (hasattr(v, 'type') and str(v.type).upper() != 'DEFAULT'))
+        }
+        log.info(f"  refined-split indices {sorted(refined_split)}")
+
+        # ------------------------------------------------------------------
+        # 3) decide where to break the poly-line
+        # ------------------------------------------------------------------
+        if is_closed and str(ctype).lower().startswith("hull"):
+            # Hull boundary – expose every edge, one segment per edge
+            break_ids = set(range(len(line)))
+        else:
+            break_ids = {0, len(line) - 1}.union(inserted_split, refined_split)
+
+        split = sorted(break_ids)
         if is_closed:
-            splits.append(splits[0])          # wrap-around
+            split.append(split[0])        # wrap-around for closed loop
 
-        segs = []
-        for i in range(len(splits) - 1):
-            a, b = splits[i], splits[i + 1]
-            part = aug[a:b + 1] if a < b else aug[a:] + aug[:b + 1]
+        # ------------------------------------------------------------------
+        # 4) build the segments
+        # ------------------------------------------------------------------
+        segments = []
+        for k in range(len(split) - 1):
+            a, b = split[k], split[k + 1]
+            part = (line[a:b + 1] if a < b else
+                    line[a:] + line[:b + 1])
             if len(part) < 2:
                 continue
-            rgb = self._next_rgb()
-            info = dict(points=part, type=ctype, surface_id=surf_idx,
-                        segment_id=len(segs), rgb=rgb,
-                        constraint_type="UNDEFINED")
-            segs.append(info)
-            self.constraint_rgb_map[tuple(rgb)] = (surf_idx, len(segs) - 1)
-        return segs
 
-    # ------------------------------------------------------------------ #
-    # helper – insert points preserving order                            #
-    # ------------------------------------------------------------------ #
+            rgb = self._next_rgb()
+            seg_info = dict(
+                points=part,
+                type=ctype,
+                surface_id=surf_idx,
+                segment_id=len(segments),
+                rgb=rgb,
+                constraint_type="UNDEFINED"
+            )
+            segments.append(seg_info)
+            self.constraint_rgb_map[tuple(rgb)] = (surf_idx, len(segments) - 1)
+
+        log.info(f"  → {len(segments)} GUI-segments produced")
+        return segments
     def _insert_points_preserving_order(self, line, to_insert):
         import numpy as np
 
@@ -1724,7 +2022,8 @@ class MeshItWorkflowGUI(QMainWindow):
                 
                 hull_indices = []
                 for pt in hull_line:
-                    all_points_3d.append(pt)
+                    xyz = pt[:3]            # ignore the type string
+                    all_points_3d.append(xyz)
                     hull_indices.append(len(all_points_3d) - 1)
                 
                 # Create hull segments (closed loop)
@@ -1739,15 +2038,17 @@ class MeshItWorkflowGUI(QMainWindow):
                     
                     line_indices = []
                     for pt in intersection_line:
-                        # Check if point already exists in all existing points (basic check)
+                        xyz = pt[:3]                        # numeric part only
+
                         existing_idx = None
-                        for existing_pt_idx, existing_pt in enumerate(all_points_3d):
-                            if np.linalg.norm(np.array(pt) - np.array(existing_pt)) < 1e-6:
-                                existing_idx = existing_pt_idx
+                        for idx, existing_pt in enumerate(all_points_3d):
+                            if np.linalg.norm(np.array(xyz, dtype=float) -
+                                            np.array(existing_pt, dtype=float)) < 1e-6:
+                                existing_idx = idx
                                 break
-                        
+
                         if existing_idx is None:
-                            all_points_3d.append(pt)
+                            all_points_3d.append(xyz)
                             line_indices.append(len(all_points_3d) - 1)
                         else:
                             line_indices.append(existing_idx)
@@ -2118,8 +2419,11 @@ class MeshItWorkflowGUI(QMainWindow):
             for line_idx, constraint_line in enumerate(constraint_lines):
                 if len(constraint_line) < 2:
                     continue
-                    
-                constraint_points = np.array(constraint_line)
+
+                # keep only numeric coordinates
+                numeric_coords = [[pt[0], pt[1], pt[2]] for pt in constraint_line]
+
+                constraint_points = np.array(numeric_coords, dtype=float)
                 
                 if line_idx == 0:  # Hull boundary
                     # Close the loop for hull
@@ -2790,7 +3094,9 @@ class MeshItWorkflowGUI(QMainWindow):
                 # Store this intersection as constraint for surface 1
                 constraint_line = []
                 for pt in intersection.points:
-                    constraint_line.append([pt.x, pt.y, pt.z])
+                    # keep the vertex “type” so the constraint manager can split later
+                    p_type = getattr(pt, "point_type", getattr(pt, "type", "DEFAULT"))
+                    constraint_line.append([pt.x, pt.y, pt.z, p_type])
                 
                 if len(constraint_line) >= 2:  # Only store if it's a valid line
                     self.datasets[original_id1]['stored_constraints'].append({
@@ -2804,7 +3110,8 @@ class MeshItWorkflowGUI(QMainWindow):
                 # Store this intersection as constraint for surface 2
                 constraint_line = []
                 for pt in intersection.points:
-                    constraint_line.append([pt.x, pt.y, pt.z])
+                    p_type = getattr(pt, "point_type", getattr(pt, "type", "DEFAULT"))
+                    constraint_line.append([pt.x, pt.y, pt.z, p_type])
                 
                 if len(constraint_line) >= 2:  # Only store if it's a valid line
                     self.datasets[original_id2]['stored_constraints'].append({
