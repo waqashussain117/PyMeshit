@@ -40,6 +40,11 @@ from meshit.intersection_utils import run_constrained_triangulation_py
 from scipy.spatial.distance import pdist, squareform
 import gc
 import atexit
+from PyQt5.QtWidgets import (QDockWidget, QListWidget, QListWidgetItem,
+                             QTableWidget, QTableWidgetItem, QPushButton,
+                             QVBoxLayout, QHBoxLayout, QLabel, QSlider,
+                             QDoubleSpinBox, QWidget, QGroupBox, QGridLayout)
+from PyQt5.QtCore import Qt, pyqtSlot
 # Import PyVista for 3D visualization
 try:
     import pyvista as pv
@@ -968,7 +973,7 @@ class MeshItWorkflowGUI(QMainWindow):
         # Placeholder for the refine_mesh_tab plotter
         self.refine_mesh_plotter = None
         self.refine_mesh_viz_frame = None # Add this line for consistency
-        
+        self.tetra_materials: list[dict] = []     # [{name:str, locations:[[x,y,z]…], attribute:int}, …]
 
         # Create menu bar
         self._create_menu_bar()
@@ -1000,7 +1005,250 @@ class MeshItWorkflowGUI(QMainWindow):
         self._create_main_layout()
         self.show()
         self._update_statistics() # Initial update
-    
+    def _init_material_selection_ui(self) -> QGroupBox:
+        """
+        Builds the ‘Materials’ group-box and returns it so the caller
+        can insert it wherever it likes (e.g. into the Tetra-mesh tab).
+        """
+        material_group = QGroupBox("Materials")
+        v_main         = QVBoxLayout(material_group)   # ← same variable name as before
+
+        # 3.1  material list
+        self.material_list = QListWidget()
+        self.material_list.currentRowChanged.connect(self._on_material_selected)
+        v_main.addWidget(QLabel("Material regions:"))
+        v_main.addWidget(self.material_list, 1)
+
+        h_mat_btns = QHBoxLayout()
+        b_add_mat  = QPushButton(" + ");  b_del_mat = QPushButton(" – ")
+        b_add_mat.clicked.connect(self._add_material)
+        b_del_mat.clicked.connect(self._remove_material)
+        h_mat_btns.addWidget(b_add_mat); h_mat_btns.addWidget(b_del_mat)
+        v_main.addLayout(h_mat_btns)
+
+        # 3.2  seed-location list
+        self.material_location_list = QListWidget()
+        self.material_location_list.currentRowChanged.connect(self._on_location_selected)
+        v_main.addWidget(QLabel("Seed locations:"))
+        v_main.addWidget(self.material_location_list, 1)
+
+        h_loc_btns = QHBoxLayout()
+        b_add_loc  = QPushButton(" + ");  b_del_loc = QPushButton(" – ")
+        b_add_loc.clicked.connect(self._add_location)
+        b_del_loc.clicked.connect(self._remove_location)
+        h_loc_btns.addWidget(b_add_loc); h_loc_btns.addWidget(b_del_loc)
+        v_main.addLayout(h_loc_btns)
+
+        # 3.2-bis  location-buttons  ▼▼▼  REPLACE THIS SHORT BLOCK
+        h_loc_btns = QHBoxLayout()
+
+        btn_add_loc   = QPushButton(" + ")
+        btn_del_loc   = QPushButton(" – ")
+        btn_auto_loc  = QPushButton("Auto")        # NEW – automatic placement
+
+        btn_add_loc.clicked.connect(self._add_location)
+        btn_del_loc.clicked.connect(self._remove_location)
+        btn_auto_loc.clicked.connect(self._auto_place_materials)   # NEW hook
+
+        h_loc_btns.addWidget(btn_add_loc)
+        h_loc_btns.addWidget(btn_del_loc)
+        h_loc_btns.addWidget(btn_auto_loc)         # show the 3rd button
+        v_main.addLayout(h_loc_btns)
+        # 3.3  coordinate editors
+        gb_coord   = QGroupBox("Edit selected location")
+        grid       = QGridLayout(gb_coord)
+
+        self.locX_val = QDoubleSpinBox(decimals=4); self.locX_val.setSuffix("  X")
+        self.locY_val = QDoubleSpinBox(decimals=4); self.locY_val.setSuffix("  Y")
+        self.locZ_val = QDoubleSpinBox(decimals=4); self.locZ_val.setSuffix("  Z")
+        for w,lbl in [(self.locX_val,"X"),(self.locY_val,"Y"),(self.locZ_val,"Z")]:
+            w.setRange(-1e9,1e9); w.setSingleStep(0.1); w.setProperty("axis",lbl)
+            w.valueChanged.connect(self._coord_spin_changed)
+
+        self.locX_slider = QSlider(Qt.Horizontal); self.locY_slider = QSlider(Qt.Horizontal); self.locZ_slider = QSlider(Qt.Horizontal)
+        for s,lbl in [(self.locX_slider,"X"),(self.locY_slider,"Y"),(self.locZ_slider,"Z")]:
+            s.setRange(-100000,100000); s.setSingleStep(1); s.setProperty("axis",lbl)
+            s.valueChanged.connect(self._coord_slider_changed)
+
+        grid.addWidget(self.locX_val,0,0);  grid.addWidget(self.locX_slider,1,0)
+        grid.addWidget(self.locY_val,0,1);  grid.addWidget(self.locY_slider,1,1)
+        grid.addWidget(self.locZ_val,0,2);  grid.addWidget(self.locZ_slider,1,2)
+
+        v_main.addWidget(gb_coord)
+        return material_group
+
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 4)  INTERNAL HELPERS / SLOTS
+    # ──────────────────────────────────────────────────────────────────────
+    def _ensure_default_material(self) -> None:
+        if not self.tetra_materials:
+            self.tetra_materials.append({
+                "name":"Material_1",
+                "locations":[self._calculate_default_location()],
+                "attribute":1
+            })
+        self._refresh_material_list()
+
+    def _refresh_material_list(self) -> None:
+        """Synchronise both list-widgets after any change."""
+        # block all signals while we rebuild
+        self.material_list.blockSignals(True)
+        self.material_location_list.blockSignals(True)
+
+        # remember what was selected
+        prev_sel = self.material_list.currentRow()
+
+        # rebuild material list
+        self.material_list.clear()
+        for m, mat in enumerate(self.tetra_materials):
+            self.material_list.addItem(
+                f"{mat['name']}  ({len(mat['locations'])} pts)"
+            )
+
+        # restore (or choose first) selection
+        if self.material_list.count():
+            if prev_sel < 0 or prev_sel >= self.material_list.count():
+                prev_sel = 0
+            self.material_list.setCurrentRow(prev_sel)
+        else:
+            prev_sel = -1          # nothing selected
+
+        # rebuild location list for the selected material
+        self.material_location_list.clear()
+        if 0 <= prev_sel < len(self.tetra_materials):
+            for i, xyz in enumerate(self.tetra_materials[prev_sel]["locations"]):
+                self.material_location_list.addItem(
+                    f"Loc {i}: ({xyz[0]:.2f}, {xyz[1]:.2f}, {xyz[2]:.2f})"
+                )
+
+        # unblock signals and refresh the rest
+        self.material_list.blockSignals(False)
+        self.material_location_list.blockSignals(False)
+
+        self._update_coordinate_editors()
+        self._update_material_visualisation()
+    @pyqtSlot(int)
+    def _on_material_selected(self,row:int)->None:
+        self._refresh_material_list()
+
+    @pyqtSlot(int)
+    def _on_location_selected(self,row:int)->None:
+        self._update_coordinate_editors()
+
+    def _add_material(self)->None:
+        idx=len(self.tetra_materials)+1
+        self.tetra_materials.append({
+            "name":f"Material_{idx}",
+            "locations":[self._calculate_default_location()],
+            "attribute":idx
+        })
+        self.material_list.setCurrentRow(len(self.tetra_materials)-1)
+        self._refresh_material_list()
+
+    def _remove_material(self)->None:
+        row=self.material_list.currentRow()
+        if row>=0:
+            del self.tetra_materials[row]
+            self.material_list.setCurrentRow(max(0,len(self.tetra_materials)-1))
+            self._refresh_material_list()
+
+    def _add_location(self) -> None:
+        """Append a new seed point to the currently selected material."""
+        m = self.material_list.currentRow()
+        if m < 0:
+            QMessageBox.information(
+                self, "Select a material",
+                "Please select (or create) a material first."
+            )
+            return
+
+        # default position = geometric centre of all constrained surfaces
+        new_pt = self._calculate_default_location()
+        self.tetra_materials[m]["locations"].append(new_pt)
+
+        self.material_location_list.setCurrentRow(
+            len(self.tetra_materials[m]["locations"]) - 1
+        )
+        self._refresh_material_list()
+
+    def _remove_location(self)->None:
+        m=self.material_list.currentRow()
+        l=self.material_location_list.currentRow()
+        if m<0 or l<0: return
+        del self.tetra_materials[m]["locations"][l]
+        self.material_location_list.setCurrentRow(max(0,len(self.tetra_materials[m]["locations"])-1))
+        self._refresh_material_list()
+
+    def _update_coordinate_editors(self)->None:
+        m=self.material_list.currentRow(); l=self.material_location_list.currentRow()
+        editing=(m>=0 and l>=0)
+        for w in (self.locX_val,self.locY_val,self.locZ_val,
+                self.locX_slider,self.locY_slider,self.locZ_slider):
+            w.blockSignals(True)
+
+        if editing:
+            x,y,z=self.tetra_materials[m]["locations"][l]
+            self.locX_val.setValue(x); self.locY_val.setValue(y); self.locZ_val.setValue(z)
+            self.locX_slider.setValue(int(x*256)); self.locY_slider.setValue(int(y*256)); self.locZ_slider.setValue(int(z*256))
+        else:
+            for w in (self.locX_val,self.locY_val,self.locZ_val): w.setValue(0)
+            for s in (self.locX_slider,self.locY_slider,self.locZ_slider): s.setValue(0)
+
+        for w in (self.locX_val,self.locY_val,self.locZ_val,
+                self.locX_slider,self.locY_slider,self.locZ_slider):
+            w.blockSignals(False)
+
+    @pyqtSlot(float)
+    def _coord_spin_changed(self,val:float)->None:
+        axis=self.sender().property("axis"); self._apply_coord_change(axis,val)
+
+    @pyqtSlot(int)
+    def _coord_slider_changed(self,val:int)->None:
+        axis=self.sender().property("axis"); self._apply_coord_change(axis,val/256.0)
+
+    def _apply_coord_change(self,axis:str,value:float)->None:
+        m=self.material_list.currentRow(); l=self.material_location_list.currentRow()
+        if m<0 or l<0: return
+        xyz=list(self.tetra_materials[m]["locations"][l])
+        if axis=="X": xyz[0]=value
+        if axis=="Y": xyz[1]=value
+        if axis=="Z": xyz[2]=value
+        self.tetra_materials[m]["locations"][l]=xyz
+        self._update_coordinate_editors()
+        self._refresh_material_list()
+        self._update_material_visualisation()
+
+    def _update_material_visualisation(self) -> None:
+        """
+        Draw/refresh coloured spheres for every material seed.
+        Works with either self.constraint_plotter (main 3-D view in this tab)
+        or the fallback self.tetra_plotter.
+        """
+        plotter = getattr(self, "constraint_plotter", None) or getattr(self, "tetra_plotter", None)
+        if not plotter:
+            return
+
+        # remove previous seed actors
+        for actor_name in list(plotter.actors.keys()):
+            if actor_name.startswith("mat_seed_"):
+                plotter.remove_actor(actor_name)
+
+        colours = ['red','blue','green','yellow','purple','cyan','orange','magenta']
+        import pyvista as pv
+        for midx, mat in enumerate(self.tetra_materials):
+            colour = colours[midx % len(colours)]
+            for lidx, xyz in enumerate(mat["locations"]):
+                cloud = pv.PolyData([xyz])
+                plotter.add_points(
+                    cloud,
+                    name=f"mat_seed_{midx}_{lidx}",
+                    render_points_as_spheres=True,
+                    point_size=12,
+                    color=colour
+                )
+        plotter.render()
     def _create_menu_bar(self):
         """Create the menu bar"""
         menu_bar = self.menuBar()
@@ -8538,18 +8786,19 @@ segmentation, triangulation, and visualization.
         
         control_layout.addWidget(generate_group)
         
-        tab_layout.addWidget(control_panel)
-        
-        # === 3D Viewer (Right) ===
+       # ─ Materials widget (C++-style) ─
+        materials_group = self._init_material_selection_ui()   # build & get the box
+
+        # build the layout, left → right
+        tab_layout.addWidget(control_panel)        # left column (constraint lists etc.)
+
         viewer_group = QGroupBox("3D Viewer - Constraint Selection")
         viewer_layout = QVBoxLayout(viewer_group)
-        
-        # Setup enhanced 3D viewer with constraint visualization
         self._setup_constraint_3d_viewer(viewer_group, viewer_layout)
-        
-        tab_layout.addWidget(viewer_group, 1)
-        
-        # Initialize
+        tab_layout.addWidget(viewer_group, 1)      # center: 3-D viewport (stretch=1)
+
+        tab_layout.addWidget(materials_group)      # right column: Materials panel
+                # Initialize
         logger.info("Enhanced tetra mesh tab with constraint selection initialized")
         
         # Initialize with delay
@@ -12000,63 +12249,58 @@ segmentation, triangulation, and visualization.
             if current_location < len(locations):
                 del locations[current_location]
                 self._update_location_list(current_material)
-    def _auto_place_materials(self):
-        """Automatically place materials based on surface geometry."""
-        if not self.selected_surfaces:
-            from PyQt5.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "No Surfaces", "Please select surfaces first.")
+    def _auto_place_materials(self) -> None:
+        """
+        Creates one material per loaded surface and drops one seed-point at the
+        centroid of its constrained vertices.  Works whether the vertex list is a
+        Python list or a NumPy array.
+        """
+        if not self.datasets:
+            QMessageBox.warning(self, "No geometry",
+                                "Load or generate surfaces first.")
             return
-        
-        # Clear existing materials except the first one
-        self.tetra_materials = self.tetra_materials[:1] if self.tetra_materials else []
-        
-        # Calculate bounding box of selected surfaces
-        all_vertices = []
-        for surface_index in self.selected_surfaces:
-            if surface_index < len(self.datasets):
-                dataset = self.datasets[surface_index]
-                vertices = dataset.get('constrained_vertices')
-                if self._has_valid_array_data(vertices):
-                    all_vertices.extend(vertices)
-        
-        if all_vertices:
-            vertices_np = np.array(all_vertices)
-            
-            # Calculate center and bounds
-            center = np.mean(vertices_np, axis=0)
-            min_coords = np.min(vertices_np, axis=0)
-            max_coords = np.max(vertices_np, axis=0)
-            
-            # Place materials at strategic locations
-            locations = [
-                center.tolist(),  # Center
-                ((min_coords + center) / 2).tolist(),  # Quarter points
-                ((max_coords + center) / 2).tolist(),
-            ]
-            
-            # Update first material or create new one
-            if self.tetra_materials:
-                self.tetra_materials[0]['locations'] = locations
-            else:
-                material = {
-                    'name': 'Auto_Material_1',
-                    'locations': locations,
-                    'attribute': 1
-                }
-                self.tetra_materials.append(material)
-            
-            self._update_material_list()
-            
-            from PyQt5.QtWidgets import QMessageBox
-            QMessageBox.information(self, "Auto-Placement", f"Placed {len(locations)} material locations automatically.")
-        
-    
-    
 
-    # Surface visibility functions removed - using only constraint selection viewer
+        # fresh start
+        self.tetra_materials.clear()
 
+        for ds_idx, ds in enumerate(self.datasets):
+            verts = ds.get("constrained_vertices", None)
+            if verts is None:
+                continue
 
+            # verts may be list-of-lists or a NumPy array
+            if isinstance(verts, np.ndarray):
+                if verts.size == 0:
+                    continue
+                verts_np = verts[:, :3]                       # keep xyz only
+            else:                                            # assume list/tuple
+                if len(verts) == 0:
+                    continue
+                verts_np = np.asarray(verts)[:, :3]
 
+            centroid = verts_np.mean(axis=0).tolist()
+
+            self.tetra_materials.append({
+                "name"     : f"Material_{ds_idx + 1}",
+                "locations": [centroid],
+                "attribute": ds_idx + 1
+            })
+
+        # ensure at least one material exists
+        if not self.tetra_materials:
+            self.tetra_materials.append({
+                "name": "Material_1",
+                "locations": [self._calculate_default_location()],
+                "attribute": 1
+            })
+
+        self.material_list.setCurrentRow(0)
+        self._refresh_material_list()
+
+        QMessageBox.information(
+            self, "Automatic placement",
+            f"Created {len(self.tetra_materials)} material(s) with one seed each."
+        )
     def _clear_current_selection(self):
         """Clear current selection."""
         self.selected_surfaces.clear()
@@ -12068,50 +12312,39 @@ segmentation, triangulation, and visualization.
 
 
     def _assign_materials_to_mesh(self, tetrahedral_grid):
-        """Assign material IDs to tetrahedral mesh."""
-        if not self.tetra_materials:
+        """Assign material IDs to the tetrahedral mesh."""
+        
+        materials = self.tetra_materials           # <- hook to the live widget list
+        if not materials:
             return
-            
+        
         try:
-            # Check if materials were already assigned by TetGen
+            # Has TetGen already tagged the cells?
             if hasattr(tetrahedral_grid, 'cell_data') and 'MaterialID' in tetrahedral_grid.cell_data:
-                material_data = tetrahedral_grid.cell_data['MaterialID']
-                if not np.all(material_data == 0):
+                if not np.all(tetrahedral_grid.cell_data['MaterialID'] == 0):
                     logger.info("Materials already assigned by TetGen")
                     return
             
-            # Manual material assignment
-            logger.info("Assigning materials manually...")
-            num_cells = tetrahedral_grid.n_cells
-            material_ids = np.ones(num_cells, dtype=int)
+            logger.info("Assigning materials manually …")
+            num_cells   = tetrahedral_grid.n_cells
+            material_ids = np.ones(num_cells, dtype=int)  # default “Material-1”
             
-            # Simple assignment based on material point locations
-            for i, material in enumerate(self.tetra_materials):
-                material_id = i + 1
-                assigned_count = 0
-                
-                for location in material['locations']:
-                    loc_point = np.array(location)
-                    cell_id = tetrahedral_grid.find_containing_cell(loc_point)
-                    
+            # simple: put each seed-point’s containing cell to its material-id
+            for mat_idx, mat in enumerate(materials):
+                mat_id = mat_idx + 1
+                assigned = 0
+                for loc in mat['locations']:
+                    cell_id = tetrahedral_grid.find_containing_cell(np.asarray(loc))
                     if cell_id >= 0:
-                        material_ids[cell_id] = material_id
-                        assigned_count += 1
-                
-                logger.info("Assigned material %d to %d cells", material_id, assigned_count)
+                        material_ids[cell_id] = mat_id
+                        assigned += 1
+                logger.info("  material %d  – tagged %d seed cells", mat_id, assigned)
             
-            # Assign remaining cells to nearest material
-            unassigned = material_ids == 1
-            if np.any(unassigned):
-                logger.info("Assigning %d unassigned cells to nearest materials", np.sum(unassigned))
-                # Simple approach: assign all to material 1
-                # Could be improved with nearest neighbor search
-            
+            # still-unassigned cells could be mapped to nearest material here …
             tetrahedral_grid.cell_data['MaterialID'] = material_ids
-            
+        
         except Exception as e:
             logger.warning("Material assignment failed: %s", e)
-
 
     def _handle_mesh_error(self, error):
         """Handle mesh generation errors."""
