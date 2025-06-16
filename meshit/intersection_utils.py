@@ -204,33 +204,30 @@ class Box:
             self.Box[i].max.z = self.center.z if (i & 4) == 0 else self.max.z # if i is 0 or 4, set max.z to center.z, otherwise set it to max.z
     
     def tri_in_box(self, triangle):
-        """Check if a triangle intersects this box"""
-        # Simple AABB-triangle overlap test
-        # First check if any vertex is inside the box
-        for vertex in [triangle.v1, triangle.v2, triangle.v3]:
-            if (self.min.x <= vertex.x <= self.max.x and
-                self.min.y <= vertex.y <= self.max.y and
-                self.min.z <= vertex.z <= self.max.z):
-                return True
-        
-        # TODO: Implement more sophisticated AABB-triangle intersection test
-        # For simplicity, we'll use a conservative test checking if triangle's bounding box
-        # overlaps with our box
-        tri_min = Vector3D(
-            min(triangle.v1.x, triangle.v2.x, triangle.v3.x),
-            min(triangle.v1.y, triangle.v2.y, triangle.v3.y),
-            min(triangle.v1.z, triangle.v2.z, triangle.v3.z)
-        )
-        tri_max = Vector3D(
-            max(triangle.v1.x, triangle.v2.x, triangle.v3.x),
-            max(triangle.v1.y, triangle.v2.y, triangle.v3.y),
-            max(triangle.v1.z, triangle.v2.z, triangle.v3.z)
-        )
-        
-        # Check if bounding boxes overlap
-        return not (tri_max.x < self.min.x or tri_min.x > self.max.x or
-                    tri_max.y < self.min.y or tri_min.y > self.max.y or
-                    tri_max.z < self.min.z or tri_min.z > self.max.z)
+        """
+        Check if a triangle intersects this box using C++ MeshIt logic.
+        Returns False only if ALL vertices are on the same side of any box boundary.
+        """
+        # Check X axis - return False only if ALL vertices are on same side
+        if ((triangle.v1.x < self.min.x) and (triangle.v2.x < self.min.x) and (triangle.v3.x < self.min.x)):
+            return False
+        if ((triangle.v1.x > self.max.x) and (triangle.v2.x > self.max.x) and (triangle.v3.x > self.max.x)):
+            return False
+            
+        # Check Y axis - return False only if ALL vertices are on same side  
+        if ((triangle.v1.y < self.min.y) and (triangle.v2.y < self.min.y) and (triangle.v3.y < self.min.y)):
+            return False
+        if ((triangle.v1.y > self.max.y) and (triangle.v2.y > self.max.y) and (triangle.v3.y > self.max.y)):
+            return False
+            
+        # Check Z axis - return False only if ALL vertices are on same side
+        if ((triangle.v1.z < self.min.z) and (triangle.v2.z < self.min.z) and (triangle.v3.z < self.min.z)):
+            return False
+        if ((triangle.v1.z > self.max.z) and (triangle.v2.z > self.max.z) and (triangle.v3.z > self.max.z)):
+            return False
+            
+        # If not all vertices are on the same side of any boundary, triangle intersects box
+        return True
     
     def seg_in_box(self, v1, v2):
         """Check if a line segment intersects this box"""
@@ -263,13 +260,13 @@ class Box:
     
     def too_much_tri(self):
         """Check if this box contains too many triangles for direct testing"""
-        # Threshold for subdivision - adjust based on performance testing
-        return len(self.T1s) > 10 and len(self.T2s) > 10
+        # Match C++ MeshIt threshold of 48 triangles per surface
+        return len(self.T1s) > 48 or len(self.T2s) > 48
     
     def too_much_seg(self):
         """Check if this box contains too many segments for direct testing"""
-        # Threshold for subdivision - adjust based on performance testing
-        return len(self.N1s) > 10 and len(self.N2s) > 10
+        # Match C++ MeshIt threshold of 48 segments per surface
+        return len(self.N1s) > 48 or len(self.N2s) > 48
     
     def split_tri(self, int_segments):
         """
@@ -405,10 +402,9 @@ def append_non_existing_segment(segments, p1, p2):
 
 def tri_tri_intersect_with_isectline(tri1, tri2):
     """
-    Fast triangle-triangle intersection test that returns the intersection line.
+    Fast triangle-triangle intersection test matching C++ MeshIt implementation.
     
-    This is a more efficient implementation that directly computes the
-    intersection line between two triangles without checking all edge-face pairs.
+    Based on Tomas Möller's algorithm with proper epsilon handling.
     
     Args:
         tri1: First triangle
@@ -417,121 +413,186 @@ def tri_tri_intersect_with_isectline(tri1, tri2):
     Returns:
         Tuple of (point1, point2) defining the intersection line, or (None, None) if no intersection
     """
-    # Implementation based on Tomas Möller's fast triangle-triangle intersection algorithm
+    # C++ MeshIt constants
+    EPSILON = 1e-12
     
-    # 1. Compute plane equations for both triangles
-    n1 = tri1.normal()
-    n2 = tri2.normal()
+    # 1. Compute plane equation (p1) of triangle T1=(V0,V1,V2)
+    # p1: N1.X+d1=0
+    E1 = tri1.v2 - tri1.v1
+    E2 = tri1.v3 - tri1.v1
+    N1 = E1.cross(E2)
+    d1 = -N1.dot(tri1.v1)
     
-    # Triangle 1 plane equation: n1·X - d1 = 0
-    d1 = n1.dot(tri1.v1)
+    # 2.a Compute signed distance of triangle T2=(U0,U1,U2) to plane p1
+    du0 = N1.dot(tri2.v1) + d1
+    du1 = N1.dot(tri2.v2) + d1
+    du2 = N1.dot(tri2.v3) + d1
     
-    # Triangle 2 plane equation: n2·X - d2 = 0
-    d2 = n2.dot(tri2.v1)
+    # 2.b Coplanarity robustness check (USE_EPSILON_TEST)
+    if abs(du0) < EPSILON:
+        du0 = 0.0
+    if abs(du1) < EPSILON:
+        du1 = 0.0  
+    if abs(du2) < EPSILON:
+        du2 = 0.0
     
-    # 2. Check if triangles are coplanar
-    if abs(n1.dot(n2)) > 0.999 and abs(d1 - d2) < 1e-6:
-        # Coplanar triangles - we'd need polygon clipping
-        # For simplicity, return no intersection
+    du0du1 = du0 * du1
+    du0du2 = du0 * du2
+    
+    # If all points of T2 are on same side of p1, no intersection
+    if du0du1 > 0.0 and du0du2 > 0.0:
         return None, None
     
-    # 3. Compute the line of intersection between the two planes
-    # The direction of the line is perpendicular to both normals
-    line_dir = n1.cross(n2).normalized()
+    # 3. Compute plane equation (p2) of triangle T2=(U0,U1,U2)
+    # p2: N2.X+d2=0
+    E1 = tri2.v2 - tri2.v1
+    E2 = tri2.v3 - tri2.v1
+    N2 = E1.cross(E2)
+    d2 = -N2.dot(tri2.v1)
     
-    if line_dir.length() < 1e-6:
-        # Parallel planes, no intersection
+    # 4.a Compute signed distance of triangle T1=(V0,V1,V2) to plane p2
+    dv0 = N2.dot(tri1.v1) + d2
+    dv1 = N2.dot(tri1.v2) + d2
+    dv2 = N2.dot(tri1.v3) + d2
+    
+    # 4.b Coplanarity robustness check (USE_EPSILON_TEST)
+    if abs(dv0) < EPSILON:
+        dv0 = 0.0
+    if abs(dv1) < EPSILON:
+        dv1 = 0.0
+    if abs(dv2) < EPSILON:
+        dv2 = 0.0
+    
+    dv0dv1 = dv0 * dv1
+    dv0dv2 = dv0 * dv2
+    
+    # If all points of T1 are on same side of p2, no intersection
+    if dv0dv1 > 0.0 and dv0dv2 > 0.0:
         return None, None
     
-    # 4. Compute distances from each vertex of tri1 to plane of tri2
-    dists1 = []
-    for v in [tri1.v1, tri1.v2, tri1.v3]:
-        dists1.append(n2.dot(v) - d2)
+    # 5. Compute direction of intersection line
+    D = N1.cross(N2)
     
-    # 5. Compute distances from each vertex of tri2 to plane of tri1
-    dists2 = []
-    for v in [tri2.v1, tri2.v2, tri2.v3]:
-        dists2.append(n1.dot(v) - d1)
+    # 6. Project triangles onto largest coordinate of D
+    max_axis = 0
+    max_val = abs(D.x)
+    if abs(D.y) > max_val:
+        max_axis = 1
+        max_val = abs(D.y)
+    if abs(D.z) > max_val:
+        max_axis = 2
     
-    # 6. Check if triangles intersect the opposite plane
-    if all(d > 0 for d in dists1) or all(d < 0 for d in dists1):
-        return None, None  # Tri1 entirely on one side of tri2's plane
+    # Project vertices onto the chosen axis
+    if max_axis == 0:  # X axis is largest
+        vv0 = tri1.v1.x
+        vv1 = tri1.v2.x
+        vv2 = tri1.v3.x
+        uu0 = tri2.v1.x
+        uu1 = tri2.v2.x
+        uu2 = tri2.v3.x
+    elif max_axis == 1:  # Y axis is largest
+        vv0 = tri1.v1.y
+        vv1 = tri1.v2.y
+        vv2 = tri1.v3.y
+        uu0 = tri2.v1.y
+        uu1 = tri2.v2.y
+        uu2 = tri2.v3.y
+    else:  # Z axis is largest
+        vv0 = tri1.v1.z
+        vv1 = tri1.v2.z
+        vv2 = tri1.v3.z
+        uu0 = tri2.v1.z
+        uu1 = tri2.v2.z
+        uu2 = tri2.v3.z
     
-    if all(d > 0 for d in dists2) or all(d < 0 for d in dists2):
-        return None, None  # Tri2 entirely on one side of tri1's plane
+    # 7. Compute intervals for triangle 1
+    isect1 = [0.0, 0.0]
+    isectpoint1 = [Vector3D(), Vector3D()]
+    compute_intervals_isectline(tri1, vv0, vv1, vv2, dv0, dv1, dv2, dv0dv1, dv0dv2, isect1, isectpoint1)
     
-    # 7. Find the two points of intersection on tri1
-    isect1 = []
-    for i in range(3):
-        j = (i + 1) % 3
-        if dists1[i] * dists1[j] <= 0 and abs(dists1[i] - dists1[j]) > 1e-6:
-            # This edge crosses the plane, compute intersection point
-            t = dists1[i] / (dists1[i] - dists1[j])
-            vertices = [tri1.v1, tri1.v2, tri1.v3]
-            point = vertices[i] + (vertices[j] - vertices[i]) * t
-            isect1.append(point)
+    # 8. Compute intervals for triangle 2
+    isect2 = [0.0, 0.0]
+    isectpoint2 = [Vector3D(), Vector3D()]
+    compute_intervals_isectline(tri2, uu0, uu1, uu2, du0, du1, du2, du0du1, du0du2, isect2, isectpoint2)
     
-    # 8. Find the two points of intersection on tri2
-    isect2 = []
-    for i in range(3):
-        j = (i + 1) % 3
-        if dists2[i] * dists2[j] <= 0 and abs(dists2[i] - dists2[j]) > 1e-6:
-            # This edge crosses the plane, compute intersection point
-            t = dists2[i] / (dists2[i] - dists2[j])
-            vertices = [tri2.v1, tri2.v2, tri2.v3]
-            point = vertices[i] + (vertices[j] - vertices[i]) * t
-            isect2.append(point)
+    # 9. Sort intervals so that isect1[0] <= isect1[1] and isect2[0] <= isect2[1]
+    if isect1[0] > isect1[1]:
+        isect1[0], isect1[1] = isect1[1], isect1[0]
+        isectpoint1[0], isectpoint1[1] = isectpoint1[1], isectpoint1[0]
     
-    # 9. Check if we found intersections
-    if len(isect1) != 2 or len(isect2) != 2:
-        # This can happen due to numerical issues or edge cases
-        # Fall back to the original edge-face intersection method
-        return None, None
+    if isect2[0] > isect2[1]:
+        isect2[0], isect2[1] = isect2[1], isect2[0]
+        isectpoint2[0], isectpoint2[1] = isectpoint2[1], isectpoint2[0]
     
-    # 10. Now we need to find the overlap between the two line segments
-    # Project both segments onto a common axis
-    # We'll use the intersection line direction as the axis
-    
-    # Project points onto line direction
-    proj1 = [line_dir.dot(p - tri1.v1) for p in isect1]
-    proj2 = [line_dir.dot(p - tri1.v1) for p in isect2]
-    
-    # Sort projections
-    if proj1[0] > proj1[1]:
-        proj1.reverse()
-        isect1.reverse()
-    
-    if proj2[0] > proj2[1]:
-        proj2.reverse()
-        isect2.reverse()
-    
-    # Find overlap
-    if proj1[1] < proj2[0] or proj2[1] < proj1[0]:
+    # 10. Check for overlap
+    if isect1[1] < isect2[0] or isect2[1] < isect1[0]:
         return None, None  # No overlap
     
-    # Compute intersection segment
-    start_t = max(proj1[0], proj2[0])
-    end_t = min(proj1[1], proj2[1])
-    
-    # Convert back to 3D points
-    if abs(proj1[1] - proj1[0]) < 1e-6:
-        # Use isect2 as reference if isect1 is degenerate
-        start_idx = 0 if abs(proj2[0] - start_t) < 1e-6 else 1
-        end_idx = 0 if abs(proj2[0] - end_t) < 1e-6 else 1
-        p1 = isect2[start_idx]
-        p2 = isect2[end_idx]
+    # 11. Compute actual intersection points
+    if isect2[0] < isect1[0]:
+        if isect1[0] < isect2[1]:
+            if isect1[1] < isect2[1]:
+                pt1 = isectpoint1[0]
+                pt2 = isectpoint1[1]
+            else:
+                pt1 = isectpoint1[0]
+                pt2 = isectpoint2[1]
+        else:
+            return None, None
     else:
-        # Interpolate along isect1
-        t1 = (start_t - proj1[0]) / (proj1[1] - proj1[0])
-        t2 = (end_t - proj1[0]) / (proj1[1] - proj1[0])
-        p1 = isect1[0] + (isect1[1] - isect1[0]) * t1
-        p2 = isect1[0] + (isect1[1] - isect1[0]) * t2
+        if isect2[0] < isect1[1]:
+            if isect2[1] < isect1[1]:
+                pt1 = isectpoint2[0]
+                pt2 = isectpoint2[1]
+            else:
+                pt1 = isectpoint2[0]
+                pt2 = isectpoint1[1]
+        else:
+            return None, None
     
     # Set intersection point types
-    p1.type = "INTERSECTION_POINT"
-    p2.type = "INTERSECTION_POINT"
+    pt1.type = "INTERSECTION_POINT"
+    pt2.type = "INTERSECTION_POINT"
     
-    return p1, p2
+    return pt1, pt2
+
+
+def compute_intervals_isectline(tri, vv0, vv1, vv2, d0, d1, d2, d0d1, d0d2, isect, isectpoint):
+    """
+    Helper function to compute intersection intervals for triangle-triangle intersection.
+    """
+    if d0d1 > 0.0:
+        # d0, d1 are on the same side, d2 on the other side
+        isect2(tri.v3, tri.v1, tri.v2, vv2, vv0, vv1, d2, d0, d1, isect, isectpoint)
+    elif d0d2 > 0.0:
+        # d0, d2 are on the same side, d1 on the other side
+        isect2(tri.v2, tri.v1, tri.v3, vv1, vv0, vv2, d1, d0, d2, isect, isectpoint)
+    elif d1 * d2 > 0.0 or d0 != 0.0:
+        # d1, d2 are on the same side, d0 on the other side
+        isect2(tri.v1, tri.v2, tri.v3, vv0, vv1, vv2, d0, d1, d2, isect, isectpoint)
+    elif d1 != 0.0:
+        isect2(tri.v2, tri.v1, tri.v3, vv1, vv0, vv2, d1, d0, d2, isect, isectpoint)
+    elif d2 != 0.0:
+        isect2(tri.v3, tri.v1, tri.v2, vv2, vv0, vv1, d2, d0, d1, isect, isectpoint)
+    else:
+        # Triangles are coplanar
+        return 1
+    return 0
+
+
+def isect2(v0, v1, v2, vv0, vv1, vv2, d0, d1, d2, isect, isectpoint):
+    """
+    Helper function for computing intersection points on triangle edges.
+    """
+    tmp = d0 / (d0 - d1)
+    isect[0] = vv0 + (vv1 - vv0) * tmp
+    diff = v1 - v0
+    isectpoint[0] = v0 + diff * tmp
+    
+    tmp = d0 / (d0 - d2)
+    isect[1] = vv0 + (vv2 - vv0) * tmp
+    diff = v2 - v0
+    isectpoint[1] = v0 + diff * tmp
 
 
 def triangle_triangle_intersection(tri1: Triangle, tri2: Triangle) -> List[Vector3D]:
@@ -1202,7 +1263,7 @@ def segment_segment_distance(a1: Vector3D, b1: Vector3D, a2: Vector3D, b2: Vecto
     return dP.length(), closest_p1, closest_p2
 
 
-def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, model, tolerance=1e-5) -> List[TriplePoint]:
+def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, model, tolerance=1e-7) -> List[TriplePoint]:
     """
     Calculate triple points between two intersection polylines using
     spatial subdivision and skew line transversal.
@@ -1427,7 +1488,7 @@ def insert_triple_points(model, tolerance=1e-5):
                  points.append(tp.point) # Append as a fallback
 
 
-def clean_identical_points(points_list: List[Vector3D], tolerance=1e-8) -> List[Vector3D]:
+def clean_identical_points(points_list: List[Vector3D], tolerance=1e-10) -> List[Vector3D]:
     """Removes duplicate points from a list, preserving order and special types."""
     if not points_list:
         return []
@@ -2124,6 +2185,13 @@ def prepare_plc_for_surface_triangulation(surface_data, intersections_on_surface
     """
     logger.info("Using new constraint processing logic for PLC preparation")
     
+    # DEBUG: Show what triple points are received in the config
+    protected_triple_points = config.get('triple_points', [])
+    logger.info(f"🔧 PLC PREPARATION: Received {len(protected_triple_points)} protected triple points")
+    for i, tp in enumerate(protected_triple_points[:3]):  # Show first 3
+        if hasattr(tp, 'x') and hasattr(tp, 'y') and hasattr(tp, 'z'):
+            logger.info(f"   Protected triple point {i}: [{tp.x:.6f}, {tp.y:.6f}, {tp.z:.6f}] type={getattr(tp, 'type', 'UNKNOWN')}")
+    
     # Use the new constraint-based approach
     try:
         points_2d, segments, point_sizes, holes_2d = prepare_constrained_triangulation_input(
@@ -2421,13 +2489,16 @@ def prepare_plc_for_surface_triangulation_fallback(surface_data, intersections_o
 def run_constrained_triangulation_py(plc_points_2d, plc_segments_indices, plc_holes_2d, 
                                      surface_projection_params, original_3d_points_for_plc, config):
     """
-    Runs constrained 2D triangulation using the Triangle library (via a wrapper)
-    and reconstructs 3D vertices. Now includes gradient control and size-based meshing.
+    Run constrained triangulation using PyVista/Triangle with proper triple point preservation.
+    
+    Returns:
+        Tuple of (vertices_3d, triangles, triple_point_indices) where triple_point_indices 
+        contains the vertex indices that are triple points
     """
     if plc_points_2d is None or len(plc_points_2d) < 3 or \
        plc_segments_indices is None or len(plc_segments_indices) < 3: # Need at least 3 segments for a closed polygon
         logger.error("Not enough points or segments for constrained triangulation.")
-        return None, None
+        return None, None, []
 
     tri_result = None
     tri_vertices_2d_final = None
@@ -2596,7 +2667,7 @@ def run_constrained_triangulation_py(plc_points_2d, plc_segments_indices, plc_ho
 
     if tri_vertices_2d_final is None or tri_triangles_indices_final is None:
         logger.error("All triangulation attempts failed.")
-        return None, None
+        return None, None, []
 
     # Z-reconstruction logic (FIXED VERSION)
     final_vertices_3d_list = []
@@ -2631,10 +2702,27 @@ def run_constrained_triangulation_py(plc_points_2d, plc_segments_indices, plc_ho
                 # Check if this new 2D vertex is one of the original PLC points
                 dist, idx_in_plc = plc_kdtree.query(new_v_2d, k=1)
                 
-                if dist < 1e-9:  # It's (close to) an original PLC point
+                if dist < 1e-11:  # It's (close to) an original PLC point
                     # Use its original 3D Z value
                     original_3d_pt_for_this_plc_pt = original_3d_points_for_plc_np[idx_in_plc]
-                    final_vertices_3d_list.append(original_3d_pt_for_this_plc_pt)
+                    
+                    # Check if this is a protected triple point (preserve exact coordinates)
+                    protected_triple_points = config.get('triple_points', [])
+                    is_triple_point = False
+                    
+                    for triple_pt in protected_triple_points:
+                        triple_dist = ((original_3d_pt_for_this_plc_pt[0] - triple_pt.x)**2 + 
+                                     (original_3d_pt_for_this_plc_pt[1] - triple_pt.y)**2 + 
+                                     (original_3d_pt_for_this_plc_pt[2] - triple_pt.z)**2)**0.5
+                        if triple_dist < 1e-10:
+                            # This is a protected triple point - use exact original coordinates
+                            logger.info(f"🎯 PROTECTED TRIPLE POINT preserved in triangulation result: [{triple_pt.x:.6f}, {triple_pt.y:.6f}, {triple_pt.z:.6f}]")
+                            final_vertices_3d_list.append(np.array([triple_pt.x, triple_pt.y, triple_pt.z]))
+                            is_triple_point = True
+                            break
+                    
+                    if not is_triple_point:
+                        final_vertices_3d_list.append(original_3d_pt_for_this_plc_pt)
                 else:  # It's a new Steiner point, interpolate Z
                     # FIXED: Pass single point correctly to griddata
                     try:
@@ -2723,8 +2811,26 @@ def run_constrained_triangulation_py(plc_points_2d, plc_segments_indices, plc_ho
                 final_vertices_3d_list.append(np.array([v_2d[0], v_2d[1], 0.0]))
 
     final_vertices_3d = np.array(final_vertices_3d_list)
+    
+    # CRITICAL FIX: Preserve triple point indices for the tetra mesh tab
+    protected_triple_points = config.get('triple_points', [])
+    preserved_triple_indices = []
+    preserved_triple_count = 0
+    
+    for vertex_idx, vertex in enumerate(final_vertices_3d):
+        for triple_pt in protected_triple_points:
+            triple_dist = ((vertex[0] - triple_pt.x)**2 + (vertex[1] - triple_pt.y)**2 + (vertex[2] - triple_pt.z)**2)**0.5
+            if triple_dist < 1e-9:
+                preserved_triple_indices.append(vertex_idx)
+                preserved_triple_count += 1
+                logger.info(f"🎯 PROTECTED TRIPLE POINT preserved at vertex index {vertex_idx}: [{triple_pt.x:.6f}, {triple_pt.y:.6f}, {triple_pt.z:.6f}]")
+                break
+    
     logger.info(f"Constrained triangulation resulted in {len(final_vertices_3d)} 3D vertices and {len(tri_triangles_indices_final)} triangles.")
-    return final_vertices_3d, tri_triangles_indices_final
+    logger.info(f"🎯 TRIANGULATION COMPLETE: {preserved_triple_count}/{len(protected_triple_points)} triple points preserved in final mesh")
+    
+    # Return vertices, triangles, AND triple point indices
+    return final_vertices_3d, tri_triangles_indices_final, preserved_triple_indices
 
 # Add these new classes and functions after the existing imports and before the existing functions
 
@@ -3054,32 +3160,42 @@ def prepare_constrained_triangulation_input(surface_data: Dict,
                                            intersections_on_surface: List[Dict],
                                            config: Dict) -> Tuple[np.ndarray, np.ndarray, List[float], np.ndarray]:
     """
-    Prepare input for constrained triangulation following C++ MeshIt logic.
+    Prepare input for constrained triangulation with protected triple points.
     
-    This function implements the C++ calculate_triangles() constraint processing:
+    This function implements the C++ calculate_triangles() constraint processing with
+    enhanced triple point protection:
     1. Calculate constraint segments
-    2. Assign sizes based on constraint types and intersections
-    3. Apply gradient control
+    2. Register protected triple points with high precision
+    3. Apply specialized deduplication preserving triple points
     4. Prepare points and segments for triangulation
     
     Args:
         surface_data: Surface data dictionary
         intersections_on_surface: List of intersections on this surface
-        config: Configuration dictionary
+        config: Configuration dictionary (should include 'triple_points' for protection)
         
     Returns:
         Tuple of (points_2d, segments, point_sizes, holes_2d)
     """
+    # DEBUG: Show what we received for constraint processing
+    protected_triple_points = config.get('triple_points', [])
+    logger.info(f"🔧 CONSTRAINT PROCESSING: Received {len(protected_triple_points)} protected triple points")
+    logger.info(f"🔧 CONSTRAINT PROCESSING: Hull points: {len(surface_data.get('hull_points', []))}")
+    logger.info(f"🔧 CONSTRAINT PROCESSING: Intersection lines: {len(intersections_on_surface)}")
+    
     # Calculate constraint segments
     constraints = calculate_constraints_for_surface(surface_data, intersections_on_surface)
+    logger.info(f"🔧 CONSTRAINT PROCESSING: Generated {len(constraints)} constraint segments")
     
     # Calculate constraint sizes
     calculate_constraint_sizes(constraints, surface_data)
     
-    # Collect all unique points and their properties
-    unique_points = {}  # Dict to store unique points with their properties
+    # NO DEDUPLICATION - Collect ALL points to preserve every point including triple points
+    all_points = []  # List to store ALL points without deduplication
     segments = []
-    point_sizes = []
+    point_index = 0
+    
+    logger.info("🔧 CONSTRAINT PROCESSING: Starting point collection WITHOUT deduplication to preserve triple points")
     
     # Process constraints to build point list and segments
     # CRITICAL FIX: C++ uses constraints where Type != "UNDEFINED"
@@ -3093,68 +3209,72 @@ def prepare_constrained_triangulation_input(surface_data: Dict,
             continue  # Skip undefined constraints in triangulation
             
         if len(constraint.points) == 1:
-            # Single point constraint
+            # Single point constraint - add without deduplication
             point = constraint.points[0]
-            point_key = (round(point.x, 8), round(point.y, 8), round(point.z, 8))
-            if point_key not in unique_points:
-                unique_points[point_key] = {
-                    'point': point,
-                    'size': constraint.size,
-                    'index': len(unique_points)
-                }
+            all_points.append({
+                'point': point,
+                'size': constraint.size,
+                'index': point_index
+            })
+            point_index += 1
+            
         elif len(constraint.points) > 1:
-            # Multi-point constraint - create segments
+            # Multi-point constraint - add ALL points without deduplication
             for i in range(len(constraint.points) - 1):
                 p1 = constraint.points[i]
                 p2 = constraint.points[i + 1]
                 
-                # Add points to unique collection
-                p1_key = (round(p1.x, 8), round(p1.y, 8), round(p1.z, 8))
-                p2_key = (round(p2.x, 8), round(p2.y, 8), round(p2.z, 8))
+                # DEBUG: Check if these are triple points
+                p1_type = getattr(p1, 'type', 'DEFAULT')
+                p2_type = getattr(p2, 'type', 'DEFAULT')
+                if p1_type == 'TRIPLE_POINT':
+                    logger.info(f"🎯 FOUND TRIPLE POINT in constraint processing: [{p1.x:.6f}, {p1.y:.6f}, {p1.z:.6f}]")
+                if p2_type == 'TRIPLE_POINT':
+                    logger.info(f"🎯 FOUND TRIPLE POINT in constraint processing: [{p2.x:.6f}, {p2.y:.6f}, {p2.z:.6f}]")
                 
-                if p1_key not in unique_points:
-                    unique_points[p1_key] = {
-                        'point': p1,
-                        'size': constraint.size,
-                        'index': len(unique_points)
-                    }
+                # Add p1 (without checking if it exists)
+                p1_index = point_index
+                all_points.append({
+                    'point': p1,
+                    'size': constraint.size,
+                    'index': p1_index
+                })
+                point_index += 1
                 
-                if p2_key not in unique_points:
-                    unique_points[p2_key] = {
-                        'point': p2,
-                        'size': constraint.size,
-                        'index': len(unique_points)
-                    }
+                # Add p2 (without checking if it exists)
+                p2_index = point_index
+                all_points.append({
+                    'point': p2,
+                    'size': constraint.size,
+                    'index': p2_index
+                })
+                point_index += 1
                 
                 # Add segment
-                idx1 = unique_points[p1_key]['index']
-                idx2 = unique_points[p2_key]['index']
-                segments.append([idx1, idx2])
+                segments.append([p1_index, p2_index])
     
     # If no constraints were processed, fall back to convex hull
-    if not unique_points:
+    if not all_points:
         hull_points = surface_data.get('hull_points', [])
-        for i, point in enumerate(hull_points[:-1]):  # Exclude last point if it's duplicate of first
-            point_key = (round(point.x, 8), round(point.y, 8), round(point.z, 8))
-            unique_points[point_key] = {
+        for i, point in enumerate(hull_points):
+            all_points.append({
                 'point': point,
                 'size': surface_data.get('size', 1.0),
                 'index': i
-            }
-            # Add hull segments
-            if i < len(hull_points) - 2:
-                segments.append([i, i + 1])
-            else:
+            })
+            # Add hull segments (connect sequential points and close the loop)
+            if i > 0:
+                segments.append([i-1, i])
+            if i == len(hull_points) - 1 and len(hull_points) > 2:
                 segments.append([i, 0])  # Close the hull
     
-    # Convert to arrays
-    points_list = [None] * len(unique_points)
-    sizes_list = [0.0] * len(unique_points)
+    # Convert to arrays - NO DEDUPLICATION
+    points_list = []
+    sizes_list = []
     
-    for point_data in unique_points.values():
-        idx = point_data['index']
-        points_list[idx] = point_data['point']
-        sizes_list[idx] = point_data['size']
+    for point_data in all_points:
+        points_list.append(point_data['point'])
+        sizes_list.append(point_data['size'])
     
     # Project to 2D
     points_2d = []
@@ -3182,7 +3302,18 @@ def prepare_constrained_triangulation_input(surface_data: Dict,
     # Prepare holes (empty for now)
     holes_2d = np.empty((0, 2))
     
-    logger.info(f"Prepared constrained triangulation input: {len(points_2d)} points, {len(segments)} segments")
+    logger.info(f"NO DEDUPLICATION: Prepared constrained triangulation input: {len(points_2d)} points, {len(segments)} segments")
+    logger.info(f"ALL POINTS PRESERVED: No points were lost to deduplication")
+    
+    # DEBUG: Count triple points in final result
+    triple_count_final = 0
+    for point_data in all_points:
+        point = point_data['point']
+        if hasattr(point, 'type') and point.type == 'TRIPLE_POINT':
+            triple_count_final += 1
+            logger.info(f"🎯 TRIPLE POINT in final result: [{point.x:.6f}, {point.y:.6f}, {point.z:.6f}]")
+    
+    logger.info(f"🎯 FINAL RESULT: {triple_count_final} triple points preserved in triangulation input")
     
     return points_2d, segments, adjusted_sizes, holes_2d
 
@@ -3593,3 +3724,141 @@ def validate_surfaces_for_tetgen(datasets, config=None):
     validation_results['recommendations'] = recommendations
     
     return validation_results
+
+
+
+def prepare_constrained_triangulation_input(surface_data: Dict,
+                                           intersections_on_surface: List[Dict],
+                                           config: Dict) -> Tuple[np.ndarray, np.ndarray, List[float], np.ndarray]:
+    """
+    Prepare input for constrained triangulation following C++ MeshIt logic.
+    
+    This function implements the C++ calculate_triangles() constraint processing:
+    1. Calculate constraint segments
+    2. Assign sizes based on constraint types and intersections
+    3. Apply gradient control
+    4. Prepare points and segments for triangulation
+    
+    Args:
+        surface_data: Surface data dictionary
+        intersections_on_surface: List of intersections on this surface
+        config: Configuration dictionary
+        
+    Returns:
+        Tuple of (points_2d, segments, point_sizes, holes_2d)
+    """
+    # Calculate constraint segments
+    constraints = calculate_constraints_for_surface(surface_data, intersections_on_surface)
+    
+    # Calculate constraint sizes
+    calculate_constraint_sizes(constraints, surface_data)
+    
+    # Collect all unique points and their properties
+    unique_points = {}  # Dict to store unique points with their properties
+    segments = []
+    point_sizes = []
+    
+    # Process constraints to build point list and segments
+    # CRITICAL FIX: C++ uses constraints where Type != "UNDEFINED"
+    # We need to mark intersection constraints as "SEGMENTS" not "UNDEFINED"
+    for constraint in constraints:
+        # Mark intersection constraints as SEGMENTS (not UNDEFINED)
+        if len(constraint.points) > 1:
+            constraint.constraint_type = "SEGMENTS"  # Mark as active constraint
+        
+        if constraint.constraint_type == "UNDEFINED":
+            continue  # Skip undefined constraints in triangulation
+            
+        if len(constraint.points) == 1:
+            # Single point constraint
+            point = constraint.points[0]
+            point_key = (round(point.x, 8), round(point.y, 8), round(point.z, 8))
+            if point_key not in unique_points:
+                unique_points[point_key] = {
+                    'point': point,
+                    'size': constraint.size,
+                    'index': len(unique_points)
+                }
+        elif len(constraint.points) > 1:
+            # Multi-point constraint - create segments
+            for i in range(len(constraint.points) - 1):
+                p1 = constraint.points[i]
+                p2 = constraint.points[i + 1]
+                
+                # Add points to unique collection
+                p1_key = (round(p1.x, 8), round(p1.y, 8), round(p1.z, 8))
+                p2_key = (round(p2.x, 8), round(p2.y, 8), round(p2.z, 8))
+                
+                if p1_key not in unique_points:
+                    unique_points[p1_key] = {
+                        'point': p1,
+                        'size': constraint.size,
+                        'index': len(unique_points)
+                    }
+                
+                if p2_key not in unique_points:
+                    unique_points[p2_key] = {
+                        'point': p2,
+                        'size': constraint.size,
+                        'index': len(unique_points)
+                    }
+                
+                # Add segment
+                idx1 = unique_points[p1_key]['index']
+                idx2 = unique_points[p2_key]['index']
+                segments.append([idx1, idx2])
+    
+    # If no constraints were processed, fall back to convex hull
+    if not unique_points:
+        hull_points = surface_data.get('hull_points', [])
+        for i, point in enumerate(hull_points[:-1]):  # Exclude last point if it's duplicate of first
+            point_key = (round(point.x, 8), round(point.y, 8), round(point.z, 8))
+            unique_points[point_key] = {
+                'point': point,
+                'size': surface_data.get('size', 1.0),
+                'index': i
+            }
+            # Add hull segments
+            if i < len(hull_points) - 2:
+                segments.append([i, i + 1])
+            else:
+                segments.append([i, 0])  # Close the hull
+    
+    # Convert to arrays
+    points_list = [None] * len(unique_points)
+    sizes_list = [0.0] * len(unique_points)
+    
+    for point_data in unique_points.values():
+        idx = point_data['index']
+        points_list[idx] = point_data['point']
+        sizes_list[idx] = point_data['size']
+    
+    # Project to 2D
+    points_2d = []
+    projection_params = surface_data.get('projection_params')
+    if projection_params:
+        centroid = np.array(projection_params['centroid'])
+        basis = np.array(projection_params['basis'])
+        for point in points_list:
+            centered_pt = np.array([point.x, point.y, point.z]) - centroid
+            pt_2d = np.dot(centered_pt, basis.T)
+            points_2d.append(pt_2d[:2])
+    else:
+        for point in points_list:
+            points_2d.append([point.x, point.y])
+    
+    points_2d = np.array(points_2d)
+    segments = np.array(segments) if segments else np.empty((0, 2), dtype=int)
+    
+    # Apply gradient control
+    gradient = config.get('gradient', 2.0)
+    gc = GradientControl()
+    gc.update(gradient, surface_data.get('size', 1.0), points_2d, sizes_list)
+    adjusted_sizes = gc.apply_gradient_transition(points_2d, sizes_list)
+    
+    # Prepare holes (empty for now)
+    holes_2d = np.empty((0, 2))
+    
+    logger.info(f"Prepared constrained triangulation input: {len(points_2d)} points, {len(segments)} segments")
+    
+    return points_2d, segments, adjusted_sizes, holes_2d

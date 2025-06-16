@@ -235,222 +235,315 @@ class ComputationWorker(QObject):
 
 
 class SurfaceConstraintManager:
-    """Manages surface subdivision into selectable constraint segments"""
-    
-    def __init__(self):
-        self.surface_constraints = {}  # surface_id -> list of constraint segments
-        self.constraint_rgb_map = {}   # RGB tuple -> (surface_id, constraint_id)
-        self.constraint_states = {}    # (surface_id, constraint_id) -> "SEGMENTS"/"UNDEFINED"/"HOLES"
-        self.surface_visibility = {}   # surface_id -> True/False for visibility
-        self.next_rgb_color = [1, 0, 0]  # Start with red
-        
+    """
+    C++-faithful constraint manager that still matches the Python GUI.
+
+    Key points
+    ----------
+    1. Triple-points are stored per-intersection (lookup table).
+    2. Each intersection line is segmented only with its own triple-points
+       → always produces 3 segments for a line with two internal triple-points.
+    3. API expected by the GUI (tetra-mesh tab) is preserved:
+         • generate_constraints_from_pre_tetra_data(datasets)
+         • surface_constraints       (dict)
+         • constraint_states         (dict)
+         • constraint_rgb_map        (dict)
+         • surface_visibility        (dict)
+         • get_selected_surfaces() / get_constraint_summary()
+    """
+
+    DEFAULT_RGB_START = [1, 0, 0]
+
+    # ------------------------------------------------------------------ #
+    # construction                                                       #
+    # ------------------------------------------------------------------ #
+    def __init__(self, parent=None):
+        self.parent = parent
+        self.surface_constraints = {}
+        self.constraint_rgb_map = {}
+        self.constraint_states = {}
+        self.surface_visibility = {}        # NEW – used by the GUI
+        self.next_rgb_color = self.DEFAULT_RGB_START.copy()
+
+        # internal stores
+        self._triple_lookup = {}            # intersection_id → [points]
+        self._triple_points_global = []     # unique list for hull
+
+    # ------------------------------------------------------------------ #
+    # public entry point (wrapper kept for GUI compatibility)            #
+    # ------------------------------------------------------------------ #
     def generate_constraints_from_pre_tetra_data(self, datasets):
-        """Generate hierarchical selectable constraints from pre-tetra mesh tab data"""
-        for surface_idx, dataset in enumerate(datasets):
-            if not self._has_constrained_mesh_data(dataset):
-                continue
-                
+        """
+        Wrapper kept so the existing call
+             constraint_manager.generate_constraints_from_pre_tetra_data(...)
+        in the tetra-mesh tab continues to work.
+        """
+        self.build_constraints_from_datasets(datasets)
+
+        # mark every surface “visible” by default (GUI uses this flag)
+        self.surface_visibility = {idx: True for idx in range(len(datasets))}
+
+    # REAL worker ------------------------------------------------------- #
+    def build_constraints_from_datasets(self, datasets):
+        self.surface_constraints.clear()
+        self.constraint_rgb_map.clear()
+        self.constraint_states.clear()
+        self.next_rgb_color = self.DEFAULT_RGB_START.copy()
+
+        # 1) triple-points
+        self._build_triple_point_lookup(datasets)
+
+        # 2) global intersection network  (with provenance)
+        global_lines = self._reconstruct_global_intersection_network(datasets)
+
+        # 3) per surface
+        for surf_idx, ds in enumerate(datasets):
             constraints = []
-            
-            # 1. Hull boundary constraints - split into individual segments at special points
-            hull_points = dataset.get('hull_points', [])
-            if len(hull_points) > 2:
-                hull_segments = self._create_detailed_hull_constraints(hull_points, surface_idx)
-                constraints.extend(hull_segments)
-            
-            # 2. Intersection line constraints - split into individual segments  
-            intersection_constraints = dataset.get('intersection_constraints', [])
-            for line_idx, intersection_line in enumerate(intersection_constraints):
-                if len(intersection_line) >= 2:
-                    intersection_segments = self._create_detailed_intersection_constraints(
-                        intersection_line, surface_idx, line_idx
+
+            # ---- hull --------------------------------------------------
+            for hull in self._extract_hull_boundary_from_constrained_mesh(ds, surf_idx):
+                constraints.extend(
+                    self._segment_open_or_closed_line(
+                        hull, self._triple_points_global,
+                        surf_idx, "hull", is_closed=True
                     )
-                    constraints.extend(intersection_segments)
-            
-            # Store constraints for this surface
-            self.surface_constraints[surface_idx] = constraints
-            
-            # Initialize all constraints as "UNDEFINED" (unselected)
-            for i, constraint in enumerate(constraints):
-                constraint_key = (surface_idx, i)
-                self.constraint_states[constraint_key] = "UNDEFINED"
-            
-            # Initialize surface as visible
-            self.surface_visibility[surface_idx] = True
-                
-        logger.info(f"Generated constraints for {len(self.surface_constraints)} surfaces")
-    
-    def _has_constrained_mesh_data(self, dataset):
-        """Check if dataset has constrained mesh data"""
-        constrained_vertices = dataset.get('constrained_vertices')
-        constrained_triangles = dataset.get('constrained_triangles')
-        return (constrained_vertices is not None and constrained_triangles is not None and 
-                len(constrained_vertices) > 0 and len(constrained_triangles) > 0)
-    
-    def _create_detailed_hull_constraints(self, hull_points, surface_idx):
-        """Create individual constraint segments from hull boundary split at special points"""
-        constraints = []
-        
-        # Split hull at special points (like C++ split_line_at_special_points)
-        segments = self._split_points_at_special_locations(hull_points)
-        
-        for segment_idx, segment_points in enumerate(segments):
-            if len(segment_points) >= 2:
-                rgb_color = self._get_next_rgb_color()
-                
-                # Create individual constraint for this segment
-                constraint = {
-                    'type': 'HULL_SEGMENT',
-                    'parent_type': 'HULL_BOUNDARY', 
-                    'segment_id': segment_idx,
-                    'segments': [{
-                        'points': segment_points,
-                        'type': 'HULL_SEGMENT',
-                        'rgb': rgb_color,
-                        'surface_id': surface_idx,
-                        'segment_id': segment_idx
-                    }],
-                    'total_points': len(segment_points)
-                }
-                
-                constraints.append(constraint)
-                
-                # Map RGB to constraint for picking
-                constraint_idx = len(constraints) - 1
-                self.constraint_rgb_map[tuple(rgb_color)] = (surface_idx, constraint_idx)
-        
-        return constraints
-    
-    def _create_detailed_intersection_constraints(self, intersection_line, surface_idx, line_idx):
-        """Create individual constraint segments from intersection line split at special points"""
-        constraints = []
-        
-        # Split intersection line at special points
-        segments = self._split_points_at_special_locations(intersection_line)
-        
-        for segment_idx, segment_points in enumerate(segments):
-            if len(segment_points) >= 2:
-                rgb_color = self._get_next_rgb_color()
-                
-                # Create individual constraint for this segment
-                constraint = {
-                    'type': 'INTERSECTION_SEGMENT',
-                    'parent_type': 'INTERSECTION_LINE',
-                    'line_id': line_idx,
-                    'segment_id': segment_idx, 
-                    'segments': [{
-                        'points': segment_points,
-                        'type': 'INTERSECTION_SEGMENT',
-                        'rgb': rgb_color,
-                        'surface_id': surface_idx,
-                        'line_id': line_idx,
-                        'segment_id': segment_idx
-                    }],
-                    'total_points': len(segment_points)
-                }
-                
-                constraints.append(constraint)
-                
-                # Map RGB to constraint for picking
-                constraint_idx = len(constraints) - 1
-                self.constraint_rgb_map[tuple(rgb_color)] = (surface_idx, constraint_idx)
-        
-        return constraints
-    
-    def _split_points_at_special_locations(self, points):
-        """Split point list at special points (non-DEFAULT types) following C++ logic"""
-        if len(points) < 2:
-            return [points] if points else []
-        
-        segments = []
-        current_segment = [points[0]]
-        
-        for i in range(1, len(points)):
-            point = points[i]
-            current_segment.append(point)
-            
-            # Check if this is a special point (end of segment)
-            # Handle different point formats: Vector3D objects, lists with type, or simple coordinates
-            point_type = "DEFAULT"
-            
-            if hasattr(point, 'type'):
-                # Vector3D object with type attribute
-                point_type = point.type
-            elif hasattr(point, 'point_type'):
-                # Vector3D object with point_type attribute  
-                point_type = point.point_type
-            elif isinstance(point, (list, tuple)) and len(point) > 3:
-                # List/tuple format [x, y, z, type]
-                point_type = point[3] if point[3] != "DEFAULT" else "DEFAULT"
+                )
+
+            # ---- intersections ----------------------------------------
+            for g in self._filter_lines_for_surface(global_lines, ds):
+                key   = (g['dataset_idx'], g['intersection_id'])
+                tp_for_this_line = self._triple_lookup.get(key, [])
+                constraints.extend(
+                    self._segment_open_or_closed_line(
+                        g['line'], tp_for_this_line,
+                        surf_idx, f"intersection_{len(constraints)}",  # name just needs to be unique
+                        is_closed=False
+                    )
+                )
+
+            self.surface_constraints[surf_idx] = constraints
+
+    # ------------------------------------------------------------------ #
+    # triple-point organisation                                          #
+    # ------------------------------------------------------------------ #
+    def _build_triple_point_lookup(self, datasets):
+        """
+        Key is now  (dataset_idx, intersection_id)  so we can
+        recover the correct triple-points later, regardless of how
+        intersection lines are re-enumerated globally.
+        """
+        self._triple_lookup.clear()
+        self._triple_points_global.clear()
+
+        for ds_idx, ds in enumerate(datasets):
+            for tp in ds.get("triple_points", []):
+                pt = tp["point"]                           # [x,y,z]
+                for iid in tp["intersection_ids"]:
+                    key = (ds_idx, iid)
+                    self._triple_lookup.setdefault(key, []).append(pt)
+
+                # keep one global copy (for hull insertion only)
+                tup = tuple(round(float(c), 8) for c in pt)
+                if tup not in {tuple(round(float(c), 8) for c in q)
+                                for q in self._triple_points_global}:
+                    self._triple_points_global.append(pt)
+
+    # ------------------------------------------------------------------ #
+    # hull boundary extraction                                           #
+    # ------------------------------------------------------------------ #
+    def _extract_hull_boundary_from_constrained_mesh(self, dataset, surf_id):
+        """
+        Re-implements the original Python logic:
+
+        • If constrained triangulation exists, find edges that belong to only
+          one triangle (boundary edges) and walk them to build closed lines.
+        • Fallback: if only ‘hull_points’ exist, return that as a single line.
+        Returns a list of poly-lines (each a list[[x,y,z], …]).
+        """
+        import numpy as np
+        verts  = dataset.get("constrained_vertices")
+        tris   = dataset.get("constrained_triangles")
+
+        # fallback – simple stored hull
+        if (verts is None or tris is None or
+                len(verts) == 0 or len(tris) == 0):
+            hp = dataset.get("hull_points", [])
+            return [hp] if len(hp) >= 3 else []
+
+        verts = np.asarray(verts)
+        tris  = np.asarray(tris)
+
+        # 1) build edge→count map
+        edge_count = {}
+        for tri in tris:
+            if len(tri) < 3:
+                continue
+            e0 = tuple(sorted((tri[0], tri[1])))
+            e1 = tuple(sorted((tri[1], tri[2])))
+            e2 = tuple(sorted((tri[2], tri[0])))
+            for e in (e0, e1, e2):
+                edge_count[e] = edge_count.get(e, 0) + 1
+
+        # 2) keep boundary edges (appear only once)
+        boundary_edges = [e for e, c in edge_count.items() if c == 1]
+        if not boundary_edges:
+            return []
+
+        # 3) trace edges into poly-lines
+        #    build adjacency map vertex → connected vertices
+        adj = {}
+        for a, b in boundary_edges:
+            adj.setdefault(a, []).append(b)
+            adj.setdefault(b, []).append(a)
+
+        lines = []
+        visited = set()
+        for start in adj:
+            if start in visited:
+                continue
+            line = [start]
+            visited.add(start)
+            cur = start
+            while True:
+                nxts = [n for n in adj[cur] if n not in visited]
+                if not nxts:
+                    break
+                nxt = nxts[0]
+                line.append(nxt)
+                visited.add(nxt)
+                cur = nxt
+            # convert indices to coords
+            lines.append([verts[idx][:3].tolist() for idx in line])
+        return lines
+
+    # ------------------------------------------------------------------ #
+    # global intersection network                                        #
+    # ------------------------------------------------------------------ #
+    def _reconstruct_global_intersection_network(self, datasets):
+        """
+        Returns a list of dictionaries:
+            { 'line'          : poly-line [[x,y,z], …],
+              'dataset_idx'   : int   (where it came from),
+              'intersection_id': int   (its id inside that dataset) }
+        The position in this list (enumeration) is still used only
+        for naming/colouring, but the real lookup uses the pair
+        (dataset_idx, intersection_id).
+        """
+        global_lines = []
+        for ds_idx, ds in enumerate(datasets):
+            for int_id, line in enumerate(ds.get("intersection_constraints", [])):
+                if len(line) >= 2:
+                    global_lines.append({
+                        'line'          : line,
+                        'dataset_idx'   : ds_idx,
+                        'intersection_id': int_id      # original id
+                    })
+        return global_lines
+
+    # ------------------------------------------------------------------ #
+    # quick heuristic: line ↔ surface relevance                           #
+    # ------------------------------------------------------------------ #
+    def _filter_lines_for_surface(self, global_lines, dataset):
+        """
+        Very light geometric heuristic to decide whether a global
+        intersection line belongs to *this* surface.
+        Returns the *same* dictionary objects it received, for every
+        relevant line.
+        """
+        relevant = []
+        orig_lines = dataset.get("intersection_constraints", [])
+        if not orig_lines:
+            return relevant
+
+        import numpy as np
+        all_pts = np.asarray([p for l in orig_lines for p in l])
+        if all_pts.size == 0:
+            return relevant
+
+        try:
+            from scipy.spatial import cKDTree as KD
+            tree = KD(all_pts)
+        except Exception:
+            tree = None
+
+        eps = 1e-2
+        for g in global_lines:
+            pts = g['line']
+            if len(pts) < 2:
+                continue
+            if tree is None:
+                relevant.append(g)
+                continue
+            hits = sum(tree.query(p, k=1)[0] < eps for p in pts)
+            if hits / len(pts) >= 0.5:
+                relevant.append(g)
+        return relevant
+
+    # ------------------------------------------------------------------ #
+    # line segmentation                                                  #
+    # ------------------------------------------------------------------ #
+    def _segment_open_or_closed_line(self, pts, extras,
+                                     surf_idx, ctype, is_closed):
+        if len(pts) < 2:
+            return []
+
+        aug = self._insert_points_preserving_order(pts, extras)
+
+        # build split indices
+        splits = list(range(len(aug)))
+        if is_closed:
+            splits.append(splits[0])          # wrap-around
+
+        segs = []
+        for i in range(len(splits) - 1):
+            a, b = splits[i], splits[i + 1]
+            part = aug[a:b + 1] if a < b else aug[a:] + aug[:b + 1]
+            if len(part) < 2:
+                continue
+            rgb = self._next_rgb()
+            info = dict(points=part, type=ctype, surface_id=surf_idx,
+                        segment_id=len(segs), rgb=rgb,
+                        constraint_type="UNDEFINED")
+            segs.append(info)
+            self.constraint_rgb_map[tuple(rgb)] = (surf_idx, len(segs) - 1)
+        return segs
+
+    # ------------------------------------------------------------------ #
+    # helper – insert points preserving order                            #
+    # ------------------------------------------------------------------ #
+    def _insert_points_preserving_order(self, line, to_insert):
+        import numpy as np
+
+        def dist(p, q):
+            return np.linalg.norm(np.asarray(p) - np.asarray(q))
+
+        new_line = line.copy()
+        for p in to_insert:
+            best_seg, best_d = None, float("inf")
+            for i in range(len(new_line) - 1):
+                a, b = np.asarray(new_line[i]), np.asarray(new_line[i + 1])
+                ab = b - a
+                L2 = np.dot(ab, ab)
+                if L2 == 0:
+                    continue
+                t = np.dot(np.asarray(p) - a, ab) / L2
+                if 0.0 <= t <= 1.0:
+                    proj = a + t * ab
+                    d = np.linalg.norm(proj - p)
+                    if d < best_d:
+                        best_seg, best_d = i, d
+            if best_seg is None:
+                if all(dist(p, q) > 1e-8 for q in new_line):
+                    new_line.append(p)
             else:
-                # Simple coordinate format [x, y, z] - use geometric analysis to detect special points
-                point_type = self._detect_special_point_geometrically(point, points, i)
-            
-            # Split at special points or at the end of the line
-            if point_type != "DEFAULT" or i == len(points) - 1:
-                if len(current_segment) >= 2:
-                    segments.append(current_segment.copy())
-                current_segment = [point]  # Start new segment
-        
-        # Handle case where no special points were found - create reasonable segments
-        if not segments and len(points) >= 2:
-            # For intersection lines without explicit special points, split into smaller segments
-            # This creates more granular selection as desired
-            segment_size = max(2, len(points) // 3)  # Create roughly 3 segments per line
-            for start_idx in range(0, len(points) - 1, segment_size - 1):
-                end_idx = min(start_idx + segment_size, len(points))
-                if end_idx > start_idx + 1:  # Ensure segment has at least 2 points
-                    segments.append(points[start_idx:end_idx])
-        
-        return segments
-    
-    def _detect_special_point_geometrically(self, point, all_points, point_index):
-        """Detect special points based on geometric properties when type info is not available"""
-        # For now, split at regular intervals or based on significant direction changes
-        # This creates the granular segmentation you want for intersection lines
-        
-        if point_index == 0 or point_index == len(all_points) - 1:
-            return "ENDPOINT"
-        
-        # Check for significant direction change (indicating a corner or special point)
-        if point_index > 0 and point_index < len(all_points) - 1:
-            try:
-                p1 = np.array(all_points[point_index - 1][:3])
-                p2 = np.array(point[:3])
-                p3 = np.array(all_points[point_index + 1][:3])
-                
-                v1 = p2 - p1
-                v2 = p3 - p2
-                
-                # Normalize vectors
-                v1_norm = np.linalg.norm(v1)
-                v2_norm = np.linalg.norm(v2)
-                
-                if v1_norm > 1e-10 and v2_norm > 1e-10:
-                    v1 = v1 / v1_norm
-                    v2 = v2 / v2_norm
-                    
-                    # Calculate angle between vectors
-                    dot_product = np.clip(np.dot(v1, v2), -1, 1)
-                    angle = np.arccos(dot_product)
-                    
-                    # If angle is significant (> 30 degrees), consider it a corner
-                    if angle > np.pi / 6:  # 30 degrees
-                        return "CORNER"
-            except:
-                pass
-        
-        # Split at regular intervals for fine-grained control
-        if point_index % 3 == 0:  # Every 3rd point is a potential split
-            return "SPLIT_POINT"
-        
-        return "DEFAULT"
-    
-    def _get_next_rgb_color(self):
-        """Generate unique RGB color for constraint identification (like C++ logic)"""
-        color = self.next_rgb_color.copy()
-        
-        # Increment RGB like C++: R->G->B->R+1
+                new_line.insert(best_seg + 1, p)
+        return new_line
+
+    # ------------------------------------------------------------------ #
+    # RGB generator                                                      #
+    # ------------------------------------------------------------------ #
+    def _next_rgb(self):
+        rgb = self.next_rgb_color.copy()
         self.next_rgb_color[0] += 1
         if self.next_rgb_color[0] > 255:
             self.next_rgb_color[0] = 0
@@ -459,46 +552,28 @@ class SurfaceConstraintManager:
                 self.next_rgb_color[1] = 0
                 self.next_rgb_color[2] += 1
                 if self.next_rgb_color[2] > 255:
-                    self.next_rgb_color[2] = 0
-        
-        return color
-    
-    def get_selected_surfaces(self):
-        """Get surfaces that have at least one constraint marked as SEGMENTS"""
-        selected_surfaces = []
-        for surface_idx, constraints in self.surface_constraints.items():
-            has_selected_constraints = False
-            for constraint_idx, constraint in enumerate(constraints):
-                constraint_key = (surface_idx, constraint_idx)
-                if self.constraint_states.get(constraint_key) == "SEGMENTS":
-                    has_selected_constraints = True
-                    break
-            
-            if has_selected_constraints:
-                selected_surfaces.append(surface_idx)
-        
-        return selected_surfaces
-    
-    def get_constraint_summary(self):
-        """Get summary of constraint selection states"""
-        total_constraints = 0
-        selected_constraints = 0
-        hole_constraints = 0
-        
-        for constraint_key, state in self.constraint_states.items():
-            total_constraints += 1
-            if state == "SEGMENTS":
-                selected_constraints += 1
-            elif state == "HOLES":
-                hole_constraints += 1
-        
-        return {
-            'total': total_constraints,
-            'selected': selected_constraints,
-            'holes': hole_constraints,
-            'undefined': total_constraints - selected_constraints - hole_constraints
-        }
+                    self.next_rgb_color = self.DEFAULT_RGB_START.copy()
+        return rgb
 
+    # ------------------------------------------------------------------ #
+    # quick helpers queried by the GUI                                   #
+    # ------------------------------------------------------------------ #
+    def get_selected_surfaces(self):
+        out = []
+        for s_idx, cons in self.surface_constraints.items():
+            if any(self.constraint_states.get((s_idx, i)) == "SEGMENTS"
+                   for i in range(len(cons))):
+                out.append(s_idx)
+        return out
+
+    def get_constraint_summary(self):
+        total = len(self.constraint_states)
+        selected = sum(1 for v in self.constraint_states.values()
+                       if v == "SEGMENTS")
+        holes = sum(1 for v in self.constraint_states.values()
+                    if v == "HOLES")
+        return dict(total=total, selected=selected,
+                    holes=holes, undefined=total - selected - holes)
 
 class MeshItWorkflowGUI(QMainWindow):
     # Define a color cycle for datasets
@@ -1680,10 +1755,47 @@ class MeshItWorkflowGUI(QMainWindow):
                     # Create intersection segments (open line)
                     for j in range(len(line_indices) - 1):
                         all_segments.append([line_indices[j], line_indices[j + 1]])
+                
+                # D. CRITICAL: Add triple points as individual point constraints
+                # This is what was missing - triple points need to be added as single-point constraints
+                triple_points_added = 0
+                if hasattr(self, 'triple_points') and self.triple_points:
+                    logger.info(f"Adding {len(self.triple_points)} triple points as point constraints")
+                    for tp in self.triple_points:
+                        try:
+                            tp_coords = tp.get('point')
+                            if tp_coords:
+                                if hasattr(tp_coords, '__len__') and len(tp_coords) >= 3:
+                                    triple_point = [float(tp_coords[0]), float(tp_coords[1]), float(tp_coords[2])]
+                                elif hasattr(tp_coords, 'x') and hasattr(tp_coords, 'y') and hasattr(tp_coords, 'z'):
+                                    triple_point = [float(tp_coords.x), float(tp_coords.y), float(tp_coords.z)]
+                                else:
+                                    continue
+                                
+                                # Check if this triple point is already in our points (avoid duplicates)
+                                existing_idx = None
+                                for existing_pt_idx, existing_pt in enumerate(all_points_3d):
+                                    if np.linalg.norm(np.array(triple_point) - np.array(existing_pt)) < 1e-6:
+                                        existing_idx = existing_pt_idx
+                                        break
+                                
+                                if existing_idx is None:
+                                    all_points_3d.append(triple_point)
+                                    triple_points_added += 1
+                                    logger.debug(f"Added triple point: {triple_point}")
+                                else:
+                                    logger.debug(f"Triple point already exists at index {existing_idx}")
+                                    
+                        except Exception as e:
+                            logger.warning(f"Error processing triple point: {e}")
+                    
+                    logger.info(f"Added {triple_points_added} new triple points as point constraints")
+                else:
+                    logger.warning("No triple points found - missing critical junction points for triangulation!")
 
                 logger.info(f"C++ APPROACH: Using {len(constraint_lines)} constraint lines "
-                        f"(1 hull + {len(constraint_lines)-1} intersections) for {dataset_name}")
-                logger.info(f"TOTAL POINTS: {len(all_points_3d)} constraint boundary points (C++ approach)")
+                        f"(1 hull + {len(constraint_lines)-1} intersections) + {triple_points_added} triple points for {dataset_name}")
+                logger.info(f"TOTAL POINTS: {len(all_points_3d)} constraint points ({len(all_points_3d) - triple_points_added} boundary + {triple_points_added} triple points)")
                 logger.info(f"C++ CONSTRAINT PROCESSING: {len(all_points_3d)} total points, {len(all_segments)} segments")
                 
                 # Safety checks
@@ -1744,37 +1856,12 @@ class MeshItWorkflowGUI(QMainWindow):
                 
                 points_2d = centered_points @ basis_3x2
                 
-                # C++ APPROACH: Deduplicate points with tolerance 1e-24 (in local coordinates)
-                # Convert to local tolerance
-                local_tolerance = 1e-8  # More reasonable tolerance for our scale
+                # NO DEDUPLICATION - Keep ALL points to preserve triple points and geometry
+                deduplicated_points_2d = points_2d  # Keep all 2D points
+                deduplicated_segments = all_segments  # Keep all segments
                 
-                deduplicated_points_2d = []
-                deduplicated_segments = []
-                point_index_map = {}  # Maps old indices to new indices
-                
-                # Deduplicate points exactly like C++ (lines 1999-2017 in geometry.cpp)
-                for i, pt_2d in enumerate(points_2d):
-                    found_duplicate = False
-                    for j, existing_pt in enumerate(deduplicated_points_2d):
-                        if np.linalg.norm(pt_2d - existing_pt) < local_tolerance:
-                            point_index_map[i] = j
-                            found_duplicate = True
-                            break
-                    
-                    if not found_duplicate:
-                        point_index_map[i] = len(deduplicated_points_2d)
-                        deduplicated_points_2d.append(pt_2d)
-                
-                # Remap segments to deduplicated indices
-                for seg in all_segments:
-                    new_start = point_index_map[seg[0]]
-                    new_end = point_index_map[seg[1]]
-                    # Only add segment if it connects different points
-                    if new_start != new_end:
-                        deduplicated_segments.append([new_start, new_end])
-                
-                logger.info(f"C++ DEDUPLICATION: {len(all_points_3d)} -> {len(deduplicated_points_2d)} points, "
-                        f"{len(all_segments)} -> {len(deduplicated_segments)} segments")
+                logger.info(f"NO DEDUPLICATION: Preserving ALL {len(points_2d)} points and {len(all_segments)} segments")
+                logger.info(f"TRIPLE POINT PRESERVATION: All points including {triple_points_added} triple points are preserved")
                 
                 if len(deduplicated_segments) < 3 or len(deduplicated_points_2d) < 3:
                     logger.warning(f"Too few points/segments after deduplication for {dataset_name}")
@@ -1830,6 +1917,26 @@ class MeshItWorkflowGUI(QMainWindow):
                     
                     logger.info(f"NEW CONSTRAINT PROCESSING: Using {len(surface_data['hull_points'])} hull points, {len(intersections_on_surface_data)} intersection lines")
                     
+                    # Prepare triple points for protection
+                    triple_points_vector3d = []
+                    if hasattr(self, 'triple_points') and self.triple_points:
+                        for tp in self.triple_points:
+                            try:
+                                tp_coords = tp.get('point')
+                                if tp_coords:
+                                    if hasattr(tp_coords, '__len__') and len(tp_coords) >= 3:
+                                        v3d = Vector3D(float(tp_coords[0]), float(tp_coords[1]), float(tp_coords[2]))
+                                        v3d.type = "TRIPLE_POINT"
+                                        triple_points_vector3d.append(v3d)
+                                    elif hasattr(tp_coords, 'x') and hasattr(tp_coords, 'y') and hasattr(tp_coords, 'z'):
+                                        v3d = Vector3D(float(tp_coords.x), float(tp_coords.y), float(tp_coords.z))
+                                        v3d.type = "TRIPLE_POINT"
+                                        triple_points_vector3d.append(v3d)
+                            except Exception as e:
+                                logger.warning(f"Error converting triple point to Vector3D: {e}")
+                    
+                    logger.info(f"PROTECTED TRIPLE POINTS: {len(triple_points_vector3d)} triple points prepared for protection")
+                    
                     # Use the new constraint processing approach
                     config = {
                         'target_feature_size': target_feature_size,
@@ -1842,6 +1949,7 @@ class MeshItWorkflowGUI(QMainWindow):
                         'hierarchical_constraints': self.hierarchical_constraints_checkbox.isChecked(),
                         'preserve_constraints': True,
                         'constraint_enforcement': 'strict',
+                        'triple_points': triple_points_vector3d,  # PROTECTED TRIPLE POINTS
                         'use_cpp_exact_logic': True
                     }
                     
@@ -1902,8 +2010,8 @@ class MeshItWorkflowGUI(QMainWindow):
                             config
                         )
                     
-                    if result is not None and len(result) == 2:
-                        vertices_3d, triangles = result
+                    if result is not None and len(result) == 3:
+                        vertices_3d, triangles, triple_point_indices = result
                         
                         # Additional safety checks
                         if (vertices_3d is not None and triangles is not None and 
@@ -1921,6 +2029,7 @@ class MeshItWorkflowGUI(QMainWindow):
                             # Also store in dataset for validation
                             self.datasets[dataset_idx]['constrained_vertices'] = vertices_3d
                             self.datasets[dataset_idx]['constrained_triangles'] = triangles
+                            self.datasets[dataset_idx]['constrained_triple_point_indices'] = triple_point_indices  # CRITICAL FIX
                             self.datasets[dataset_idx]['constraint_processing_used'] = True
                             self.datasets[dataset_idx]['intersection_constraints'] = constraint_lines[1:]  # Exclude hull boundary
                             
@@ -2035,6 +2144,24 @@ class MeshItWorkflowGUI(QMainWindow):
                     name=label,
                     style='wireframe'
                 )
+                
+                # Add small spheres to show constraint line points (to see if triple points are embedded)
+                constraint_point_cloud = pv.PolyData(constraint_points)
+                constraint_spheres = constraint_point_cloud.glyph(
+                    geom=pv.Sphere(radius=0.5, phi_resolution=6, theta_resolution=6),
+                    scale=False
+                )
+                plotter.add_mesh(
+                    constraint_spheres,
+                    color='white' if line_idx == 0 else 'lightblue',
+                    style='surface',
+                    opacity=0.8,
+                    name=f'{label}_points',
+                    show_edges=False
+                )
+        
+        # Add HIGHLY VISIBLE triple points visualization
+        self._add_triple_points_visualization(plotter)
         
         # Add legend
         legend_entries = []
@@ -2045,6 +2172,10 @@ class MeshItWorkflowGUI(QMainWindow):
                 legend_entries.append([f"{dataset_name}: {len(mesh_data['vertices'])} vertices", 
                                     self.datasets[dataset_idx].get('color', [0.7, 0.7, 0.7])])
         
+        # Add triple points to legend
+        if hasattr(self, 'triple_points') and self.triple_points:
+            legend_entries.append([f"Triple Points: {len(self.triple_points)}", 'yellow'])
+        
         if legend_entries:
             plotter.add_legend(legend_entries, bcolor='white', face='rectangle')
         
@@ -2052,7 +2183,194 @@ class MeshItWorkflowGUI(QMainWindow):
         plotter.show_axes()
         plotter.reset_camera()
         
-        logger.info(f"Visualized {len(self.constrained_meshes)} constrained meshes with constraint boundaries")
+        logger.info(f"Visualized {len(self.constrained_meshes)} constrained meshes with constraint boundaries and {len(self.triple_points) if hasattr(self, 'triple_points') else 0} triple points")
+
+    def _add_triple_points_visualization(self, plotter):
+        """Add highly visible triple points to the pre-tetra mesh visualization"""
+        if not hasattr(self, 'triple_points') or not self.triple_points:
+            logger.info("No triple points found to visualize")
+            return
+        
+        import pyvista as pv
+        
+        # DEBUG: Show triple point structure
+        logger.info(f"DEBUG: Found {len(self.triple_points)} triple points")
+        for i, tp in enumerate(self.triple_points[:3]):  # Show first 3 for debugging
+            logger.info(f"  Triple point {i}: type={type(tp)}, value={tp}")
+        
+        # Extract triple point coordinates with better debugging
+        triple_coords = []
+        for i, tp in enumerate(self.triple_points):
+            coord = None
+            
+            # Handle dictionary format: {'point': Vector3D(...), 'intersections': [...]}
+            if isinstance(tp, dict) and 'point' in tp:
+                point = tp['point']
+                if hasattr(point, 'x') and hasattr(point, 'y') and hasattr(point, 'z'):
+                    # Vector3D object
+                    coord = [float(point.x), float(point.y), float(point.z)]
+                elif isinstance(point, (list, tuple)) and len(point) >= 3:
+                    # List/tuple coordinates
+                    coord = [float(point[0]), float(point[1]), float(point[2])]
+            # Handle direct object format
+            elif hasattr(tp, 'point'):
+                # Triple point has a point attribute
+                point = tp.point
+                if hasattr(point, 'x') and hasattr(point, 'y') and hasattr(point, 'z'):
+                    # Vector3D object
+                    coord = [float(point.x), float(point.y), float(point.z)]
+                elif isinstance(point, (list, tuple)) and len(point) >= 3:
+                    # List/tuple coordinates
+                    coord = [float(point[0]), float(point[1]), float(point[2])]
+            # Handle direct Vector3D object
+            elif hasattr(tp, 'x') and hasattr(tp, 'y') and hasattr(tp, 'z'):
+                # Direct Vector3D object
+                coord = [float(tp.x), float(tp.y), float(tp.z)]
+            # Handle direct list/tuple
+            elif isinstance(tp, (list, tuple)) and len(tp) >= 3:
+                # Direct list/tuple coordinates
+                coord = [float(tp[0]), float(tp[1]), float(tp[2])]
+            
+            if coord:
+                triple_coords.append(coord)
+                logger.info(f"  Extracted triple point {i}: {coord}")
+            else:
+                logger.warning(f"  Could not extract coordinates from triple point {i}: {tp}")
+        
+        if not triple_coords:
+            logger.warning("No valid triple point coordinates found")
+            # Instead, highlight triple points in constraint lines if they exist
+            self._highlight_triple_points_in_constraints(plotter)
+            return
+        
+        # Convert to numpy array
+        triple_coords_np = np.array(triple_coords)
+        logger.info(f"Adding {len(triple_coords_np)} highly visible triple points to visualization")
+        
+        # Create point cloud for triple points
+        triple_point_cloud = pv.PolyData(triple_coords_np)
+        
+        # Add LARGE, BRIGHT spheres for triple points
+        sphere_radius = 2.0  # Large radius for visibility
+        spheres = triple_point_cloud.glyph(
+            geom=pv.Sphere(radius=sphere_radius, phi_resolution=8, theta_resolution=8),
+            scale=False
+        )
+        
+        # Add to plotter with very visible styling
+        plotter.add_mesh(
+            spheres,
+            color='yellow',           # Bright yellow color
+            style='surface',
+            opacity=1.0,             # Fully opaque
+            name='triple_points_spheres',
+            show_edges=False,
+            lighting=True,
+            ambient=0.6,             # High ambient lighting
+            diffuse=0.8,             # High diffuse reflection
+            specular=0.2             # Some specular reflection for shine
+        )
+        
+        # Also add text labels for each triple point
+        for i, coord in enumerate(triple_coords_np):
+            plotter.add_point_labels(
+                coord.reshape(1, -1),
+                [f'TP{i+1}'],
+                point_size=0,  # No point, just label
+                font_size=12,
+                text_color='black',
+                name=f'triple_point_label_{i}'
+            )
+        
+        logger.info(f"Added {len(triple_coords_np)} triple points as bright yellow spheres with labels")
+
+    def _highlight_triple_points_in_constraints(self, plotter):
+        """Highlight triple points by finding them in constraint line vertices"""
+        if not hasattr(self, 'constrained_meshes') or not self.constrained_meshes:
+            return
+        
+        import pyvista as pv
+        
+        # Get original triple point coordinates for comparison
+        original_triple_coords = []
+        if hasattr(self, 'triple_points') and self.triple_points:
+            for tp in self.triple_points:
+                coord = None
+                
+                # Handle dictionary format: {'point': Vector3D(...), 'intersections': [...]}
+                if isinstance(tp, dict) and 'point' in tp:
+                    point = tp['point']
+                    if hasattr(point, 'x') and hasattr(point, 'y') and hasattr(point, 'z'):
+                        coord = [float(point.x), float(point.y), float(point.z)]
+                # Handle direct object format
+                elif hasattr(tp, 'point'):
+                    point = tp.point
+                    if hasattr(point, 'x') and hasattr(point, 'y') and hasattr(point, 'z'):
+                        coord = [float(point.x), float(point.y), float(point.z)]
+                # Handle direct Vector3D object
+                elif hasattr(tp, 'x') and hasattr(tp, 'y') and hasattr(tp, 'z'):
+                    coord = [float(tp.x), float(tp.y), float(tp.z)]
+                
+                if coord:
+                    original_triple_coords.append(coord)
+        
+        if not original_triple_coords:
+            logger.info("No original triple point coordinates for comparison")
+            return
+        
+        original_triple_coords_np = np.array(original_triple_coords)
+        logger.info(f"Looking for {len(original_triple_coords)} triple points in constraint mesh vertices")
+        
+        # Find triple points in mesh vertices
+        found_triple_points = []
+        tolerance = 1e-3  # Tolerance for coordinate matching
+        
+        for dataset_idx, mesh_data in self.constrained_meshes.items():
+            vertices = mesh_data.get('vertices', [])
+            if len(vertices) == 0:
+                continue
+                
+            vertices_np = np.array(vertices)
+            
+            # Check each original triple point against mesh vertices
+            for i, orig_tp in enumerate(original_triple_coords_np):
+                distances = np.linalg.norm(vertices_np - orig_tp, axis=1)
+                min_dist_idx = np.argmin(distances)
+                min_dist = distances[min_dist_idx]
+                
+                if min_dist < tolerance:
+                    found_vertex = vertices_np[min_dist_idx]
+                    found_triple_points.append(found_vertex)
+                    logger.info(f"  Found triple point {i} in dataset {dataset_idx} at {found_vertex} (dist: {min_dist:.6f})")
+        
+        if found_triple_points:
+            # Create visualization for found triple points
+            found_triple_points_np = np.array(found_triple_points)
+            triple_point_cloud = pv.PolyData(found_triple_points_np)
+            
+            # Add EXTRA LARGE spheres for found triple points
+            sphere_radius = 3.0  # Even larger radius
+            spheres = triple_point_cloud.glyph(
+                geom=pv.Sphere(radius=sphere_radius, phi_resolution=8, theta_resolution=8),
+                scale=False
+            )
+            
+            plotter.add_mesh(
+                spheres,
+                color='red',           # Bright red color for found triple points
+                style='surface',
+                opacity=1.0,
+                name='found_triple_points_spheres',
+                show_edges=False,
+                lighting=True,
+                ambient=0.8,
+                diffuse=0.9,
+                specular=0.3
+            )
+            
+            logger.info(f"Added {len(found_triple_points)} found triple points as red spheres")
+        else:
+            logger.warning("No triple points found in constrained mesh vertices")
 
     def _analyze_refinement_results(self):
         """Analyze refinement results and return a summary string focusing on special points and hull status."""
@@ -2612,7 +2930,7 @@ class MeshItWorkflowGUI(QMainWindow):
                     if pt_type == "COMMON_INTERSECTION_CONVEXHULL_POINT":
                         # Check if this point is already in the hull (within tolerance)
                         already_in_hull = any(
-                            abs(pt.x - hp.x) < 1e-8 and abs(pt.y - hp.y) < 1e-8 and abs(pt.z - hp.z) < 1e-8
+                            abs(pt.x - hp.x) < 1e-10 and abs(pt.y - hp.y) < 1e-10 and abs(pt.z - hp.z) < 1e-10
                             for hp in temp_surface.convex_hull
                         )
                         if not already_in_hull:
@@ -7770,6 +8088,7 @@ segmentation, triangulation, and visualization.
         
         # Initialize constraint manager
         self.constraint_manager = SurfaceConstraintManager()
+        self.constraint_manager._parent_gui = self  # Pass reference for accessing triple points
         
         # Border recognition
         self.border_surface_indices = self._identify_border_surfaces()
@@ -8201,8 +8520,27 @@ segmentation, triangulation, and visualization.
         constraint_key = (surface_idx, constraint_idx)
         constraint_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
         
-        for segment_idx, segment in enumerate(constraint['segments']):
-            points = np.array([[p[0], p[1], p[2]] for p in segment['points']])
+        # Handle new constraint format (direct points) vs old format (segments list)
+        if 'segments' in constraint:
+            # Old format compatibility
+            segments_to_render = constraint['segments']
+        else:
+            # New format - constraint is the segment itself
+            segments_to_render = [constraint]
+        
+        for segment_idx, segment in enumerate(segments_to_render):
+            # Extract points safely
+            if 'points' in segment:
+                points_data = segment['points']
+            else:
+                logger.warning(f"No points found in constraint segment {constraint_idx}")
+                continue
+                
+            try:
+                points = np.array([[p[0], p[1], p[2]] for p in points_data])
+            except (IndexError, TypeError, ValueError) as e:
+                logger.warning(f"Error extracting points from constraint: {e}")
+                continue
             
             if len(points) < 2:
                 continue
@@ -8214,7 +8552,7 @@ segmentation, triangulation, and visualization.
             # Color and style based on mode and state
             if selection_mode:
                 # Selection mode: use RGB color for picking
-                rgb_color = segment['rgb']
+                rgb_color = segment.get('rgb', [255, 255, 255])
                 color = [c/255.0 for c in rgb_color]  # Normalize to [0,1]
                 line_width = 3
                 opacity = 1.0
@@ -8328,10 +8666,15 @@ segmentation, triangulation, and visualization.
             intersection_groups = {}  # line_id -> list of segments
             
             for constraint_idx, constraint in enumerate(constraints):
-                if constraint['type'] == 'HULL_SEGMENT':
+                constraint_type = constraint.get('type', 'UNKNOWN')
+                if constraint_type == 'hull':
                     hull_segments.append((constraint_idx, constraint))
-                elif constraint['type'] == 'INTERSECTION_SEGMENT':
-                    line_id = constraint.get('line_id', 0)
+                elif constraint_type.startswith('intersection_'):
+                    # Extract line_id from type like "intersection_0", "intersection_1", etc.
+                    try:
+                        line_id = int(constraint_type.split('_')[1])
+                    except (IndexError, ValueError):
+                        line_id = 0
                     if line_id not in intersection_groups:
                         intersection_groups[line_id] = []
                     intersection_groups[line_id].append((constraint_idx, constraint))
@@ -8352,11 +8695,13 @@ segmentation, triangulation, and visualization.
                     segment_id = constraint.get('segment_id', constraint_idx)
                     segment_name = f"Hull Segment {segment_id}"
                     
+                    # Get point count from constraint data
+                    total_points = len(constraint.get('points', []))
                     segment_item = QTreeWidgetItem([
                         segment_name, 
                         "HULL_SEGMENT", 
                         constraint_state, 
-                        f"{constraint['total_points']} points"
+                        f"{total_points} points"
                     ])
                     segment_item.setData(0, Qt.UserRole, ('constraint', surface_idx, constraint_idx))
                     segment_item.setFlags(segment_item.flags() | Qt.ItemIsUserCheckable)
@@ -8395,11 +8740,13 @@ segmentation, triangulation, and visualization.
                     segment_id = constraint.get('segment_id', 0)
                     segment_name = f"Intersection Segment {segment_id}"
                     
+                    # Get point count from constraint data
+                    total_points = len(constraint.get('points', []))
                     segment_item = QTreeWidgetItem([
                         segment_name, 
                         "INTERSECTION_SEGMENT", 
                         constraint_state, 
-                        f"{constraint['total_points']} points"
+                        f"{total_points} points"
                     ])
                     segment_item.setData(0, Qt.UserRole, ('constraint', surface_idx, constraint_idx))
                     segment_item.setFlags(segment_item.flags() | Qt.ItemIsUserCheckable)
@@ -8465,6 +8812,7 @@ segmentation, triangulation, and visualization.
             item.setText(2, self.constraint_manager.constraint_states[constraint_key])
             
             # EFFICIENT UPDATE: Only change the visual properties of this specific constraint
+            logger.info(f"Updating constraint appearance: Surface {surface_idx}, Constraint {constraint_idx}, State: {self.constraint_manager.constraint_states[constraint_key]}")
             self._update_constraint_appearance(surface_idx, constraint_idx)
             
             # Update parent checkbox state based on children
@@ -8663,8 +9011,16 @@ segmentation, triangulation, and visualization.
             constraint_key = (surface_idx, constraint_idx)
             constraint_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
             
+            # Handle new constraint format (direct segment) vs old format (segments list)
+            if 'segments' in constraint:
+                # Old format compatibility
+                segments_to_update = constraint['segments']
+            else:
+                # New format - constraint is the segment itself
+                segments_to_update = [constraint]
+            
             # Update each segment of this constraint
-            for segment_idx, segment in enumerate(constraint.get('segments', [])):
+            for segment_idx, segment in enumerate(segments_to_update):
                 actor_name = f"constraint_{surface_idx}_{constraint_idx}_{segment_idx}"
                 
                 # Check if actor exists in the plotter
@@ -8672,24 +9028,39 @@ segmentation, triangulation, and visualization.
                     actor = self.constraint_plotter.actors[actor_name]
                     
                     # Update visual properties based on state WITHOUT recreating the mesh
-                    if constraint_state == "SEGMENTS":
+                    # Check if we're in selection mode or normal visualization mode
+                    if hasattr(self, 'constraint_visualization_mode') and self.constraint_visualization_mode == "SELECTION":
+                        # In selection mode - use RGB colors for picking
+                        rgb_color = self._get_rgb_color_for_constraint(surface_idx, constraint_idx, segment_idx)
+                        normalized_color = [c / 255.0 for c in rgb_color]
+                        logger.debug(f"Setting actor {actor_name} to RGB {rgb_color} (SELECTION mode)")
+                        actor.GetProperty().SetColor(*normalized_color)
+                        actor.GetProperty().SetLineWidth(4)
+                        actor.GetProperty().SetOpacity(1.0)
+                    # Normal mode - use state-based colors
+                    elif constraint_state == "SEGMENTS":
                         # Selected: blue color, thick line
+                        logger.debug(f"Setting actor {actor_name} to BLUE (SEGMENTS)")
                         actor.GetProperty().SetColor(0, 0, 1)  # Blue
                         actor.GetProperty().SetLineWidth(5)
                         actor.GetProperty().SetOpacity(0.9)
                     elif constraint_state == "HOLES":
                         # Holes: red color, thick line
+                        logger.debug(f"Setting actor {actor_name} to RED (HOLES)")
                         actor.GetProperty().SetColor(1, 0, 0)  # Red
                         actor.GetProperty().SetLineWidth(5)
                         actor.GetProperty().SetOpacity(0.9)
                     else:  # "UNDEFINED"
                         # Unselected: white color, thin line
+                        logger.debug(f"Setting actor {actor_name} to WHITE (UNDEFINED)")
                         actor.GetProperty().SetColor(1, 1, 1)  # White
                         actor.GetProperty().SetLineWidth(3)
                         actor.GetProperty().SetOpacity(0.7)
                     
                     # Force update of the actor
                     actor.Modified()
+                else:
+                    logger.warning(f"Actor {actor_name} not found in plotter.actors")
             
             # Only render once after updating all segments of this constraint
             self.constraint_plotter.render()
@@ -8735,7 +9106,13 @@ segmentation, triangulation, and visualization.
                     continue
                     
                 for constraint_idx, constraint in enumerate(constraints):
-                    for segment_idx, segment in enumerate(constraint.get('segments', [])):
+                    # Handle new constraint format (direct segment) vs old format (segments list)
+                    if 'segments' in constraint:
+                        segments_to_update = constraint['segments']
+                    else:
+                        segments_to_update = [constraint]
+                    
+                    for segment_idx, segment in enumerate(segments_to_update):
                         actor_name = f"constraint_{surface_idx}_{constraint_idx}_{segment_idx}"
                         
                         if actor_name in self.constraint_plotter.actors:
