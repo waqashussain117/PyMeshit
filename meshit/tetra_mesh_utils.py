@@ -2,7 +2,7 @@
 Tetrahedral Mesh Generation Utilities
 
 This module contains the core functionality for generating tetrahedral meshes
-using TetGen with proper border handling and material regions.
+using TetGen with C++ MeshIt compatible approach (separate surfaces).
 """
 
 import numpy as np
@@ -18,12 +18,11 @@ class TetrahedralMeshGenerator:
     """
     A utility class for generating tetrahedral meshes from surface data.
     
-    This class encapsulates all the core functionality for:
-    - Collecting and preparing surface data
-    - Validating and repairing surface meshes
-    - Running TetGen with various strategies
-    - Managing material regions and constraints
-    - Exporting results
+    This class follows the C++ MeshIt approach exactly:
+    - Keeps surfaces separate with individual triangulations
+    - Uses precise vertex matching to find shared vertices
+    - Passes separate surface data + intersection constraints to TetGen
+    - No geometric merging of surfaces
     """
     
     def __init__(self, datasets: List[Dict], selected_surfaces: set, 
@@ -50,7 +49,7 @@ class TetrahedralMeshGenerator:
         
     def generate_tetrahedral_mesh(self, tetgen_switches: str = "pq1.414aA") -> Optional[Dict]:
         """
-        Generate tetrahedral mesh using selected surfaces with C++ MeshIt-style border handling.
+        Generate tetrahedral mesh using C++ MeshIt approach.
         
         Args:
             tetgen_switches: TetGen command line switches
@@ -62,67 +61,39 @@ class TetrahedralMeshGenerator:
             logger.warning("No surfaces selected for mesh generation.")
             return None
         
-        logger.info("Creating PLC from refined constrained meshes (C++ MeshIt compatible)...")
-        
-        # Collect surface data with border recognition
-        surface_data_dict = self._collect_surface_data()
-        
-        if not surface_data_dict['vertices'].size:
-            logger.error("No surface data available. Complete pre-tetra mesh tab first.")
-            return None
-        
-        # Generate border IDs string like C++ version
-        border_ids = self._get_border_ids_string()
-        logger.info(f"Border surfaces selected: {border_ids}" if border_ids else "No border surfaces selected")
-        
-        # Group surfaces by type for proper handling
-        unit_surfaces = [i for i in self.selected_surfaces if i in self.unit_surface_indices]
-        fault_surfaces = [i for i in self.selected_surfaces if i in self.fault_surface_indices]
-        border_surfaces = [i for i in self.selected_surfaces if i in self.border_surface_indices]
-        
-        logger.info(f"Selected surfaces by type: {len(unit_surfaces)} units, {len(fault_surfaces)} faults, {len(border_surfaces)} borders")
+        logger.info("Creating PLC using C++ MeshIt approach (separate surfaces)...")
         
         try:
-            # Validate and repair surface meshes
-            surface_data_dict = self._validate_and_repair_surface_meshes(surface_data_dict)
+            # Step 1: Collect surface data without merging
+            surface_data = self._collect_separate_surface_data()
             
-            # Create PyVista mesh from surface data
-            vertices = surface_data_dict['vertices']
-            triangles = surface_data_dict['triangles']
-            surface_markers = surface_data_dict['surface_markers']
-            edge_constraints = surface_data_dict.get('edge_constraints', np.array([], dtype=np.int32).reshape(0, 2))
-            edge_markers = surface_data_dict.get('edge_markers', np.array([], dtype=np.int32))
+            if not surface_data['vertices'].size:
+                logger.error("No surface data available. Complete pre-tetra mesh tab first.")
+                return None
             
-            logger.info(f"Validating mesh: {len(vertices)} vertices, {len(triangles)} triangles")
+            # Step 2: Create PyVista mesh from separate surface data
+            surface_mesh_pv = self._create_pyvista_mesh(surface_data)
             
-            # Create triangular faces for PyVista (prepend face size)
-            pv_faces = []
-            for triangle in triangles:
-                pv_faces.extend([3, triangle[0], triangle[1], triangle[2]])
+            if surface_mesh_pv is None:
+                logger.error("Failed to create PyVista mesh")
+                return None
             
-            surface_mesh_pv = pv.PolyData(vertices, faces=pv_faces)
+            logger.info(f"Created PLC: {surface_mesh_pv.n_points} vertices, {surface_mesh_pv.n_faces} facets, {len(surface_data['edge_constraints'])} constraints")
             
-            # Assign surface markers as cell data
-            if len(surface_markers) == len(triangles):
-                surface_mesh_pv.cell_data['surface_id'] = surface_markers
-            
-            logger.info(f"Prepared PLC PyVista mesh: {surface_mesh_pv.n_points} vertices, {surface_mesh_pv.n_faces} facets (triangles), {len(edge_constraints)} PLC edges (segments).")
-            
-            # Prepare material regions
+            # Step 3: Prepare material regions
             region_attributes_list = self._prepare_material_regions(surface_mesh_pv)
             logger.info(f"Prepared {len(region_attributes_list)} material regions")
             
-            # Prepare lists for TetGen
-            facets_markers_list = surface_markers.tolist() if len(surface_markers) else []
-            edges_constraints_list = edge_constraints.tolist() if len(edge_constraints) else []
-            edge_markers_list = edge_markers.tolist() if len(edge_markers) else []
+            # Step 4: Generate border IDs string
+            border_ids = self._get_border_ids_string()
+            logger.info(f"Border surfaces selected: {border_ids}" if border_ids else "No border surfaces selected")
             
-            # Run TetGen with border-aware strategies
-            tetrahedral_grid = self._run_tetgen_with_border_support(
+            # Step 5: Run TetGen with C++ compatible approach
+            tetrahedral_grid = self._run_tetgen_cpp_style(
                 surface_mesh_pv, 
-                facets_markers_list,
-                edges_constraints_list, 
-                edge_markers_list, 
+                surface_data['surface_markers'],
+                surface_data['edge_constraints'], 
+                surface_data['edge_markers'], 
                 region_attributes_list,
                 border_ids,
                 tetgen_switches
@@ -140,145 +111,195 @@ class TetrahedralMeshGenerator:
             logger.error(f"Mesh generation failed: {str(e)}")
             return None
 
-    def _collect_surface_data(self) -> Dict[str, np.ndarray]:
-        """Collect surface data using refined constrained meshes - matching C++ MeshIt behavior."""
+    def _collect_separate_surface_data(self) -> Dict[str, np.ndarray]:
+        """
+        Collect surface data using C++ approach: separate surfaces with precise vertex matching.
         
-        # Use C++ MeshIt tolerances
-        tolerance = 1e-12  # Match C++ FABS tolerance
+        This replicates the C++ calculate_tets function exactly:
+        1. Process each surface individually 
+        2. Find shared vertices using 1e-12 tolerance (like C++)
+        3. Keep surface triangulations separate with proper markers
+        4. Add intersection polylines as edge constraints
+        """
+        logger.info("Collecting surface data using C++ approach...")
         
-        all_vertices = []
+        # Global vertex list with precise matching (like C++ pointlist)
+        global_vertices = []  # [x, y, z, x, y, z, ...]
+        vertex_tet_ids = []   # Global vertex indices
+        tolerance = 1e-12     # C++ uses 1e-12 for vertex matching
+        
+        # Step 1: Process surface vertices (like C++ Surfaces loop)
+        surface_vertex_maps = {}  # surface_idx -> {local_idx: global_idx}
+        
+        for s_idx in self.selected_surfaces:
+            logger.info(f"Processing surface {s_idx}...")
+            ds = self.datasets[s_idx]
+            
+            # Get constrained vertices (from pre-tetra mesh tab)
+            vertices = ds.get("constrained_vertices")
+            if vertices is None or len(vertices) == 0:
+                vertices = ds.get("triangulated_vertices", [])
+            
+            if len(vertices) == 0:
+                logger.warning(f"Surface {s_idx} has no vertices. Skipping.")
+                continue
+                
+            surface_vertex_maps[s_idx] = {}
+            
+            # Process each vertex in this surface
+            for local_idx, vertex in enumerate(vertices):
+                # Find existing vertex with precise matching (like C++)
+                found_global_idx = None
+                x, y, z = float(vertex[0]), float(vertex[1]), float(vertex[2])
+                
+                # Search existing vertices for match
+                for global_idx in range(len(vertex_tet_ids)):
+                    existing_x = global_vertices[global_idx * 3]
+                    existing_y = global_vertices[global_idx * 3 + 1] 
+                    existing_z = global_vertices[global_idx * 3 + 2]
+                    
+                    if (abs(x - existing_x) < tolerance and 
+                        abs(y - existing_y) < tolerance and 
+                        abs(z - existing_z) < tolerance):
+                        found_global_idx = global_idx
+                        break
+                
+                if found_global_idx is None:
+                    # Add new vertex
+                    global_vertices.extend([x, y, z])
+                    global_idx = len(vertex_tet_ids)
+                    vertex_tet_ids.append(global_idx)
+                else:
+                    # Use existing vertex
+                    global_idx = found_global_idx
+                    
+                surface_vertex_maps[s_idx][local_idx] = global_idx
+        
+        logger.info(f"Global vertex processing complete: {len(vertex_tet_ids)} unique vertices")
+        
+        # Step 2: Process surface triangles (like C++ facet creation)
         all_triangles = []
         surface_markers = []
+        
+        for s_idx in self.selected_surfaces:
+            ds = self.datasets[s_idx]
+            triangles = ds.get("constrained_triangles")
+            if triangles is None or len(triangles) == 0:
+                triangles = ds.get("triangulated_triangles", [])
+                
+            if len(triangles) == 0 or s_idx not in surface_vertex_maps:
+                continue
+                
+            vertex_map = surface_vertex_maps[s_idx]
+            
+            # Convert triangles to global indices
+            for triangle in triangles:
+                if len(triangle) >= 3:
+                    try:
+                        global_tri = [
+                            vertex_map[int(triangle[0])],
+                            vertex_map[int(triangle[1])], 
+                            vertex_map[int(triangle[2])]
+                        ]
+                        # Check for degenerate triangles
+                        if len(set(global_tri)) == 3:
+                            all_triangles.append(global_tri)
+                            surface_markers.append(s_idx)  # Use surface index as marker
+                    except (KeyError, ValueError, IndexError):
+                        continue
+        
+        logger.info(f"Triangle processing complete: {len(all_triangles)} triangles from {len(self.selected_surfaces)} surfaces")
+        
+        # Step 3: Process intersection polylines as edge constraints (like C++ Polylines)
         edge_constraints = []
         edge_markers = []
         
-        vertex_counter = 0
-        
-        logger.info("Creating PLC from refined constrained meshes (C++ MeshIt compatible)...")
-        
-        def add_vertex_with_deduplication(vertex, tolerance=1e-12):
-            """Add vertex with exact deduplication matching C++ behavior."""
-            nonlocal vertex_counter
+        for s_idx in self.selected_surfaces:
+            ds = self.datasets[s_idx]
             
-            # Check for existing vertex with strict tolerance (match C++ FABS comparison)
-            for existing_idx, existing_vertex in enumerate(all_vertices):
-                if (abs(existing_vertex[0] - vertex[0]) < tolerance and 
-                    abs(existing_vertex[1] - vertex[1]) < tolerance and 
-                    abs(existing_vertex[2] - vertex[2]) < tolerance):
-                    return existing_idx
-            
-            # Add new vertex
-            all_vertices.append(list(vertex))
-            vertex_id = vertex_counter
-            vertex_counter += 1
-            return vertex_id
-        
-        constrained_mesh_used = False
-        
-        # Process each selected surface using refined constrained mesh data
-        for surface_index in self.selected_surfaces:
-            if surface_index < len(self.datasets):
-                dataset = self.datasets[surface_index]
+            # Get intersection constraints from stored_constraints
+            for constraint in ds.get('stored_constraints', []):
+                if constraint.get('type') != 'intersection_line':
+                    continue
+                    
+                points = constraint.get('points', [])
+                if len(points) < 2:
+                    continue
                 
-                # Use refined constrained mesh data from pre-tetra mesh tab
-                constrained_vertices = dataset.get('constrained_vertices')
-                constrained_triangles = dataset.get('constrained_triangles')
-                
-                if (constrained_vertices is not None and constrained_triangles is not None and 
-                    len(constrained_vertices) > 0 and len(constrained_triangles) > 0):
+                # Find global indices for intersection points
+                global_indices = []
+                for point in points:
+                    x, y, z = float(point[0]), float(point[1]), float(point[2])
                     
-                    logger.info(f"Using REFINED constrained mesh for surface {surface_index}")
-                    constrained_mesh_used = True
-                    
-                    # Add each triangle as a facet (matching C++ Surfaces[s].Ts behavior)
-                    vertices_np = np.array(constrained_vertices, dtype=np.float64)
-                    
-                    # Create local vertex mapping for this surface
-                    local_to_global_map = {}
-                    for local_idx, vertex_coords in enumerate(vertices_np):
-                        global_idx = add_vertex_with_deduplication(vertex_coords, tolerance)
-                        local_to_global_map[local_idx] = global_idx
-                    
-                    # Add all triangles directly (minimal validation - match C++ behavior)
-                    valid_triangle_count = 0
-                    for triangle_indices in constrained_triangles:
-                        if len(triangle_indices) >= 3:
-                            try:
-                                # Map local indices to global indices
-                                global_triangle = [
-                                    local_to_global_map[triangle_indices[0]],
-                                    local_to_global_map[triangle_indices[1]],
-                                    local_to_global_map[triangle_indices[2]]
-                                ]
-                                
-                                # Only check for duplicate vertices (basic validation)
-                                if len(set(global_triangle)) == 3:
-                                    all_triangles.append(global_triangle)
-                                    surface_markers.append(surface_index)  # Match C++ facetmarkerlist[face_number++] = s
-                                    valid_triangle_count += 1
-                                    
-                            except (KeyError, IndexError) as e:
-                                logger.warning(f"Skipping invalid triangle in surface {surface_index}: {e}")
-                    
-                    logger.info(f"Added surface {surface_index}: {len(vertices_np)} vertices, {valid_triangle_count} triangles")
-                    
-                    # Add intersection constraints if available (match C++ polylines/edge constraints)
-                    intersection_constraints = dataset.get('intersection_constraints', [])
-                    if intersection_constraints:
-                        logger.info(f"Adding {len(intersection_constraints)} intersection constraints for surface {surface_index}")
+                    # Find matching global vertex
+                    found_idx = None
+                    for global_idx in range(len(vertex_tet_ids)):
+                        existing_x = global_vertices[global_idx * 3]
+                        existing_y = global_vertices[global_idx * 3 + 1]
+                        existing_z = global_vertices[global_idx * 3 + 2]
                         
-                        for constraint_line in intersection_constraints:
-                            if len(constraint_line) >= 2:
-                                # Add constraint points and create edge segments
-                                constraint_vertices = []
-                                for point_coords in constraint_line:
-                                    global_idx = add_vertex_with_deduplication(np.array(point_coords), tolerance)
-                                    constraint_vertices.append(global_idx)
-                                
-                                # Create edge segments from constraint line
-                                for i in range(len(constraint_vertices) - 1):
-                                    if constraint_vertices[i] != constraint_vertices[i+1]:
-                                        edge_constraints.append([constraint_vertices[i], constraint_vertices[i+1]])
-                                        edge_markers.append(surface_index + 2)  # Match C++ p+2 (avoid 0,1)
-                
-                else:
-                    logger.error(f"No refined constrained mesh data found for surface {surface_index}")
-                    logger.error("Pre-tetra mesh tab should have been completed first!")
-        
-        # Add global intersection edges if available
-        if hasattr(self, 'datasets') and self.datasets:
-            for dataset_idx, dataset in enumerate(self.datasets):
-                intersections = dataset.get('intersections', [])
-                
-                for intersection_idx, intersection in enumerate(intersections):
-                    intersection_points = intersection.get('points', [])
+                        if (abs(x - existing_x) < tolerance and 
+                            abs(y - existing_y) < tolerance and 
+                            abs(z - existing_z) < tolerance):
+                            found_idx = global_idx
+                            break
                     
-                    if len(intersection_points) >= 2:
-                        # Add intersection line as edge constraints
-                        intersection_vertices = []
-                        for point in intersection_points:
-                            global_idx = add_vertex_with_deduplication(np.array([point[0], point[1], point[2]]), tolerance)
-                            intersection_vertices.append(global_idx)
-                        
-                        # Create edge segments
-                        for i in range(len(intersection_vertices) - 1):
-                            if intersection_vertices[i] != intersection_vertices[i+1]:
-                                edge_constraints.append([intersection_vertices[i], intersection_vertices[i+1]])
-                                edge_markers.append(1000 + dataset_idx)  # Global intersection marker
+                    if found_idx is None:
+                        # Add new vertex for intersection point
+                        global_vertices.extend([x, y, z])
+                        found_idx = len(vertex_tet_ids)
+                        vertex_tet_ids.append(found_idx)
+                    
+                    global_indices.append(found_idx)
+                
+                # Create edge constraints for this polyline
+                for i in range(len(global_indices) - 1):
+                    edge_constraints.append([global_indices[i], global_indices[i + 1]])
+                    edge_markers.append(-1)  # Generic marker for intersections
         
-        data_source = "REFINED constrained meshes" if constrained_mesh_used else "fallback data"
-        logger.info(f"PLC created from {data_source}: {len(all_vertices)} vertices, {len(all_triangles)} triangles, {len(edge_constraints)} edges")
+        logger.info(f"Edge constraint processing complete: {len(edge_constraints)} edge constraints")
         
-        if not constrained_mesh_used:
-            logger.error("WARNING: No refined constrained mesh data was used. Please complete pre-tetra mesh tab first!")
+        # Convert to numpy arrays 
+        vertices_array = np.array(global_vertices, dtype=np.float64).reshape(-1, 3)
+        triangles_array = np.array(all_triangles, dtype=np.int32)
+        markers_array = np.array(surface_markers, dtype=np.int32)
+        constraints_array = np.array(edge_constraints, dtype=np.int32) if edge_constraints else np.array([], dtype=np.int32).reshape(0, 2)
+        edge_markers_array = np.array(edge_markers, dtype=np.int32)
         
         return {
-            'vertices': np.array(all_vertices, dtype=np.float64),
-            'triangles': np.array(all_triangles, dtype=np.int32),
-            'surface_markers': np.array(surface_markers, dtype=np.int32),
-            'edge_constraints': np.array(edge_constraints, dtype=np.int32) if edge_constraints else np.array([], dtype=np.int32).reshape(0, 2),
-            'edge_markers': np.array(edge_markers, dtype=np.int32)
+            'vertices': vertices_array,
+            'triangles': triangles_array, 
+            'surface_markers': markers_array,
+            'edge_constraints': constraints_array,
+            'edge_markers': edge_markers_array
         }
+
+    def _create_pyvista_mesh(self, surface_data: Dict) -> Optional[pv.PolyData]:
+        """Create PyVista mesh from separate surface data."""
+        vertices = surface_data['vertices']
+        triangles = surface_data['triangles']
+        surface_markers = surface_data['surface_markers']
+        
+        if len(vertices) == 0 or len(triangles) == 0:
+            logger.error("No vertices or triangles to create mesh")
+            return None
+            
+        # Create PyVista faces format
+        pv_faces = []
+        for triangle in triangles:
+            pv_faces.extend([3, triangle[0], triangle[1], triangle[2]])
+        
+        try:
+            mesh = pv.PolyData(vertices, faces=pv_faces)
+            
+            # Add surface markers as cell data
+            if len(surface_markers) == len(triangles):
+                mesh.cell_data['surface_id'] = surface_markers
+                
+            return mesh
+        except Exception as e:
+            logger.error(f"Failed to create PyVista mesh: {e}")
+            return None
 
     def _get_border_ids_string(self) -> str:
         """Generate border IDs string like C++ version."""
@@ -294,47 +315,8 @@ class TetrahedralMeshGenerator:
         border_list = sorted(list(selected_borders))
         return ",".join(str(idx) for idx in border_list)
 
-    def _validate_and_repair_surface_meshes(self, surface_data_dict: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        """Validate and repair surface meshes before tetrahedral generation."""
-        logger.info("Validating and repairing surface meshes...")
-        
-        vertices = surface_data_dict['vertices']
-        triangles = surface_data_dict['triangles']
-        surface_markers = surface_data_dict['surface_markers']
-        
-        # Basic validation
-        if len(vertices) == 0:
-            logger.error("No vertices in surface data")
-            return surface_data_dict
-            
-        if len(triangles) == 0:
-            logger.error("No triangles in surface data")
-            return surface_data_dict
-        
-        # Check triangle indices are valid
-        max_vertex_index = len(vertices) - 1
-        valid_triangles = []
-        valid_markers = []
-        
-        for i, triangle in enumerate(triangles):
-            if (len(triangle) >= 3 and 
-                all(0 <= idx <= max_vertex_index for idx in triangle[:3]) and
-                len(set(triangle[:3])) == 3):  # No duplicate vertices
-                valid_triangles.append(triangle[:3])
-                if i < len(surface_markers):
-                    valid_markers.append(surface_markers[i])
-                else:
-                    valid_markers.append(0)  # Default marker
-        
-        logger.info(f"Validation: {len(valid_triangles)}/{len(triangles)} triangles are valid")
-        
-        surface_data_dict['triangles'] = np.array(valid_triangles, dtype=np.int32)
-        surface_data_dict['surface_markers'] = np.array(valid_markers, dtype=np.int32)
-        
-        return surface_data_dict
-
     def _prepare_material_regions(self, surface_mesh_pv) -> List[List[float]]:
-        """Prepare material regions for TetGen."""
+        """Prepare material regions for TetGen (C++ compatible)."""
         region_attributes_list = []
         
         if not self.materials:
@@ -350,6 +332,9 @@ class TetrahedralMeshGenerator:
         else:
             for material_idx, material in enumerate(self.materials):
                 locations = material.get('locations', [])
+                # Use the material's attribute if specified, otherwise use index + 1
+                material_attribute = material.get('attribute', material_idx + 1)
+                
                 for location in locations:
                     if len(location) >= 3:
                         # Format: [x, y, z, region_attribute, max_volume]
@@ -357,74 +342,111 @@ class TetrahedralMeshGenerator:
                             float(location[0]), 
                             float(location[1]), 
                             float(location[2]), 
-                            material_idx + 1,  # Material ID (1-based)
+                            int(material_attribute),  # Use specified attribute
                             -1  # No volume constraint
                         ])
                         
-            logger.info(f"Added {len(region_attributes_list)} material regions")
+            logger.info(f"Added {len(region_attributes_list)} material regions from {len(self.materials)} materials")
         
         return region_attributes_list
 
-    def _run_tetgen_with_border_support(self, surface_mesh_pv, facets_markers_list: List[int], 
-                                       edges_constraints_list: List[List[int]], edge_markers_list: List[int], 
-                                       region_attributes_list: List[List[float]], border_ids: str, 
-                                       plc_switches: str) -> Optional[pv.UnstructuredGrid]:
-        """Run TetGen with proper border handling like C++ version."""
-        
-        # Create TetGen object with border awareness
-        tet = tetgen.TetGen(surface_mesh_pv)
-        
-        # Add border-specific constraints
-        if border_ids:
-            logger.info(f"Processing border constraints for border IDs: {border_ids}")
-            # Borders get special treatment - they define domain boundaries
-            tet.make_manifold(verbose=False)
-        
-        # Progressive strategy approach with border consideration
+    def _run_tetgen_cpp_style(
+            self,
+            surface_mesh_pv,                 # PyVista PolyData (PLC facets)
+            surface_markers: np.ndarray,     # Surface markers for each facet
+            edge_constraints: np.ndarray,    # Edge constraints array 
+            edge_markers: np.ndarray,        # Edge markers array
+            region_attributes_list: list,
+            border_ids: str,
+            plc_switches: str,
+    ) -> Optional[pv.UnstructuredGrid]:
+        """
+        Execute TetGen using C++ compatible approach with proper surface markers.
+        """
+        import tetgen
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        # Clean the input mesh
+        try:
+            surface_mesh_pv.clean(inplace=True)
+        except Exception:
+            pass
+
+        def _create_tetgen_instance():
+            """Helper to create and configure a new TetGen instance with proper surface markers."""
+            tet = tetgen.TetGen(surface_mesh_pv)
+            
+            # CRITICAL: Set surface markers properly (like C++ facetmarkerlist)
+            if len(surface_markers) > 0:
+                # Convert surface markers to list and ensure they match triangle count
+                marker_list = surface_markers.tolist()
+                if len(marker_list) == surface_mesh_pv.n_faces:
+                    tet.facet_markers = marker_list
+                    logger.info(f"Applied {len(marker_list)} surface markers to TetGen")
+                else:
+                    logger.warning(f"Surface marker count ({len(marker_list)}) does not match face count ({surface_mesh_pv.n_faces})")
+            
+            # Set edge constraints (like C++ edgelist)
+            if len(edge_constraints) > 0:
+                edge_list = edge_constraints.tolist()
+                tet.edge_list = edge_list
+                logger.info(f"Applied {len(edge_list)} edge constraints to TetGen")
+                
+                # Set edge markers if available
+                if len(edge_markers) > 0:
+                    tet.edge_markers = edge_markers.tolist()
+            
+            # Add material regions (like C++ regionlist)
+            for reg in region_attributes_list:
+                try:
+                    tet.add_region(reg[:3], attribute=int(reg[3]), max_volume=float(reg[4]))
+                except AttributeError:
+                    # Fallback for older TetGen wrapper versions
+                    tet.regionlist = region_attributes_list
+                    break
+            return tet
+
+        # Define fallback strategies with proper tolerance handling
+        initial_switches = plc_switches
+        if border_ids and 'p' not in initial_switches:
+            initial_switches = 'p' + initial_switches
+
+        # Strategy definitions
         strategies = [
-            ('A', 'Basic Delaunay (no boundary recovery) - BEST for constrained meshes'),
-            ('pA', 'Basic with PLC - Good for borders'),
-            ('pq1.2A', 'Quality with PLC - Balanced approach'),
-            (plc_switches, 'User-specified switches'),
-            ('pq1.414aAY', 'Final fallback with all options')
+            ('Initial', initial_switches, True),
+            ('Robust + Tolerance', 'pT1e-12A', True),
+            ('Very Permissive', 'pT1e-8A', True),
+            ('No Constraints', 'pT1e-8A', False),  # Last resort: no edge constraints
         ]
-        
-        for switches, description in strategies:
+
+        # Execute strategies
+        for name, switches, use_edges in strategies:
+            logger.info(f"Running TetGen with strategy: '{name}', switches: '{switches}'")
             try:
-                logger.info(f"Trying TetGen strategy: '{switches}' ({description})")
+                tet = _create_tetgen_instance()
                 
-                # Configure tetgen based on strategy
-                if border_ids and 'p' not in switches:
-                    # For borders, ensure PLC mode is used
-                    switches = 'p' + switches
-                    logger.info(f"Added PLC mode for borders: '{switches}'")
+                # Optionally remove edge constraints for final fallback
+                if not use_edges:
+                    tet.edge_list = []
+                    tet.edge_markers = []
+                    logger.info("Removed edge constraints for final fallback")
                 
-                grid = tet.tetrahedralize(
-                    switches=switches,
-                    facetmarkerlist=facets_markers_list,
-                    edgelist=edges_constraints_list if len(edges_constraints_list) else None,
-                    edgemarkerlist=edge_markers_list if len(edge_markers_list) else None,
-                    regionlist=region_attributes_list if len(region_attributes_list) else None
-                )
+                # Run TetGen
+                tet.tetrahedralize(switches=switches)
+                grid = tet.grid
                 
-                if grid and grid.n_cells > 0:
-                    logger.info(f"✓ Strategy '{switches}' succeeded!")
-                    logger.info(f"  Generated {grid.n_cells} tetrahedra in minimal time")
-                    logger.info(f"  Vertices: {grid.n_points}")
-                    logger.info(f"  Used edge constraints: {len(edges_constraints_list) > 0}")
-                    
-                    if border_ids:
-                        logger.info(f"  Border handling: Applied for IDs {border_ids}")
-                    
+                if grid is not None and grid.n_cells > 0:
+                    logger.info(f"✓ TetGen succeeded with '{name}': {grid.n_cells} tetrahedra generated.")
                     return grid
                 else:
-                    logger.warning(f"Strategy '{switches}' produced no tetrahedra")
+                    logger.warning(f"TetGen ran with '{name}' but produced no tetrahedra.")
                     
             except Exception as e:
-                logger.warning(f"Strategy '{switches}' failed: {str(e)}")
-                continue
+                logger.warning(f"TetGen failed with strategy '{name}': {e}")
         
-        logger.error("All TetGen strategies failed")
+        logger.error("All TetGen strategies failed. Surface data may have fundamental issues.")
         return None
 
     def export_mesh(self, file_path: str, mesh_data: Optional[Dict] = None) -> bool:

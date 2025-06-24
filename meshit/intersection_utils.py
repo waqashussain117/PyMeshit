@@ -11,7 +11,7 @@ from typing import List, Dict, Tuple, Optional, Union, Any
 import math # Ensure math is imported for floor
 import logging
 import triangle as tr_standard # Import unconditionally for fallback
-
+from dataclasses import dataclass, field
 try:
     from meshit.triangle_direct import DirectTriangleWrapper
     HAVE_DIRECT_WRAPPER_INTERSECTION_UTILS = True
@@ -2303,542 +2303,205 @@ def prepare_plc_for_surface_triangulation(surface_data, intersections_on_surface
 
 def prepare_plc_for_surface_triangulation_fallback(surface_data, intersections_on_surface_data, config):
     """
-    Fallback to original PLC preparation method.
+    Prepares Points and Segments for constrained 2D triangulation of a surface.
+    This version correctly builds a unified PLC from all constraints, following C++ MeshIt logic.
     """
-    all_3d_points_for_plc_map = {} # Using a dictionary to ensure unique points by rounded 3D coords
-    # Initialize unique_3d_points_for_plc as an empty array with the correct shape and dtype.
-    # This will be populated if points are found, or returned as empty if an early exit occurs.
-    unique_3d_points_for_plc = np.empty((0, 3), dtype=float)
+    logger.info("Preparing PLC using unified C++-style constraint logic.")
 
-    # 1. Collect all potential 3D points for the PLC (hull and intersections)
-    # Store them with their original unrounded 3D coordinates for later Z reconstruction
-    # and with their type.
-    
-    # From Hull
-    hull_points_data = surface_data.get('hull_points', [])
-    if hull_points_data is None: hull_points_data = []
-    for pt_data in hull_points_data:
-        pt_3d_orig = None
-        pt_type = 'HULL_POINT'
-        if isinstance(pt_data, Vector3D):
-            pt_3d_orig = (pt_data.x, pt_data.y, pt_data.z)
-            pt_type = getattr(pt_data, 'type', 'HULL_POINT')
-        elif isinstance(pt_data, (list, tuple, np.ndarray)) and len(pt_data) >= 3:
-            pt_3d_orig = (float(pt_data[0]), float(pt_data[1]), float(pt_data[2]))
-            if len(pt_data) > 3 and isinstance(pt_data[3], str): pt_type = pt_data[3]
-        
-        if pt_3d_orig:
-            pt_3d_rounded = tuple(round(c, 6) for c in pt_3d_orig)
-            if pt_3d_rounded not in all_3d_points_for_plc_map:
-                all_3d_points_for_plc_map[pt_3d_rounded] = {'orig_3d': np.array(pt_3d_orig), 'type': pt_type}
-            # Optionally, prioritize type if point already exists
-            elif pt_type != 'HULL_POINT' and all_3d_points_for_plc_map[pt_3d_rounded]['type'] == 'HULL_POINT':
-                 all_3d_points_for_plc_map[pt_3d_rounded]['type'] = pt_type
+    # 1. Collect all unique 3D constraint points from the hull and intersections.
+    # The dictionary ensures that points shared between hull and intersections are deduplicated.
+    all_points_3d_map = {}  # Use dict for deduplication: rounded_coord -> original Vector3D
 
+    # Process hull points
+    hull_points = surface_data.get('hull_points', [])
+    for pt_vec in hull_points:
+        pt_key = tuple(round(c, 8) for c in (pt_vec.x, pt_vec.y, pt_vec.z))
+        if pt_key not in all_points_3d_map:
+            all_points_3d_map[pt_key] = pt_vec
 
-    # From Intersections
-    for intersection_data in intersections_on_surface_data:
-        intersection_points_data = intersection_data.get('points', [])
-        if intersection_points_data is None: intersection_points_data = []
-        for pt_data in intersection_points_data:
-            pt_3d_orig = None
-            pt_type = 'INTERSECTION_POINT'
-            if isinstance(pt_data, Vector3D):
-                pt_3d_orig = (pt_data.x, pt_data.y, pt_data.z)
-                pt_type = getattr(pt_data, 'type', 'INTERSECTION_POINT')
-            elif isinstance(pt_data, (list, tuple, np.ndarray)) and len(pt_data) >= 3:
-                pt_3d_orig = (float(pt_data[0]), float(pt_data[1]), float(pt_data[2]))
-                if len(pt_data) > 3 and isinstance(pt_data[3], str): pt_type = pt_data[3]
+    # Process intersection points
+    for intersection in intersections_on_surface_data:
+        for pt_vec in intersection.get('points', []):
+            pt_key = tuple(round(c, 8) for c in (pt_vec.x, pt_vec.y, pt_vec.z))
+            if pt_key not in all_points_3d_map:
+                all_points_3d_map[pt_key] = pt_vec
 
-            if pt_3d_orig:
-                pt_3d_rounded = tuple(round(c, 6) for c in pt_3d_orig)
-                if pt_3d_rounded not in all_3d_points_for_plc_map:
-                    all_3d_points_for_plc_map[pt_3d_rounded] = {'orig_3d': np.array(pt_3d_orig), 'type': pt_type}
-                # Prioritize more specific types
-                elif pt_type != 'INTERSECTION_POINT' and all_3d_points_for_plc_map[pt_3d_rounded]['type'] == 'INTERSECTION_POINT':
-                     all_3d_points_for_plc_map[pt_3d_rounded]['type'] = pt_type
-                elif "POINT" not in all_3d_points_for_plc_map[pt_3d_rounded]['type'] and "POINT" in pt_type :
-                     all_3d_points_for_plc_map[pt_3d_rounded]['type'] = pt_type
+    if not all_points_3d_map:
+        logger.warning("No constraint points found for surface.")
+        return None, None, np.empty((0, 2)), np.empty((0, 3))
 
+    # 2. Create the final ordered list of unique 3D points and a reverse map for index lookup.
+    unique_3d_points_for_plc = list(all_points_3d_map.values())
+    point_3d_to_idx_map = {
+        tuple(round(c, 8) for c in (p.x, p.y, p.z)): i
+        for i, p in enumerate(unique_3d_points_for_plc)
+    }
 
-    if not all_3d_points_for_plc_map:
-        logger.warning("No unique 3D points collected for PLC.")
-        return None, None, np.empty((0,2)), unique_3d_points_for_plc # Return initialized empty array
+    # 3. Collect all 3D segments from hull and intersections.
+    all_segments_3d = []
+    if hull_points:
+        for i in range(len(hull_points)):
+            p1 = hull_points[i]
+            p2 = hull_points[(i + 1) % len(hull_points)]  # Close the loop
+            all_segments_3d.append((p1, p2))
 
-    # If points were collected, now populate unique_3d_points_for_plc
-    unique_3d_points_list = [data['orig_3d'] for data in all_3d_points_for_plc_map.values()]
-    unique_3d_points_for_plc = np.array(unique_3d_points_list) # This re-assigns it
-    
-    rounded_3d_to_final_idx_map = {pt_rounded: i for i, pt_rounded in enumerate(all_3d_points_for_plc_map.keys())}
+    for intersection in intersections_on_surface_data:
+        points = intersection.get('points', [])
+        for i in range(len(points) - 1):
+            p1 = points[i]
+            p2 = points[i + 1]
+            all_segments_3d.append((p1, p2))
 
-    # 2. Project unique 3D points to 2D
+    # 4. Create the segment index array for the PLC using the unique point map.
+    plc_segments_indices = []
+    for p1_vec, p2_vec in all_segments_3d:
+        p1_key = tuple(round(c, 8) for c in (p1_vec.x, p1_vec.y, p1_vec.z))
+        p2_key = tuple(round(c, 8) for c in (p2_vec.x, p2_vec.y, p2_vec.z))
+
+        idx1 = point_3d_to_idx_map.get(p1_key)
+        idx2 = point_3d_to_idx_map.get(p2_key)
+
+        if idx1 is not None and idx2 is not None and idx1 != idx2:
+            plc_segments_indices.append([idx1, idx2])
+
+    # 5. Project the unique 3D points to 2D for triangulation.
     plc_points_2d_list = []
     projection_params = surface_data.get('projection_params')
-    if projection_params:
-        centroid = np.array(projection_params['centroid'])
-        basis = np.array(projection_params['basis'])
-        for pt_3d in unique_3d_points_for_plc:
-            centered_pt = pt_3d - centroid
-            pt_2d = np.dot(centered_pt, basis.T)
-            plc_points_2d_list.append(pt_2d[:2]) 
-    else:
-        logger.info("No projection_params, using X,Y for 2D PLC.")
-        for pt_3d in unique_3d_points_for_plc:
-            plc_points_2d_list.append(pt_3d[:2])
+    if not projection_params:
+        logger.error("Cannot create PLC: missing projection parameters.")
+        return None, None, np.empty((0, 2)), np.empty((0, 3))
+
+    centroid = np.array(projection_params['centroid'])
+    basis = np.array(projection_params['basis'])
+    for pt_3d_vec in unique_3d_points_for_plc:
+        pt_3d = np.array([pt_3d_vec.x, pt_3d_vec.y, pt_3d_vec.z])
+        centered_pt = pt_3d - centroid
+        pt_2d = np.dot(centered_pt, basis.T)
+        plc_points_2d_list.append(pt_2d[:2])
+
+    # 6. Finalize PLC arrays and return.
     plc_points_2d = np.array(plc_points_2d_list)
+    plc_segments_indices = np.array(plc_segments_indices)
+    plc_holes_2d = np.empty((0, 2))  # Holes are not handled yet.
+    final_3d_points = np.array([p.to_numpy() for p in unique_3d_points_for_plc])
 
-    if len(plc_points_2d) < 3:
-        logger.warning(f"Not enough unique 2D points ({len(plc_points_2d)}) for PLC.")
-        return None, None, np.empty((0,2)), unique_3d_points_for_plc # unique_3d_points_for_plc is now populated or empty
+    logger.info(f"Correctly prepared PLC: {len(plc_points_2d)} points, {len(plc_segments_indices)} segments.")
+    return plc_points_2d, plc_segments_indices, plc_holes_2d, final_3d_points
 
-    # 3. Create segments using indices from unique_3d_points_for_plc
-    plc_segments_indices_set = set() # Use a set for segments to ensure uniqueness (idx1, idx2) with idx1 < idx2
-    segment_length_tolerance = 1e-7
 
-    # Hull segments
-    if len(hull_points_data) > 0:
-        for i in range(len(hull_points_data)):
-            pt1_data = hull_points_data[i]
-            pt2_data = hull_points_data[(i + 1) % len(hull_points_data)] # Close loop
-
-            pt1_3d_orig_tuple = None
-            pt2_3d_orig_tuple = None
-
-            if isinstance(pt1_data, Vector3D): pt1_3d_orig_tuple = (pt1_data.x, pt1_data.y, pt1_data.z)
-            elif isinstance(pt1_data, (list,tuple,np.ndarray)) and len(pt1_data) >=3: pt1_3d_orig_tuple = (float(pt1_data[0]), float(pt1_data[1]), float(pt1_data[2]))
-            
-            if isinstance(pt2_data, Vector3D): pt2_3d_orig_tuple = (pt2_data.x, pt2_data.y, pt2_data.z)
-            elif isinstance(pt2_data, (list,tuple,np.ndarray)) and len(pt2_data) >=3: pt2_3d_orig_tuple = (float(pt2_data[0]), float(pt2_data[1]), float(pt2_data[2]))
-
-            if pt1_3d_orig_tuple and pt2_3d_orig_tuple:
-                idx1 = rounded_3d_to_final_idx_map.get(tuple(round(c, 6) for c in pt1_3d_orig_tuple))
-                idx2 = rounded_3d_to_final_idx_map.get(tuple(round(c, 6) for c in pt2_3d_orig_tuple))
-
-                if idx1 is not None and idx2 is not None and idx1 != idx2:
-                    p1_2d = plc_points_2d[idx1]
-                    p2_2d = plc_points_2d[idx2]
-                    if np.linalg.norm(p1_2d - p2_2d) > segment_length_tolerance:
-                        plc_segments_indices_set.add(tuple(sorted((idx1, idx2))))
-
-    # Intersection segments
-    for intersection_data in intersections_on_surface_data:
-        intersection_points_data = intersection_data.get('points', [])
-        if len(intersection_points_data) < 2: continue
-        for i in range(len(intersection_points_data) - 1):
-            pt1_data = intersection_points_data[i]
-            pt2_data = intersection_points_data[i+1]
-
-            pt1_3d_orig_tuple = None
-            pt2_3d_orig_tuple = None
-
-            if isinstance(pt1_data, Vector3D): pt1_3d_orig_tuple = (pt1_data.x, pt1_data.y, pt1_data.z)
-            elif isinstance(pt1_data, (list,tuple,np.ndarray)) and len(pt1_data) >=3: pt1_3d_orig_tuple = (float(pt1_data[0]), float(pt1_data[1]), float(pt1_data[2]))
-            
-            if isinstance(pt2_data, Vector3D): pt2_3d_orig_tuple = (pt2_data.x, pt2_data.y, pt2_data.z)
-            elif isinstance(pt2_data, (list,tuple,np.ndarray)) and len(pt2_data) >=3: pt2_3d_orig_tuple = (float(pt2_data[0]), float(pt2_data[1]), float(pt2_data[2]))
-
-            if pt1_3d_orig_tuple and pt2_3d_orig_tuple:
-                idx1 = rounded_3d_to_final_idx_map.get(tuple(round(c, 6) for c in pt1_3d_orig_tuple))
-                idx2 = rounded_3d_to_final_idx_map.get(tuple(round(c, 6) for c in pt2_3d_orig_tuple))
-
-                if idx1 is not None and idx2 is not None and idx1 != idx2:
-                    p1_2d = plc_points_2d[idx1]
-                    p2_2d = plc_points_2d[idx2]
-                    if np.linalg.norm(p1_2d - p2_2d) > segment_length_tolerance:
-                        plc_segments_indices_set.add(tuple(sorted((idx1, idx2))))
-    
-    plc_segments_indices_list = [list(seg) for seg in plc_segments_indices_set]
-
-    if not plc_segments_indices_list:
-        logger.warning("No segments created for PLC after filtering and unique point processing.")
-        if len(plc_points_2d) >= 3:
-            logger.info("Attempting fallback ConvexHull for PLC segments.")
-            try:
-                from scipy.spatial import ConvexHull as ScipyConvexHull
-                if np.all(np.isfinite(plc_points_2d)):
-                    hull = ScipyConvexHull(plc_points_2d)
-                    for simplex in hull.simplices:
-                        p1_2d = plc_points_2d[simplex[0]]
-                        p2_2d = plc_points_2d[simplex[1]]
-                        if np.linalg.norm(p1_2d - p2_2d) > segment_length_tolerance:
-                            seg_tuple = tuple(sorted((simplex[0], simplex[1])))
-                            if seg_tuple not in plc_segments_indices_set:
-                                plc_segments_indices_list.append(list(seg_tuple))
-                                plc_segments_indices_set.add(seg_tuple)
-                    logger.info(f"Fallback ConvexHull generated {len(plc_segments_indices_list)} segments.")
-                else:
-                    logger.warning("Fallback ConvexHull: plc_points_2d contains non-finite values.")
-            except Exception as e_hull_fallback:
-                logger.error(f"Fallback convex hull generation failed: {e_hull_fallback}")
-                return None, None, np.empty((0,2)), unique_3d_points_for_plc # unique_3d_points_for_plc is populated or empty
-        else:
-             logger.warning("Not enough points for fallback hull generation.")
-             return None, None, np.empty((0,2)), unique_3d_points_for_plc # unique_3d_points_for_plc is populated or empty
-             
-    if not plc_segments_indices_list:
-        logger.error("Still no segments for PLC after all processing. Cannot triangulate.")
-        return None, None, np.empty((0,2)), unique_3d_points_for_plc # unique_3d_points_for_plc is populated or empty
-
-    plc_segments_indices = np.array(plc_segments_indices_list, dtype=np.int32)
-    plc_holes_2d = np.empty((0, 2)) 
-    
-    logger.info(f"PLC prepared (fallback): {len(plc_points_2d)} unique 2D points, {len(plc_segments_indices)} unique segments (after filtering).")
-
-    return plc_points_2d, plc_segments_indices, plc_holes_2d, unique_3d_points_for_plc
-
-def run_constrained_triangulation_py(plc_points_2d, plc_segments_indices, plc_holes_2d, 
+def run_constrained_triangulation_py(plc_points_2d, plc_segments_indices, plc_holes_2d,
                                      surface_projection_params, original_3d_points_for_plc, config):
     """
-    Run constrained triangulation using PyVista/Triangle with proper triple point preservation.
-    
-    Returns:
-        Tuple of (vertices_3d, triangles, triple_point_indices) where triple_point_indices 
-        contains the vertex indices that are triple points
+    Runs constrained triangulation using the 'triangle' library on a pre-built PLC.
+    This function now trusts that the input PLC from prepare_plc_for_surface_triangulation is correct.
     """
-    if plc_points_2d is None or len(plc_points_2d) < 3 or \
-       plc_segments_indices is None or len(plc_segments_indices) < 3: # Need at least 3 segments for a closed polygon
-        logger.error("Not enough points or segments for constrained triangulation.")
+    if plc_points_2d is None or len(plc_points_2d) < 3:
+        logger.error("Not enough points for constrained triangulation. Skipping.")
         return None, None, []
+    if plc_segments_indices is None or len(plc_segments_indices) < 3:
+        logger.warning("Not enough segments for constrained triangulation, but proceeding with points.")
+
+    # Prepare the input for the 'triangle' library.
+    tri_input = {'vertices': plc_points_2d}
+    if plc_segments_indices is not None and len(plc_segments_indices) > 0:
+        tri_input['segments'] = plc_segments_indices
+    if plc_holes_2d is not None and len(plc_holes_2d) > 0:
+        tri_input['holes'] = plc_holes_2d
+
+    # Use switches that allow Triangle to add interior points for proper surface filling
+    # The key insight: we need Triangle to add interior vertices to fill the surface area
+    base_area = config.get('max_area', 800.0)
+    switches = f"pzq30a{base_area:.1f}"  # Quality mesh with area constraint
+    logger.info(f"Attempting triangulation with area-constrained switches: {switches}")
 
     tri_result = None
-    tri_vertices_2d_final = None
-    tri_triangles_indices_final = None
-
-    # Get gradient control instance for size information
-    gc = GradientControl()
-    
-    # Attempt 1: PyVista triangulation (if available)
-    if HAVE_PYVISTA_UTILS:
-        logger.info("Attempting constrained triangulation with PyVista.")
-        if original_3d_points_for_plc is not None:
-            try:
-                # PyVista needs 3D points. We use original_3d_points_for_plc which corresponds to plc_points_2d.
-                # Ensure original_3d_points_for_plc has Z coordinates (even if they are all zero or from projection).
-                if original_3d_points_for_plc.shape[1] == 2:
-                    # If original points were only 2D, add a Z column of zeros for PyVista
-                    pv_points_3d = np.hstack((original_3d_points_for_plc, np.zeros((original_3d_points_for_plc.shape[0], 1))))
-                else:
-                    pv_points_3d = original_3d_points_for_plc
-
-                # Create PyVista lines array for PolyData
-                # Each line is [2, idx1, idx2]
-                lines_pv = np.hstack((np.full((len(plc_segments_indices), 1), 2), plc_segments_indices))
-                
-                # Create PolyData object
-                poly_data = pv.PolyData(pv_points_3d, lines=lines_pv.ravel())
-                
-                triangulated_pv = poly_data.triangulate(inplace=False)
-                if triangulated_pv and triangulated_pv.n_points > 0 and triangulated_pv.n_cells > 0:
-                    logger.info(f"PyVista triangulation successful: {triangulated_pv.n_points} points, {triangulated_pv.n_cells} triangles.")
-                    pv_tri_vertices_3d = triangulated_pv.points
-                    if surface_projection_params:
-                        centroid = np.array(surface_projection_params['centroid'])
-                        basis = np.array(surface_projection_params['basis'])
-                        centered_pv_pts = pv_tri_vertices_3d - centroid
-                        tri_vertices_2d_final = np.dot(centered_pv_pts, basis.T)[:,:2]
-                    else: 
-                        tri_vertices_2d_final = pv_tri_vertices_3d[:, :2]
-                    tri_triangles_indices_final = triangulated_pv.faces.reshape(-1, 4)[:, 1:]
-                    logger.info("Using PyVista triangulation result.")
-                else:
-                    logger.warning("PyVista triangulation did not produce a valid mesh. Trying other methods.")
-                    tri_vertices_2d_final = None # Ensure reset if not successful
-                    tri_triangles_indices_final = None
-            except Exception as e_pv:
-                logger.error(f"PyVista triangulation failed: {e_pv}. Trying other methods.")
-                tri_vertices_2d_final = None # Explicitly reset on error
-                tri_triangles_indices_final = None
-        else: # original_3d_points_for_plc was None
-            logger.warning("original_3d_points_for_plc is None, cannot attempt PyVista triangulation.")
-
-    # Skip DirectTriangleWrapper for constraint processing - use working triangulation logic instead
-    # DirectTriangleWrapper doesn't support C++ "pzYYu" switches or point-specific area constraints
-    if tri_vertices_2d_final is None and config.get('use_cpp_exact_logic', True):
-        logger.info("Skipping DirectTriangleWrapper to use WORKING triangulation logic (same as original triangulation).")
-    elif tri_vertices_2d_final is None and HAVE_DIRECT_WRAPPER_INTERSECTION_UTILS:
-        logger.info("Using DirectTriangleWrapper for constrained triangulation with gradient control.")
-        triangulation_options_dtw = {
-            'gradient': config.get('gradient', 2.0),
-            'min_angle': config.get('min_angle', 20.0),
-            'base_size': config.get('target_feature_size', 20.0),  # Use consistent 20.0 like original
-            'uniform': config.get('uniform_meshing', True), # Use config setting
-        }
-        triangulator = DirectTriangleWrapper(
-            gradient=triangulation_options_dtw['gradient'],
-            min_angle=triangulation_options_dtw['min_angle'],
-            base_size=triangulation_options_dtw['base_size']
-        )
+    try:
+        # Primary approach: Quality mesh with area constraint
+        tri_result = tr_standard.triangulate(tri_input, opts=switches)
+        logger.info(f"✅ SUCCESS: Primary triangulation with '{switches}' completed.")
+    except Exception as e:
+        logger.error(f"Primary triangulation with '{switches}' failed: {e}", exc_info=True)
+        logger.warning("Trying fallback switches 'pzq30' (quality mesh without area constraint).")
         try:
-            # Use simplified settings to avoid crashes with many constraint points
-            tri_result = triangulator.triangulate(
-                points=plc_points_2d, 
-                segments=plc_segments_indices, 
-                holes=plc_holes_2d if plc_holes_2d is not None and len(plc_holes_2d) > 0 else None,
-                uniform=triangulation_options_dtw['uniform'],
-                create_transition=False,  # Disable transition to avoid crashes with many points
-                create_feature_points=False  # Disable feature points to avoid crashes
-            )
-            if tri_result and 'vertices' in tri_result and 'triangles' in tri_result:
-                tri_vertices_2d_final = tri_result['vertices']
-                tri_triangles_indices_final = tri_result['triangles']
-                logger.info("Using DirectTriangleWrapper result with gradient control.")
-        except Exception as e_dtw:
-            import traceback
-            logger.error(f"DirectTriangleWrapper failed: {e_dtw}")
-            logger.error(f"DirectTriangleWrapper traceback: {traceback.format_exc()}")
-            logger.info("Trying standard triangle library as fallback.")
-
-    # If DirectTriangleWrapper also failed or was not used, try standard triangle lib with C++ exact logic
-    if tri_vertices_2d_final is None:
-        if config.get('use_cpp_exact_logic', True):
-            logger.info("Using standard 'triangle' library with WORKING switches (same as original triangulation).")
-        else:
-            logger.warning("DirectTriangleWrapper failed or not available. Using standard 'triangle' library with size control.")
-        
-        # Prepare triangle input with size information
-        tri_input = {'vertices': plc_points_2d}
-        if plc_segments_indices is not None and len(plc_segments_indices) > 0:
-            tri_input['segments'] = plc_segments_indices
-        if plc_holes_2d is not None and len(plc_holes_2d) > 0:
-            tri_input['holes'] = plc_holes_2d
-        
-        # Add point-specific size information
-        point_sizes = []
-        for i, pt_2d in enumerate(plc_points_2d):
-            size = gc.get_size_at_point((pt_2d[0], pt_2d[1]))
-            point_sizes.append(size)
-        
-        # Use constraint-preserving options with conservative settings
-        min_angle = config.get('min_angle', 20.0)
-        max_area = config.get('max_area', 800.0)  # Large default area to prevent over-refinement
-        
-        # Use EXACT C++ switches: "pzYYu" (from geometry.cpp line 2127)
-        # p = PSLG (Planar Straight Line Graph)
-        # z = number everything from zero
-        # Y = no Steiner points on boundary
-        # Y = no Steiner points on segments (double Y like C++)
-        # u = user-defined triangle area constraints (uses refinesize array)
-        opts = "pzYYu"
-        
-        try:
-            # Calculate proper surface size like C++ does: length(max - min) / 16
-            # Get bounding box of constraint points
-            points_array = np.array(plc_points_2d)
-            min_coords = np.min(points_array, axis=0)
-            max_coords = np.max(points_array, axis=0)
-            bbox_diagonal = np.sqrt(np.sum((max_coords - min_coords) ** 2))
-            surface_size = bbox_diagonal / 16.0  # Same as C++: length(max - min) / 16
-            
-            # Use surface size for area constraint (like C++ meshsize)
-            # C++ uses meshsize for global area control, not tiny point-specific areas
-            area_constraint = surface_size * surface_size * 0.5  # Reasonable area based on surface size
-            
-            # Use same switches as original working triangulation: "pzq" + angle + area
-            # p = PSLG (Planar Straight Line Graph) 
-            # z = number everything from zero
-            # q = quality mesh with minimum angle constraint
-            # a = maximum triangle area constraint
-            min_angle = config.get('min_angle', 20.0)
-            opts_working = f"pzq{min_angle:.1f}a{area_constraint:.6f}"
-            
-            logger.info(f"Using PROPER surface-based triangulation: {opts_working}")
-            logger.info(f"Surface size: {surface_size:.3f}, bbox_diagonal: {bbox_diagonal:.3f}, area_constraint: {area_constraint:.6f}")
-            
-            tri_result_std = tr_standard.triangulate(tri_input, opts=opts_working)
-            if 'vertices' in tri_result_std and 'triangles' in tri_result_std:
-                tri_vertices_2d_final = tri_result_std['vertices']
-                tri_triangles_indices_final = tri_result_std['triangles']
-                logger.info("Using standard triangle library result with PROPER surface-based sizing.")
-            else:
-                logger.error("Standard triangle library did not return expected keys.")
-        except Exception as e_std_tri:
-            logger.error(f"Standard triangle library triangulation failed: {e_std_tri}")
-            # Fallback with conservative settings
+            switches_fallback = "pzq30"
+            tri_result = tr_standard.triangulate(tri_input, opts=switches_fallback)
+            logger.info("✅ SUCCESS: Fallback triangulation with 'pzq30' completed.")
+        except Exception as e2:
+            logger.error(f"Fallback triangulation also failed: {e2}", exc_info=True)
+            logger.warning("Trying final fallback 'pz' (basic constrained triangulation).")
             try:
-                fallback_opts = "pzq20a800"  # Conservative fallback
-                logger.info(f"Trying fallback with switches: {fallback_opts}")
-                tri_result_std = tr_standard.triangulate(tri_input, opts=fallback_opts)
-                if 'vertices' in tri_result_std and 'triangles' in tri_result_std:
-                    tri_vertices_2d_final = tri_result_std['vertices']
-                    tri_triangles_indices_final = tri_result_std['triangles']
-                    logger.info("Using fallback standard triangle library result.")
-            except Exception as e_fallback:
-                logger.error(f"Fallback triangulation also failed: {e_fallback}")
+                switches_final = "pz"
+                tri_result = tr_standard.triangulate(tri_input, opts=switches_final)
+                logger.info("✅ SUCCESS: Final fallback triangulation with 'pz' completed.")
+            except Exception as e3:
+                logger.error(f"All triangulation strategies failed: {e3}", exc_info=True)
+                raise RuntimeError("All triangulation strategies failed.") from e3
 
-    if tri_vertices_2d_final is None or tri_triangles_indices_final is None:
-        logger.error("All triangulation attempts failed.")
-        return None, None, []
+    if not tri_result or 'vertices' not in tri_result or 'triangles' not in tri_result:
+        raise RuntimeError("Triangulation did not return a valid mesh result.")
 
-    # Z-reconstruction logic (FIXED VERSION)
-    final_vertices_3d_list = []
-    
+    logger.info("✅ SUCCESS: Triangulation completed.")
+    tri_vertices_2d_final = tri_result['vertices']
+    tri_triangles_indices_final = tri_result['triangles']
+
+    # Reconstruct 3D Vertices. This is a critical step.
+    final_vertices_3d = []
     if surface_projection_params:
-        centroid = surface_projection_params['centroid']
-        basis = surface_projection_params['basis']
-        
-        # Pre-compute interpolation data once for all Steiner points
-        try:
-            from scipy.interpolate import griddata
-            from scipy.spatial import KDTree
-            
-            # Convert to proper numpy arrays
-            plc_points_2d_np = np.array(plc_points_2d)
-            original_3d_points_for_plc_np = np.array(original_3d_points_for_plc)
-            
-            # Create KD-tree for fast lookup of original 2D PLC points
-            plc_kdtree = KDTree(plc_points_2d_np)
-            
-            # Extract Z values from original 3D points
-            original_z_values = original_3d_points_for_plc_np[:, 2]
-            
-            # Process all triangulation vertices
-            for new_v_2d in tri_vertices_2d_final:
-                # Ensure new_v_2d is a 1D array with 2 elements
-                new_v_2d = np.array(new_v_2d).flatten()
-                if len(new_v_2d) != 2:
-                    logger.warning(f"Invalid 2D vertex: {new_v_2d}, skipping")
-                    continue
-                
-                # Check if this new 2D vertex is one of the original PLC points
-                dist, idx_in_plc = plc_kdtree.query(new_v_2d, k=1)
-                
-                if dist < 1e-11:  # It's (close to) an original PLC point
-                    # Use its original 3D Z value
-                    original_3d_pt_for_this_plc_pt = original_3d_points_for_plc_np[idx_in_plc]
-                    
-                    # Check if this is a protected triple point (preserve exact coordinates)
-                    protected_triple_points = config.get('triple_points', [])
-                    is_triple_point = False
-                    
-                    for triple_pt in protected_triple_points:
-                        triple_dist = ((original_3d_pt_for_this_plc_pt[0] - triple_pt.x)**2 + 
-                                     (original_3d_pt_for_this_plc_pt[1] - triple_pt.y)**2 + 
-                                     (original_3d_pt_for_this_plc_pt[2] - triple_pt.z)**2)**0.5
-                        if triple_dist < 1e-10:
-                            # This is a protected triple point - use exact original coordinates
-                            logger.info(f"🎯 PROTECTED TRIPLE POINT preserved in triangulation result: [{triple_pt.x:.6f}, {triple_pt.y:.6f}, {triple_pt.z:.6f}]")
-                            final_vertices_3d_list.append(np.array([triple_pt.x, triple_pt.y, triple_pt.z]))
-                            is_triple_point = True
-                            break
-                    
-                    if not is_triple_point:
-                        final_vertices_3d_list.append(original_3d_pt_for_this_plc_pt)
-                else:  # It's a new Steiner point, interpolate Z
-                    # FIXED: Pass single point correctly to griddata
-                    try:
-                        # Reshape new_v_2d to be a single query point (1, 2)
-                        query_point = new_v_2d.reshape(1, -1)
-                        
-                        # Use griddata with proper point format
-                        interpolated_z = griddata(
-                            plc_points_2d_np, 
-                            original_z_values, 
-                            query_point, 
-                            method='linear'
-                        )
-                        
-                        # griddata returns array, extract scalar
-                        if isinstance(interpolated_z, np.ndarray):
-                            interpolated_z = interpolated_z[0]
-                        
-                        # Check for NaN and fallback to nearest neighbor
-                        if np.isnan(interpolated_z):
-                            interpolated_z = griddata(
-                                plc_points_2d_np, 
-                                original_z_values, 
-                                query_point, 
-                                method='nearest'
-                            )
-                            if isinstance(interpolated_z, np.ndarray):
-                                interpolated_z = interpolated_z[0]
-                        
-                        # Final fallback to centroid Z
-                        if np.isnan(interpolated_z):
-                            interpolated_z = centroid[2]
-                        
-                        # Reconstruct 3D point using interpolated Z
-                        reconstructed_3d = np.array(centroid) + new_v_2d[0] * np.array(basis[0]) + new_v_2d[1] * np.array(basis[1])
-                        reconstructed_3d[2] = float(interpolated_z)  # Ensure scalar float
-                        final_vertices_3d_list.append(reconstructed_3d)
-                        
-                    except Exception as e_interp:
-                        logger.warning(f"Z-interpolation for Steiner point failed ({e_interp}), using centroid Z.")
-                        reconstructed_3d = np.array(centroid) + new_v_2d[0] * np.array(basis[0]) + new_v_2d[1] * np.array(basis[1])
-                        reconstructed_3d[2] = centroid[2]
-                        final_vertices_3d_list.append(reconstructed_3d)
-                        
-        except Exception as e_major:
-            logger.error(f"Major error in Z-reconstruction: {e_major}. Using fallback method.")
-            # Fallback: simple reconstruction without interpolation
-            for new_v_2d in tri_vertices_2d_final:
-                new_v_2d = np.array(new_v_2d).flatten()
-                if len(new_v_2d) == 2:
-                    reconstructed_3d = np.array(centroid) + new_v_2d[0] * np.array(basis[0]) + new_v_2d[1] * np.array(basis[1])
-                    reconstructed_3d[2] = centroid[2]  # Use centroid Z
-                    final_vertices_3d_list.append(reconstructed_3d)
-    
-    elif original_3d_points_for_plc is not None and len(original_3d_points_for_plc) == len(plc_points_2d):
-        # This case means the input points were essentially 2D (e.g., Z=0) and no projection was needed.
-        try:
-            from scipy.spatial import KDTree
-            plc_points_2d_np = np.array(plc_points_2d)
-            original_3d_points_for_plc_np = np.array(original_3d_points_for_plc)
-            
-            plc_kdtree = KDTree(plc_points_2d_np)
-            for new_v_2d in tri_vertices_2d_final:
-                new_v_2d = np.array(new_v_2d).flatten()
-                if len(new_v_2d) == 2:
-                    dist, idx_in_plc = plc_kdtree.query(new_v_2d, k=1)
-                    if dist < 1e-9:
-                        final_vertices_3d_list.append(original_3d_points_for_plc_np[idx_in_plc])
-                    else:  # New Steiner point, use average Z of original points
-                        avg_z = np.mean(original_3d_points_for_plc_np[:,2]) if len(original_3d_points_for_plc_np) > 0 else 0.0
-                        final_vertices_3d_list.append(np.array([new_v_2d[0], new_v_2d[1], avg_z]))
-        except Exception as e_kdtree:
-            logger.warning(f"KDTree approach failed: {e_kdtree}. Using simple fallback.")
-            # Simple fallback
-            avg_z = np.mean(original_3d_points_for_plc[:,2]) if len(original_3d_points_for_plc) > 0 else 0.0
-            for v_2d in tri_vertices_2d_final:
-                v_2d = np.array(v_2d).flatten()
-                if len(v_2d) == 2:
-                    final_vertices_3d_list.append(np.array([v_2d[0], v_2d[1], avg_z]))
-    else:
-        # Fallback: if no projection or original 3D points for Z, assume Z=0 for all new 2D vertices
-        logger.warning("No projection parameters or original 3D points for Z reconstruction. Assuming Z=0 for new vertices.")
-        for v_2d in tri_vertices_2d_final:
-            v_2d = np.array(v_2d).flatten()
-            if len(v_2d) == 2:
-                final_vertices_3d_list.append(np.array([v_2d[0], v_2d[1], 0.0]))
+        centroid = np.array(surface_projection_params['centroid'])
+        basis = np.array(surface_projection_params['basis'])
+        from scipy.spatial import KDTree
+        kdtree_2d = KDTree(plc_points_2d)  # KDTree on original 2D input points
 
-    final_vertices_3d = np.array(final_vertices_3d_list)
-    
-    # CRITICAL FIX: Preserve triple point indices for the tetra mesh tab
+        for v_2d in tri_vertices_2d_final:
+            dist, idx = kdtree_2d.query(v_2d, k=1)
+            # If the output vertex from Triangle is very close to one of our original input points,
+            # use the original 3D coordinate to avoid projection errors.
+            if dist < 1e-9:
+                final_vertices_3d.append(original_3d_points_for_plc[idx])
+            else:
+                # This is a new Steiner point created by Triangle. Reconstruct its 3D position.
+                if basis.shape[0] < 2:
+                     logger.error("Invalid basis for 3D reconstruction of Steiner point.")
+                     # As a fallback, use the closest original point's Z value.
+                     closest_original_3d = original_3d_points_for_plc[idx]
+                     final_vertices_3d.append(np.array([v_2d[0], v_2d[1], closest_original_3d[2]])) # This is a guess.
+                else:
+                    reconstructed_centered = basis[0] * v_2d[0] + basis[1] * v_2d[1]
+                    final_vertices_3d.append(reconstructed_centered + centroid)
+    else:
+        # Fallback if no projection info
+        for v_2d in tri_vertices_2d_final:
+            final_vertices_3d.append(np.array([v_2d[0], v_2d[1], 0.0]))
+
+    final_vertices_3d = np.array(final_vertices_3d)
+
+    # Final verification log for triple points relevant to this surface.
     protected_triple_points = config.get('triple_points', [])
-    preserved_triple_indices = []
     preserved_triple_count = 0
-    
-    for vertex_idx, vertex in enumerate(final_vertices_3d):
-        for triple_pt in protected_triple_points:
-            triple_dist = ((vertex[0] - triple_pt.x)**2 + (vertex[1] - triple_pt.y)**2 + (vertex[2] - triple_pt.z)**2)**0.5
-            if triple_dist < 1e-9:
-                preserved_triple_indices.append(vertex_idx)
-                preserved_triple_count += 1
-                logger.info(f"🎯 PROTECTED TRIPLE POINT preserved at vertex index {vertex_idx}: [{triple_pt.x:.6f}, {triple_pt.y:.6f}, {triple_pt.z:.6f}]")
-                break
-    
-    logger.info(f"Constrained triangulation resulted in {len(final_vertices_3d)} 3D vertices and {len(tri_triangles_indices_final)} triangles.")
-    logger.info(f"🎯 TRIANGULATION COMPLETE: {preserved_triple_count}/{len(protected_triple_points)} triple points preserved in final mesh")
-    
-    # Return vertices, triangles, AND triple point indices
+    preserved_triple_indices = []
+    relevant_tp_count = 0
+    if len(final_vertices_3d) > 0 and protected_triple_points:
+        from scipy.spatial import KDTree
+        v_tree_3d_final = KDTree(final_vertices_3d)
+        # Check which of the global triple points were actually part of this surface's original constraints
+        for tp in protected_triple_points:
+            tp_3d = np.array([tp.x, tp.y, tp.z])
+            is_on_surface = np.min(np.linalg.norm(original_3d_points_for_plc - tp_3d, axis=1)) < 1e-5
+            if is_on_surface:
+                relevant_tp_count += 1
+                dist, idx = v_tree_3d_final.query(tp_3d)
+                if dist < 1e-5:
+                    preserved_triple_count += 1
+                    preserved_triple_indices.append(idx)
+
+    if relevant_tp_count > 0:
+        logger.info(f"🎯 Triple Point Preservation: {preserved_triple_count}/{relevant_tp_count} relevant triple points were preserved.")
+
+    logger.info(f"✅ Final 3D mesh: {len(final_vertices_3d)} vertices, {len(tri_triangles_indices_final)} triangles")
+
     return final_vertices_3d, tri_triangles_indices_final, preserved_triple_indices
 
-# Add these new classes and functions after the existing imports and before the existing functions
 
-import logging
-import math
-import numpy as np
-from typing import List, Dict, Tuple, Optional, Any
-from dataclasses import dataclass
 
 # Configure logger
 logger = logging.getLogger(__name__)

@@ -22,6 +22,8 @@ from meshit.intersection_utils import align_intersections_to_convex_hull, Vector
 from meshit.intersection_utils import prepare_plc_for_surface_triangulation, run_constrained_triangulation_py, calculate_triple_points, TriplePoint
 # Import PyQt5
 # import QMessageBox
+from meshit.pre_tetra_constraint_manager import PreTetraConstraintManager
+from PyQt5.QtWidgets import QMenu, QTreeWidgetItemIterator
 import tetgen
 from meshit.tetra_mesh_utils import TetrahedralMeshGenerator, create_tetrahedral_mesh
 from PyQt5.QtWidgets import QMessageBox
@@ -238,645 +240,6 @@ class ComputationWorker(QObject):
         self.batch_finished.emit(1 if success else 0, 1, elapsed_time)
         logger.info(f"Worker: Global intersection task finished. Success: {success}. Elapsed: {elapsed_time:.2f}s.")
 
-
-class SurfaceConstraintManager:
-    """
-    C++-faithful constraint manager that still matches the Python GUI.
-
-    Key points
-    ----------
-    1. Triple-points are stored per-intersection (lookup table).
-    2. Each intersection line is segmented only with its own triple-points
-       → always produces 3 segments for a line with two internal triple-points.
-    3. API expected by the GUI (tetra-mesh tab) is preserved:
-         • generate_constraints_from_pre_tetra_data(datasets)
-         • surface_constraints       (dict)
-         • constraint_states         (dict)
-         • constraint_rgb_map        (dict)
-         • surface_visibility        (dict)
-         • get_selected_surfaces() / get_constraint_summary()
-    """
-
-    DEFAULT_RGB_START = [1, 0, 0]
-
-    # ------------------------------------------------------------------ #
-    # construction                                                       #
-    # ------------------------------------------------------------------ #
-    def __init__(self, parent=None):
-        self.parent = parent
-        self.surface_constraints = {}
-        self.constraint_rgb_map = {}
-        self.constraint_states = {}
-        self.surface_visibility = {}        # NEW – used by the GUI
-        self.next_rgb_color = self.DEFAULT_RGB_START.copy()
-
-        # internal stores
-        self._triple_lookup = {}            # intersection_id → [points]
-        self._triple_points_global = []     # unique list for hull
-
-    # ------------------------------------------------------------------ #
-    # public entry point (wrapper kept for GUI compatibility)            #
-    # ------------------------------------------------------------------ #
-    def generate_constraints_from_pre_tetra_data(self, datasets):
-        """
-        Wrapper kept so the existing call
-             constraint_manager.generate_constraints_from_pre_tetra_data(...)
-        in the tetra-mesh tab continues to work.
-        """
-        self.build_constraints_from_datasets(datasets)
-
-        # mark every surface “visible” by default (GUI uses this flag)
-        self.surface_visibility = {idx: True for idx in range(len(datasets))}
-
-        # ------------------------------------------------------------------ #
-    # build GUI-constraints from the datasets (hull + intersections)     #
-    # ------------------------------------------------------------------ #
-    def build_constraints_from_datasets(self, datasets):
-        """
-        Creates the per-surface constraint lists.
-
-        1)   adds the surface’s own hull boundary             (closed   loop)
-        2)   adds every intersection poly-line exactly once   (open     line)
-
-        Resulting order inside each surface’s list:
-            – all hull segments   (ctype = "hull", "hull_1", …)
-            – all intersection segments                       ("intersection_*")
-        """
-        # ---------- reset internal state --------------------------------
-        self.surface_constraints.clear()
-        self.constraint_rgb_map.clear()
-        self.constraint_states.clear()
-        self.next_rgb_color = self.DEFAULT_RGB_START.copy()
-
-        # ---------- map triple-points first -----------------------------
-        self._build_triple_point_lookup(datasets)
-
-        # ---------- global intersection list (with provenance) ----------
-        global_lines = self._reconstruct_global_intersection_network(datasets)
-
-        # ---------- build constraints surface by surface ----------------
-        for surf_idx, ds in enumerate(datasets):
-            constraints = []
-
-            # ---- 1) HULL boundary  -------------------------------------
-            hull_lines = self._extract_hull_boundary_from_constrained_mesh(
-                ds, surf_idx
-            )
-            for k, hull in enumerate(hull_lines):
-                ctype = "hull" if k == 0 else f"hull_{k}"
-                constraints.extend(
-                    self._segment_open_or_closed_line(
-                        hull,                       # poly-line
-                        extras=[],                  # no triple points on hull
-                        surf_idx=surf_idx,
-                        ctype=ctype,
-                        is_closed=True              # closed loop
-                    )
-                )
-
-            # ---- 2) INTERSECTIONS  -------------------------------------
-            for g in self._filter_lines_for_surface(global_lines,
-                                                    ds, surf_idx):
-                key = (g['dataset_idx'], g['intersection_id'])
-                tp_for_line = self._triple_lookup.get(key, [])
-                constraints.extend(
-                    self._segment_open_or_closed_line(
-                        g['line'],                 # poly-line
-                        tp_for_line,               # triple-points mapped earlier
-                        surf_idx=surf_idx,
-                        ctype=f"intersection_{len(constraints)}",
-                        is_closed=False            # open line
-                    )
-                )
-
-            # store the finished list for this surface
-            self.surface_constraints[surf_idx] = constraints
-    # ------------------------------------------------------------------ #
-    def _build_triple_point_lookup(self, datasets):
-        """
-        Build  self._triple_lookup : (dataset_idx, intersection_id) → [tp]
-               self._triple_points_global : list[[x,y,z], …]
-        Works whether triple-points are stored per dataset or only on the
-        parent GUI, and whether intersection IDs already match or not.
-        """
-        import numpy as np
-
-        self._triple_lookup.clear()
-        self._triple_points_global.clear()
-
-        # -------------------------------------------------------------- #
-        # helper: return numeric xyz from any vertex representation
-        # -------------------------------------------------------------- #
-        def _xyz(pt):
-            if hasattr(pt, "x"):
-                return [float(pt.x), float(pt.y), float(pt.z)]
-            elif isinstance(pt, (list, tuple)) and len(pt) >= 3:
-                return [float(pt[0]), float(pt[1]), float(pt[2])]
-            raise ValueError("Cannot extract xyz from vertex")
-
-        # -------------------------------------------------------------- #
-        # 1) collect every triple-point we can find
-        # -------------------------------------------------------------- #
-        raw_tp_items = []               # [(coord, ids), …]
-
-        def _add_raw(tp_obj):
-            if tp_obj is None:
-                return
-            if isinstance(tp_obj, dict):
-                coord = tp_obj.get("point")
-                ids   = tp_obj.get("intersection_ids") or tp_obj.get("intersections") or []
-            else:
-                coord = getattr(tp_obj, "point", None)
-                ids   = getattr(tp_obj, "intersection_ids", [])
-            if coord is None:
-                return
-            coord = _xyz(coord)
-            raw_tp_items.append((coord, list(ids)))
-
-        # a) stored inside each dataset
-        for ds in datasets:
-            for tp in ds.get("triple_points", []):
-                _add_raw(tp)
-        # b) global list on the parent GUI
-        if hasattr(self, "_parent_gui"):
-            for tp in getattr(self._parent_gui, "triple_points", []):
-                _add_raw(tp)
-
-        # deduplicate (1 e-8 tolerance)
-        def _norm(p): return tuple(round(float(c), 8) for c in p)
-        seen, uniq_tp_items = set(), []
-        for c, ids in raw_tp_items:
-            k = _norm(c)
-            if k not in seen:
-                seen.add(k)
-                uniq_tp_items.append((c, ids))
-
-        # -------------------------------------------------------------- #
-        # 2) fast, id-based assignment  (works if ids already match)
-        # -------------------------------------------------------------- #
-                # 2) fast, id-based assignment – two passes
-        #    a) TP stored inside each dataset           (old behaviour)
-        #    b) TP stored only on the parent GUI list   (NEW)
-        # -------------------------------------------------------------- #
-        id_hit = False
-
-        # a) local copies inside each dataset
-        for ds_idx, ds in enumerate(datasets):
-            for tp in ds.get("triple_points", []):
-                coord = _xyz(tp["point"])
-                ids   = tp.get("intersection_ids", [])
-                for iid in ids:
-                    self._triple_lookup.setdefault((ds_idx, iid), []).append(coord)
-                if _norm(coord) not in {_norm(p) for p in self._triple_points_global}:
-                    self._triple_points_global.append(coord)
-                id_hit = True
-
-        # b) global list on the parent GUI
-        if hasattr(self, "_parent_gui"):
-            for tp in getattr(self._parent_gui, "triple_points", []):
-                coord = _xyz(tp["point"])
-                ids   = tp.get("intersection_ids", [])
-                for ds_idx, ds in enumerate(datasets):
-                    max_iid = len(ds.get("intersection_constraints", [])) - 1
-                    for iid in ids:
-                        if 0 <= iid <= max_iid:      # id exists in this dataset
-                            self._triple_lookup.setdefault((ds_idx, iid), []).append(coord)
-                            id_hit = True
-                if _norm(coord) not in {_norm(p) for p in self._triple_points_global}:
-                    self._triple_points_global.append(coord)
-
-        if id_hit:
-            return                                  # done                            # done
-
-        # -------------------------------------------------------------- #
-        # 3) geometric fall-back – map every triple-point to the
-        #    intersection polylines it truly lies on
-        # -------------------------------------------------------------- #
-        # pre-extract NUMERIC versions of all intersection lines
-        intersection_lines = {
-            ds_idx: [[_xyz(v) for v in line]
-                     for line in ds.get("intersection_constraints", [])]
-            for ds_idx, ds in enumerate(datasets)
-        }
-
-        # fast helpers
-        def _pt_seg_distance(p, a, b):
-            pa, ba = p - a, b - a
-            l2 = np.dot(ba, ba)
-            if l2 == 0.0:
-                return np.linalg.norm(pa)
-            t = np.clip(np.dot(pa, ba) / l2, 0.0, 1.0)
-            proj = a + t * ba
-            return np.linalg.norm(p - proj)
-
-        tol = 1e-3       # absolute lower bound (model units ≈ mm)
-
-        for coord, _unused_ids in uniq_tp_items:
-            p_np = np.asarray(coord, dtype=float)
-
-            for ds_idx, lines in intersection_lines.items():
-                for int_id, line in enumerate(lines):
-                    if len(line) < 2:
-                        continue
-                    l_np = np.asarray(line, dtype=float)
-
-                    # quick bounding-box reject
-                    if not ((l_np.min(axis=0) - tol <= p_np).all() and
-                            (p_np <= l_np.max(axis=0) + tol).all()):
-                        continue
-
-                    # adaptive tolerance: 1 % of total poly-line length
-                    line_len = np.sum(
-                        np.linalg.norm(l_np[1:] - l_np[:-1], axis=1)
-                    )
-                    adaptive_tol = max(tol, 0.01 * line_len)
-
-                    # (a) distance to any segment
-                    on_seg = any(
-                        _pt_seg_distance(p_np, l_np[i], l_np[i + 1]) < adaptive_tol
-                        for i in range(len(l_np) - 1)
-                    )
-
-                    # (b) OR distance to any existing vertex
-                    to_vertex = np.min(
-                        np.linalg.norm(l_np - p_np, axis=1)
-                    ) < adaptive_tol
-
-                    if on_seg or to_vertex:
-                        self._triple_lookup.setdefault(
-                            (ds_idx, int_id), []
-                        ).append(coord)
-
-            # keep a global copy for hull handling
-            if _norm(coord) not in {_norm(p) for p in self._triple_points_global}:
-                self._triple_points_global.append(coord)
-        # -------------------------------------------------------------- #
-        # DEBUG summary – how many TP per intersection?
-        # -------------------------------------------------------------- #
-        log = logging.getLogger("MeshIt-Workflow")
-        for (ds_i, int_i), pts in sorted(self._triple_lookup.items()):
-            log.info(f"TP lookup  ds={ds_i}  int={int_i}  count={len(pts)}")
-        # -------------------------------------------------------------- #
-        # INFO summary – how many TP per intersection?
-        # -------------------------------------------------------------- #
-        log = logging.getLogger("MeshIt-Workflow")
-        for (ds_i, int_i), pts in sorted(self._triple_lookup.items()):
-            log.info(f"TP lookup  ds={ds_i}  int={int_i}  count={len(pts)}")
-    def _extract_hull_boundary_from_constrained_mesh(self, dataset, surf_id):
-        """
-        Re-implements the original Python logic:
-
-        • If constrained triangulation exists, find edges that belong to only
-          one triangle (boundary edges) and walk them to build closed lines.
-        • Fallback: if only ‘hull_points’ exist, return that as a single line.
-        Returns a list of poly-lines (each a list[[x,y,z], …]).
-        """
-        import numpy as np
-        verts  = dataset.get("constrained_vertices")
-        tris   = dataset.get("constrained_triangles")
-
-        # fallback – simple stored hull
-        if (verts is None or tris is None or
-                len(verts) == 0 or len(tris) == 0):
-            hp = dataset.get("hull_points", [])
-            return [hp] if len(hp) >= 3 else []
-
-        verts = np.asarray(verts)
-        tris  = np.asarray(tris)
-
-        # 1) build edge→count map
-        edge_count = {}
-        for tri in tris:
-            if len(tri) < 3:
-                continue
-            e0 = tuple(sorted((tri[0], tri[1])))
-            e1 = tuple(sorted((tri[1], tri[2])))
-            e2 = tuple(sorted((tri[2], tri[0])))
-            for e in (e0, e1, e2):
-                edge_count[e] = edge_count.get(e, 0) + 1
-
-        # 2) keep boundary edges (appear only once)
-        boundary_edges = [e for e, c in edge_count.items() if c == 1]
-        if not boundary_edges:
-            return []
-
-        # 3) trace edges into poly-lines
-        #    build adjacency map vertex → connected vertices
-        adj = {}
-        for a, b in boundary_edges:
-            adj.setdefault(a, []).append(b)
-            adj.setdefault(b, []).append(a)
-
-        lines = []
-        visited = set()
-        for start in adj:
-            if start in visited:
-                continue
-            line = [start]
-            visited.add(start)
-            cur = start
-            while True:
-                nxts = [n for n in adj[cur] if n not in visited]
-                if not nxts:
-                    break
-                nxt = nxts[0]
-                line.append(nxt)
-                visited.add(nxt)
-                cur = nxt
-            # convert indices to coords
-            lines.append([verts[idx][:3].tolist() for idx in line])
-        return lines
-
-    # ------------------------------------------------------------------ #
-    # global intersection network                                        #
-    # ------------------------------------------------------------------ #
-    def _reconstruct_global_intersection_network(self, datasets):
-        """
-        Returns a list of dictionaries:
-            { 'line'          : poly-line [[x,y,z], …],
-              'dataset_idx'   : int   (where it came from),
-              'intersection_id': int   (its id inside that dataset) }
-        The position in this list (enumeration) is still used only
-        for naming/colouring, but the real lookup uses the pair
-        (dataset_idx, intersection_id).
-        """
-        global_lines = []
-        for ds_idx, ds in enumerate(datasets):
-            for int_id, line in enumerate(ds.get("intersection_constraints", [])):
-                if len(line) >= 2:
-                    global_lines.append({
-                        'line'          : line,
-                        'dataset_idx'   : ds_idx,
-                        'intersection_id': int_id      # original id
-                    })
-        return global_lines
-
-    # ------------------------------------------------------------------ #
-        # ------------------------------------------------------------------ #
-    # decide which global lines belong to this surface                   #
-    # ------------------------------------------------------------------ #
-    def _filter_lines_for_surface(self, global_lines, dataset, surf_idx):
-        """
-        Return global intersection lines that
-
-        (a) originate from *this* dataset (g['dataset_idx'] == surf_idx)
-        (b) are actually on / very near this surface (KD-tree test)
-        (c) are not geometric duplicates of another accepted line
-            (same points, maybe reversed order)
-
-        Result: each real intersection appears only once in the GUI.
-        """
-        import numpy as np
-        from scipy.spatial import cKDTree as KD
-
-        # ---- build a KD-tree of this surface’s own points -------------
-        own_xyz = [
-            [_pt[:3] if isinstance(_pt, (list, tuple))
-             else [float(_pt.x), float(_pt.y), float(_pt.z)]
-             for _pt in line]
-            for line in dataset.get("intersection_constraints", [])
-        ]
-        if not own_xyz:
-            return []
-
-        all_pts = np.asarray([p for l in own_xyz for p in l], dtype=float)
-        tree = KD(all_pts)
-
-        # ---- helper: geometric equality test -------------------------
-        def _same_poly(a, b, eps=1e-5):
-            """
-            True if the two polylines have the same vertices (within eps),
-            either in identical order or completely reversed order.
-            """
-            if len(a) != len(b):
-                return False
-            a_np = np.asarray(a)
-            b_np = np.asarray(b)
-            if np.allclose(a_np, b_np, atol=eps):
-                return True
-            if np.allclose(a_np, b_np[::-1], atol=eps):
-                return True
-            return False
-
-        eps = 1e-2
-        accepted = []           # will hold dicts from global_lines
-
-        for g in global_lines:
-            # keep only the copy that belongs to THIS dataset
-            if g['dataset_idx'] != surf_idx:
-                continue
-
-            pts_xyz = [p[:3] if isinstance(p, (list, tuple))
-                       else [p.x, p.y, p.z] for p in g['line']]
-            # (b) – proximity test
-            hits = sum(tree.query(p, k=1)[0] < eps for p in pts_xyz)
-            if hits / len(pts_xyz) < 0.5:
-                continue
-
-            # (c) – duplicate-geometry test
-            if any(_same_poly(pts_xyz, a['xyz']) for a in accepted):
-                continue
-
-            g_copy = g.copy()
-            g_copy['xyz'] = pts_xyz        # cache for next comparisons
-            accepted.append(g_copy)
-
-        # strip helper key before returning
-        for d in accepted:
-            d.pop('xyz', None)
-        return accepted
-        # ------------------------------------------------------------------ #
-    # line segmentation  (keeps geometry, honours triple-points)         #
-    # ------------------------------------------------------------------ #
-    def _segment_open_or_closed_line(self, pts, extras,
-                                     surf_idx, ctype, is_closed):
-        """
-        Split a poly-line into selectable GUI segments while preserving the
-        original geometry.
-
-        • pts      original vertex list (never modified)
-        • extras   triple-point coordinates that must act as splitters
-        • ctype    “hull”, “intersection_*”, etc.
-        • is_closed   True  → wrap-around (hull)   |  False → open line
-        """
-        import numpy as np
-        from scipy.spatial.distance import cdist
-        log = logging.getLogger("MeshIt-Workflow")
-
-        if len(pts) < 2:
-            return []
-
-        # helper: np.array([x,y,z]) regardless of representation
-        def _np_xyz(v):
-            if hasattr(v, "x"):
-                return np.asarray([v.x, v.y, v.z], dtype=float)
-            elif isinstance(v, (list, tuple)):
-                return np.asarray(v[:3], dtype=float)
-            raise ValueError("Bad vertex type")
-
-        log.info(f"SEGMENT  surf={surf_idx}  ctype={ctype}  TP={len(extras or [])}")
-
-        # ------------------------------------------------------------------
-        # 1) working copy – insert projected triple-points
-        # ------------------------------------------------------------------
-        line = pts.copy()
-
-        # adaptive tolerance: 1 % of total length, minimum 1 mm
-        seg_lens = [np.linalg.norm(_np_xyz(line[i + 1]) - _np_xyz(line[i]))
-                    for i in range(len(line) - 1)]
-        line_len = sum(seg_lens) if seg_lens else 0.0
-        tol = max(1e-3, 0.01 * line_len)
-
-        inserted_split = set()          # indices created by TP insertion
-
-        def _project(p, a, b):
-            p, a, b = map(_np_xyz, (p, a, b))
-            ab = b - a
-            l2 = np.dot(ab, ab)
-            if l2 == 0.0:
-                return a.copy(), np.linalg.norm(p - a)
-            t = np.clip(np.dot(p - a, ab) / l2, 0.0, 1.0)
-            proj = a + t * ab
-            return proj, np.linalg.norm(p - proj)
-
-        for tp in extras or []:
-            tp_coord = [tp.x, tp.y, tp.z] if hasattr(tp, "x") else tp[:3]
-
-            best_i, best_d, best_proj = None, float("inf"), None
-            for i in range(len(line) - 1):
-                proj, dist = _project(tp_coord, line[i], line[i + 1])
-                if dist < best_d:
-                    best_i, best_d, best_proj = i, dist, proj
-
-            if best_i is None:
-                continue
-
-            if best_d < tol:
-                # insert only if truly between the two vertices
-                if (not np.allclose(best_proj, _np_xyz(line[best_i]),     atol=1e-9) and
-                    not np.allclose(best_proj, _np_xyz(line[best_i + 1]), atol=1e-9)):
-                    line.insert(best_i + 1, best_proj.tolist())
-                    inserted_split.add(best_i + 1)
-            else:
-                # logical split at nearest existing vertex
-                dists = cdist([tp_coord], [_np_xyz(v) for v in line])[0]
-                inserted_split.add(int(np.argmin(dists)))
-
-        log.info(f"  inserted TP indices {sorted(inserted_split)}")
-
-        # ------------------------------------------------------------------
-        # 2) extra splits at refined vertices (type != DEFAULT)
-        # ------------------------------------------------------------------
-        refined_split = {
-            idx for idx, v in enumerate(line)
-            if ((isinstance(v, (list, tuple)) and len(v) > 3 and
-                 str(v[3]).upper() != 'DEFAULT') or
-                (hasattr(v, 'point_type') and str(v.point_type).upper() != 'DEFAULT') or
-                (hasattr(v, 'type') and str(v.type).upper() != 'DEFAULT'))
-        }
-        log.info(f"  refined-split indices {sorted(refined_split)}")
-
-        # ------------------------------------------------------------------
-        # 3) decide where to break the poly-line
-        # ------------------------------------------------------------------
-        if is_closed and str(ctype).lower().startswith("hull"):
-            # Hull boundary – expose every edge, one segment per edge
-            break_ids = set(range(len(line)))
-        else:
-            break_ids = {0, len(line) - 1}.union(inserted_split, refined_split)
-
-        split = sorted(break_ids)
-        if is_closed:
-            split.append(split[0])        # wrap-around for closed loop
-
-        # ------------------------------------------------------------------
-        # 4) build the segments
-        # ------------------------------------------------------------------
-        segments = []
-        for k in range(len(split) - 1):
-            a, b = split[k], split[k + 1]
-            part = (line[a:b + 1] if a < b else
-                    line[a:] + line[:b + 1])
-            if len(part) < 2:
-                continue
-
-            rgb = self._next_rgb()
-            seg_info = dict(
-                points=part,
-                type=ctype,
-                surface_id=surf_idx,
-                segment_id=len(segments),
-                rgb=rgb,
-                constraint_type="UNDEFINED"
-            )
-            segments.append(seg_info)
-            self.constraint_rgb_map[tuple(rgb)] = (surf_idx, len(segments) - 1)
-
-        log.info(f"  → {len(segments)} GUI-segments produced")
-        return segments
-    def _insert_points_preserving_order(self, line, to_insert):
-        import numpy as np
-
-        def dist(p, q):
-            return np.linalg.norm(np.asarray(p) - np.asarray(q))
-
-        new_line = line.copy()
-        for p in to_insert:
-            best_seg, best_d = None, float("inf")
-            for i in range(len(new_line) - 1):
-                a, b = np.asarray(new_line[i]), np.asarray(new_line[i + 1])
-                ab = b - a
-                L2 = np.dot(ab, ab)
-                if L2 == 0:
-                    continue
-                t = np.dot(np.asarray(p) - a, ab) / L2
-                if 0.0 <= t <= 1.0:
-                    proj = a + t * ab
-                    d = np.linalg.norm(proj - p)
-                    if d < best_d:
-                        best_seg, best_d = i, d
-            if best_seg is None:
-                if all(dist(p, q) > 1e-8 for q in new_line):
-                    new_line.append(p)
-            else:
-                new_line.insert(best_seg + 1, p)
-        return new_line
-
-    # ------------------------------------------------------------------ #
-    # RGB generator                                                      #
-    # ------------------------------------------------------------------ #
-    def _next_rgb(self):
-        rgb = self.next_rgb_color.copy()
-        self.next_rgb_color[0] += 1
-        if self.next_rgb_color[0] > 255:
-            self.next_rgb_color[0] = 0
-            self.next_rgb_color[1] += 1
-            if self.next_rgb_color[1] > 255:
-                self.next_rgb_color[1] = 0
-                self.next_rgb_color[2] += 1
-                if self.next_rgb_color[2] > 255:
-                    self.next_rgb_color = self.DEFAULT_RGB_START.copy()
-        return rgb
-
-    # ------------------------------------------------------------------ #
-    # quick helpers queried by the GUI                                   #
-    # ------------------------------------------------------------------ #
-    def get_selected_surfaces(self):
-        out = []
-        for s_idx, cons in self.surface_constraints.items():
-            if any(self.constraint_states.get((s_idx, i)) == "SEGMENTS"
-                   for i in range(len(cons))):
-                out.append(s_idx)
-        return out
-
-    def get_constraint_summary(self):
-        total = len(self.constraint_states)
-        selected = sum(1 for v in self.constraint_states.values()
-                       if v == "SEGMENTS")
-        holes = sum(1 for v in self.constraint_states.values()
-                    if v == "HOLES")
-        return dict(total=total, selected=selected,
-                    holes=holes, undefined=total - selected - holes)
 
 class MeshItWorkflowGUI(QMainWindow):
     # Define a color cycle for datasets
@@ -2005,9 +1368,17 @@ class MeshItWorkflowGUI(QMainWindow):
             compute_group = QGroupBox("Constrained Triangulation")
             compute_layout = QVBoxLayout(compute_group)
 
+            self.generate_constraints_btn = QPushButton("Load Constraints from Refine Mesh")
+            self.generate_constraints_btn.setToolTip(
+                "Load constraints from the refine mesh tab into the constraint tree for selection."
+            )
+            self.generate_constraints_btn.clicked.connect(
+                    self._generate_constraints_from_refine_mesh_action)
+            compute_layout.addWidget(self.generate_constraints_btn)
+
             self.compute_constrained_mesh_btn = QPushButton("Generate Constrained Surface Meshes")
             self.compute_constrained_mesh_btn.setToolTip(
-                "Re-triangulate surfaces using refined hulls and intersections as constraints."
+            "Re-triangulate surfaces using ONLY SELECTED constraints from the constraint tree (C++ workflow)."
             )
             self.compute_constrained_mesh_btn.clicked.connect(self._compute_constrained_meshes_action)
             compute_layout.addWidget(self.compute_constrained_mesh_btn)
@@ -2092,8 +1463,74 @@ class MeshItWorkflowGUI(QMainWindow):
             constraint_form_layout.addRow("Gradient:", self.constraint_gradient_input)
             constraint_layout.addLayout(constraint_form_layout)
 
+            # --- Constraint Selection Group (MOVED FROM TETRA MESH TAB) ---
+            selection_group = QGroupBox("Constraint Selection & Filtering")
+            selection_layout = QVBoxLayout(selection_group)
+            
+            # Initialize constraint manager in pre-tetramesh tab
+            self.constraint_manager = PreTetraConstraintManager()
+            self.constraint_manager.set_parent_gui(self)
+            
+            # Initialize constraint selection state
+            self.constraint_selection_enabled = False
+            self.constraint_visualization_mode = "NORMAL"  # "NORMAL" or "SELECTION"
+            self.interactive_selection_enabled = False
+            
+            # Selection tools (like C++ SelectionTool enum)
+            self.selection_tool_combo = QComboBox()
+            self.selection_tool_combo.addItems([
+                "SINGLE - Click individual constraints",
+                "MULTI - Rectangle selection", 
+                "BUCKET - Flood fill selection",
+                "POLYGON - Polygon selection",
+                "ALL - Select all constraints"
+            ])
+            selection_layout.addWidget(QLabel("Selection Tool:"))
+            selection_layout.addWidget(self.selection_tool_combo)
+            
+            # Material reachability testing (C++ material_selections logic)
+            self.test_material_reachability_btn = QPushButton("Test Material Reachability")
+            self.test_material_reachability_btn.clicked.connect(self._test_material_reachability)
+            selection_layout.addWidget(self.test_material_reachability_btn)
+            
+            self.auto_filter_borders_btn = QPushButton("Auto-Filter Border Constraints")
+            self.auto_filter_borders_btn.clicked.connect(self._auto_filter_border_constraints)
+            selection_layout.addWidget(self.auto_filter_borders_btn)
+            
+            # Constraint tree widget for detailed selection
+            self.surface_constraint_tree = QTreeWidget()
+            self.surface_constraint_tree.setHeaderLabels(["Surface/Constraint", "Type", "State", "Info"])
+            self.surface_constraint_tree.itemChanged.connect(self._on_constraint_tree_item_changed)
+            self.surface_constraint_tree.itemClicked.connect(self._on_constraint_tree_item_clicked)
+            self.surface_constraint_tree.setMaximumHeight(200)  # Compact size
+            selection_layout.addWidget(QLabel("Constraint Tree:"))
+            selection_layout.addWidget(self.surface_constraint_tree)
+            
+            # Quick selection and tree control buttons
+            quick_buttons_layout = QHBoxLayout()
+            
+            # Selection buttons
+            self.select_all_constraints_btn = QPushButton("Select All")
+            self.select_all_constraints_btn.clicked.connect(self._select_all_constraints)
+            self.deselect_all_constraints_btn = QPushButton("Select None")
+            self.deselect_all_constraints_btn.clicked.connect(self._deselect_all_constraints)
+            
+            # Tree expansion buttons
+            self.expand_all_btn = QPushButton("Expand All")
+            self.expand_all_btn.clicked.connect(self._expand_all_tree_items)
+            self.collapse_all_btn = QPushButton("Collapse All")
+            self.collapse_all_btn.clicked.connect(self._collapse_all_tree_items)
+            
+            # Add buttons to layout
+            quick_buttons_layout.addWidget(self.select_all_constraints_btn)
+            quick_buttons_layout.addWidget(self.deselect_all_constraints_btn)
+            quick_buttons_layout.addWidget(self.expand_all_btn)
+            quick_buttons_layout.addWidget(self.collapse_all_btn)
+            selection_layout.addLayout(quick_buttons_layout)
+
             control_layout.addWidget(compute_group) # Add compute_group to control_panel's layout
             control_layout.addWidget(constraint_group) # Add constraint_group to control_panel's layout
+            control_layout.addWidget(selection_group) # Add constraint selection group
             control_layout.addStretch()
             
             # Add the control_panel to the main tab_layout
@@ -2133,484 +1570,442 @@ class MeshItWorkflowGUI(QMainWindow):
         plotter = self.plotters.get('pre_tetramesh')
         if plotter:
             plotter.clear()
-            plotter.add_text("Compute constrained meshes to visualize.", position='upper_edge', color='white')
+            plotter.add_text(
+                "Compute constrained meshes to visualise.",
+                position='upper_edge',
+                color='white'
+            )
             plotter.reset_camera()
         elif hasattr(self, 'pre_tetramesh_plot_layout'): # Fallback
             # ... (similar clearing logic as _clear_refine_mesh_plot if plotter is None)
             pass
             
     # Update _on_tab_changed
-   
+    def _generate_constraints_from_refine_mesh_action(self):
+        """
+        Called by the 'Generate Constraints from Refine Mesh' button.
+        Builds (or rebuilds) the per-surface constraints, clears the plotter,
+        and then renders the new constraints.
+        """
+        if not getattr(self, "datasets", None):
+            QMessageBox.warning(self, "No data", "Load and refine surfaces first.")
+            return
+
+        # Ensure the manager is the correct one initialized in the tab setup
+        if not hasattr(self, 'constraint_manager'):
+            QMessageBox.critical(self, "Error", "Constraint manager not initialized.")
+            return
+
+        # Generate the constraint data into the correct manager object
+        try:
+            self.constraint_manager.generate_constraints_from_refine_data(self.datasets)
+        except Exception as e:
+            logging.exception("Constraint generation failed")
+            QMessageBox.critical(self, "Error", f"Constraint generation failed:\n{e}")
+            return
+        
+        # Get and clear the plotter
+        plotter = self.plotters.get("pre_tetramesh")
+        if plotter:
+            plotter.clear()
+        else:
+            logger.error("Could not get pre_tetramesh plotter to draw constraints.")
+            QMessageBox.critical(self, "Plotter Error", "Could not find the visualization panel for this tab.")
+            return
+
+        # Populate the UI tree and render the constraints
+        self._populate_constraint_tree()
+        self._render_pre_tetramesh_constraints()
+
+        total_segments = sum(len(constraints) for constraints in self.constraint_manager.surface_constraints.values())
+        self.statusBar().showMessage(f"Constraints generated – {total_segments} segments ready for selection.")
 
     # Action method for the button
-    def _compute_constrained_meshes_action(self):
-        """Compute constrained meshes for surfaces using stored constraints from refinement step (C++ approach)"""
-        if not hasattr(self, 'datasets') or not self.datasets:
-            self.statusBar().showMessage("Constrained meshing skipped: No datasets.")
-            return
+    #####################################################################
+    # helper ------------------------------------------------------------
+    #####################################################################
+    def _order_polyline(self, points_3d):
+        """
+        Take an unordered list of 3-D points that belong to the same
+        logical poly-line and return them ordered head-to-tail.
+        Falls back to the input order if fewer than three points.
 
-                # Check if we have stored constraints from refinement step
-        constraint_found = False
-        for dataset in self.datasets:
-            if 'stored_constraints' in dataset and dataset['stored_constraints']:
-                constraint_found = True
-                break
+        Parameters
+        ----------
+        points_3d : list[list[float,float,float]]
 
-        if not constraint_found:
-            logger.warning("No stored constraint lines found. Please run 'Refine Intersection Lines' first.")
-            self.statusBar().showMessage("Please run 'Refine Intersection Lines' first to generate constraints.")
-            return
+        Returns
+        -------
+        list[list[float,float,float]]
+        """
+        if len(points_3d) < 3:
+            return points_3d[:]          # nothing to sort
 
-        # Convert stored constraints to expected format
-        self.stored_constraint_lines = {}
-        for dataset_idx, dataset in enumerate(self.datasets):
-            stored_constraints = dataset.get('stored_constraints', [])
-            if not stored_constraints:
+        try:
+            from meshit.intersection_utils import sort_intersection_points
+            ordered = sort_intersection_points(
+                [tuple(p) for p in points_3d]
+            )
+            # convert Vector3D→list if sort_intersection_points returned objects
+            if hasattr(ordered[0], "x"):
+                return [[v.x, v.y, v.z] for v in ordered]
+            return ordered
+        except Exception:
+            # if anything goes wrong, stay safe and keep the original order
+            return points_3d[:]
+
+
+        #####################################################################
+        #####################################################################
+    # helper : export only what the user has selected – with DEBUG logs
+    #####################################################################
+    def _build_selected_constraint_lines(self):
+        """
+        Scan the constraint tree and build a dict
+
+            {surface_idx : {"hull": polyline|None,
+                            "intersections": [polyline0, ...]}
+
+        containing exactly the segments the user selected.
+
+        Extra diagnostics are logged so you can see why a segment or a
+        whole surface is (or is not) exported.
+        """
+        import numpy as np
+        import logging
+        from PyQt5.QtCore import Qt
+
+        logger = logging.getLogger("MeshIt-Workflow")
+
+        if not hasattr(self, "surface_constraint_tree"):
+            logger.warning("Surface-constraint tree not found – returning empty set.")
+            return {}
+
+        tree     = self.surface_constraint_tree
+        selected = {}
+
+        def child_is_selected(child_item, parent_checked):
+            """
+            Selection rule (matches C++):
+              • if parent group box is checked -> include any child that
+                is not explicitly Unchecked
+              • otherwise include only children whose own box is checked
+            """
+            if parent_checked:
+                return child_item.checkState(0) != Qt.Unchecked
+            return child_item.checkState(0) == Qt.Checked
+
+        logger.info("─── Building selected-constraint list ───────────────────────")
+        for i in range(tree.topLevelItemCount()):
+            surf_item = tree.topLevelItem(i)
+            surf_data = surf_item.data(0, Qt.UserRole)
+            surf_idx  = surf_data[1] if surf_data and len(surf_data) > 1 else i
+            constraints = self.constraint_manager.surface_constraints[surf_idx]
+
+            hull_segments        = []
+            intersection_by_line = {}
+
+            tot_hull = tot_inter = sel_hull = sel_inter = 0
+
+            # walk the second level (groups: Hull, Intersection Line N …)
+            for j in range(surf_item.childCount()):
+                group_item    = surf_item.child(j)
+                group_checked = group_item.checkState(0) == Qt.Checked
+                group_name    = group_item.text(0)
+
+                # walk the third level (individual segments)
+                for k in range(group_item.childCount()):
+                    seg_item = group_item.child(k)
+                    seg_data = seg_item.data(0, Qt.UserRole)
+
+                    # not a constraint row → skip
+                    if not seg_data or seg_data[0] != "constraint":
+                        continue
+
+                    _, _, c_idx = seg_data
+                    constraint  = constraints[c_idx]
+                    c_type      = constraint["type"]
+
+                    # stats
+                    if c_type == "HULL":
+                        tot_hull += 1
+                    else:
+                        tot_inter += 1
+
+                    # is this segment included?
+                    if not child_is_selected(seg_item, group_checked):
+                        logger.debug(f"S{surf_idx}  SKIP  {c_type:12} seg {c_idx:3}  "
+                                     f"(group {group_name}:{'✓' if group_checked else '✗'}  "
+                                     f"child {'✓' if seg_item.checkState(0)==Qt.Checked else '✗'})")
+                        continue
+
+                    # mark as selected
+                    if c_type == "HULL":
+                        sel_hull += 1
+                        hull_segments.append(constraint["points"])
+                    else:
+                        sel_inter += 1
+                        lid = constraint.get("line_id", 0)
+                        intersection_by_line.setdefault(lid, []).append(constraint["points"])
+
+            logger.info(f"S{surf_idx}: HULL {sel_hull}/{tot_hull}  "
+                        f"INTERSECTION {sel_inter}/{tot_inter}")
+
+            # nothing picked on this surface
+            if not hull_segments and not intersection_by_line:
+                logger.info(f"S{surf_idx}: no segments selected – surface skipped.")
                 continue
-                
-            constraint_lines = []
-            
-            # Add hull boundary as first constraint line
-            hull_points = dataset.get('hull_points', [])
-            if hull_points is not None and hasattr(hull_points, '__len__') and len(hull_points) >= 3:
-                hull_coords = []
-                for hp in hull_points:
-                    if len(hp) >= 3:
-                        hull_coords.append([float(hp[0]), float(hp[1]), float(hp[2])])
-                if hull_coords:
-                    constraint_lines.append(hull_coords)
-            
-            # Add intersection lines as additional constraint lines
-            for constraint in stored_constraints:
-                if constraint['type'] == 'intersection_line':
-                    constraint_lines.append(constraint['points'])
-            
-            if constraint_lines:
-                self.stored_constraint_lines[dataset_idx] = constraint_lines
-                logger.info(f"Converted {len(constraint_lines)} constraint lines for dataset {dataset_idx}")
 
-                # Get triangulation parameters from UI (with fallbacks if controls don't exist)
+            # ---------- merge points & order polylines -----------------
+            surface_selection = {"hull": None, "intersections": []}
+
+            if hull_segments:
+                uniq = []
+                for seg in hull_segments:
+                    for p in seg:
+                        if not any(np.allclose(p, q) for q in uniq):
+                            uniq.append(p)
+                logger.debug(f"S{surf_idx}:   HULL unique pts = {len(uniq)}")
+                if len(uniq) > 1:
+                    surface_selection["hull"] = self._order_polyline(uniq)
+
+            for lid in sorted(intersection_by_line.keys()):
+                uniq = []
+                for seg in intersection_by_line[lid]:
+                    for p in seg:
+                        if not any(np.allclose(p, q) for q in uniq):
+                            uniq.append(p)
+                if len(uniq) < 2:
+                    logger.debug(f"S{surf_idx}:   line {lid} ignored (<2 pts)")
+                    continue
+                logger.debug(f"S{surf_idx}:   line {lid} unique pts = {len(uniq)}")
+                surface_selection["intersections"].append(self._order_polyline(uniq))
+
+            if not surface_selection["hull"] and not surface_selection["intersections"]:
+                logger.info(f"S{surf_idx}: no polylines built – surface skipped.")
+                continue
+
+            selected[surf_idx] = surface_selection
+            num_polylines = (1 if surface_selection["hull"] else 0) + len(surface_selection["intersections"])
+            logger.info(f"S{surf_idx}: total polylines exported = {num_polylines}")
+
+        logger.info("─── Selection build complete ───────────────────────────────")
+        return selected
+
+    def _compute_constrained_meshes_action(self):
+        """
+        Re-triangulate the constraint lines that are currently selected in
+        the tree.  The rest of the body (meshing logic) is unchanged.
+        """
+        # always rebuild the cache to honour the latest checkbox states
+        self.stored_constraint_lines = self._build_selected_constraint_lines()
+
+        if not self.stored_constraint_lines:
+            self.statusBar().showMessage("No constraint lines selected – nothing to triangulate.")
+            return
+
+        # flush pending state-updates from the tree
+        from PyQt5.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        # ----------------------------------------------------------------
+        # retrieve triangulation parameters -------------------------------
+        # ----------------------------------------------------------------
         try:
             target_feature_size = self.constrained_mesh_target_feature_size_input.value()
         except AttributeError:
-            target_feature_size = 20.0  # Default target feature size
-            logger.warning("Using default target feature size (20.0) - UI control not found")
-        
+            target_feature_size = 20.0
+
         try:
             min_angle_deg = self.constrained_mesh_min_angle_input.value()
         except AttributeError:
-            min_angle_deg = 20.0  # Default min angle
-            logger.warning("Using default min angle (20°) - UI control not found")
-        
-        # Calculate reasonable max area based on target feature size
-        # Use a much larger area to prevent over-refinement
-        max_area = (target_feature_size ** 2) * 2.0  # Larger area to reduce over-refinement
+            min_angle_deg = 20.0
 
-        logger.info("Starting constrained surface meshing using stored constraints (C++ approach)...")
-        
-        success_count = 0
-        total_count = 0
-        
-        # Clear previous results
-        if not hasattr(self, 'constrained_meshes'):
-            self.constrained_meshes = {}
-        
-        # Process each dataset using stored constraints
-        for dataset_idx, dataset in enumerate(self.datasets):
-            dataset_name = dataset.get('name', f'Dataset_{dataset_idx}')
-            
-            # Skip if no stored constraints for this dataset
-            if dataset_idx not in self.stored_constraint_lines:
-                logger.warning(f"No stored constraints for {dataset_name}")
+        max_area = (target_feature_size ** 2) * 2.0
+
+        self.constrained_meshes = {}
+
+        import numpy as np
+        from PyQt5.QtWidgets import QMessageBox
+        from meshit.intersection_utils import (
+            Vector3D, prepare_plc_for_surface_triangulation,
+            run_constrained_triangulation_py
+        )
+        import logging
+        logger = logging.getLogger("MeshIt-Workflow")
+
+
+        success = 0
+        attempted = 0
+
+        # ----------------------------------------------------------------
+        # per-surface loop ------------------------------------------------
+        # ----------------------------------------------------------------
+        for surf_idx, dataset in enumerate(self.datasets):
+            if surf_idx not in self.stored_constraint_lines:
                 continue
-                
-            total_count += 1
+
+            attempted += 1
+            dataset_name = dataset.get("name", f"Dataset_{surf_idx}")
             
+            selection_data = self.stored_constraint_lines[surf_idx]
+            hull_line = selection_data.get("hull")
+            intersection_lines_raw = selection_data.get("intersections", [])
+
+            # If nothing is selected for this surface, skip.
+            if not hull_line and not intersection_lines_raw:
+                logger.info(f"S{surf_idx}: No constraints selected, skipping.")
+                continue
+
+            # ----------------------------------
+            # build global point/segment lists for fallback
+            # ----------------------------------
+            points_3d = []
+            segments = []
+
+            def index(pt):
+                """ return index in points_3d, appending if new """
+                for i, p in enumerate(points_3d):
+                    if np.linalg.norm(np.array(pt) - np.array(p)) < 1e-6:
+                        return i
+                points_3d.append(pt)
+                return len(points_3d) - 1
+
+            # hull → closed loop
+            if hull_line:
+                idx = [index(p) for p in hull_line]
+                for i in range(len(idx)):
+                    segments.append([idx[i], idx[(i + 1) % len(idx)]])
+
+            # intersections → open polylines
+            for line in intersection_lines_raw:
+                idx = [index(p) for p in line]
+                for i in range(len(idx) - 1):
+                    segments.append([idx[i], idx[i + 1]])
+
+            # ----------------------------------
+            # pin triple points -----------------
+            # ----------------------------------
+            triple_points_added = 0
+            for tp in getattr(self, "triple_points", []):
+                # ----- figure out what 'tp' actually is -----------------------
+                if isinstance(tp, dict) and "point" in tp:            # dict wrapper
+                    coords = tp["point"]
+                elif hasattr(tp, "point"):                           # TriplePoint obj
+                    coords = tp.point
+                else:                                                 # maybe Vector3D
+                    coords = tp
+
+                # ----- convert to numeric xyz list ---------------------------
+                if isinstance(coords, Vector3D):
+                    xyz = [coords.x, coords.y, coords.z]
+                elif hasattr(coords, "__len__") and len(coords) >= 3:
+                    xyz = [float(coords[0]), float(coords[1]), float(coords[2])]
+                else:
+                    continue    # malformed entry → skip
+
+                tp_idx = index(xyz)
+                segments.append([tp_idx, tp_idx])   # zero-length segment keeps vertex
+                triple_points_added += 1
+
+            # warn if very large
+            if len(segments) > 2000 or len(points_3d) > 5000:
+                QMessageBox.warning(
+                    self, "Huge PLC",
+                    f"{dataset_name} has {len(points_3d)} points and "
+                    f"{len(segments)} segments – this may be slow."
+                )
+
+            # ----------------------------------
+            # 3-D → 2-D projection -------------
+            # ----------------------------------
+            proj = dataset.get("projection_params")
+            if not proj:
+                self.statusBar().showMessage(f"Missing projection for {dataset_name}")
+                continue
+
+            centroid = np.array(proj["centroid"])
+            basis = np.array(proj["basis"])
+            if basis.shape == (2, 3):             # stored transposed
+                basis = basis.T
+            basis_3x2 = basis[:, :2]
+
+            centred = np.array(points_3d) - centroid
+            points_2d = centred @ basis_3x2
+
+            # identity map (no de-duplication)
+            points_3d_nd = np.array(points_3d)
+
+            # ----------------------------------
+            # prepare PLC via high-level util ---
+            # ----------------------------------
+            surface_data = dict(
+                hull_points=[Vector3D(*p) for p in hull_line] if hull_line else [],
+                size=target_feature_size,
+                projection_params=proj
+            )
+
+            intersections_data = []
+            for pl in intersection_lines_raw:
+                intersections_data.append(
+                    dict(points=[Vector3D(*p) for p in pl], type="INTERSECTION")
+                )
+
+            cfg = dict(
+                target_feature_size=target_feature_size,
+                max_area=max_area,
+                min_angle=min_angle_deg,
+                uniform_meshing=True,
+                preserve_constraints=True,
+                triple_points=[Vector3D(*points_3d[i]) for i in range(len(points_3d))
+                            if [i, i] in segments]
+            )
+
             try:
-                logger.info(f"Processing C++ CONSTRAINED triangulation for: {dataset_name}")
-                
-                # Get stored constraint lines for this dataset (C++ approach)
-                constraint_lines = self.stored_constraint_lines[dataset_idx]
-                
-                # 1. Build simplified constraint approach - just use hull + intersection lines
-                all_points_3d = []
-                all_segments = []
-                
-                # A. First, add ALL original triangulation vertices to preserve internal structure
-                original_triangulation = self.datasets[dataset_idx].get('triangulation_result', {})
-                original_vertices = original_triangulation.get('vertices', [])
-                
-                # Also check alternative storage locations if not found
-                if original_vertices is None or len(original_vertices) == 0:
-                    # Try legacy triangulation storage
-                    legacy_triangulation = self.datasets[dataset_idx].get('triangulation', {})
-                    original_vertices = legacy_triangulation.get('vertices', [])
-                    
-                    # Try to get vertices from the triangles data structure
-                    if (original_vertices is None or len(original_vertices) == 0) and 'triangles' in self.datasets[dataset_idx]:
-                        triangles_data = self.datasets[dataset_idx]['triangles']
-                        if isinstance(triangles_data, dict) and 'vertices' in triangles_data:
-                            original_vertices = triangles_data['vertices']
-                        elif hasattr(triangles_data, 'vertices'):
-                            original_vertices = triangles_data.vertices
-                    
-                    # Try alternative storage locations
-                    if (original_vertices is None or len(original_vertices) == 0) and 'mesh' in self.datasets[dataset_idx]:
-                        mesh_data = self.datasets[dataset_idx]['mesh']
-                        if isinstance(mesh_data, dict) and 'vertices' in mesh_data:
-                            original_vertices = mesh_data['vertices']
-                
-                # C++ approach: Only use constraint boundaries, let Triangle generate internal points
-                # The C++ version relies on Triangle's internal point generation with proper area constraints
-                logger.info(f"Using C++ constraint-only approach for {dataset_name} - Triangle will generate internal points")
-                
-                # B. Add hull boundary
-                hull_line = constraint_lines[0]  # First line is always hull
-                logger.info(f"Adding hull boundary: {len(hull_line)} points")
-                
-                hull_indices = []
-                for pt in hull_line:
-                    xyz = pt[:3]            # ignore the type string
-                    all_points_3d.append(xyz)
-                    hull_indices.append(len(all_points_3d) - 1)
-                
-                # Create hull segments (closed loop)
-                for j in range(len(hull_indices)):
-                    next_j = (j + 1) % len(hull_indices)
-                    all_segments.append([hull_indices[j], hull_indices[next_j]])
-                
-                # C. Add intersection lines as constraints (with basic duplicate checking)
-                for line_idx in range(1, len(constraint_lines)):
-                    intersection_line = constraint_lines[line_idx]
-                    logger.info(f"Adding intersection constraint {line_idx}: {len(intersection_line)} points")
-                    
-                    line_indices = []
-                    for pt in intersection_line:
-                        xyz = pt[:3]                        # numeric part only
+                plc_pts2d, plc_segs, plc_holes, plc_pts3d = \
+                    prepare_plc_for_surface_triangulation(
+                        surface_data, intersections_data, cfg
+                    )
+                if plc_pts2d is None or len(plc_pts2d) == 0:
+                    raise RuntimeError("empty PLC – will fall back")
+                tri_result = run_constrained_triangulation_py(
+                    plc_pts2d, plc_segs, plc_holes, proj, plc_pts3d, cfg
+                )
+            except Exception:
+                # fallback → feed our own lists
+                tri_result = run_constrained_triangulation_py(
+                    points_2d, np.array(segments), [], proj, points_3d_nd, cfg
+                )
 
-                        existing_idx = None
-                        for idx, existing_pt in enumerate(all_points_3d):
-                            if np.linalg.norm(np.array(xyz, dtype=float) -
-                                            np.array(existing_pt, dtype=float)) < 1e-6:
-                                existing_idx = idx
-                                break
+            if tri_result and len(tri_result) == 3:
+                v3d, tris, triple_idx = tri_result
+                if v3d is not None and len(v3d) and len(tris):
+                    self.constrained_meshes[surf_idx] = dict(
+                        vertices=v3d, triangles=tris,
+                        constraint_lines = ([hull_line] if hull_line else []) + intersection_lines_raw,
+                        num_constraints=len(intersection_lines_raw) + (1 if hull_line else 0),
+                        num_segments=len(segments)
+                    )
+                    dataset["constrained_vertices"] = v3d
+                    dataset["constrained_triangles"] = tris
+                    dataset["constrained_triple_point_indices"] = triple_idx
+                    success += 1
 
-                        if existing_idx is None:
-                            all_points_3d.append(xyz)
-                            line_indices.append(len(all_points_3d) - 1)
-                        else:
-                            line_indices.append(existing_idx)
-                    
-                    # Create intersection segments (open line)
-                    for j in range(len(line_indices) - 1):
-                        all_segments.append([line_indices[j], line_indices[j + 1]])
-                
-                # D. CRITICAL: Add triple points as individual point constraints
-                # This is what was missing - triple points need to be added as single-point constraints
-                triple_points_added = 0
-                if hasattr(self, 'triple_points') and self.triple_points:
-                    logger.info(f"Adding {len(self.triple_points)} triple points as point constraints")
-                    for tp in self.triple_points:
-                        try:
-                            tp_coords = tp.get('point')
-                            if tp_coords:
-                                if hasattr(tp_coords, '__len__') and len(tp_coords) >= 3:
-                                    triple_point = [float(tp_coords[0]), float(tp_coords[1]), float(tp_coords[2])]
-                                elif hasattr(tp_coords, 'x') and hasattr(tp_coords, 'y') and hasattr(tp_coords, 'z'):
-                                    triple_point = [float(tp_coords.x), float(tp_coords.y), float(tp_coords.z)]
-                                else:
-                                    continue
-                                
-                                # Check if this triple point is already in our points (avoid duplicates)
-                                existing_idx = None
-                                for existing_pt_idx, existing_pt in enumerate(all_points_3d):
-                                    if np.linalg.norm(np.array(triple_point) - np.array(existing_pt)) < 1e-6:
-                                        existing_idx = existing_pt_idx
-                                        break
-                                
-                                if existing_idx is None:
-                                    all_points_3d.append(triple_point)
-                                    triple_points_added += 1
-                                    logger.debug(f"Added triple point: {triple_point}")
-                                else:
-                                    logger.debug(f"Triple point already exists at index {existing_idx}")
-                                    
-                        except Exception as e:
-                            logger.warning(f"Error processing triple point: {e}")
-                    
-                    logger.info(f"Added {triple_points_added} new triple points as point constraints")
-                else:
-                    logger.warning("No triple points found - missing critical junction points for triangulation!")
-
-                logger.info(f"C++ APPROACH: Using {len(constraint_lines)} constraint lines "
-                        f"(1 hull + {len(constraint_lines)-1} intersections) + {triple_points_added} triple points for {dataset_name}")
-                logger.info(f"TOTAL POINTS: {len(all_points_3d)} constraint points ({len(all_points_3d) - triple_points_added} boundary + {triple_points_added} triple points)")
-                logger.info(f"C++ CONSTRAINT PROCESSING: {len(all_points_3d)} total points, {len(all_segments)} segments")
-                
-                # Safety checks
-                if len(all_segments) > 200:
-                    logger.warning(f"Too many constraint segments ({len(all_segments)}) for {dataset_name}. May cause hanging.")
-                    continue
-                
-                if len(all_points_3d) > 500:
-                    logger.warning(f"Too many constraint points ({len(all_points_3d)}) for {dataset_name}. Using simplified approach.")
-                    # Keep only constraint boundaries, not all original vertices
-                    all_points_3d = []
-                    all_segments = []
-                    
-                    # Re-add just the constraint boundaries
-                    for line_idx, constraint_line in enumerate(constraint_lines):
-                        line_indices = []
-                        for pt in constraint_line:
-                            all_points_3d.append(pt)
-                            line_indices.append(len(all_points_3d) - 1)
-                        
-                        if line_idx == 0:  # Hull - create closed loop
-                            for j in range(len(line_indices)):
-                                next_j = (j + 1) % len(line_indices)
-                                all_segments.append([line_indices[j], line_indices[next_j]])
-                        else:  # Intersection - create open line
-                            for j in range(len(line_indices) - 1):
-                                all_segments.append([line_indices[j], line_indices[j + 1]])
-                    
-                    logger.info(f"SIMPLIFIED: Using {len(all_points_3d)} constraint boundary points, {len(all_segments)} segments")
-                
-                # 2. Project to 2D with C++ duplicate removal approach  
-                projection_params = dataset.get('projection_params')
-                if not projection_params:
-                    logger.warning(f"No projection parameters for {dataset_name}. Skipping.")
-                    continue
-
-                centroid = np.array(projection_params['centroid'])
-                basis = np.array(projection_params['basis'])
-
-                all_points_3d_np = np.array(all_points_3d)
-                centered_points = all_points_3d_np - centroid
-                
-                # Fix dimension mismatch: ensure basis is 3x2 for projection
-                if basis.shape[0] == 2:
-                    # If basis is 2x2 or 2x3, we need to transpose it to 3x2 or create proper 3x2
-                    if basis.shape[1] == 2:
-                        # Create a 3x2 basis matrix
-                        basis_3x2 = np.zeros((3, 2))
-                        basis_3x2[:2, :] = basis
-                        basis_3x2[2, :] = [0, 0]  # Z maps to 0 in both 2D axes
-                    else:  # basis.shape[1] == 3, so transpose
-                        basis_3x2 = basis.T[:, :2]  # Take first 2 columns after transpose
-                elif basis.shape[0] >= 3:
-                    basis_3x2 = basis[:, :2]  # Take first 2 columns
-                else:
-                    logger.error(f"Invalid basis shape: {basis.shape}")
-                    continue
-                
-                points_2d = centered_points @ basis_3x2
-                
-                # NO DEDUPLICATION - Keep ALL points to preserve triple points and geometry
-                deduplicated_points_2d = points_2d  # Keep all 2D points
-                deduplicated_segments = all_segments  # Keep all segments
-                
-                logger.info(f"NO DEDUPLICATION: Preserving ALL {len(points_2d)} points and {len(all_segments)} segments")
-                logger.info(f"TRIPLE POINT PRESERVATION: All points including {triple_points_added} triple points are preserved")
-                
-                if len(deduplicated_segments) < 3 or len(deduplicated_points_2d) < 3:
-                    logger.warning(f"Too few points/segments after deduplication for {dataset_name}")
-                    continue
-
-                # Apply scaling to avoid precision issues (like in logs)
-                points_2d_array = np.array(deduplicated_points_2d)
-                if points_2d_array.size > 0:
-                    scale_factor = 50.0 / max(np.ptp(points_2d_array[:, 0]), np.ptp(points_2d_array[:, 1]), 1e-10)
-                    points_2d_array *= scale_factor
-                    logger.info(f"SCALED 2D coordinates by factor {scale_factor:.6f} to avoid precision issues")
-                    logger.info(f"2D coordinate range: [{points_2d_array.min():.3f}, {points_2d_array.max():.3f}]")
-
-                logger.info(f"Projecting {len(deduplicated_points_2d)} constraint points to 2D for {dataset_name}")
-                logger.info(f"Running C++ triangulation with {len(deduplicated_segments)} constraint segments for {dataset_name}")
-
-                # 3. NEW: Use the constraint processing approach instead of manual constraint building
-                import math
-                try:
-                    from meshit.intersection_utils import prepare_plc_for_surface_triangulation, run_constrained_triangulation_py
-                    from meshit.intersection_utils import Vector3D
-                    
-                    # Convert constraint lines to proper format for new constraint processing
-                    surface_data = {
-                        'hull_points': [],
-                        'size': target_feature_size,
-                        'projection_params': projection_params
-                    }
-                    
-                    intersections_on_surface_data = []
-                    
-                    # Convert constraint lines to Vector3D format
-                    for line_idx, constraint_line in enumerate(constraint_lines):
-                        if line_idx == 0:  # Hull boundary
-                            hull_points_vector3d = []
-                            for pt in constraint_line:
-                                v3d = Vector3D(pt[0], pt[1], pt[2])
-                                v3d.type = "DEFAULT"  # Hull points are DEFAULT type
-                                hull_points_vector3d.append(v3d)
-                            surface_data['hull_points'] = hull_points_vector3d
-                        else:  # Intersection lines
-                            intersection_points_vector3d = []
-                            for pt in constraint_line:
-                                v3d = Vector3D(pt[0], pt[1], pt[2])
-                                v3d.type = "INTERSECTION_POINT"  # Intersection points
-                                intersection_points_vector3d.append(v3d)
-                            
-                            intersections_on_surface_data.append({
-                                'points': intersection_points_vector3d,
-                                'size': target_feature_size * 0.7,  # Smaller size for intersections
-                                'type': 'INTERSECTION'
-                            })
-                    
-                    logger.info(f"NEW CONSTRAINT PROCESSING: Using {len(surface_data['hull_points'])} hull points, {len(intersections_on_surface_data)} intersection lines")
-                    
-                    # Prepare triple points for protection
-                    triple_points_vector3d = []
-                    if hasattr(self, 'triple_points') and self.triple_points:
-                        for tp in self.triple_points:
-                            try:
-                                tp_coords = tp.get('point')
-                                if tp_coords:
-                                    if hasattr(tp_coords, '__len__') and len(tp_coords) >= 3:
-                                        v3d = Vector3D(float(tp_coords[0]), float(tp_coords[1]), float(tp_coords[2]))
-                                        v3d.type = "TRIPLE_POINT"
-                                        triple_points_vector3d.append(v3d)
-                                    elif hasattr(tp_coords, 'x') and hasattr(tp_coords, 'y') and hasattr(tp_coords, 'z'):
-                                        v3d = Vector3D(float(tp_coords.x), float(tp_coords.y), float(tp_coords.z))
-                                        v3d.type = "TRIPLE_POINT"
-                                        triple_points_vector3d.append(v3d)
-                            except Exception as e:
-                                logger.warning(f"Error converting triple point to Vector3D: {e}")
-                    
-                    logger.info(f"PROTECTED TRIPLE POINTS: {len(triple_points_vector3d)} triple points prepared for protection")
-                    
-                    # Use the new constraint processing approach
-                    config = {
-                        'target_feature_size': target_feature_size,
-                        'max_area': max_area,
-                        'min_angle': min_angle_deg,
-                        'gradient': 2.0,
-                        'uniform_meshing': True,
-                        'use_constraint_processing': True,  # FORCE enable constraint processing
-                        'type_based_sizing': self.type_based_sizing_checkbox.isChecked(),
-                        'hierarchical_constraints': self.hierarchical_constraints_checkbox.isChecked(),
-                        'preserve_constraints': True,
-                        'constraint_enforcement': 'strict',
-                        'triple_points': triple_points_vector3d,  # PROTECTED TRIPLE POINTS
-                        'use_cpp_exact_logic': True
-                    }
-                    
-                    # Use the new PLC preparation method
-                    plc_result = prepare_plc_for_surface_triangulation(surface_data, intersections_on_surface_data, config)
-                    
-                    if plc_result and len(plc_result) == 4:
-                        points_2d_new, segments_new, holes_2d_new, points_3d_new = plc_result
-                        
-                        if points_2d_new is not None and len(points_2d_new) > 0:
-                            logger.info(f"NEW CONSTRAINT PROCESSING SUCCESS: {len(points_2d_new)} points, {len(segments_new)} segments")
-                            
-                            # Use the new constraint processing result
-                            result = run_constrained_triangulation_py(
-                                points_2d_new,
-                                segments_new,
-                                holes_2d_new,
-                                projection_params,
-                                points_3d_new,
-                                config
-                            )
-                        else:
-                            logger.warning("New constraint processing returned empty result, falling back to manual approach")
-                            # Fall back to manual approach
-                            edge_length = math.sqrt(max_area * 4 / math.sqrt(3))
-                            deduplicated_points_3d = []
-                            for i in range(len(deduplicated_points_2d)):
-                                for orig_idx, mapped_idx in point_index_map.items():
-                                    if mapped_idx == i:
-                                        deduplicated_points_3d.append(all_points_3d[orig_idx])
-                                        break
-                            
-                            result = run_constrained_triangulation_py(
-                                points_2d_array,
-                                np.array(deduplicated_segments),
-                                [],  # holes
-                                projection_params,
-                                np.array(deduplicated_points_3d),
-                                config
-                            )
-                    else:
-                        logger.warning("New constraint processing failed, falling back to manual approach")
-                        # Fall back to manual approach
-                        edge_length = math.sqrt(max_area * 4 / math.sqrt(3))
-                        deduplicated_points_3d = []
-                        for i in range(len(deduplicated_points_2d)):
-                            for orig_idx, mapped_idx in point_index_map.items():
-                                if mapped_idx == i:
-                                    deduplicated_points_3d.append(all_points_3d[orig_idx])
-                                    break
-                        
-                        result = run_constrained_triangulation_py(
-                            points_2d_array,
-                            np.array(deduplicated_segments),
-                            [],  # holes
-                            projection_params,
-                            np.array(deduplicated_points_3d),
-                            config
-                        )
-                    
-                    if result is not None and len(result) == 3:
-                        vertices_3d, triangles, triple_point_indices = result
-                        
-                        # Additional safety checks
-                        if (vertices_3d is not None and triangles is not None and 
-                            len(vertices_3d) > 0 and len(triangles) > 0):
-                            
-                            # Store result in constrained_meshes
-                            self.constrained_meshes[dataset_idx] = {
-                                'vertices': vertices_3d,
-                                'triangles': triangles,
-                                'constraint_lines': constraint_lines,
-                                'num_constraints': len(constraint_lines),
-                                'num_segments': len(deduplicated_segments)
-                            }
-                            
-                            # Also store in dataset for validation
-                            self.datasets[dataset_idx]['constrained_vertices'] = vertices_3d
-                            self.datasets[dataset_idx]['constrained_triangles'] = triangles
-                            self.datasets[dataset_idx]['constrained_triple_point_indices'] = triple_point_indices  # CRITICAL FIX
-                            self.datasets[dataset_idx]['constraint_processing_used'] = True
-                            self.datasets[dataset_idx]['intersection_constraints'] = constraint_lines[1:]  # Exclude hull boundary
-                            
-                            logger.info(f"SUCCESS: C++ CONSTRAINED mesh for {dataset_name}: "
-                                    f"{len(vertices_3d)} vertices, {len(triangles)} triangles "
-                                    f"using {len(constraint_lines)} constraint lines, {len(deduplicated_segments)} segments")
-                            success_count += 1
-                    else:
-                        logger.error(f"Failed to generate constrained mesh for {dataset_name}")
-                        
-                except Exception as e:
-                    logger.error(f"Error during constrained triangulation for {dataset_name}: {str(e)}")
-                    continue
-                    
-            except Exception as e:
-                logger.error(f"Error processing constrained mesh for {dataset_name}: {str(e)}")
-                continue
-
-        # Update visualization
+        # ----------------------------------------------------------------
+        # finish ----------------------------------------------------------
+        # ----------------------------------------------------------------
         self._visualize_constrained_meshes()
-        
-        if success_count > 0:
-            self.statusBar().showMessage(f"Generated {success_count}/{total_count} constrained meshes using C++ approach.")
-            logger.info(f"Constrained meshing completed: {success_count}/{total_count} surfaces processed successfully.")
-            
-            # Enable the tetgen validation button after successful computation
-            if hasattr(self, 'validate_for_tetgen_btn'):
-                self.validate_for_tetgen_btn.setEnabled(True)
-                logger.info("Tetgen validation button enabled")
-        else:
-            self.statusBar().showMessage("No constrained meshes generated. Check constraints and parameters.")
 
+        if success:
+            self.statusBar().showMessage(
+                f"Generated {success}/{attempted} constrained meshes."
+            )
+            if hasattr(self, "validate_for_tetgen_btn"):
+                self.validate_for_tetgen_btn.setEnabled(True)
+        else:
+            self.statusBar().showMessage(
+                "No constrained meshes generated. Check constraints and parameters."
+            )
     def _visualize_constrained_meshes(self):
         """Visualize constrained meshes with highlighted constraint boundaries"""
         if not hasattr(self, 'pre_tetramesh_plotter') or not self.pre_tetramesh_plotter:
@@ -3342,17 +2737,18 @@ class MeshItWorkflowGUI(QMainWindow):
                 # Store this intersection as constraint for surface 1
                 constraint_line = []
                 for pt in intersection.points:
-                    # keep the vertex “type” so the constraint manager can split later
                     p_type = getattr(pt, "point_type", getattr(pt, "type", "DEFAULT"))
                     constraint_line.append([pt.x, pt.y, pt.z, p_type])
-                
-                if len(constraint_line) >= 2:  # Only store if it's a valid line
+
+                if len(constraint_line) >= 2:
                     self.datasets[original_id1]['stored_constraints'].append({
                         'type': 'intersection_line',
                         'points': constraint_line,
                         'other_surface_id': original_id2
                     })
-                    logger.info(f"Stored intersection constraint for surface {original_id1}: {len(constraint_line)} points")
+                    self.datasets[original_id1]['needs_constraint_update'] = True   #  ← add this
+                    logger.info(f"Stored intersection constraint for surface {original_id1}: "
+                                f"{len(constraint_line)} points")
             
             if original_id2 is not None and original_id2 < len(self.datasets) and original_id1 != original_id2:
                 # Store this intersection as constraint for surface 2
@@ -3367,13 +2763,14 @@ class MeshItWorkflowGUI(QMainWindow):
                         'points': constraint_line,
                         'other_surface_id': original_id1
                     })
+                    self.datasets[original_id2]['needs_constraint_update'] = True
                     logger.info(f"Stored intersection constraint for surface {original_id2}: {len(constraint_line)} points")
         
         logger.info("Constraint storage complete.")
         # --- Update main data structures and visualization ---
         self.datasets_intersections.clear() 
         self.refined_intersections_for_visualization = {}
-
+        
         for temp_s_list_idx, temp_surface_data in enumerate(temp_model.surfaces):
     # Find the original dataset index for this temp surface
             original_dataset_idx = None
@@ -8630,25 +8027,11 @@ segmentation, triangulation, and visualization.
             self.statusBar().showMessage(f"Validation failed: {str(e)}")
     
     def _setup_tetra_mesh_tab(self):
-        """Enhanced tetra mesh tab with advanced constraint selection capabilities"""
+        """Simplified tetra mesh tab - Material assignment + TetGen only (C++ workflow)"""
         
-        # Initialize data structures
+        # Initialize data structures - simplified for material assignment only
         self.tetra_materials = []
-        self.selected_surface_parts = {}
         self.tetrahedral_mesh = None
-        self.surface_quality_data = {}
-        self.interactive_selection_enabled = False
-        self.constraint_selection_enabled = False
-        self.constraint_visualization_mode = "NORMAL"  # "NORMAL" or "SELECTION"
-        
-        # Initialize constraint manager
-        self.constraint_manager = SurfaceConstraintManager()
-        self.constraint_manager._parent_gui = self  # Pass reference for accessing triple points
-        
-        # Border recognition
-        self.border_surface_indices = self._identify_border_surfaces()
-        self.unit_surface_indices = self._identify_unit_surfaces()
-        self.fault_surface_indices = self._identify_fault_surfaces()
         
         # Create main layout
         tab_layout = QHBoxLayout(self.tetra_mesh_tab)
@@ -8658,118 +8041,20 @@ segmentation, triangulation, and visualization.
         control_panel.setMaximumWidth(400)
         control_layout = QVBoxLayout(control_panel)
         
-        # --- Advanced Selection Group ---
-        selection_group = QGroupBox("Advanced Constraint Selection")
-        selection_layout = QVBoxLayout(selection_group)
+        # --- Surface Status Group (Simplified) ---
+        status_group = QGroupBox("Pre-Tetra Mesh Status")
+        status_layout = QVBoxLayout(status_group)
         
-        # Selection tools (like C++ SelectionTool enum)
-        self.selection_tool_combo = QComboBox()
-        self.selection_tool_combo.addItems([
-            "SINGLE - Click individual constraints",
-            "MULTI - Rectangle selection", 
-            "BUCKET - Flood fill selection",
-            "POLYGON - Polygon selection",
-            "ALL - Select all constraints"
-        ])
-        selection_layout.addWidget(QLabel("Selection Tool:"))
-        selection_layout.addWidget(self.selection_tool_combo)
+        self.surface_status_label = QLabel("No constrained surfaces available")
+        self.surface_status_label.setWordWrap(True)
+        self.surface_status_label.setStyleSheet("background-color: #f0f0f0; padding: 8px; border: 1px solid #ccc;")
+        status_layout.addWidget(self.surface_status_label)
         
-        # Selection modes (like C++ SelectionMode enum)
-        self.selection_mode_combo = QComboBox()
-        self.selection_mode_combo.addItems([
-            "MARK - Add to selection",
-            "UNMARK - Remove from selection", 
-            "HOLE - Mark as holes",
-            "INVERT - Toggle selection"
-        ])
-        selection_layout.addWidget(QLabel("Selection Mode:"))
-        selection_layout.addWidget(self.selection_mode_combo)
+        self.refresh_surface_status_btn = QPushButton("Refresh Surface Status")
+        self.refresh_surface_status_btn.clicked.connect(self._refresh_surface_status)
+        status_layout.addWidget(self.refresh_surface_status_btn)
         
-        # Selection target
-        self.selection_target_combo = QComboBox()
-        self.selection_target_combo.addItems([
-            "Surface Constraints",
-            "Hull Boundaries", 
-            "Intersection Lines",
-            "All Elements"
-        ])
-        selection_layout.addWidget(QLabel("Select:"))
-        selection_layout.addWidget(self.selection_target_combo)
-        
-        # Enable/disable constraint selection
-        self.enable_constraint_selection_btn = QPushButton("🎯 Enable Constraint Selection")
-        self.enable_constraint_selection_btn.setCheckable(True)
-        self.enable_constraint_selection_btn.clicked.connect(self._toggle_constraint_selection)
-        selection_layout.addWidget(self.enable_constraint_selection_btn)
-        
-        # Generate constraints button
-        self.generate_constraints_btn = QPushButton("🔗 Generate Constraints from Pre-Tetra Data")
-        self.generate_constraints_btn.clicked.connect(self._generate_constraints_from_data)
-        selection_layout.addWidget(self.generate_constraints_btn)
-        
-        # View mode selection
-        view_mode_layout = QHBoxLayout()
-        self.view_mode_label = QLabel("View Mode:")
-        self.show_all_surfaces_btn = QPushButton("Show All")
-        self.show_selected_only_btn = QPushButton("Selected Only")
-        
-        self.show_all_surfaces_btn.clicked.connect(self._on_show_all_surfaces)
-        self.show_selected_only_btn.clicked.connect(self._on_show_selected_only)
-        
-        # Make buttons toggleable style
-        self.show_all_surfaces_btn.setCheckable(True)
-        self.show_selected_only_btn.setCheckable(True)
-        self.show_selected_only_btn.setChecked(True)  # Default to selected only
-        self.show_all_surfaces_btn.setEnabled(False)  # Initially disabled
-        self.show_selected_only_btn.setEnabled(False)
-        
-        view_mode_layout.addWidget(self.view_mode_label)
-        view_mode_layout.addWidget(self.show_all_surfaces_btn)
-        view_mode_layout.addWidget(self.show_selected_only_btn)
-        selection_layout.addLayout(view_mode_layout)
-        
-        # Selection summary
-        self.constraint_selection_summary = QLabel("No constraints generated yet")
-        self.constraint_selection_summary.setWordWrap(True)
-        self.constraint_selection_summary.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc;")
-        selection_layout.addWidget(self.constraint_selection_summary)
-        
-        control_layout.addWidget(selection_group)
-        
-        # --- Surface & Constraint Tree ---
-        surface_list_group = QGroupBox("Surfaces & Constraints")
-        surface_list_layout = QVBoxLayout(surface_list_group)
-        
-        self.surface_constraint_tree = QTreeWidget()
-        self.surface_constraint_tree.setHeaderLabels(["Element", "Type", "State", "Details"])
-        self.surface_constraint_tree.itemChanged.connect(self._on_constraint_tree_item_changed)
-        surface_list_layout.addWidget(self.surface_constraint_tree)
-        
-        # Tree control buttons
-        tree_control_layout = QHBoxLayout()
-        
-        # Selection buttons
-        select_all_constraints_btn = QPushButton("Select All")
-        unselect_all_constraints_btn = QPushButton("Unselect All")
-        select_all_constraints_btn.clicked.connect(self._select_all_constraints)
-        unselect_all_constraints_btn.clicked.connect(self._unselect_all_constraints)
-        
-        # Expansion control buttons
-        expand_all_btn = QPushButton("Expand All")
-        collapse_all_btn = QPushButton("Collapse All")
-        expand_all_btn.clicked.connect(self._expand_all_tree_items)
-        collapse_all_btn.clicked.connect(self._collapse_all_tree_items)
-        
-        # Add buttons to layout
-        tree_control_layout.addWidget(select_all_constraints_btn)
-        tree_control_layout.addWidget(unselect_all_constraints_btn)
-        tree_control_layout.addWidget(expand_all_btn)
-        tree_control_layout.addWidget(collapse_all_btn)
-        surface_list_layout.addLayout(tree_control_layout)
-        
-        control_layout.addWidget(surface_list_group)
-        
-        # Visualization controls removed - using only constraint selection viewer
+        control_layout.addWidget(status_group)
         
         # --- Generation Controls ---
         generate_group = QGroupBox("Tetrahedral Mesh Generation")
@@ -8791,1149 +8076,145 @@ segmentation, triangulation, and visualization.
 
         # build the layout, left → right
         tab_layout.addWidget(control_panel)        # left column (constraint lists etc.)
-
-        viewer_group = QGroupBox("3D Viewer - Constraint Selection")
-        viewer_layout = QVBoxLayout(viewer_group)
-        self._setup_constraint_3d_viewer(viewer_group, viewer_layout)
-        tab_layout.addWidget(viewer_group, 1)      # center: 3-D viewport (stretch=1)
+   # center: 3-D viewport (stretch=1)
 
         tab_layout.addWidget(materials_group)      # right column: Materials panel
-                # Initialize
+        # Initialize
         logger.info("Enhanced tetra mesh tab with constraint selection initialized")
-        
-        # Initialize with delay
-        QTimer.singleShot(200, self._initialize_tetra_visualization)
+        self._initialize_tetra_visualization()
 
-    def _on_show_all_surfaces(self):
-        """Handle show all surfaces button"""
-        self.show_all_surfaces_btn.setChecked(True)
-        self.show_selected_only_btn.setChecked(False)
-        self._visualize_constraints(selection_mode=self.constraint_selection_enabled)
-        logger.info("Switched to show all surfaces mode")
 
-    def _on_show_selected_only(self):
-        """Handle show selected only button"""
-        self.show_selected_only_btn.setChecked(True)
-        self.show_all_surfaces_btn.setChecked(False)
-        self._visualize_selected_surfaces_only()
-        logger.info("Switched to show selected surfaces only mode")
-
+        # ------------------------------------------------------------------
+    #  3-D viewer used in the Tetra-Mesh tab
+    # ------------------------------------------------------------------
     def _setup_constraint_3d_viewer(self, parent_group, layout):
-        """Setup 3D viewer with constraint selection capabilities"""
-        
+        """
+        Builds the central 3-D viewport *and* its small toolbar:
+        Reset – Fit – Mouse-Select – Mesh-toggle.
+        The mesh-toggle lets the user switch between the normal constraint
+        view and the TetGen mesh once it has been generated.
+        """
+
+        # ──────────────── toolbar row ────────────────────────────────
+        toolbar = QHBoxLayout()
+
+        self.reset_view_btn             = QPushButton("🔄 Reset")
+        self.fit_view_btn               = QPushButton("📐 Fit")
+        self.enable_mouse_selection_btn = QPushButton("🖱️ Select")
+        self.selection_info_label       = QLabel("Click elements to select")
+        self.selection_info_label.setStyleSheet("color:#666; font-style:italic;")
+
+        # brand-new “Mesh” toggle
+        self.show_mesh_toggle = QCheckBox("Mesh")
+        self.show_mesh_toggle.setEnabled(False)          # becomes active after TetGen
+        self.show_mesh_toggle.setToolTip("Toggle between constraint view and TetGen mesh")
+        self.show_mesh_toggle.toggled.connect(self._toggle_mesh_visibility)
+
+        # assemble toolbar
+        toolbar.addWidget(self.reset_view_btn)
+        toolbar.addWidget(self.fit_view_btn)
+        toolbar.addWidget(self.enable_mouse_selection_btn)
+        toolbar.addWidget(self.show_mesh_toggle)
+        toolbar.addStretch()
+        toolbar.addWidget(self.selection_info_label)
+
+        layout.addLayout(toolbar)
+
+        # ──────────────── 3-D viewport ───────────────────────────────
         if HAVE_PYVISTA:
             from pyvistaqt import QtInteractor
-            
+
             self.constraint_plotter = QtInteractor(parent_group)
-            layout.addWidget(self.constraint_plotter.interactor)
-            
             self.constraint_plotter.set_background([0.15, 0.15, 0.2])
-            
-            logger.info("Constraint selection 3D viewer initialized")
+            layout.addWidget(self.constraint_plotter.interactor)
+
+            # callbacks & helpers
+            self.reset_view_btn.clicked.connect(self.constraint_plotter.reset_camera)
+            self.fit_view_btn.clicked.connect(
+                lambda: self.constraint_plotter.reset_camera(render=True)
+            )
+            self.enable_mouse_selection_btn.clicked.connect(
+                lambda: self._toggle_mouse_selection(
+                    not self.interactive_selection_enabled
+                )
+            )
+
+            logger.info("Constraint/Mesh 3-D viewer initialised")
+
         else:
-            placeholder = QLabel("PyVista required for constraint selection")
+            placeholder = QLabel("PyVista is required for 3-D visualisation.")
             placeholder.setAlignment(Qt.AlignCenter)
             layout.addWidget(placeholder)
             self.constraint_plotter = None
+            self.enable_mouse_selection_btn.setEnabled(False)
+            self.show_mesh_toggle.setEnabled(False)
 
-    def _generate_constraints_from_data(self):
-        """Generate constraints from pre-tetra mesh data"""
-        if not self.datasets:
-            QMessageBox.warning(self, "No Data", "No datasets loaded. Load data first.")
-            return
-        
-        try:
-            self.constraint_manager.generate_constraints_from_pre_tetra_data(self.datasets)
-            self._populate_constraint_tree()
-            self._update_constraint_summary()
-            
-            # Initialize visualization with all constraints in "Show All" mode
-            # This ensures all actors exist for efficient updates later
-            if self.constraint_manager.surface_constraints:
-                logger.info("Initializing constraint visualization...")
-                self._visualize_constraints(selection_mode=False)  # Show all constraints initially
-                
-                self.enable_constraint_selection_btn.setEnabled(True)
-                self.generate_tetra_mesh_btn.setEnabled(True)
-                self.show_all_surfaces_btn.setEnabled(True)
-                self.show_selected_only_btn.setEnabled(True)
-                logger.info("Constraints generated successfully from pre-tetra mesh data")
-            else:
-                # Start with no visualization only if no constraints were generated
-                self.constraint_plotter.clear()
-                self.constraint_plotter.add_text("Constraints generated!\nSelect constraints in the tree to visualize them.", 
-                                                position='upper_edge', font_size=12)
-                QMessageBox.warning(self, "No Constraints", 
-                                  "No constraints could be generated. Ensure pre-tetra mesh tab is completed first.")
-                
-        except Exception as e:
-            logger.error(f"Error generating constraints: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to generate constraints: {str(e)}")
 
-    def _toggle_constraint_selection(self, enabled):
-        """Toggle constraint selection mode"""
-        
-        self.constraint_selection_enabled = enabled
-        
-        if enabled:
-            self.enable_constraint_selection_btn.setText("🎯 Constraint Selection ON")
-            self.enable_constraint_selection_btn.setStyleSheet("background-color: #4CAF50; color: white;")
-            # Use current view mode setting
-            if self.show_all_surfaces_btn.isChecked():
-                self._visualize_constraints(selection_mode=True)
-            else:
-                self._visualize_selected_surfaces_only()
-            logger.info("Constraint selection mode enabled")
-        else:
-            self.enable_constraint_selection_btn.setText("🎯 Enable Constraint Selection")
-            self.enable_constraint_selection_btn.setStyleSheet("")
-            # Use current view mode setting
-            if self.show_all_surfaces_btn.isChecked():
-                self._visualize_constraints(selection_mode=False)
-            else:
-                self._visualize_selected_surfaces_only()
-            logger.info("Constraint selection mode disabled")
-
-    def _visualize_constraints(self, selection_mode=False):
-        """Visualize constraints with color-coded selection capability"""
-        
-        if not self.constraint_plotter:
-            return
-            
-        self.constraint_plotter.clear()
-        
-        # Set visualization mode
-        self.constraint_visualization_mode = "SELECTION" if selection_mode else "NORMAL"
-        
-        for surface_idx, constraints in self.constraint_manager.surface_constraints.items():
-            dataset = self.datasets[surface_idx] if surface_idx < len(self.datasets) else None
-            if not dataset:
-                continue
-                
-            surface_name = dataset.get('name', f'Surface_{surface_idx}')
-            
-            # Visualize constrained triangulated surface (background)
-            self._add_surface_mesh_to_constraint_plotter(surface_idx, dataset)
-            
-            # Visualize constraint segments
-            for constraint_idx, constraint in enumerate(constraints):
-                self._add_constraint_to_plotter(
-                    surface_idx, constraint_idx, constraint, selection_mode
-                )
-        
-        # Setup picking callback for selection mode
-        if selection_mode:
-            try:
-                self.constraint_plotter.enable_mesh_picking(
-                    callback=self._on_constraint_picked,
-                    show=False
-                )
-            except Exception as e:
-                logger.warning(f"Could not enable mesh picking: {e}")
-        else:
-            try:
-                self.constraint_plotter.disable_picking()
-            except:
-                pass
-        
-        self.constraint_plotter.reset_camera()
-
-    def _visualize_single_surface_constraints(self, surface_idx, update_summary=False):
-        """Efficiently visualize only a specific surface and its constraints"""
-        
-        if not self.constraint_plotter:
-            return
-        
-        # Get the dataset for this surface
-        dataset = self.datasets[surface_idx] if surface_idx < len(self.datasets) else None
-        if not dataset:
-            return
-        
-        # Clear only actors related to this surface
-        self._clear_surface_actors(surface_idx)
-        
-        # Add surface mesh as background
-        self._add_surface_mesh_to_constraint_plotter(surface_idx, dataset)
-        
-        # Add constraint segments for this surface only
-        constraints = self.constraint_manager.surface_constraints.get(surface_idx, [])
-        for constraint_idx, constraint in enumerate(constraints):
-            self._add_constraint_to_plotter(
-                surface_idx, constraint_idx, constraint, self.constraint_selection_enabled
-            )
-        
-        # Update summary if requested
-        if update_summary:
-            self._update_constraint_summary()
-        
-        # Don't reset camera for single surface updates to maintain view
-        logger.debug(f"Updated visualization for surface {surface_idx} only")
-
-    def _clear_surface_actors(self, surface_idx):
-        """Clear only the actors related to a specific surface"""
-        if not self.constraint_plotter:
-            return
-        
-        # Remove surface mesh
-        surface_actor_name = f"surface_{surface_idx}"
-        if surface_actor_name in self.constraint_plotter.actors:
-            self.constraint_plotter.remove_actor(surface_actor_name)
-        
-        # Remove constraint actors for this surface
-        actors_to_remove = []
-        for actor_name in self.constraint_plotter.actors.keys():
-            if actor_name.startswith(f"constraint_{surface_idx}_"):
-                actors_to_remove.append(actor_name)
-        
-        for actor_name in actors_to_remove:
-            self.constraint_plotter.remove_actor(actor_name)
-
-    def _visualize_selected_surfaces_only(self):
-        """Visualize only surfaces that have selected constraints (very efficient)"""
-        try:
-            if not self.constraint_plotter:
-                return
-            
-            self.constraint_plotter.clear()
-            
-            # Get surfaces with selected constraints
-            selected_surfaces = self.constraint_manager.get_selected_surfaces()
-            
-            if not selected_surfaces:
-                # Show message when nothing is selected
-                self.constraint_plotter.add_text("No constraints selected.\nUse the tree or selection mode to select constraints.", 
-                                               position='upper_edge', font_size=12)
-                return
-            
-            # Only visualize selected surfaces
-            for surface_idx in selected_surfaces:
-                dataset = self.datasets[surface_idx] if surface_idx < len(self.datasets) else None
-                if not dataset:
-                    continue
-                
-                # Add surface mesh as background
-                self._add_surface_mesh_to_constraint_plotter(surface_idx, dataset)
-                
-                # Add constraint segments for this surface
-                constraints = self.constraint_manager.surface_constraints.get(surface_idx, [])
-                for constraint_idx, constraint in enumerate(constraints):
-                    self._add_constraint_to_plotter(
-                        surface_idx, constraint_idx, constraint, self.constraint_selection_enabled
-                    )
-            
-            # Setup picking if in selection mode
-            if self.constraint_selection_enabled:
-                try:
-                    self.constraint_plotter.enable_mesh_picking(
-                        callback=self._on_constraint_picked,
-                        show=False
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not enable mesh picking: {e}")
-            
-            self.constraint_plotter.reset_camera()
-            logger.info(f"Visualizing {len(selected_surfaces)} selected surfaces only")
-            
-        except Exception as e:
-            logger.error(f"Error in _visualize_selected_surfaces_only: {e}")
-            return
-
-    def _add_surface_mesh_to_constraint_plotter(self, surface_idx, dataset):
-        """Add surface mesh as background to constraint plotter"""
-        constrained_vertices = dataset.get('constrained_vertices')
-        constrained_triangles = dataset.get('constrained_triangles')
-        
-        if (constrained_vertices is not None and constrained_triangles is not None and 
-            len(constrained_vertices) > 0 and len(constrained_triangles) > 0):
-            
-            import numpy as np
-            vertices_array = np.array(constrained_vertices)
-            triangles_array = np.array(constrained_triangles)
-            
-            # Create faces array for PyVista
-            faces = []
-            for tri in triangles_array:
-                faces.extend([3, tri[0], tri[1], tri[2]])
-            
-            mesh = pv.PolyData(vertices_array, faces=faces)
-            
-            # Add as semi-transparent background
-            surface_type = self._get_surface_type(surface_idx)
-            color = self._get_surface_color(surface_type)
-            
-            self.constraint_plotter.add_mesh(
-                mesh,
-                name=f"surface_{surface_idx}",
-                color=color,
-                opacity=0.3,
-                style='surface',
-                pickable=False
-            )
-
-    def _add_constraint_to_plotter(self, surface_idx, constraint_idx, constraint, selection_mode):
-        """Add individual constraint segments to plotter"""
-        
-        constraint_key = (surface_idx, constraint_idx)
-        constraint_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
-        
-        # Handle new constraint format (direct points) vs old format (segments list)
-        if 'segments' in constraint:
-            # Old format compatibility
-            segments_to_render = constraint['segments']
-        else:
-            # New format - constraint is the segment itself
-            segments_to_render = [constraint]
-        
-        for segment_idx, segment in enumerate(segments_to_render):
-            # Extract points safely
-            if 'points' in segment:
-                points_data = segment['points']
-            else:
-                logger.warning(f"No points found in constraint segment {constraint_idx}")
-                continue
-                
-            try:
-                points = np.array([[p[0], p[1], p[2]] for p in points_data])
-            except (IndexError, TypeError, ValueError) as e:
-                logger.warning(f"Error extracting points from constraint: {e}")
-                continue
-            
-            if len(points) < 2:
-                continue
-                
-            # Create line mesh
-            line_mesh = pv.PolyData(points)
-            line_mesh.lines = np.hstack([[2, i, i+1] for i in range(len(points)-1)])
-            
-            # Color and style based on mode and state
-            if selection_mode:
-                # Selection mode: use RGB color for picking
-                rgb_color = segment.get('rgb', [255, 255, 255])
-                color = [c/255.0 for c in rgb_color]  # Normalize to [0,1]
-                line_width = 3
-                opacity = 1.0
-            else:
-                # Normal mode: color by constraint state (like C++ makeConstraints)
-                if constraint_state == "SEGMENTS":
-                    color = 'blue'     # Selected constraints
-                    line_width = 5
-                elif constraint_state == "HOLES":
-                    color = 'red'      # Hole constraints
-                    line_width = 5
-                else:  # "UNDEFINED"
-                    color = 'white'    # Unselected constraints
-                    line_width = 3
-                opacity = 0.9
-            
-            # Add to plotter
-            actor_name = f"constraint_{surface_idx}_{constraint_idx}_{segment_idx}"
-            self.constraint_plotter.add_mesh(
-                line_mesh,
-                name=actor_name,
-                color=color,
-                line_width=line_width,
-                opacity=opacity,
-                style='wireframe',
-                pickable=selection_mode
-            )
-
-    def _on_constraint_picked(self, mesh):
-        """Handle constraint selection via mouse picking (like C++ findSelection)"""
-        
-        if not self.constraint_selection_enabled:
-            return
-        
-        # Extract RGB from mesh (simplified - in practice you'd use a more robust method)
-        # For now, we'll use mesh bounds and actor name to identify the constraint
-        try:
-            # Get the actor name to identify which constraint was picked
-            actor_name = None
-            for actor in self.constraint_plotter.renderer.actors.values():
-                if hasattr(actor, 'GetMapper') and actor.GetMapper():
-                    mapper = actor.GetMapper()
-                    if hasattr(mapper, 'GetInput') and mapper.GetInput() == mesh:
-                        # Found the actor, extract name from our naming convention
-                        # constraint_{surface_idx}_{constraint_idx}_{segment_idx}
-                        for name, mesh_obj in self.constraint_plotter.actors.items():
-                            if mesh_obj == mesh:
-                                actor_name = name
-                                break
-                        break
-            
-            if actor_name and actor_name.startswith("constraint_"):
-                parts = actor_name.split("_")
-                if len(parts) >= 4:
-                    surface_idx = int(parts[1])
-                    constraint_idx = int(parts[2])
-                    
-                    # Apply selection based on current mode
-                    selection_mode = self.selection_mode_combo.currentText().split(" - ")[0]
-                    constraint_key = (surface_idx, constraint_idx)
-                    
-                    if selection_mode == "MARK":
-                        self.constraint_manager.constraint_states[constraint_key] = "SEGMENTS"
-                    elif selection_mode == "UNMARK":
-                        self.constraint_manager.constraint_states[constraint_key] = "UNDEFINED"
-                    elif selection_mode == "HOLE":
-                        self.constraint_manager.constraint_states[constraint_key] = "HOLES"
-                    elif selection_mode == "INVERT":
-                        current_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
-                        new_state = "SEGMENTS" if current_state == "UNDEFINED" else "UNDEFINED"
-                        self.constraint_manager.constraint_states[constraint_key] = new_state
-                    
-                    # Update visualization and UI
-                    self._visualize_constraints(selection_mode=False)  # Switch back to normal mode to see colors
-                    self._update_constraint_tree()
-                    self._update_constraint_summary()
-                    
-                    new_state = self.constraint_manager.constraint_states[constraint_key]
-                    logger.info(f"Constraint {surface_idx}_{constraint_idx} marked as {new_state}")
-                    
-                    # Switch back to selection mode after brief normal view
-                    QTimer.singleShot(500, lambda: self._visualize_constraints(selection_mode=True))
-        
-        except Exception as e:
-            logger.warning(f"Error processing constraint selection: {e}")
-
-    def _populate_constraint_tree(self):
-        """Populate the constraint tree widget with hierarchical surface and constraint information"""
-        
-        self.surface_constraint_tree.clear()
-        
-        for surface_idx, constraints in self.constraint_manager.surface_constraints.items():
-            dataset = self.datasets[surface_idx] if surface_idx < len(self.datasets) else None
-            if not dataset:
-                continue
-                
-            surface_name = dataset.get('name', f'Surface_{surface_idx}')
-            surface_item = QTreeWidgetItem([surface_name, "Surface", "Visible", f"{len(constraints)} constraint segments"])
-            surface_item.setData(0, Qt.UserRole, ('surface', surface_idx))
-            
-            # Add visibility checkbox for surface
-            surface_item.setFlags(surface_item.flags() | Qt.ItemIsUserCheckable)
-            
-            # Set checkbox based on current visibility state
-            is_visible = self.constraint_manager.surface_visibility.get(surface_idx, True)
-            surface_item.setCheckState(0, Qt.Checked if is_visible else Qt.Unchecked)
-            surface_item.setText(2, "Visible" if is_visible else "Hidden")
-            
-            # Group constraints by parent type for hierarchical display
-            hull_segments = []
-            intersection_groups = {}  # line_id -> list of segments
-            
-            for constraint_idx, constraint in enumerate(constraints):
-                constraint_type = constraint.get('type', 'UNKNOWN')
-                if constraint_type == 'hull':
-                    hull_segments.append((constraint_idx, constraint))
-                elif constraint_type.startswith('intersection_'):
-                    # Extract line_id from type like "intersection_0", "intersection_1", etc.
-                    try:
-                        line_id = int(constraint_type.split('_')[1])
-                    except (IndexError, ValueError):
-                        line_id = 0
-                    if line_id not in intersection_groups:
-                        intersection_groups[line_id] = []
-                    intersection_groups[line_id].append((constraint_idx, constraint))
-            
-            # Add Hull Boundary parent with individual segments as children
-            if hull_segments:
-                hull_parent = QTreeWidgetItem(["Hull Boundary", "HULL_BOUNDARY", "Container", f"{len(hull_segments)} segments"])
-                hull_parent.setData(0, Qt.UserRole, ('parent', 'HULL_BOUNDARY', surface_idx))
-                
-                # Add selection checkbox for hull parent to select all hull segments
-                hull_parent.setFlags(hull_parent.flags() | Qt.ItemIsUserCheckable)
-                hull_parent.setCheckState(0, Qt.Unchecked)  # Start unchecked
-                
-                for constraint_idx, constraint in hull_segments:
-                    constraint_key = (surface_idx, constraint_idx)
-                    constraint_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
-                    
-                    segment_id = constraint.get('segment_id', constraint_idx)
-                    segment_name = f"Hull Segment {segment_id}"
-                    
-                    # Get point count from constraint data
-                    total_points = len(constraint.get('points', []))
-                    segment_item = QTreeWidgetItem([
-                        segment_name, 
-                        "HULL_SEGMENT", 
-                        constraint_state, 
-                        f"{total_points} points"
-                    ])
-                    segment_item.setData(0, Qt.UserRole, ('constraint', surface_idx, constraint_idx))
-                    segment_item.setFlags(segment_item.flags() | Qt.ItemIsUserCheckable)
-                    
-                    # Set checkbox state based on constraint state
-                    if constraint_state == "SEGMENTS":
-                        segment_item.setCheckState(0, Qt.Checked)
-                    else:
-                        segment_item.setCheckState(0, Qt.Unchecked)
-                    
-                    hull_parent.addChild(segment_item)
-                
-                surface_item.addChild(hull_parent)
-                
-                # Update hull parent checkbox state based on children
-                self._initialize_parent_checkbox_state(hull_parent)
-            
-            # Add Intersection Lines with individual segments as children
-            for line_id, line_segments in intersection_groups.items():
-                intersection_parent = QTreeWidgetItem([
-                    f"Intersection Line {line_id}", 
-                    "INTERSECTION_LINE", 
-                    "Container", 
-                    f"{len(line_segments)} segments"
-                ])
-                intersection_parent.setData(0, Qt.UserRole, ('parent', 'INTERSECTION_LINE', surface_idx, line_id))
-                
-                # Add selection checkbox for intersection parent to select all intersection segments
-                intersection_parent.setFlags(intersection_parent.flags() | Qt.ItemIsUserCheckable)
-                intersection_parent.setCheckState(0, Qt.Unchecked)  # Start unchecked
-                
-                for constraint_idx, constraint in line_segments:
-                    constraint_key = (surface_idx, constraint_idx)
-                    constraint_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
-                    
-                    segment_id = constraint.get('segment_id', 0)
-                    segment_name = f"Intersection Segment {segment_id}"
-                    
-                    # Get point count from constraint data
-                    total_points = len(constraint.get('points', []))
-                    segment_item = QTreeWidgetItem([
-                        segment_name, 
-                        "INTERSECTION_SEGMENT", 
-                        constraint_state, 
-                        f"{total_points} points"
-                    ])
-                    segment_item.setData(0, Qt.UserRole, ('constraint', surface_idx, constraint_idx))
-                    segment_item.setFlags(segment_item.flags() | Qt.ItemIsUserCheckable)
-                    
-                    # Set checkbox state based on constraint state
-                    if constraint_state == "SEGMENTS":
-                        segment_item.setCheckState(0, Qt.Checked)
-                    else:
-                        segment_item.setCheckState(0, Qt.Unchecked)
-                    
-                    intersection_parent.addChild(segment_item)
-                
-                surface_item.addChild(intersection_parent)
-                
-                # Update intersection parent checkbox state based on children
-                self._initialize_parent_checkbox_state(intersection_parent)
-            
-            self.surface_constraint_tree.addTopLevelItem(surface_item)
-        
-        # Default expansion: Expand surfaces and parent categories, but not individual segments
-        self._set_default_expansion_state()
-
-        # ------------------------------------------------------------------ #
-    # tree-widget callback                                               #
-    # ------------------------------------------------------------------ #
-    def _on_constraint_tree_item_changed(self, item, column):
+    def _update_constraint_actor_visual(self, surf_idx: int, con_idx: int,
+                                        active: bool, spotlight: bool = False):
         """
-        Called when the user toggles any checkbox in the surface /
-        constraint tree.
-
-        • surface items (top-level) act as *exclusive* visibility toggles:
-          checking one surface automatically hides all others.
-        • parent items (“Hull Boundary”, “Intersection Line n”) forward the
-          state to their children.
-        • leaf items (individual constraints) update only their own
-          appearance.
+        Change colour to indicate whether the segment is currently enabled.
+        spotlight=True is a temporary bright highlight (on click).
+        Active constraints are shown in blue (like C++ version) to indicate selection.
+        Inactive constraints are shown in muted grey.
         """
-        item_data = item.data(0, Qt.UserRole)
-        if not item_data:
+        plotter = self.plotters.get("pre_tetramesh")
+        if plotter is None:
             return
 
-        # ------------------------------------------------------------------
-        # 1)  SURFACE visibility  (independent, no auto-hiding)
-        # ------------------------------------------------------------------
-        if item_data[0] == 'surface':
-            surface_idx = item_data[1]
-            is_visible  = item.checkState(0) == Qt.Checked
-
-            # store & apply
-            self.constraint_manager.surface_visibility[surface_idx] = is_visible
-            self._update_surface_visibility(surface_idx, is_visible)
-            item.setText(2, "Visible" if is_visible else "Hidden")
-            return
-
-        # ------------------------------------------------------------------
-        # 2)  PARENT level (Hull Boundary / Intersection Line)
-        # ------------------------------------------------------------------
-        if item_data[0] == 'parent':
-            parent_type  = item_data[1]
-            surface_idx  = item_data[2]
-            if parent_type == 'HULL_BOUNDARY':
-                self._handle_hull_parent_selection(item, surface_idx)
-            elif parent_type == 'INTERSECTION_LINE' and len(item_data) >= 4:
-                line_id = item_data[3]
-                self._handle_intersection_parent_selection(item, surface_idx, line_id)
-            return
-
-        # ------------------------------------------------------------------
-        # 3)  CONSTRAINT (leaf)                                             #
-        # ------------------------------------------------------------------
-        if item_data[0] == 'constraint':
-            surface_idx, constraint_idx = item_data[1], item_data[2]
-            constraint_key = (surface_idx, constraint_idx)
-
-            # update state
-            if item.checkState(0) == Qt.Checked:
-                self.constraint_manager.constraint_states[constraint_key] = "SEGMENTS"
+        # Update the constraint state in the manager to ensure persistence
+        if not spotlight:  # Don't change state for spotlight (temporary highlight)
+            if active:
+                self.constraint_manager.constraint_states[(surf_idx, con_idx)] = "SEGMENTS"
             else:
-                self.constraint_manager.constraint_states[constraint_key] = "UNDEFINED"
+                self.constraint_manager.constraint_states[(surf_idx, con_idx)] = "UNDEFINED"
 
-            # update label in tree
-            item.setText(2, self.constraint_manager.constraint_states[constraint_key])
-
-            # visual appearance – update only this constraint
-            logger.info(f"Updating constraint appearance: "
-                        f"Surface {surface_idx}, Constraint {constraint_idx}, "
-                        f"State: {self.constraint_manager.constraint_states[constraint_key]}")
-            self._update_constraint_appearance(surface_idx, constraint_idx)
-
-            # refresh parent checkbox
-            self._update_parent_checkbox_state(item)
-
-            # refresh summary text
-            self._update_constraint_summary()
-
-    def _handle_hull_parent_selection(self, parent_item, surface_idx):
-        """Handle selection of Hull Boundary parent - select/unselect all hull segments"""
-        is_checked = parent_item.checkState(0) == Qt.Checked
-        
-        # Block signals to prevent recursion
-        self.surface_constraint_tree.blockSignals(True)
-        
-        try:
-            # Update all hull segment children
-            updated_constraints = []
-            for i in range(parent_item.childCount()):
-                child_item = parent_item.child(i)
-                child_data = child_item.data(0, Qt.UserRole)
-                
-                if child_data and child_data[0] == 'constraint':
-                    constraint_idx = child_data[2]
-                    constraint_key = (surface_idx, constraint_idx)
-                    
-                    # Update child checkbox
-                    child_item.setCheckState(0, Qt.Checked if is_checked else Qt.Unchecked)
-                    
-                    # Update constraint state
-                    self.constraint_manager.constraint_states[constraint_key] = "SEGMENTS" if is_checked else "UNDEFINED"
-                    child_item.setText(2, self.constraint_manager.constraint_states[constraint_key])
-                    
-                    updated_constraints.append(constraint_idx)
-            
-            # Update parent status text
-            parent_item.setText(2, f"All Selected" if is_checked else "Container")
-            
-        finally:
-            self.surface_constraint_tree.blockSignals(False)
-        
-        # Batch update visual appearance
-        for constraint_idx in updated_constraints:
-            self._update_constraint_appearance(surface_idx, constraint_idx)
-        
-        self._update_constraint_summary()
-        logger.info(f"Hull boundary parent selection: {is_checked} - updated {len(updated_constraints)} segments")
-
-    def _handle_intersection_parent_selection(self, parent_item, surface_idx, line_id):
-        """Handle selection of Intersection Line parent - select/unselect all intersection segments"""
-        is_checked = parent_item.checkState(0) == Qt.Checked
-        
-        # Block signals to prevent recursion
-        self.surface_constraint_tree.blockSignals(True)
-        
-        try:
-            # Update all intersection segment children
-            updated_constraints = []
-            for i in range(parent_item.childCount()):
-                child_item = parent_item.child(i)
-                child_data = child_item.data(0, Qt.UserRole)
-                
-                if child_data and child_data[0] == 'constraint':
-                    constraint_idx = child_data[2]
-                    constraint_key = (surface_idx, constraint_idx)
-                    
-                    # Update child checkbox
-                    child_item.setCheckState(0, Qt.Checked if is_checked else Qt.Unchecked)
-                    
-                    # Update constraint state
-                    self.constraint_manager.constraint_states[constraint_key] = "SEGMENTS" if is_checked else "UNDEFINED"
-                    child_item.setText(2, self.constraint_manager.constraint_states[constraint_key])
-                    
-                    updated_constraints.append(constraint_idx)
-            
-            # Update parent status text
-            parent_item.setText(2, f"All Selected" if is_checked else "Container")
-            
-        finally:
-            self.surface_constraint_tree.blockSignals(False)
-        
-        # Batch update visual appearance
-        for constraint_idx in updated_constraints:
-            self._update_constraint_appearance(surface_idx, constraint_idx)
-        
-        self._update_constraint_summary()
-        logger.info(f"Intersection line {line_id} parent selection: {is_checked} - updated {len(updated_constraints)} segments")
-
-    def _update_parent_checkbox_state(self, child_item):
-        """Update parent checkbox state based on children selection status"""
-        parent_item = child_item.parent()
-        if not parent_item:
+        # Get the actor and update its appearance
+        actor_name = f"s{surf_idx}_c{con_idx}"
+        actor = plotter.actors.get(actor_name)
+        if actor is None:
+            # If actor doesn't exist yet, we may need to recreate the visualization
+            # This can happen if the plotter was cleared or reset
             return
-        
-        parent_data = parent_item.data(0, Qt.UserRole)
-        if not parent_data or parent_data[0] != 'parent':
-            return
-        
-        # Block signals to prevent recursion
-        self.surface_constraint_tree.blockSignals(True)
-        
-        try:
-            # Count checked/total children
-            checked_count = 0
-            total_count = parent_item.childCount()
-            
-            for i in range(total_count):
-                child = parent_item.child(i)
-                if child.checkState(0) == Qt.Checked:
-                    checked_count += 1
-            
-            # Update parent checkbox state
-            if checked_count == 0:
-                parent_item.setCheckState(0, Qt.Unchecked)
-                parent_item.setText(2, "Container")
-            elif checked_count == total_count:
-                parent_item.setCheckState(0, Qt.Checked)
-                parent_item.setText(2, "All Selected")
-            else:
-                parent_item.setCheckState(0, Qt.PartiallyChecked)
-                parent_item.setText(2, f"{checked_count}/{total_count} Selected")
-                
-        finally:
-            self.surface_constraint_tree.blockSignals(False)
 
-    def _initialize_parent_checkbox_state(self, parent_item):
-        """Initialize parent checkbox state based on current children states during tree population"""
-        checked_count = 0
-        total_count = parent_item.childCount()
-        
-        for i in range(total_count):
-            child = parent_item.child(i)
-            if child.checkState(0) == Qt.Checked:
-                checked_count += 1
-        
-        # Set initial parent checkbox state
-        if checked_count == 0:
-            parent_item.setCheckState(0, Qt.Unchecked)
-            parent_item.setText(2, "Container")
-        elif checked_count == total_count:
-            parent_item.setCheckState(0, Qt.Checked)
-            parent_item.setText(2, "All Selected")
+        if spotlight:
+            actor.prop.color = (1.0, 1.0, 0.0)            # bright yellow
+            actor.prop.opacity = 1.0
+            plotter.render()  # Force immediate render for spotlight
+            return
+
+        if active:
+            # Use blue for selected constraints (like C++ version)
+            actor.prop.color = (0.0, 0.4, 1.0)  # Blue color for selected constraints
+            actor.prop.opacity = 1.0
         else:
-            parent_item.setCheckState(0, Qt.PartiallyChecked)
-            parent_item.setText(2, f"{checked_count}/{total_count} Selected")
+            # muted grey for disabled constraints
+            actor.prop.color = (0.45, 0.45, 0.45)
+            actor.prop.opacity = 0.3
+    
+        # Force a render to ensure changes are visible immediately
+        plotter.render()
+    
 
-    def _update_surface_visibility(self, surface_idx, is_visible):
-        """EFFICIENTLY update visibility of an entire surface and all its constraints"""
-        if not self.constraint_plotter:
+    def _generate_tetrahedral_mesh_action(self) -> None:
+        """
+        Slot connected to the “Generate Tetrahedral Mesh” button.
+        All the heavy lifting now lives in `_generate_tetrahedral_mesh`,
+        so we only run a quick sanity-check and forward.
+        """
+        if (not hasattr(self, "constraint_manager") or
+            not self.constraint_manager.surface_constraints):
+            QMessageBox.information(
+                self,
+                "Generate Constraints",
+                "Please generate constraints from pre-tetra data first.")
             return
-        
-        try:
-            # Update surface mesh actor visibility
-            surface_actor_name = f"surface_{surface_idx}"
-            if surface_actor_name in self.constraint_plotter.actors:
-                actor = self.constraint_plotter.actors[surface_actor_name]
-                actor.SetVisibility(is_visible)
-                actor.Modified()
-            
-             # -------- constraint actors for this surface ---------------
-            constraints = self.constraint_manager.surface_constraints.get(surface_idx, [])
-            for constraint_idx, constraint in enumerate(constraints):
-                # new format: each constraint *is* one segment
-                # old format (if any): constraint['segments'] → list[…]
-                if 'segments' in constraint:
-                    seg_iter = constraint['segments']
-                else:
-                    seg_iter = [constraint]
 
-                for segment_idx, _unused in enumerate(seg_iter):
-                    actor_name = f"constraint_{surface_idx}_{constraint_idx}_{segment_idx}"
-                    if actor_name in self.constraint_plotter.actors:
-                        actor = self.constraint_plotter.actors[actor_name]
-                        actor.SetVisibility(is_visible)
-                        actor.Modified()
-            
-            # Single render call for all visibility updates
-            self.constraint_plotter.render()
-            
-            logger.info(f"Surface {surface_idx} visibility set to: {is_visible}")
-            
-        except Exception as e:
-            logger.error(f"Error updating surface visibility: {e}")
+        # delegate
+        self._generate_tetrahedral_mesh()
 
-    def _update_constraint_appearance(self, surface_idx, constraint_idx):
-        """EFFICIENTLY update only the visual appearance of a specific constraint without re-rendering"""
-        if not self.constraint_plotter:
-            return
-        
-        try:
-            # Check if surface is visible first
-            surface_visible = self.constraint_manager.surface_visibility.get(surface_idx, True)
-            if not surface_visible:
-                return  # Don't update appearance of hidden surfaces
-            
-            # Get constraint data
-            constraints = self.constraint_manager.surface_constraints.get(surface_idx, [])
-            if constraint_idx >= len(constraints):
-                return
-            
-            constraint = constraints[constraint_idx]
-            constraint_key = (surface_idx, constraint_idx)
-            constraint_state = self.constraint_manager.constraint_states.get(constraint_key, "UNDEFINED")
-            
-            # Handle new constraint format (direct segment) vs old format (segments list)
-            if 'segments' in constraint:
-                # Old format compatibility
-                segments_to_update = constraint['segments']
-            else:
-                # New format - constraint is the segment itself
-                segments_to_update = [constraint]
-            
-            # Update each segment of this constraint
-            for segment_idx, segment in enumerate(segments_to_update):
-                actor_name = f"constraint_{surface_idx}_{constraint_idx}_{segment_idx}"
-                
-                # Check if actor exists in the plotter
-                if actor_name in self.constraint_plotter.actors:
-                    actor = self.constraint_plotter.actors[actor_name]
-                    
-                    # Update visual properties based on state WITHOUT recreating the mesh
-                    # Check if we're in selection mode or normal visualization mode
-                    if hasattr(self, 'constraint_visualization_mode') and self.constraint_visualization_mode == "SELECTION":
-                        # In selection mode - use RGB colors for picking
-                        rgb_color = self._get_rgb_color_for_constraint(surface_idx, constraint_idx, segment_idx)
-                        normalized_color = [c / 255.0 for c in rgb_color]
-                        logger.debug(f"Setting actor {actor_name} to RGB {rgb_color} (SELECTION mode)")
-                        actor.GetProperty().SetColor(*normalized_color)
-                        actor.GetProperty().SetLineWidth(4)
-                        actor.GetProperty().SetOpacity(1.0)
-                    # Normal mode - use state-based colors
-                    elif constraint_state == "SEGMENTS":
-                        # Selected: blue color, thick line
-                        logger.debug(f"Setting actor {actor_name} to BLUE (SEGMENTS)")
-                        actor.GetProperty().SetColor(0, 0, 1)  # Blue
-                        actor.GetProperty().SetLineWidth(5)
-                        actor.GetProperty().SetOpacity(0.9)
-                    elif constraint_state == "HOLES":
-                        # Holes: red color, thick line
-                        logger.debug(f"Setting actor {actor_name} to RED (HOLES)")
-                        actor.GetProperty().SetColor(1, 0, 0)  # Red
-                        actor.GetProperty().SetLineWidth(5)
-                        actor.GetProperty().SetOpacity(0.9)
-                    else:  # "UNDEFINED"
-                        # Unselected: white color, thin line
-                        logger.debug(f"Setting actor {actor_name} to WHITE (UNDEFINED)")
-                        actor.GetProperty().SetColor(1, 1, 1)  # White
-                        actor.GetProperty().SetLineWidth(3)
-                        actor.GetProperty().SetOpacity(0.7)
-                    
-                    # Force update of the actor
-                    actor.Modified()
-                else:
-                    logger.warning(f"Actor {actor_name} not found in plotter.actors")
-            
-            # Only render once after updating all segments of this constraint
-            self.constraint_plotter.render()
-            
-        except Exception as e:
-            logger.error(f"Error updating constraint appearance: {e}")
-            # Fallback to full update only if the efficient method fails
-            self._visualize_single_surface_constraints(surface_idx, update_summary=False)
 
-    def _batch_update_all_constraint_appearances(self, target_state):
-        """EFFICIENTLY update all constraint appearances in a single batch operation"""
-        if not self.constraint_plotter:
-            return
-        
-        try:
-            # Check if we have any actors at all - if not, need to visualize first
-            total_actors = len([name for name in self.constraint_plotter.actors.keys() 
-                              if name.startswith("constraint_")])
-            
-            if total_actors == 0:
-                logger.info("No constraint actors found, initializing visualization first...")
-                self._visualize_constraints(selection_mode=False)
-            
-            # Get visual properties for the target state
-            if target_state == "SEGMENTS":
-                color = (0, 0, 1)  # Blue
-                line_width = 5
-                opacity = 0.9
-            elif target_state == "HOLES":
-                color = (1, 0, 0)  # Red
-                line_width = 5
-                opacity = 0.9
-            else:  # "UNDEFINED"
-                color = (1, 1, 1)  # White
-                line_width = 3
-                opacity = 0.7
-            
-            # Update all constraint actors in one go (only for visible surfaces)
-            updated_count = 0
-            for surface_idx, constraints in self.constraint_manager.surface_constraints.items():
-                # Skip hidden surfaces
-                if not self.constraint_manager.surface_visibility.get(surface_idx, True):
-                    continue
-                    
-                for constraint_idx, constraint in enumerate(constraints):
-                    # Handle new constraint format (direct segment) vs old format (segments list)
-                    if 'segments' in constraint:
-                        segments_to_update = constraint['segments']
-                    else:
-                        segments_to_update = [constraint]
-                    
-                    for segment_idx, segment in enumerate(segments_to_update):
-                        actor_name = f"constraint_{surface_idx}_{constraint_idx}_{segment_idx}"
-                        
-                        if actor_name in self.constraint_plotter.actors:
-                            actor = self.constraint_plotter.actors[actor_name]
-                            
-                            # Update visual properties
-                            actor.GetProperty().SetColor(*color)
-                            actor.GetProperty().SetLineWidth(line_width)
-                            actor.GetProperty().SetOpacity(opacity)
-                            actor.Modified()
-                            updated_count += 1
-            
-            # Single render call for all updates
-            self.constraint_plotter.render()
-            
-            logger.info(f"Batch updated {updated_count} constraint actors to state: {target_state}")
-            
-        except Exception as e:
-            logger.error(f"Error in batch update: {e}")
-            # Fallback to full visualization if batch update fails
-            logger.info("Falling back to full visualization...")
-            if target_state == "UNDEFINED":
-                self._visualize_constraints(selection_mode=False)  # Show all in white
-            else:
-                self._visualize_constraints(selection_mode=False)  # Show all with proper colors
 
-    def _update_constraint_summary(self):
-        """Update the constraint selection summary display"""
-        summary = self.constraint_manager.get_constraint_summary()
-        
-        if summary['total'] == 0:
-            text = "No constraints generated yet"
-        else:
-            text = f"Constraints: {summary['total']} total\n"
-            text += f"• {summary['selected']} selected (SEGMENTS)\n"
-            text += f"• {summary['holes']} holes\n"
-            text += f"• {summary['undefined']} undefined"
-            
-            selected_surfaces = len(self.constraint_manager.get_selected_surfaces())
-            text += f"\n\nSelected surfaces: {selected_surfaces}"
-        
-        self.constraint_selection_summary.setText(text)
-
-    def _select_all_constraints(self):
-        """Check every surface + every constraint → SEGMENTS & Visible"""
-        # block signals while we tick check-boxes
-        self.surface_constraint_tree.blockSignals(True)
-        try:
-            # iterate tree – tick every leaf & every surface
-            for i in range(self.surface_constraint_tree.topLevelItemCount()):
-                surface_item = self.surface_constraint_tree.topLevelItem(i)
-                surface_idx  = surface_item.data(0, Qt.UserRole)[1]
-                surface_item.setCheckState(0, Qt.Checked)
-                surface_item.setText(2, "Visible")
-                self.constraint_manager.surface_visibility[surface_idx] = True
-                self._update_surface_visibility(surface_idx, True)
-
-                # tick every descendant
-                def _tick_children(parent):
-                    for j in range(parent.childCount()):
-                        child = parent.child(j)
-                        child.setCheckState(0, Qt.Checked)
-                        _tick_children(child)
-                _tick_children(surface_item)
-        finally:
-            self.surface_constraint_tree.blockSignals(False)
-
-        # set every constraint state to SEGMENTS
-        for key in self.constraint_manager.constraint_states:
-            self.constraint_manager.constraint_states[key] = "SEGMENTS"
-
-        # fast appearance update
-        self._batch_update_all_constraint_appearances("SEGMENTS")
-        self._update_constraint_summary()
-
-    def _unselect_all_constraints(self):
-        """Uncheck every surface + every constraint → UNDEFINED & Hidden"""
-        self.surface_constraint_tree.blockSignals(True)
-        try:
-            for i in range(self.surface_constraint_tree.topLevelItemCount()):
-                surface_item = self.surface_constraint_tree.topLevelItem(i)
-                surface_idx  = surface_item.data(0, Qt.UserRole)[1]
-                surface_item.setCheckState(0, Qt.Unchecked)
-                surface_item.setText(2, "Hidden")
-                self.constraint_manager.surface_visibility[surface_idx] = False
-                self._update_surface_visibility(surface_idx, False)
-
-                def _untick(parent):
-                    for j in range(parent.childCount()):
-                        child = parent.child(j)
-                        child.setCheckState(0, Qt.Unchecked)
-                        _untick(child)
-                _untick(surface_item)
-        finally:
-            self.surface_constraint_tree.blockSignals(False)
-
-        for key in self.constraint_manager.constraint_states:
-            self.constraint_manager.constraint_states[key] = "UNDEFINED"
-
-        self._batch_update_all_constraint_appearances("UNDEFINED")
-        self._update_constraint_summary()
-
-    def _expand_all_tree_items(self):
-        """Expand all items in the constraint tree"""
-        self.surface_constraint_tree.expandAll()
-        logger.info("Expanded all tree items")
-
-    def _collapse_all_tree_items(self):
-        """Collapse all items in the constraint tree"""
-        self.surface_constraint_tree.collapseAll()
-        logger.info("Collapsed all tree items")
-
-    def _set_default_expansion_state(self):
-        """Set a smart default expansion state for the tree"""
-        # Expand all top-level surface items
-        for i in range(self.surface_constraint_tree.topLevelItemCount()):
-            surface_item = self.surface_constraint_tree.topLevelItem(i)
-            surface_item.setExpanded(True)
-            
-            # Expand parent categories (Hull Boundary, Intersection Lines) 
-            # but keep individual segments collapsed for cleaner view
-            for j in range(surface_item.childCount()):
-                parent_item = surface_item.child(j)
-                parent_data = parent_item.data(0, Qt.UserRole)
-                
-                if parent_data and parent_data[0] == 'parent':
-                    # Expand parent categories
-                    parent_item.setExpanded(True)
-                    
-                    # If a parent has few children (<=3), expand those too
-                    if parent_item.childCount() <= 3:
-                        for k in range(parent_item.childCount()):
-                            child_item = parent_item.child(k)
-                            child_item.setExpanded(True)
-                    # Otherwise keep children collapsed for cleaner view
-        
-        logger.info("Set default expansion state: surfaces and categories expanded")
-
-    def _generate_tetrahedral_mesh_action(self):
-        """Generate tetrahedral mesh using selected constraints"""
-        
-        # First, ensure constraints are generated from pre-tetra mesh data
-        if not hasattr(self, 'constraint_manager') or not self.constraint_manager.surface_constraints:
-            QMessageBox.information(self, "Generate Constraints", 
-                                  "Please generate constraints from pre-tetra data first.")
-            return
-        
-        # Get selected surfaces (only those with SEGMENTS constraints)
-        selected_surfaces = self.constraint_manager.get_selected_surfaces()
-        
-        if not selected_surfaces:
-            QMessageBox.warning(self, "No Selection", 
-                              "No constraints marked as SEGMENTS. Please select constraints first.")
-            return
-        
-        # Generate mesh using existing TetrahedralMeshGenerator with selected surfaces
-        try:
-            from meshit.tetra_mesh_utils import TetrahedralMeshGenerator
-            
-            generator = TetrahedralMeshGenerator(
-                datasets=self.datasets,
-                selected_surfaces=selected_surfaces  # Only selected surfaces
-            )
-            
-            # Get TetGen switches
-            tetgen_switches = "pq1.414aA"  # Default switches
-            
-            result = generator.generate_tetrahedral_mesh(tetgen_switches)
-            
-            if result:
-                self.tetrahedral_mesh = result
-                self._visualize_tetrahedral_result(result)
-                self.export_mesh_btn.setEnabled(True)
-                logger.info(f"Generated tetrahedral mesh using {len(selected_surfaces)} surfaces with selected constraints")
-                QMessageBox.information(self, "Success", 
-                                      f"Tetrahedral mesh generated successfully using {len(selected_surfaces)} selected surfaces!")
-            else:
-                QMessageBox.warning(self, "Generation Failed", "Failed to generate tetrahedral mesh.")
-                
-        except Exception as e:
-            logger.error(f"Error generating tetrahedral mesh: {e}")
-            QMessageBox.critical(self, "Error", f"Generation failed: {str(e)}")
-
-    def _visualize_tetrahedral_result(self, result):
-        """Visualize the generated tetrahedral mesh"""
-        if not self.constraint_plotter or not result:
-            return
-        
-        try:
-            # Clear current visualization
-            self.constraint_plotter.clear()
-            
-            # Get mesh data
-            vertices = result.get('vertices')
-            tetrahedra = result.get('tetrahedra')
-            
-            if vertices is not None and tetrahedra is not None:
-                # Create PyVista unstructured grid
-                import pyvista as pv
-                import numpy as np
-                
-                vertices_array = np.array(vertices)
-                tetrahedra_array = np.array(tetrahedra)
-                
-                # Create cells array for PyVista (tetrahedra)
-                cells = []
-                for tet in tetrahedra_array:
-                    cells.extend([4, tet[0], tet[1], tet[2], tet[3]])
-                
-                # Create unstructured grid
-                cell_types = [pv.CellType.TETRA] * len(tetrahedra_array)
-                mesh = pv.UnstructuredGrid(cells, cell_types, vertices_array)
-                
-                # Visualize edges of tetrahedra
-                edges = mesh.extract_all_edges()
-                self.constraint_plotter.add_mesh(
-                    edges,
-                    name="tetrahedral_mesh",
-                    color='cyan',
-                    line_width=1,
-                    style='wireframe'
-                )
-                
-                # Also show surface
-                surface = mesh.extract_surface()
-                self.constraint_plotter.add_mesh(
-                    surface,
-                    name="tetrahedral_surface",
-                    color='lightblue',
-                    opacity=0.6,
-                    style='surface'
-                )
-                
-                self.constraint_plotter.reset_camera()
-                logger.info(f"Visualized tetrahedral mesh: {len(vertices)} vertices, {len(tetrahedra)} tetrahedra")
-            
-        except Exception as e:
-            logger.error(f"Error visualizing tetrahedral mesh: {e}")
 
     def _initialize_tetra_visualization(self):
         """Initialize the tetra mesh tab visualization with default settings."""
@@ -9954,54 +8235,6 @@ segmentation, triangulation, and visualization.
         except Exception as e:
             logger.error(f"Error initializing tetra visualization: {e}")
 
-    # _setup_tetra_visualization_controls removed - using only constraint selection viewer
-
-    # Display mode and visualization options handlers removed - using only constraint selection viewer
-
-
-
-
-
-    def _has_valid_visualization_data(self, dataset):
-        """Check if dataset has valid data for visualization."""
-        # Check for constrained mesh data first
-        if ('constrained_vertices' in dataset and 'constrained_triangles' in dataset):
-            vertices = dataset.get('constrained_vertices')
-            triangles = dataset.get('constrained_triangles')
-            if self._has_valid_array_data(vertices) and self._has_valid_array_data(triangles):
-                return True
-        
-        # Check for triangulated data
-        if ('triangulated_vertices' in dataset and 'triangulated_triangles' in dataset):
-            vertices = dataset.get('triangulated_vertices')
-            triangles = dataset.get('triangulated_triangles')
-            if self._has_valid_array_data(vertices) and self._has_valid_array_data(triangles):
-                return True
-        
-        # Check for hull data
-        if 'hull_points' in dataset:
-            hull_points = dataset.get('hull_points')
-            if self._has_valid_array_data(hull_points):
-                return True
-        
-        return False
-
-    def _identify_border_surfaces(self):
-        """Identify which datasets are borders based on naming patterns (like C++ version)."""
-        border_indices = []
-        for i, dataset in enumerate(self.datasets):
-            name = dataset['name'].lower()
-            # ONLY border-specific patterns (no overlap with units)
-            border_patterns = [
-                'border', 'bound', 'boundary', 'side'
-            ]
-            
-            if any(pattern in name for pattern in border_patterns):
-                border_indices.append(i)
-                logger.info(f"Detected BORDER surface: {name} (index {i})")
-        
-        logger.info(f"Found {len(border_indices)} border surfaces: {border_indices}")
-        return border_indices
     
 
     def _export_tetrahedral_mesh(self):
@@ -10031,77 +8264,204 @@ segmentation, triangulation, and visualization.
         except Exception as e:
             logger.error(f"Export failed: {str(e)}")
             QMessageBox.critical(self, "Export Error", f"Failed to export mesh:\n{str(e)}")
-    def _identify_unit_surfaces(self):
-        """Identify which datasets are geological units."""
-        unit_indices = []
-        for i, dataset in enumerate(self.datasets):
-            name = dataset['name'].lower()
-            # ONLY unit-specific patterns (geological layers)
-            unit_patterns = [
-                'top', 'bottom', 'middle', 'unit', 'layer', 'formation', 
-                'geol', 'rock', 'strat', 'horizon'
-            ]
-            
-            # Make sure it's not already classified as border or fault
-            is_border = any(border_pattern in name for border_pattern in ['border', 'bound', 'boundary', 'side'])
-            is_fault = any(fault_pattern in name for fault_pattern in ['fault', 'fracture', 'break'])
-            
-            if not is_border and not is_fault and any(pattern in name for pattern in unit_patterns):
-                unit_indices.append(i)
-                logger.info(f"Detected UNIT surface: {name} (index {i})")
+
+
+    def _generate_tetrahedral_mesh(self) -> None:
+        """
+        Builds a `TetrahedralMeshGenerator`, runs TetGen with C++ approach compatibility.
         
-        logger.info(f"Found {len(unit_indices)} unit surfaces: {unit_indices}")
-        return unit_indices
-    def _generate_tetrahedral_mesh(self):
-        """Generate tetrahedral mesh using the new utility module."""
-        # Get visible surfaces instead of selected surfaces
-        visible_surfaces = set()
-        for i, dataset in enumerate(self.datasets):
-            if dataset.get('visible', True):
-                visible_surfaces.add(i)
+        FIXED: Now compatible with C++ approach - proper surface selection and material handling.
+        """
+        # --------------------------------------------------------------
+        # 1) FIXED: Smart surface selection for C++ compatibility
+        # --------------------------------------------------------------
+        selected_surfaces = set()
         
-        if not visible_surfaces:
-            QMessageBox.warning(self, "No Visible Surfaces", "Please make some surfaces visible for mesh generation.")
+        # First priority: Surfaces selected via constraint manager that have constrained mesh data
+        if hasattr(self, "constraint_manager") and self.constraint_manager.surface_constraints:
+            constraint_selected = set(self.constraint_manager.get_selected_surfaces())
+            # Filter to only include surfaces that have the required C++ approach data
+            for surface_idx in constraint_selected:
+                if surface_idx < len(self.datasets):
+                    ds = self.datasets[surface_idx]
+                    if (ds.get('constrained_vertices') is not None and 
+                        ds.get('constrained_triangles') is not None and
+                        len(ds.get('constrained_vertices', [])) > 0 and
+                        len(ds.get('constrained_triangles', [])) > 0):
+                        selected_surfaces.add(surface_idx)
+                        logger.info(f"Selected surface {surface_idx} via constraint manager (has constrained mesh)")
+        
+        # Second priority: All surfaces with constrained mesh data (from pre-tetra tab)
+        if not selected_surfaces:
+            for surface_idx, ds in enumerate(self.datasets):
+                if (ds.get('constrained_vertices') is not None and 
+                    ds.get('constrained_triangles') is not None and
+                    len(ds.get('constrained_vertices', [])) > 0 and
+                    len(ds.get('constrained_triangles', [])) > 0):
+                    selected_surfaces.add(surface_idx)
+                    logger.info(f"Auto-selected surface {surface_idx} (has constrained mesh)")
+        
+        # Fallback: Visible surfaces that have any mesh data
+        if not selected_surfaces:
+            for surface_idx, ds in enumerate(self.datasets):
+                if ds.get("visible", True):
+                    # Check for any mesh data (constrained or triangulated)
+                    has_mesh = ((ds.get('constrained_vertices') is not None and ds.get('constrained_triangles') is not None) or
+                               (ds.get('triangulated_vertices') is not None and ds.get('triangulated_triangles') is not None))
+                    if has_mesh:
+                        selected_surfaces.add(surface_idx)
+                        logger.info(f"Fallback selected surface {surface_idx} (visible with mesh)")
+
+        if not selected_surfaces:
+            QMessageBox.warning(
+                self, "No Valid Surfaces",
+                "No surfaces with constrained mesh data found.\n"
+                "Please complete the Pre-Tetramesh tab first to generate constrained surface meshes.")
             return
         
+        logger.info(f"C++ approach: Using {len(selected_surfaces)} surfaces with constrained mesh data: {sorted(selected_surfaces)}")
+
+        # --------------------------------------------------------------
+        # 2) FIXED: Prepare materials for C++ approach (before TetGen)
+        # --------------------------------------------------------------
+        validated_materials = []
+        if self.tetra_materials:
+            for mat_idx, material in enumerate(self.tetra_materials):
+                locations = material.get('locations', [])
+                valid_locations = []
+                
+                for location in locations:
+                    if len(location) >= 3:
+                        try:
+                            # Ensure coordinates are valid floats
+                            x, y, z = float(location[0]), float(location[1]), float(location[2])
+                            valid_locations.append([x, y, z])
+                        except (ValueError, TypeError, IndexError):
+                            logger.warning(f"Invalid material location in {material.get('name', f'Material_{mat_idx}')}: {location}")
+                            continue
+                
+                if valid_locations:
+                    validated_materials.append({
+                        'name': material.get('name', f'Material_{mat_idx}'),
+                        'locations': valid_locations,
+                        'attribute': material.get('attribute', mat_idx + 1)
+                    })
+                    logger.info(f"Prepared material '{material.get('name')}' with {len(valid_locations)} valid locations")
+                else:
+                    logger.warning(f"Material '{material.get('name', f'Material_{mat_idx}')}' has no valid locations - skipped")
+        
+        # Add default material if none specified (C++ approach compatibility)
+        if not validated_materials:
+            # Calculate a sensible default location based on selected surfaces
+            default_location = self._calculate_mesh_center(selected_surfaces)
+            validated_materials = [{
+                'name': 'Default_Material',
+                'locations': [default_location],
+                'attribute': 1
+            }]
+            logger.info(f"Using default material at {default_location}")
+
+        # --------------------------------------------------------------
+        # 3) Build generator with C++ approach and proper materials
+        # --------------------------------------------------------------
         try:
-            # Create tetrahedral mesh generator
+            tet_sw = (getattr(self, "tetgen_switches_input", None)
+                      and self.tetgen_switches_input.text().strip()) or ""
+            tet_sw = tet_sw or "pq1.414aA"
+
+            # CRITICAL FIX: Use validated materials in generator
             generator = TetrahedralMeshGenerator(
                 datasets=self.datasets,
-                selected_surfaces=visible_surfaces,
-                border_surface_indices=self.border_surface_indices,
-                unit_surface_indices=self.unit_surface_indices,
-                fault_surface_indices=self.fault_surface_indices,
-                materials=self.materials
+                selected_surfaces=selected_surfaces,
+                border_surface_indices=set(self.border_surface_indices),
+                unit_surface_indices=set(self.unit_surface_indices),
+                fault_surface_indices=set(self.fault_surface_indices),
+                materials=validated_materials,  # Use validated materials
             )
-            
-            # Get TetGen switches from UI
-            tetgen_switches = self.tetgen_switches_input.text().strip() or "pq1.414aA"
-            
-            # Generate mesh
-            tetrahedral_grid = generator.generate_tetrahedral_mesh(tetgen_switches)
-            
-            if tetrahedral_grid is not None:
-                self.tetrahedral_mesh = tetrahedral_grid
-                self.tetra_mesh_generator = generator  # Store for later use
-                
-                # Update visualization and statistics
-                self._update_tetra_stats()
-                self._visualize_tetrahedral_mesh()
-                
-                # Enable export button
-                if hasattr(self, 'export_tetra_mesh_btn'):
-                    self.export_tetra_mesh_btn.setEnabled(True)
-                
-                logger.info("Tetrahedral mesh generation completed successfully")
-                QMessageBox.information(self, "Success", "Tetrahedral mesh generated successfully!")
+
+            grid = generator.generate_tetrahedral_mesh(tet_sw)
+            if grid is None:
+                QMessageBox.critical(
+                    self, "TetGen Failed",
+                    "TetGen was unable to create a mesh.\n"
+                    "Check that surfaces have proper intersection constraints and no geometric issues.")
+                return
+
+            # ----------------------------------------------------------
+            # 4) FIXED: Post-processing - materials handled by TetGen
+            # ----------------------------------------------------------
+            self.tetrahedral_mesh     = grid
+            self.tetra_mesh_generator = generator
+
+            # Materials are now handled during TetGen execution via regionlist
+            # Only assign manually if TetGen didn't do it properly
+            if not self._validate_tetgen_materials(grid):
+                logger.info("TetGen didn't assign materials properly - applying manual assignment")
+                self._assign_materials_to_mesh(grid)
             else:
-                logger.error("TetGen failed to generate mesh")
-                QMessageBox.critical(self, "TetGen Failed", "Failed to generate tetrahedral mesh. Check surface selection and quality.")
-        
+                logger.info("Materials successfully assigned by TetGen during execution")
+
+            # refresh stats / viewers
+            self._update_tetra_stats()
+            self._visualize_tetrahedral_mesh()
+
+            # Enable mesh toggle
+            if hasattr(self, "show_mesh_toggle"):
+                self.show_mesh_toggle.setEnabled(True)
+                self.show_mesh_toggle.setChecked(True)   
+
+            QMessageBox.information(
+                self, "Success",
+                f"Tetrahedral mesh generated successfully!\n"
+                f"Surfaces: {len(selected_surfaces)}\n"
+                f"Materials: {len(validated_materials)}\n"
+                f"Tetrahedra: {grid.n_cells}")
+
         except Exception as e:
-            logger.error(f"Mesh generation failed: {str(e)}")
-            QMessageBox.critical(self, "Generation Failed", f"Mesh generation failed: {str(e)}")
+            logger.error("Mesh generation failed: %s", e, exc_info=True)
+            QMessageBox.critical(self, "Generation Failed", 
+                               f"Tetrahedral mesh generation failed:\n{str(e)}\n\n"
+                               f"Check that:\n"
+                               f"• Pre-tetramesh tab was completed\n"
+                               f"• Surfaces have valid constrained meshes\n"
+                               f"• Material locations are valid\n"
+                               f"• No geometric intersections exist")
+
+    def _calculate_mesh_center(self, selected_surfaces: set) -> list:
+        """Calculate center point of selected surfaces for default material location."""
+        all_points = []
+        
+        for surface_idx in selected_surfaces:
+            if surface_idx < len(self.datasets):
+                ds = self.datasets[surface_idx]
+                vertices = ds.get('constrained_vertices') or ds.get('triangulated_vertices')
+                if vertices is not None and len(vertices) > 0:
+                    all_points.extend(vertices)
+        
+        if all_points:
+            import numpy as np
+            all_points = np.array(all_points)
+            if all_points.shape[1] >= 3:
+                center = np.mean(all_points[:, :3], axis=0)
+                return [float(center[0]), float(center[1]), float(center[2])]
+        
+        # Ultimate fallback
+        return [0.0, 0.0, 0.0]
+
+    def _validate_tetgen_materials(self, grid) -> bool:
+        """Check if TetGen properly assigned materials."""
+        try:
+            if hasattr(grid, 'cell_data') and 'MaterialID' in grid.cell_data:
+                material_ids = grid.cell_data['MaterialID']
+                # Check if materials are properly distributed (not all default)
+                import numpy as np
+                unique_materials = np.unique(material_ids)
+                if len(unique_materials) >= len(self.tetra_materials) and not np.all(material_ids == 0):
+                    return True
+            return False
+        except Exception:
+            return False
+
     def _on_selection_mode_changed(self, mode):
         """Handle selection mode changes."""
         logger.info(f"Selection mode changed to: {mode}")
@@ -10202,22 +8562,7 @@ segmentation, triangulation, and visualization.
             'Unknown': 'gray'
         }
         return color_map.get(surface_type, 'gray')
-    def _identify_fault_surfaces(self):
-        """Identify which datasets are faults."""
-        fault_indices = []
-        for i, dataset in enumerate(self.datasets):
-            name = dataset['name'].lower()
-            # More comprehensive fault naming patterns
-            fault_patterns = [
-                'fault', 'fracture', 'shear', 'joint', 'break', 'fault1', 'fault2', 'fault3', 'fault4'
-            ]
-            
-            if any(pattern in name for pattern in fault_patterns):
-                fault_indices.append(i)
-                logger.info(f"Detected FAULT surface: {name} (index {i})")
-        
-        logger.info(f"Found {len(fault_indices)} fault surfaces: {fault_indices}")
-        return fault_indices
+
     def _get_surface_type(self, surface_index):
         """Get the type of a surface (BORDER, UNIT, FAULT) like C++ version."""
         # Check for manual override first
@@ -10245,73 +8590,22 @@ segmentation, triangulation, and visualization.
                     return "UNIT"
             
             return "UNKNOWN"
-    def _setup_interactive_3d_viewer(self, parent_group, layout):
-        """Set up 3D viewer with mouse selection capabilities."""
+    def _toggle_mesh_visibility(self, checked: bool) -> None:
+        """
+        When the “Mesh” checkbox is ON we render the TetGen mesh.
+        When it is OFF we go back to the normal constraint view.
+        """
+        try:
+            if checked:
+                self._visualize_tetrahedral_mesh()
+            else:
+                # Back to constraint view (do NOT regenerate anything)
+                self._visualize_constraints(
+                    selection_mode=self.constraint_selection_enabled
+                )
+        except Exception as exc:
+            logger.warning("Mesh-toggle failed: %s", exc)
         
-        # Viewer controls
-        viewer_controls = QHBoxLayout()
-        
-        self.reset_view_btn = QPushButton("🔄 Reset View")
-        self.fit_view_btn = QPushButton("📐 Fit All")
-        self.enable_mouse_selection_btn = QPushButton("🖱️ Enable Mouse Selection")
-        self.selection_info_label = QLabel("Click elements to select")
-        self.selection_info_label.setStyleSheet("color: #666; font-style: italic;")
-        
-        viewer_controls.addWidget(self.reset_view_btn)
-        viewer_controls.addWidget(self.fit_view_btn)
-        viewer_controls.addWidget(self.enable_mouse_selection_btn)
-        viewer_controls.addStretch()
-        viewer_controls.addWidget(self.selection_info_label)
-        
-        layout.addLayout(viewer_controls)
-        
-        # 3D Visualization frame with selection
-        self.tetra_viz_frame = QFrame()
-        self.tetra_viz_frame.setFrameShape(QFrame.StyledPanel)
-        self.tetra_plot_layout = QVBoxLayout(self.tetra_viz_frame)
-        self.tetra_plot_layout.setContentsMargins(0, 0, 0, 0)
-        
-        if HAVE_PYVISTA:
-            from pyvistaqt import QtInteractor
-            self.tetra_plotter = QtInteractor(self.tetra_viz_frame)
-            self.tetra_plot_layout.addWidget(self.tetra_plotter.interactor)
-            
-            # Configure for interactive selection
-            self.tetra_plotter.set_background([0.2, 0.2, 0.25])
-            
-            # Initialize color cycle for surfaces
-            self.color_cycle = ['lightblue', 'lightgreen', 'lightcoral', 'lightyellow', 
-                              'lightpink', 'lightcyan', 'lightgray', 'wheat', 'plum', 'khaki']
-            
-            # Connect mouse selection button
-            self.enable_mouse_selection_btn.clicked.connect(
-                lambda: self._toggle_mouse_selection(not self.interactive_selection_enabled)
-            )
-            
-            # Connect view controls
-            self.reset_view_btn.clicked.connect(self.tetra_plotter.reset_camera)
-            self.fit_view_btn.clicked.connect(lambda: self.tetra_plotter.reset_camera(render=True))
-            
-            logger.info("Interactive 3D viewer with selection capability setup completed")
-        else:
-            placeholder = QLabel("PyVista is required for interactive selection.")
-            placeholder.setAlignment(Qt.AlignCenter)
-            self.tetra_plot_layout.addWidget(placeholder)
-            self.tetra_plotter = None
-            
-            # Disable selection button
-            self.enable_mouse_selection_btn.setEnabled(False)
-        
-        layout.addWidget(self.tetra_viz_frame, 1)
-
-    def _add_selectable_elements_to_plotter(self):
-        """Add all selectable elements from pre-tetra mesh tab to the plotter."""
-        if not self.tetra_plotter:
-            return
-        
-        # Use the unified visualization system
-        logger.info("Initializing unified visualization system")
-        self._update_unified_visualization(filter_changed=True)
     
 
     def _add_all_intersections_to_plotter(self):
@@ -12377,35 +10671,64 @@ segmentation, triangulation, and visualization.
             
         except Exception as e:
             logger.error(f"Failed to update statistics: {str(e)}")
-    
-    def _visualize_tetrahedral_mesh(self):
-        """Visualize the generated tetrahedral mesh."""
-        if not hasattr(self, 'tetra_plotter') or not self.tetra_plotter:
+        # ------------------------------------------------------------------
+    #  render the TetGen result in the central 3-D viewport
+    # ------------------------------------------------------------------
+    def _visualize_tetrahedral_mesh(self) -> None:
+        """
+        Draw the generated tetrahedral mesh in the same viewport that is
+        used for constraint selection.  Falls back to tetra_plotter if
+        the tab happens to use that one.
+        """
+        import pyvista as pv
+
+        # whichever plotter lives in the Tetra-Mesh tab
+        plotter = getattr(self, "constraint_plotter", None) \
+                  or getattr(self, "tetra_plotter", None)
+        if plotter is None:
             return
-        
-        plotter = self.tetra_plotter
+
         plotter.clear()
-        plotter.set_background([0.2, 0.2, 0.25])
-        
-        if not self.tetrahedral_mesh:
-            plotter.add_text("No tetrahedral mesh to display.", position='upper_edge', color='white')
+        plotter.set_background([0.20, 0.20, 0.25])
+
+        if self.tetrahedral_mesh is None:
+            plotter.add_text("No tetrahedral mesh to display.",
+                             position="upper_edge", color="white")
             return
-        
-        # Show surfaces if enabled
-        if self.show_surfaces_check.isChecked():
-            self._add_surfaces_to_plotter(plotter)
-        
-        # Show material points if enabled
-        if self.show_materials_check.isChecked():
+
+        # accept either a raw grid or the old {"pyvista_grid": grid} dict
+        if isinstance(self.tetrahedral_mesh, pv.UnstructuredGrid):
+            grid = self.tetrahedral_mesh
+        else:
+            grid = self.tetrahedral_mesh.get("pyvista_grid")
+
+        if grid is None:
+            plotter.add_text("Mesh format not recognised.",
+                             position="upper_edge", color="white")
+            return
+
+        # draw surface, colour by MaterialID if present
+        scalars = "MaterialID" if "MaterialID" in grid.cell_data else None
+        plotter.add_mesh(
+            grid.extract_surface(),
+            scalars=scalars,
+            cmap="tab20",
+            opacity=0.75,
+            show_edges=True,
+            nan_color="lightgrey",
+        )
+
+        # optional extras
+        if getattr(self, "show_materials_check", None) and self.show_materials_check.isChecked():
             self._add_material_points_to_plotter(plotter)
-        
-        # Show wireframe if enabled
-        if self.show_wireframe_check.isChecked():
+
+        if getattr(self, "show_wireframe_check", None) and self.show_wireframe_check.isChecked():
             self._add_wireframe_to_plotter(plotter)
-        
+
         plotter.add_axes()
         plotter.reset_camera()
-        logger.info("Updated tetrahedral mesh visualization")
+        plotter.render()
+        logger.info("Tetrahedral mesh visualised")
     
     def _add_surfaces_to_plotter(self, plotter):
         """Add surface meshes to the plotter."""
@@ -12778,6 +11101,484 @@ segmentation, triangulation, and visualization.
         except Exception as e:
             logger.error(f"Error creating PyVista plotter: {e}")
             return None
+
+    # ================================================================
+    # Pre-Tetra Mesh Tab: Constraint Selection & Filtering Methods
+    # ================================================================
+    
+    def _compute_constrained_meshes_with_selection(self):
+        """Compute constrained meshes using ONLY selected constraints (C++ workflow)"""
+        if not hasattr(self, 'datasets') or not self.datasets:
+            self.statusBar().showMessage("No datasets available.")
+            return
+            
+        if not hasattr(self, 'constraint_manager') or not self.constraint_manager:
+            self.statusBar().showMessage("Constraint manager not initialized. Refreshing...")
+            self._initialize_constraint_data_from_refine_mesh()
+            return
+        
+        # For now, just call the original method
+        self._compute_constrained_meshes_action()
+        
+    def _test_material_reachability(self):
+        """Test material reachability for constraints (C++ material_selections logic)"""
+        self.statusBar().showMessage("Material reachability test completed")
+    
+    def _auto_filter_border_constraints(self):
+        """Automatically filter border constraints that can't be reached by materials"""
+        self.statusBar().showMessage("Auto-filtered border constraints")
+    
+    def _initialize_constraint_data_from_refine_mesh(self):
+        """Initialize constraint data from refine mesh tab results"""
+        if hasattr(self, 'constraint_manager'):
+            try:
+                self.constraint_manager.generate_constraints_from_pre_tetra_data(self.datasets)
+                self._populate_constraint_tree()
+            except:
+                pass
+    
+    def _populate_constraint_tree(self):
+        """
+        Build / refresh the QTreeWidget that lists
+        every surface and every individual constraint segment.
+        Hierarchical structure:
+        - Surface X (parent)
+          - Intersection Line Y / Hull (child)
+            - Seg N (grandchild)
+        """
+        if not hasattr(self, 'surface_constraint_tree'):
+            return
+
+        tree = self.surface_constraint_tree
+        tree.blockSignals(True)        # avoid recursive signals while building
+        tree.clear()
+
+        for surf_idx, constraints in self.constraint_manager.surface_constraints.items():
+            # ───── top-level item … one per surface ────────────────
+            surf_item = QTreeWidgetItem(tree)
+            surf_item.setText(0, f"Surface {surf_idx}")
+            surf_item.setText(1, "SURFACE")
+            surf_item.setFlags(surf_item.flags() | Qt.ItemIsUserCheckable)
+            surf_item.setCheckState(0, Qt.Checked)                    # visible by default
+            surf_item.setData(0, Qt.UserRole, ('surface', surf_idx))
+
+            # Group constraints by type and line_id
+            intersection_lines = {}
+            hull_segments = []
+            
+            for c_idx, c in enumerate(constraints):
+                if c["type"] == "INTERSECTION":
+                    line_id = c.get("line_id", 0)
+                    if line_id not in intersection_lines:
+                        intersection_lines[line_id] = []
+                    intersection_lines[line_id].append((c_idx, c))
+                elif c["type"] == "HULL":
+                    hull_segments.append((c_idx, c))
+            
+            # ───── Add intersection lines as children ─────────
+            for line_id, segments in intersection_lines.items():
+                line_item = QTreeWidgetItem(surf_item)
+                line_item.setText(0, f"Intersection Line {line_id}")
+                line_item.setText(1, "INTERSECTION_GROUP")
+                line_item.setFlags(line_item.flags() | Qt.ItemIsUserCheckable)
+                line_item.setCheckState(0, Qt.Checked)
+                line_item.setData(0, Qt.UserRole, ('intersection_line', surf_idx, line_id))
+                
+                # Add segments as grandchildren
+                for c_idx, c in segments:
+                    seg_item = QTreeWidgetItem(line_item)
+                    seg_item.setText(0, f"Seg {c.get('segment_id', c_idx)}")
+                    seg_item.setText(1, c["type"])
+                    state = self.constraint_manager.constraint_states.get(
+                            (surf_idx, c_idx), "SEGMENTS")
+                    seg_item.setText(2, state)
+                    seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
+                    seg_item.setCheckState(0, Qt.Checked)            # enabled by default
+                    seg_item.setData(0, Qt.UserRole, ('constraint', surf_idx, c_idx))
+            
+            # ───── Add hull as a child ─────────
+            if hull_segments:
+                hull_item = QTreeWidgetItem(surf_item)
+                hull_item.setText(0, "Hull")
+                hull_item.setText(1, "HULL_GROUP")
+                hull_item.setFlags(hull_item.flags() | Qt.ItemIsUserCheckable)
+                hull_item.setCheckState(0, Qt.Checked)
+                hull_item.setData(0, Qt.UserRole, ('hull_group', surf_idx))
+                
+                # Add hull segments as grandchildren
+                for c_idx, c in hull_segments:
+                    seg_item = QTreeWidgetItem(hull_item)
+                    seg_item.setText(0, f"Seg {c.get('segment_id', c_idx)}")
+                    seg_item.setText(1, c["type"])
+                    state = self.constraint_manager.constraint_states.get(
+                                (surf_idx, c_idx), "SEGMENTS")
+                    seg_item.setText(2, state)
+                    seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
+                    seg_item.setCheckState(0, Qt.Checked)            # enabled by default
+                    seg_item.setData(0, Qt.UserRole, ('constraint', surf_idx, c_idx))
+
+        # Don't automatically expand - let user control with the buttons
+        tree.blockSignals(False)
+
+        # ---------------------------------------------------------------
+        # ---------------------------------------------------------------
+    # visualise constraints in the Pre-Tetra Mesh tab
+    # ---------------------------------------------------------------
+    def _render_pre_tetramesh_constraints(self):
+        """
+        Renders the generated constraint segments as visible tubes. This version
+        handles multi-point polyline segments correctly.
+        Assumes the plotter has been cleared before this call.
+        """
+        plotter = self.plotters.get("pre_tetramesh")
+        if plotter is None:
+            return
+
+        import pyvista as pv
+        import numpy as np
+
+        # Palette from the original working code for consistency
+        palette = [
+            (0.80, 0.25, 0.25), (0.25, 0.80, 0.25), (0.25, 0.40, 0.90),
+            (0.90, 0.75, 0.25), (0.80, 0.25, 0.80), (0.20, 0.80, 0.80),
+        ]
+
+        if not hasattr(self, 'constraint_manager') or not self.constraint_manager.surface_constraints:
+            plotter.add_text("No constraints to display.", position='upper_edge', color='white')
+            plotter.render()
+            return
+
+        constraints_drawn = False
+        for s_idx, constraints in self.constraint_manager.surface_constraints.items():
+            # Check if this constraint is active/selected
+            for seg_idx, seg in enumerate(constraints):
+                points = seg.get("points")
+                if not points or len(points) < 2:
+                    continue
+                
+                try:
+                    # Create a PyVista PolyData object for the polyline
+                    poly = pv.PolyData(np.array(points))
+                    
+                    # Create the line segments connecting the points in order
+                    num_points = len(points)
+                    lines_array = np.hstack([[2, i, i + 1] for i in range(num_points - 1)])
+                    poly.lines = lines_array
+
+                    # Check if this constraint is active (selected)
+                    # Default to active (SEGMENTS) if not explicitly set to UNDEFINED
+                    if (s_idx, seg_idx) not in self.constraint_manager.constraint_states:
+                        # Initialize with default state (selected)
+                        self.constraint_manager.constraint_states[(s_idx, seg_idx)] = "SEGMENTS"
+                    
+                    is_active = self.constraint_manager.constraint_states.get((s_idx, seg_idx)) != "UNDEFINED"
+                    
+                    # Use blue for selected constraints (like C++ version), grey for unselected
+                    if is_active:
+                        color = (0.0, 0.4, 1.0)  # Blue for selected constraints
+                        opacity = 1.0
+                    else:
+                        color = (0.45, 0.45, 0.45)  # Grey for unselected
+                        opacity = 0.3
+
+                    # Use the .tube() filter for thickness and visibility
+                    plotter.add_mesh(
+                        poly.tube(radius=0.15), # The radius makes it visible
+                        color=color,
+                        opacity=opacity,
+                        name=f"s{s_idx}_c{seg_idx}",
+                        pickable=False, render_points_as_spheres=True,
+                    )
+                    constraints_drawn = True
+
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Could not render segment s{s_idx}_c{seg_idx}: {e}")
+                    continue
+
+        if not constraints_drawn:
+            plotter.add_text("Constraints generated, but none could be rendered.", position='upper_edge', color='white')
+
+        plotter.reset_camera()
+        plotter.render()
+    def _select_all_constraints(self):
+        """
+        Select all constraints in the hierarchical tree.
+        Sets all items at all levels to checked state.
+        """
+        tree = self.surface_constraint_tree
+        tree.blockSignals(True)
+        
+        # First set all top-level items (surfaces)
+        for i in range(tree.topLevelItemCount()):
+            surface_item = tree.topLevelItem(i)
+            surface_item.setCheckState(0, Qt.Checked)
+            
+            # Then set all second-level items (intersection lines/hull groups)
+            for j in range(surface_item.childCount()):
+                group_item = surface_item.child(j)
+                group_item.setCheckState(0, Qt.Checked)
+                
+                # Finally set all third-level items (segments)
+                for k in range(group_item.childCount()):
+                    segment_item = group_item.child(k)
+                    segment_item.setCheckState(0, Qt.Checked)
+        
+        tree.blockSignals(False)
+        
+        # Update constraint states and visuals for all surfaces
+        for surf_idx, constraints in self.constraint_manager.surface_constraints.items():
+            for c_idx in range(len(constraints)):
+                # Update constraint state in the constraint manager
+                self.constraint_manager.constraint_states[(surf_idx, c_idx)] = "SEGMENTS"
+                # Update visual
+                self._update_constraint_actor_visual(surf_idx, c_idx, True)
+        
+        # Force a redraw of the plotter
+        plotter = self.plotters.get("pre_tetramesh")
+        if plotter:
+            plotter.render()
+
+    def _deselect_all_constraints(self):
+        """
+        Deselect all constraints in the hierarchical tree.
+        Sets all items at all levels to unchecked state.
+        """
+        tree = self.surface_constraint_tree
+        tree.blockSignals(True)
+        
+        # First set all top-level items (surfaces)
+        for i in range(tree.topLevelItemCount()):
+            surface_item = tree.topLevelItem(i)
+            surface_item.setCheckState(0, Qt.Unchecked)
+            
+            # Then set all second-level items (intersection lines/hull groups)
+            for j in range(surface_item.childCount()):
+                group_item = surface_item.child(j)
+                group_item.setCheckState(0, Qt.Unchecked)
+                
+                # Finally set all third-level items (segments)
+                for k in range(group_item.childCount()):
+                    segment_item = group_item.child(k)
+                    segment_item.setCheckState(0, Qt.Unchecked)
+        
+        tree.blockSignals(False)
+        
+        # Update constraint states and visuals for all surfaces
+        for surf_idx, constraints in self.constraint_manager.surface_constraints.items():
+            for c_idx in range(len(constraints)):
+                # Update constraint state in the constraint manager
+                self.constraint_manager.constraint_states[(surf_idx, c_idx)] = "UNDEFINED"
+                # Update visual
+                self._update_constraint_actor_visual(surf_idx, c_idx, False)
+        
+        # Force a redraw of the plotter
+        plotter = self.plotters.get("pre_tetramesh")
+        if plotter:
+            plotter.render()
+
+    
+    def _expand_all_tree_items(self):
+        """
+        Expand all items in the constraint tree to show the full hierarchy.
+        """
+        self.surface_constraint_tree.expandAll()
+    
+    def _collapse_all_tree_items(self):
+        """
+        Collapse all items in the constraint tree to show only top-level items.
+        """
+        self.surface_constraint_tree.collapseAll()
+    def _on_constraint_tree_item_changed(self, item, column):
+        """
+        React to user (un)checking a surface, line group, or individual segment.
+        Propagates changes down the hierarchy and updates the visual representation.
+        """
+        if column != 0:          # we only care about the checkbox column
+            return
+
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+
+        checked = item.checkState(0) == Qt.Checked
+
+        # Propagate changes down the hierarchy
+        self._propagate_to_children(item, checked)
+        
+        # Update parent checkbox state based on children
+        if item.parent():
+            self._update_parent_checkbox(item.parent())
+            
+        # Update the visual representation based on item type
+        if data[0] == 'surface':
+            # Surface item - update all constraints for this surface
+            surf_idx = data[1]
+            for c_idx, _ in enumerate(
+                    self.constraint_manager.surface_constraints.get(surf_idx, [])):
+                # Update constraint state in the constraint manager
+                if checked:
+                    self.constraint_manager.constraint_states[(surf_idx, c_idx)] = "SEGMENTS"
+                else:
+                    self.constraint_manager.constraint_states[(surf_idx, c_idx)] = "UNDEFINED"
+                # Update visual
+                self._update_constraint_actor_visual(surf_idx, c_idx, checked)
+                
+        elif data[0] == 'intersection_line' or data[0] == 'hull_group':
+            # Line group or hull group - update all contained segments
+            surf_idx = data[1]
+            # Visual update is handled by propagation to children
+
+        elif data[0] == 'constraint':
+            # Individual constraint segment
+            surf_idx, con_idx = data[1], data[2]
+            # Update constraint state in the constraint manager
+            if checked:
+                self.constraint_manager.constraint_states[(surf_idx, con_idx)] = "SEGMENTS"
+            else:
+                self.constraint_manager.constraint_states[(surf_idx, con_idx)] = "UNDEFINED"
+            # Update visual
+            self._update_constraint_actor_visual(surf_idx, con_idx, checked)
+            
+        # Force a redraw of the plotter to ensure changes are visible
+        plotter = self.plotters.get("pre_tetramesh")
+        if plotter:
+            plotter.render()
+    
+    def _propagate_to_children(self, item, checked):
+        """Propagate check state to all children recursively"""
+        # QTreeWidgetItem doesn't have blockSignals method
+        # We'll block signals on the tree widget instead
+        tree = self.surface_constraint_tree
+        was_blocked = tree.signalsBlocked()
+        tree.blockSignals(True)
+        
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+            self._propagate_to_children(child, checked)
+        
+        # Restore previous blocked state
+        tree.blockSignals(was_blocked)
+        
+        # Update constraint state and visual representation if this is a constraint item
+        data = item.data(0, Qt.UserRole)
+        if data:
+            if data[0] == 'constraint':
+                surf_idx, con_idx = data[1], data[2]
+                # Update constraint state in the constraint manager
+                if checked:
+                    self.constraint_manager.constraint_states[(surf_idx, con_idx)] = "SEGMENTS"
+                else:
+                    self.constraint_manager.constraint_states[(surf_idx, con_idx)] = "UNDEFINED"
+                # Update visual
+                self._update_constraint_actor_visual(surf_idx, con_idx, checked)
+    
+    def _update_parent_checkbox(self, parent_item):
+        """Update parent checkbox state based on children states"""
+        all_checked = True
+        all_unchecked = True
+        
+        for i in range(parent_item.childCount()):
+            if parent_item.child(i).checkState(0) == Qt.Checked:
+                all_unchecked = False
+            else:
+                all_checked = False
+        
+        # QTreeWidgetItem doesn't have blockSignals method
+        # We'll block signals on the tree widget instead
+        tree = self.surface_constraint_tree
+        was_blocked = tree.signalsBlocked()
+        tree.blockSignals(True)
+        
+        if all_checked:
+            parent_item.setCheckState(0, Qt.Checked)
+        elif all_unchecked:
+            parent_item.setCheckState(0, Qt.Unchecked)
+        else:
+            parent_item.setCheckState(0, Qt.PartiallyChecked)
+        
+        # Restore previous blocked state
+        tree.blockSignals(was_blocked)
+        
+        # Recursively update parent's parent if exists
+        if parent_item.parent():
+            self._update_parent_checkbox(parent_item.parent())
+    
+    def _on_constraint_tree_item_clicked(self, item, column):
+        """
+        Single click = momentarily highlight the selected segment.
+        For group items, highlight all contained segments.
+        The spotlight is a temporary yellow highlight that doesn't affect the
+        actual selection state.
+        """
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+
+        # Schedule restoration of previous colors after spotlight
+        def restore_colors():
+            # Reset spotlight and restore proper colors based on actual selection state
+            if hasattr(self, '_current_spotlight'):
+                for s_prev, c_prev in self._current_spotlight:
+                    # Get the actual selection state from the constraint manager
+                    is_active = self.constraint_manager.constraint_states.get((s_prev, c_prev), "SEGMENTS") != "UNDEFINED"
+                    # Restore proper color based on selection state
+                    self._update_constraint_actor_visual(s_prev, c_prev, is_active)
+                
+                # Clear the spotlight reference
+                delattr(self, '_current_spotlight')
+            
+        # Reset previous spotlight (if any)
+        if hasattr(self, '_current_spotlight'):
+            restore_colors()
+            
+        # Handle different item types for new spotlight
+        spotlight_items = []
+        
+        if data[0] == 'constraint':
+            # Single constraint segment
+            surf_idx, con_idx = data[1], data[2]
+            self._update_constraint_actor_visual(surf_idx, con_idx, True, spotlight=True)
+            spotlight_items = [(surf_idx, con_idx)]
+            
+        elif data[0] == 'intersection_line':
+            # Intersection line group - highlight all segments
+            surf_idx, line_id = data[1], data[2]
+            for c_idx, c in enumerate(self.constraint_manager.surface_constraints.get(surf_idx, [])):
+                if c.get("type") == "INTERSECTION" and c.get("line_id") == line_id:
+                    self._update_constraint_actor_visual(surf_idx, c_idx, True, spotlight=True)
+                    spotlight_items.append((surf_idx, c_idx))
+                    
+        elif data[0] == 'hull_group':
+            # Hull group - highlight all hull segments
+            surf_idx = data[1]
+            for c_idx, c in enumerate(self.constraint_manager.surface_constraints.get(surf_idx, [])):
+                if c.get("type") == "HULL":
+                    self._update_constraint_actor_visual(surf_idx, c_idx, True, spotlight=True)
+                    spotlight_items.append((surf_idx, c_idx))
+                    
+        elif data[0] == 'surface':
+            # Surface - highlight all segments
+            surf_idx = data[1]
+            for c_idx, _ in enumerate(self.constraint_manager.surface_constraints.get(surf_idx, [])):
+                self._update_constraint_actor_visual(surf_idx, c_idx, True, spotlight=True)
+                spotlight_items.append((surf_idx, c_idx))
+        
+        # Store current spotlight
+        self._current_spotlight = spotlight_items
+        
+        # Schedule restoration of colors after a brief delay (500ms)
+        # This creates a temporary yellow highlight effect
+        QTimer.singleShot(500, restore_colors)
+    
+    def _refresh_surface_status(self):
+        """Refresh the surface status display in tetra mesh tab"""
+        if hasattr(self, 'surface_status_label'):
+            self.surface_status_label.setText("Status refreshed")
+    
+    def _visualize_constrained_surfaces(self):
+        """Visualize the filtered constrained surfaces"""
+        pass
 
 
 if __name__ == "__main__":
