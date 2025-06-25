@@ -2181,125 +2181,186 @@ def refine_intersection_line_by_length(intersection, target_length, min_angle_de
 def prepare_plc_for_surface_triangulation(surface_data, intersections_on_surface_data, config):
     """
     Prepares Points and Segments for constrained 2D triangulation of a surface.
-    Now uses the new constraint processing logic following C++ MeshIt.
+    FIXED: Uses robust high-precision rounding approach following C++ MeshIt logic.
     """
-    logger.info("Using new constraint processing logic for PLC preparation")
+    logger.info("Using FIXED robust PLC preparation following C++ MeshIt logic")
     
-    # DEBUG: Show what triple points are received in the config
-    protected_triple_points = config.get('triple_points', [])
-    logger.info(f"🔧 PLC PREPARATION: Received {len(protected_triple_points)} protected triple points")
-    for i, tp in enumerate(protected_triple_points[:3]):  # Show first 3
-        if hasattr(tp, 'x') and hasattr(tp, 'y') and hasattr(tp, 'z'):
-            logger.info(f"   Protected triple point {i}: [{tp.x:.6f}, {tp.y:.6f}, {tp.z:.6f}] type={getattr(tp, 'type', 'UNKNOWN')}")
+    # ================================================================
+    # Direct PLC Generation Following C++ calculate_triangles Logic
+    # ================================================================
     
-    # Use the new constraint-based approach
-    try:
-        points_2d, segments, point_sizes, holes_2d = prepare_constrained_triangulation_input(
-            surface_data, intersections_on_surface_data, config
-        )
+    # Initialize unique points map using high-precision rounding (round to 9 decimal places)
+    # This eliminates floating-point tolerance issues that cause triple point loss
+    unique_points_map = {}  # key: (round_x, round_y, round_z) -> value: {'index': int, 'point': Vector3D, 'metadata': dict}
+    final_points_list = []  # Final list of Vector3D points in index order
+    segment_indices_list = []  # Final list of [idx1, idx2] segment pairs
+    
+    def add_point_to_plc(point, point_metadata=None):
+        """
+        Add a point to the PLC with high-precision deduplication.
+        Returns the index of the point in the final list.
         
-        if points_2d is None or len(points_2d) < 3:
-            logger.warning("New constraint processing failed, falling back to original method")
-            return prepare_plc_for_surface_triangulation_fallback(surface_data, intersections_on_surface_data, config)
+        Args:
+            point: Vector3D point
+            point_metadata: Optional dict with point type and other info
         
-        # CRITICAL FIX: Preserve original 3D points in EXACT SAME ORDER as 2D points
-        # The constraint processing creates points in a specific order, we must match that exactly
-        unique_3d_points_for_plc = []
+        Returns:
+            int: Index of the point in final_points_list
+        """
+        if point_metadata is None:
+            point_metadata = {'type': 'DEFAULT', 'size': surface_data.get('size', 1.0)}
         
-        # Re-run the EXACT SAME constraint processing logic to get the point ordering
-        constraints = calculate_constraints_for_surface(surface_data, intersections_on_surface_data)
-        calculate_constraint_sizes(constraints, surface_data)
+        # Create high-precision key (round to 9 decimal places to handle floating-point precision)
+        key = (round(point.x, 9), round(point.y, 9), round(point.z, 9))
         
-        # Replicate the EXACT SAME point collection logic as prepare_constrained_triangulation_input
-        unique_points_dict = {}  # Same as in prepare_constrained_triangulation_input
-        
-        # Process constraints in EXACT SAME ORDER
-        for constraint in constraints:
-            # Mark intersection constraints as SEGMENTS (same logic)
-            if len(constraint.points) > 1:
-                constraint.constraint_type = "SEGMENTS"
+        if key in unique_points_map:
+            # Point already exists - preserve special types over DEFAULT
+            existing_data = unique_points_map[key]
+            existing_metadata = existing_data['metadata']
             
-            if constraint.constraint_type == "UNDEFINED":
+            # If new point has special type and existing is DEFAULT, update metadata
+            if (point_metadata.get('type', 'DEFAULT') != 'DEFAULT' and 
+                existing_metadata.get('type', 'DEFAULT') == 'DEFAULT'):
+                existing_metadata.update(point_metadata)
+                logger.debug(f"Updated point metadata to {point_metadata.get('type', 'DEFAULT')} at {key}")
+            
+            return existing_data['index']
+        else:
+            # New point - add to map and list
+            new_index = len(final_points_list)
+            unique_points_map[key] = {
+                'index': new_index,
+                'point': point,
+                'metadata': point_metadata
+            }
+            final_points_list.append(point)
+            return new_index
+
+    # ----------------------------------------------------------------
+    # Process hull constraints (closed loop)
+    # ----------------------------------------------------------------
+    hull_points = surface_data.get('hull_points', [])
+    if hull_points:
+        logger.debug(f"Processing hull with {len(hull_points)} points")
+        hull_indices = []
+        for point in hull_points:
+            idx = add_point_to_plc(point, {'type': 'HULL', 'size': surface_data.get('size', 1.0)})
+            hull_indices.append(idx)
+        
+        # Create closed loop segments for hull (skip if duplicate first/last point)
+        for i in range(len(hull_indices)):
+            idx1 = hull_indices[i]
+            idx2 = hull_indices[(i + 1) % len(hull_indices)]
+            if idx1 != idx2:  # Avoid zero-length segments
+                segment_indices_list.append([idx1, idx2])
+
+    # ----------------------------------------------------------------
+    # Process intersection constraints (open polylines)
+    # ----------------------------------------------------------------
+    for line_idx, intersection_data in enumerate(intersections_on_surface_data):
+        intersection_points = intersection_data.get('points', [])
+        if not intersection_points:
                 continue
                 
-            if len(constraint.points) == 1:
-                # Single point constraint
-                point = constraint.points[0]
-                point_key = (round(point.x, 8), round(point.y, 8), round(point.z, 8))
-                if point_key not in unique_points_dict:
-                    unique_points_dict[point_key] = {
-                        'point': point,
-                        'index': len(unique_points_dict)
-                    }
-            elif len(constraint.points) > 1:
-                # Multi-point constraint
-                for i in range(len(constraint.points) - 1):
-                    p1 = constraint.points[i]
-                    p2 = constraint.points[i + 1]
-                    
-                    # Add points in EXACT SAME ORDER
-                    p1_key = (round(p1.x, 8), round(p1.y, 8), round(p1.z, 8))
-                    p2_key = (round(p2.x, 8), round(p2.y, 8), round(p2.z, 8))
-                    
-                    if p1_key not in unique_points_dict:
-                        unique_points_dict[p1_key] = {
-                            'point': p1,
-                            'index': len(unique_points_dict)
-                        }
-                    
-                    if p2_key not in unique_points_dict:
-                        unique_points_dict[p2_key] = {
-                            'point': p2,
-                            'index': len(unique_points_dict)
-                        }
+        logger.debug(f"Processing intersection line {line_idx} with {len(intersection_points)} points")
+        line_indices = []
+        intersection_size = intersection_data.get('size', surface_data.get('size', 1.0))
         
-        # Fallback to convex hull if no constraints (same logic)
-        if not unique_points_dict:
-            hull_points = surface_data.get('hull_points', [])
-            for i, point in enumerate(hull_points[:-1]):
-                point_key = (round(point.x, 8), round(point.y, 8), round(point.z, 8))
-                unique_points_dict[point_key] = {
-                    'point': point,
-                    'index': i
-                }
+        for point in intersection_points:
+            idx = add_point_to_plc(point, {'type': 'INTERSECTION', 'size': intersection_size})
+            line_indices.append(idx)
         
-        # Convert to ordered list in EXACT SAME ORDER as 2D points
-        points_3d_list = [None] * len(unique_points_dict)
-        for point_data in unique_points_dict.values():
-            idx = point_data['index']
-            point = point_data['point']
-            points_3d_list[idx] = np.array([point.x, point.y, point.z])
+        # Create segments for intersection polyline
+        for i in range(len(line_indices) - 1):
+            idx1 = line_indices[i]
+            idx2 = line_indices[i + 1]
+            if idx1 != idx2:  # Avoid zero-length segments
+                segment_indices_list.append([idx1, idx2])
+
+    # ----------------------------------------------------------------
+    # FIXED: Triple points are already embedded in constraint lines
+    # ----------------------------------------------------------------
+    # Triple points should already be embedded in the constraint polylines from refinement.
+    # We don't add them separately - they exist as vertices within the constraint segments.
+    # This follows the C++ approach where triple points are constraint vertices, not isolated points.
+    
+    # Count triple points that exist in our constraint lines for verification
+    protected_triple_points = config.get('triple_points', [])
+    triple_points_in_constraints = 0
+    
+    for tp in protected_triple_points:
+        # Extract Vector3D from various formats
+        if isinstance(tp, Vector3D):
+            point = tp
+        elif hasattr(tp, 'x') and hasattr(tp, 'y') and hasattr(tp, 'z'):
+            point = Vector3D(tp.x, tp.y, tp.z, point_type='TRIPLE_POINT')
+        elif isinstance(tp, (list, tuple)) and len(tp) >= 3:
+            point = Vector3D(float(tp[0]), float(tp[1]), float(tp[2]), point_type='TRIPLE_POINT')
+        else:
+            continue  # malformed entry
         
-        # Use the original 3D points (preserves exact coordinates)
-        unique_3d_points_for_plc = points_3d_list
+        # Check if this triple point exists in our constraint points
+        key = (round(point.x, 9), round(point.y, 9), round(point.z, 9))
+        point_found = False
         
-        # Verify point correspondence
-        if len(unique_3d_points_for_plc) != len(points_2d):
-            logger.warning(f"Point ordering mismatch ({len(unique_3d_points_for_plc)} vs {len(points_2d)}), using projection reconstruction")
-            unique_3d_points_for_plc = []
-            projection_params = surface_data.get('projection_params')
+        for existing_point in final_points_list:
+            existing_key = (round(existing_point.x, 9), round(existing_point.y, 9), round(existing_point.z, 9))
+            if key == existing_key:
+                # Update metadata to mark as triple point (preserves existing constraint connectivity)
+                if hasattr(existing_point, 'point_type'):
+                    existing_point.point_type = 'TRIPLE_POINT'
+                else:
+                    setattr(existing_point, 'point_type', 'TRIPLE_POINT')
+                point_found = True
+                triple_points_in_constraints += 1
+                break
+
+    logger.info(f"Robust PLC built: {len(final_points_list)} unique points, {len(segment_indices_list)} segments, {triple_points_in_constraints} triple points")
+
+    # ----------------------------------------------------------------
+    # Validate PLC
+    # ----------------------------------------------------------------
+    if len(final_points_list) < 3:
+        logger.error(f"Insufficient points ({len(final_points_list)}) for triangulation")
+        return None, None, np.empty((0, 2)), np.empty((0, 3))
+    
+    if len(segment_indices_list) < 3:
+        logger.warning(f"Few segments ({len(segment_indices_list)}) - may not form valid boundary")
+
+    # ----------------------------------------------------------------
+    # Project to 2D
+    # ----------------------------------------------------------------
+    projection_params = surface_data.get('projection_params')
+    if not projection_params:
+        logger.error("Cannot create PLC: missing projection parameters.")
+        return None, None, np.empty((0, 2)), np.empty((0, 3))
             
-            if projection_params:
-                centroid = np.array(projection_params['centroid'])
-                basis = np.array(projection_params['basis'])
+    centroid = np.array(projection_params['centroid'])
+    basis = np.array(projection_params['basis'])
                 
-                for i, pt_2d in enumerate(points_2d):
-                    # Reconstruct 3D point from 2D projection
-                    reconstructed_3d = centroid + pt_2d[0] * basis[0] + pt_2d[1] * basis[1]
-                    unique_3d_points_for_plc.append(np.array([reconstructed_3d[0], reconstructed_3d[1], reconstructed_3d[2]]))
-            else:
-                # Simple 2D to 3D conversion (Z=0)
-                for pt_2d in points_2d:
-                    unique_3d_points_for_plc.append(np.array([pt_2d[0], pt_2d[1], 0.0]))
+    points_2d_list = []
+    points_3d_array = []
+    
+    for point in final_points_list:
+        # Store original 3D coordinates
+        points_3d_array.append([point.x, point.y, point.z])
         
-        unique_3d_points_for_plc = np.array(unique_3d_points_for_plc)
-        
-        logger.info(f"New constraint processing successful: {len(points_2d)} points, {len(segments)} segments")
-        return points_2d, segments, holes_2d, unique_3d_points_for_plc
-        
-    except Exception as e:
-        logger.error(f"New constraint processing failed: {e}, falling back to original method")
-        return prepare_plc_for_surface_triangulation_fallback(surface_data, intersections_on_surface_data, config)
+        # Project to 2D
+        pt_3d = np.array([point.x, point.y, point.z])
+        centered_pt = pt_3d - centroid
+        pt_2d = np.dot(centered_pt, basis.T)
+        points_2d_list.append(pt_2d[:2])
+
+    # ----------------------------------------------------------------
+    # Finalize arrays
+    # ----------------------------------------------------------------
+    points_2d = np.array(points_2d_list)
+    segments_array = np.array(segment_indices_list) if segment_indices_list else np.empty((0, 2), dtype=int)
+    holes_2d = np.empty((0, 2))  # No holes for now
+    points_3d_array = np.array(points_3d_array)
+
+    logger.info(f"FIXED robust PLC preparation successful: {len(points_2d)} points, {len(segments_array)} segments")
+    return points_2d, segments_array, holes_2d, points_3d_array
 
 def prepare_plc_for_surface_triangulation_fallback(surface_data, intersections_on_surface_data, config):
     """
@@ -2390,7 +2451,7 @@ def prepare_plc_for_surface_triangulation_fallback(surface_data, intersections_o
 
 
 def run_constrained_triangulation_py(plc_points_2d, plc_segments_indices, plc_holes_2d,
-                                     surface_projection_params, original_3d_points_for_plc, config):
+                                   surface_projection_params, original_3d_points_for_plc, config):
     """
     Runs constrained triangulation using the 'triangle' library on a pre-built PLC.
     This function now trusts that the input PLC from prepare_plc_for_surface_triangulation is correct.
@@ -2408,31 +2469,31 @@ def run_constrained_triangulation_py(plc_points_2d, plc_segments_indices, plc_ho
     if plc_holes_2d is not None and len(plc_holes_2d) > 0:
         tri_input['holes'] = plc_holes_2d
 
-    # Use switches that allow Triangle to add interior points for proper surface filling
-    # The key insight: we need Triangle to add interior vertices to fill the surface area
-    base_area = config.get('max_area', 800.0)
-    switches = f"pzq30a{base_area:.1f}"  # Quality mesh with area constraint
-    logger.info(f"Attempting triangulation with area-constrained switches: {switches}")
+    # FIXED: Use C++ MeshIt switches following geometry.cpp line 2111
+    # Primary: "pzYYu" as used in C++ calculate_triangles
+    # Fallback: "pzYYa" then "pzq" for quality mesh
+    switches_primary = "pzYYu"  # C++ primary switch - conforming Delaunay with no new points on boundary
+    logger.info(f"Attempting triangulation with C++ primary switches: {switches_primary}")
 
     tri_result = None
     try:
-        # Primary approach: Quality mesh with area constraint
-        tri_result = tr_standard.triangulate(tri_input, opts=switches)
-        logger.info(f"✅ SUCCESS: Primary triangulation with '{switches}' completed.")
+        # Primary approach: C++ style switches
+        tri_result = tr_standard.triangulate(tri_input, opts=switches_primary)
+        logger.info(f"✅ SUCCESS: Primary triangulation with '{switches_primary}' completed.")
     except Exception as e:
-        logger.error(f"Primary triangulation with '{switches}' failed: {e}", exc_info=True)
-        logger.warning("Trying fallback switches 'pzq30' (quality mesh without area constraint).")
+        logger.error(f"Primary triangulation with '{switches_primary}' failed: {e}", exc_info=True)
+        logger.warning("Trying fallback switches 'pzYYa' (C++ style with angle constraint).")
         try:
-            switches_fallback = "pzq30"
+            switches_fallback = "pzYYa"
             tri_result = tr_standard.triangulate(tri_input, opts=switches_fallback)
-            logger.info("✅ SUCCESS: Fallback triangulation with 'pzq30' completed.")
+            logger.info("✅ SUCCESS: Fallback triangulation with 'pzYYa' completed.")
         except Exception as e2:
             logger.error(f"Fallback triangulation also failed: {e2}", exc_info=True)
-            logger.warning("Trying final fallback 'pz' (basic constrained triangulation).")
+            logger.warning("Trying final fallback 'pzq' (quality mesh).")
             try:
-                switches_final = "pz"
+                switches_final = "pzq"
                 tri_result = tr_standard.triangulate(tri_input, opts=switches_final)
-                logger.info("✅ SUCCESS: Final fallback triangulation with 'pz' completed.")
+                logger.info("✅ SUCCESS: Final fallback triangulation with 'pzq' completed.")
             except Exception as e3:
                 logger.error(f"All triangulation strategies failed: {e3}", exc_info=True)
                 raise RuntimeError("All triangulation strategies failed.") from e3
@@ -2461,10 +2522,10 @@ def run_constrained_triangulation_py(plc_points_2d, plc_segments_indices, plc_ho
             else:
                 # This is a new Steiner point created by Triangle. Reconstruct its 3D position.
                 if basis.shape[0] < 2:
-                     logger.error("Invalid basis for 3D reconstruction of Steiner point.")
-                     # As a fallback, use the closest original point's Z value.
-                     closest_original_3d = original_3d_points_for_plc[idx]
-                     final_vertices_3d.append(np.array([v_2d[0], v_2d[1], closest_original_3d[2]])) # This is a guess.
+                    logger.error("Invalid basis for 3D reconstruction of Steiner point.")
+                    # As a fallback, use the closest original point's Z value.
+                    closest_original_3d = original_3d_points_for_plc[idx]
+                    final_vertices_3d.append(np.array([v_2d[0], v_2d[1], closest_original_3d[2]])) # This is a guess.
                 else:
                     reconstructed_centered = basis[0] * v_2d[0] + basis[1] * v_2d[1]
                     final_vertices_3d.append(reconstructed_centered + centroid)
@@ -2500,7 +2561,6 @@ def run_constrained_triangulation_py(plc_points_2d, plc_segments_indices, plc_ho
     logger.info(f"✅ Final 3D mesh: {len(final_vertices_3d)} vertices, {len(tri_triangles_indices_final)} triangles")
 
     return final_vertices_3d, tri_triangles_indices_final, preserved_triple_indices
-
 
 
 # Configure logger
@@ -2638,7 +2698,7 @@ def calculate_constraints_for_surface(surface_data: Dict, intersections_on_surfa
         intersection_points = intersection_data.get('points', [])
         if not intersection_points:
             continue
-            
+
         intersection_size = intersection_data.get('size', surface_data.get('size', 1.0))
         
         if len(intersection_points) == 1:
@@ -2664,7 +2724,7 @@ def calculate_constraints_for_surface(surface_data: Dict, intersections_on_surfa
                     )
                     constraints.append(constraint)
                     increment_rgb(rgb_counter)
-    
+
     logger.info(f"Generated {len(constraints)} constraint segments for surface")
     return constraints
 
@@ -2820,7 +2880,7 @@ def assign_point_types_and_sizes(points: List[Vector3D],
             setattr(point, 'size', assigned_size)
 
 def prepare_constrained_triangulation_input(surface_data: Dict, 
-                                           intersections_on_surface: List[Dict],
+        intersections_on_surface: List[Dict],
                                            config: Dict) -> Tuple[np.ndarray, np.ndarray, List[float], np.ndarray]:
     """
     Prepare input for constrained triangulation with protected triple points.

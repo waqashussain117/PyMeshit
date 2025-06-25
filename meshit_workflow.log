@@ -1,0 +1,190 @@
+2025-06-25 12:01:06,418 - MeshIt-Workflow - INFO - Logging to file: C:\Users\Waqas Hussain\OneDrive - Università degli Studi di Milano-Bicocca\Documents\GitHub\MeshIt-master\meshit_workflow.log
+2025-06-25 12:01:06,418 - MeshIt-Workflow - INFO - Logging to file: C:\Users\Waqas Hussain\OneDrive - Università degli Studi di Milano-Bicocca\Documents\GitHub\MeshIt-master\meshit_workflow.log
+2025-06-25 12:01:06,419 - MeshIt-Workflow - INFO - Successfully imported DirectTriangleWrapper
+2025-06-25 12:01:06,419 - MeshIt-Workflow - INFO - Successfully imported DirectTriangleWrapper
+2025-06-25 12:01:07,200 - MeshIt-Workflow - INFO - Successfully created refine_mesh_plotter
+2025-06-25 12:01:07,200 - MeshIt-Workflow - INFO - Successfully created refine_mesh_plotter
+2025-06-25 12:01:07,315 - MeshIt-Workflow - INFO - Successfully created pre_tetramesh_plotter
+2025-06-25 12:01:07,315 - MeshIt-Workflow - INFO - Successfully created pre_tetramesh_plotter
+2025-06-25 12:01:07,338 - MeshIt-Workflow - INFO - Enhanced tetra mesh tab with constraint selection initialized
+2025-06-25 12:01:07,338 - MeshIt-Workflow - INFO - Enhanced tetra mesh tab with constraint selection initialized
+2025-06-25 12:01:07,339 - MeshIt-Workflow - ERROR - Error initializing tetra visualization: 'MeshItWorkflowGUI' object has no attribute '_add_selectable_elements_to_plotter'
+2025-06-25 12:01:07,339 - MeshIt-Workflow - ERROR - Error initializing tetra visualization: 'MeshItWorkflowGUI' object has no attribute '_add_selectable_elements_to_plotter'
+2025-06-25 12:01:14,393 - MeshIt-Workflow - INFO - Read 4 points using line-by-line parsing.
+2025-06-25 12:01:14,393 - MeshIt-Workflow - INFO - Read 4 points using line-by-line parsing.
+2025-06-25 12:01:14,394 - MeshIt-Workflow - INFO - Read 4 points using line-by-line parsing.
+2025-06-25 12:01:14,394 - MeshIt-Workflow - INFO - Read 4 points using line-by-line parsing.
+2025-06-25 12:01:14,394 - MeshIt-Workflow - INFO - Read 4 points using line-by-line parsing.
+2025-06-25 12:01:14,394 - MeshIt-Workflow - INFO - Read 4 points using line-by-line parsing.
+2025-06-25 12:01:14,394 - MeshIt-Workflow - INFO - Read 4 points using line-by-line parsing.
+2025-06-25 12:01:14,394 - MeshIt-Workflow - INFO - Read 4 points using line-by-line parsing.
+2025-06-25 12:01:14,396 - MeshIt-Workflow - INFO - Read 441 points using line-by-line parsing.
+2025-06-25 12:01:14,396 - MeshIt-Workflow - INFO - Read 441 points using line-by-line parsing.
+2025-06-25 12:01:14,396 - MeshIt-Workflow - INFO - Read 4 points using line-by-line parsing.
+2025-06-25 12:01:14,396 - MeshIt-Workflow - INFO - Read 4 points using line-by-line parsing.
+2025-06-25 12:01:14,396 - MeshIt-Workflow - INFO - Read 4 points using line-by-line parsing.
+2025-06-25 12:01:14,396 - MeshIt-Workflow - INFO - Read 4 points using line-by-line parsing.
+2025-06-25 12:01:14,397 - MeshIt-Workflow - INFO - Read 441 points using line-by-line parsing.
+2025-06-25 12:01:14,397 - MeshIt-Workflow - INFO - Read 441 points using line-by-line parsing.
+2025-06-25 12:01:14,399 - MeshIt-Workflow - INFO - Read 441 points using line-by-line parsing.
+2025-06-25 12:01:14,399 - MeshIt-Workflow - INFO - Read 441 points using line-by-line parsing.
+2025-06-25 12:01:16,120 - MeshIt-Workflow - INFO - Starting batch computation: hulls
+2025-06-25 12:01:16,120 - MeshIt-Workflow - INFO - Starting batch computation: hulls
+2025-06-25 12:01:16,133 - MeshIt-Workflow - INFO - Worker thread started for hulls.
+2025-06-25 12:01:16,133 - MeshIt-Workflow - INFO - Worker thread started for hulls.
+2025-06-25 12:01:16,133 - MeshIt-Workflow - INFO - Worker: Starting hull computation batch.
+2025-06-25 12:01:16,133 - MeshIt-Workflow - INFO - Worker: Starting hull computation batch.
+2025-06-25 12:01:16,145 - MeshIt-Workflow - INFO - Worker: Hull batch finished. Success: 9/9. Elapsed: 0.01s.
+2025-06-25 12:01:16,145 - MeshIt-Workflow - INFO - Worker: Hull batch finished. Success: 9/9. Elapsed: 0.01s.
+2025-06-25 12:01:16,147 - MeshIt-Workflow - INFO - Batch computation finished. Success: 9/9. Time: 0.01s
+2025-06-25 12:01:16,147 - MeshIt-Workflow - INFO - Batch computation finished. Success: 9/9. Time: 0.01s
+2025-06-25 12:01:16,150 - MeshIt-Workflow - INFO - Cancel computation requested by user.
+2025-06-25 12:01:16,150 - MeshIt-Workflow - INFO - Cancel computation requested by user.
+2025-06-25 12:01:16,150 - MeshIt-Workflow - INFO - Signaling worker thread to stop and quit.
+2025-06-25 12:01:16,150 - MeshIt-Workflow - INFO - Signaling worker thread to stop and quit.
+2025-06-25 12:01:16,151 - MeshIt-Workflow - INFO - Worker thread finished gracefully.
+2025-06-25 12:01:16,151 - MeshIt-Workflow - INFO - Worker thread finished gracefully.
+2025-06-25 12:01:20,639 - MeshIt-Workflow - INFO - Starting batch computation: segments
+2025-06-25 12:01:20,639 - MeshIt-Workflow - INFO - Starting batch computation: segments
+2025-06-25 12:01:20,650 - MeshIt-Workflow - INFO - Worker thread started for segments.
+2025-06-25 12:01:20,650 - MeshIt-Workflow - INFO - Worker thread started for segments.
+2025-06-25 12:01:20,650 - MeshIt-Workflow - INFO - Worker: Starting segment computation batch.
+2025-06-25 12:01:20,650 - MeshIt-Workflow - INFO - Worker: Starting segment computation batch.
+2025-06-25 12:01:20,652 - MeshIt-Workflow - INFO - Worker: Segment batch finished. Success: 9/9. Elapsed: 0.00s.
+2025-06-25 12:01:20,652 - MeshIt-Workflow - INFO - Worker: Segment batch finished. Success: 9/9. Elapsed: 0.00s.
+2025-06-25 12:01:20,656 - MeshIt-Workflow - INFO - Batch computation finished. Success: 9/9. Time: 0.00s
+2025-06-25 12:01:20,656 - MeshIt-Workflow - INFO - Batch computation finished. Success: 9/9. Time: 0.00s
+2025-06-25 12:01:20,660 - MeshIt-Workflow - INFO - Cancel computation requested by user.
+2025-06-25 12:01:20,660 - MeshIt-Workflow - INFO - Cancel computation requested by user.
+2025-06-25 12:01:20,660 - MeshIt-Workflow - INFO - Signaling worker thread to stop and quit.
+2025-06-25 12:01:20,660 - MeshIt-Workflow - INFO - Signaling worker thread to stop and quit.
+2025-06-25 12:01:20,661 - MeshIt-Workflow - INFO - Worker thread finished gracefully.
+2025-06-25 12:01:20,661 - MeshIt-Workflow - INFO - Worker thread finished gracefully.
+2025-06-25 12:01:30,815 - MeshIt-Workflow - INFO - Starting batch computation: triangulations
+2025-06-25 12:01:30,815 - MeshIt-Workflow - INFO - Starting batch computation: triangulations
+2025-06-25 12:01:30,828 - MeshIt-Workflow - INFO - Worker thread started for triangulations.
+2025-06-25 12:01:30,828 - MeshIt-Workflow - INFO - Worker thread started for triangulations.
+2025-06-25 12:01:30,829 - MeshIt-Workflow - INFO - Worker: Starting triangulation computation batch.
+2025-06-25 12:01:30,829 - MeshIt-Workflow - INFO - Worker: Starting triangulation computation batch.
+2025-06-25 12:01:30,829 - MeshIt-Workflow - INFO - Using 42 unique points and 42 segments from segmentation step for triangulation.
+2025-06-25 12:01:30,829 - MeshIt-Workflow - INFO - Using 42 unique points and 42 segments from segmentation step for triangulation.
+2025-06-25 12:01:30,829 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for border1.txt
+2025-06-25 12:01:30,829 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for border1.txt
+2025-06-25 12:01:30,830 - MeshIt-Workflow - INFO - Triangulating border1.txt with Target Edge Length = 20.0000
+2025-06-25 12:01:30,830 - MeshIt-Workflow - INFO - Triangulating border1.txt with Target Edge Length = 20.0000
+2025-06-25 12:01:31,009 - MeshIt-Workflow - INFO - Triangulation for border1.txt completed. Vertices: 190, Triangles: 336
+2025-06-25 12:01:31,009 - MeshIt-Workflow - INFO - Triangulation for border1.txt completed. Vertices: 190, Triangles: 336
+2025-06-25 12:01:31,009 - MeshIt-Workflow - INFO - Using 42 unique points and 42 segments from segmentation step for triangulation.
+2025-06-25 12:01:31,009 - MeshIt-Workflow - INFO - Using 42 unique points and 42 segments from segmentation step for triangulation.
+2025-06-25 12:01:31,009 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for border2.txt
+2025-06-25 12:01:31,009 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for border2.txt
+2025-06-25 12:01:31,010 - MeshIt-Workflow - INFO - Triangulating border2.txt with Target Edge Length = 20.0000
+2025-06-25 12:01:31,010 - MeshIt-Workflow - INFO - Triangulating border2.txt with Target Edge Length = 20.0000
+2025-06-25 12:01:31,180 - MeshIt-Workflow - INFO - Triangulation for border2.txt completed. Vertices: 186, Triangles: 328
+2025-06-25 12:01:31,180 - MeshIt-Workflow - INFO - Triangulation for border2.txt completed. Vertices: 186, Triangles: 328
+2025-06-25 12:01:31,180 - MeshIt-Workflow - INFO - Using 42 unique points and 42 segments from segmentation step for triangulation.
+2025-06-25 12:01:31,180 - MeshIt-Workflow - INFO - Using 42 unique points and 42 segments from segmentation step for triangulation.
+2025-06-25 12:01:31,181 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for border3.txt
+2025-06-25 12:01:31,181 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for border3.txt
+2025-06-25 12:01:31,181 - MeshIt-Workflow - INFO - Triangulating border3.txt with Target Edge Length = 20.0000
+2025-06-25 12:01:31,181 - MeshIt-Workflow - INFO - Triangulating border3.txt with Target Edge Length = 20.0000
+2025-06-25 12:01:31,344 - MeshIt-Workflow - INFO - Triangulation for border3.txt completed. Vertices: 190, Triangles: 336
+2025-06-25 12:01:31,344 - MeshIt-Workflow - INFO - Triangulation for border3.txt completed. Vertices: 190, Triangles: 336
+2025-06-25 12:01:31,344 - MeshIt-Workflow - INFO - Using 42 unique points and 42 segments from segmentation step for triangulation.
+2025-06-25 12:01:31,344 - MeshIt-Workflow - INFO - Using 42 unique points and 42 segments from segmentation step for triangulation.
+2025-06-25 12:01:31,345 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for border4.txt
+2025-06-25 12:01:31,345 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for border4.txt
+2025-06-25 12:01:31,355 - MeshIt-Workflow - INFO - Triangulating border4.txt with Target Edge Length = 20.0000
+2025-06-25 12:01:31,355 - MeshIt-Workflow - INFO - Triangulating border4.txt with Target Edge Length = 20.0000
+2025-06-25 12:01:31,514 - MeshIt-Workflow - INFO - Triangulation for border4.txt completed. Vertices: 186, Triangles: 328
+2025-06-25 12:01:31,514 - MeshIt-Workflow - INFO - Triangulation for border4.txt completed. Vertices: 186, Triangles: 328
+2025-06-25 12:01:31,514 - MeshIt-Workflow - INFO - Using 46 unique points and 46 segments from segmentation step for triangulation.
+2025-06-25 12:01:31,514 - MeshIt-Workflow - INFO - Using 46 unique points and 46 segments from segmentation step for triangulation.
+2025-06-25 12:01:31,515 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for bottom.dat
+2025-06-25 12:01:31,515 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for bottom.dat
+2025-06-25 12:01:31,515 - MeshIt-Workflow - INFO - Triangulating bottom.dat with Target Edge Length = 20.0000
+2025-06-25 12:01:31,515 - MeshIt-Workflow - INFO - Triangulating bottom.dat with Target Edge Length = 20.0000
+2025-06-25 12:01:34,384 - MeshIt-Workflow - INFO - Triangulation for bottom.dat completed. Vertices: 209, Triangles: 370
+2025-06-25 12:01:34,384 - MeshIt-Workflow - INFO - Triangulation for bottom.dat completed. Vertices: 209, Triangles: 370
+2025-06-25 12:01:34,385 - MeshIt-Workflow - INFO - Using 38 unique points and 38 segments from segmentation step for triangulation.
+2025-06-25 12:01:34,385 - MeshIt-Workflow - INFO - Using 38 unique points and 38 segments from segmentation step for triangulation.
+2025-06-25 12:01:34,385 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for fault1.txt
+2025-06-25 12:01:34,385 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for fault1.txt
+2025-06-25 12:01:34,385 - MeshIt-Workflow - INFO - Triangulating fault1.txt with Target Edge Length = 20.0000
+2025-06-25 12:01:34,385 - MeshIt-Workflow - INFO - Triangulating fault1.txt with Target Edge Length = 20.0000
+2025-06-25 12:01:34,502 - MeshIt-Workflow - INFO - Triangulation for fault1.txt completed. Vertices: 136, Triangles: 232
+2025-06-25 12:01:34,502 - MeshIt-Workflow - INFO - Triangulation for fault1.txt completed. Vertices: 136, Triangles: 232
+2025-06-25 12:01:34,502 - MeshIt-Workflow - INFO - Using 36 unique points and 36 segments from segmentation step for triangulation.
+2025-06-25 12:01:34,502 - MeshIt-Workflow - INFO - Using 36 unique points and 36 segments from segmentation step for triangulation.
+2025-06-25 12:01:34,502 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for fault2.txt
+2025-06-25 12:01:34,502 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for fault2.txt
+2025-06-25 12:01:34,503 - MeshIt-Workflow - INFO - Triangulating fault2.txt with Target Edge Length = 20.0000
+2025-06-25 12:01:34,503 - MeshIt-Workflow - INFO - Triangulating fault2.txt with Target Edge Length = 20.0000
+2025-06-25 12:01:34,599 - MeshIt-Workflow - INFO - Triangulation for fault2.txt completed. Vertices: 126, Triangles: 214
+2025-06-25 12:01:34,599 - MeshIt-Workflow - INFO - Triangulation for fault2.txt completed. Vertices: 126, Triangles: 214
+2025-06-25 12:01:34,599 - MeshIt-Workflow - INFO - Using 48 unique points and 48 segments from segmentation step for triangulation.
+2025-06-25 12:01:34,599 - MeshIt-Workflow - INFO - Using 48 unique points and 48 segments from segmentation step for triangulation.
+2025-06-25 12:01:34,601 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for middle.dat
+2025-06-25 12:01:34,601 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for middle.dat
+2025-06-25 12:01:34,601 - MeshIt-Workflow - INFO - Triangulating middle.dat with Target Edge Length = 20.0000
+2025-06-25 12:01:34,601 - MeshIt-Workflow - INFO - Triangulating middle.dat with Target Edge Length = 20.0000
+2025-06-25 12:01:37,517 - MeshIt-Workflow - INFO - Triangulation for middle.dat completed. Vertices: 207, Triangles: 364
+2025-06-25 12:01:37,517 - MeshIt-Workflow - INFO - Triangulation for middle.dat completed. Vertices: 207, Triangles: 364
+2025-06-25 12:01:37,518 - MeshIt-Workflow - INFO - Using 46 unique points and 46 segments from segmentation step for triangulation.
+2025-06-25 12:01:37,518 - MeshIt-Workflow - INFO - Using 46 unique points and 46 segments from segmentation step for triangulation.
+2025-06-25 12:01:37,518 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for top.dat
+2025-06-25 12:01:37,518 - MeshIt-Workflow - INFO - Projecting ALL 3D points to best-fit plane for triangulation for top.dat
+2025-06-25 12:01:37,518 - MeshIt-Workflow - INFO - Triangulating top.dat with Target Edge Length = 20.0000
+2025-06-25 12:01:37,518 - MeshIt-Workflow - INFO - Triangulating top.dat with Target Edge Length = 20.0000
+2025-06-25 12:01:40,366 - MeshIt-Workflow - INFO - Triangulation for top.dat completed. Vertices: 208, Triangles: 368
+2025-06-25 12:01:40,366 - MeshIt-Workflow - INFO - Triangulation for top.dat completed. Vertices: 208, Triangles: 368
+2025-06-25 12:01:40,366 - MeshIt-Workflow - INFO - Worker: Triangulation batch finished. Success: 9/9. Elapsed: 9.54s.
+2025-06-25 12:01:40,366 - MeshIt-Workflow - INFO - Worker: Triangulation batch finished. Success: 9/9. Elapsed: 9.54s.
+2025-06-25 12:01:40,367 - MeshIt-Workflow - INFO - Batch computation finished. Success: 9/9. Time: 9.54s
+2025-06-25 12:01:40,367 - MeshIt-Workflow - INFO - Batch computation finished. Success: 9/9. Time: 9.54s
+2025-06-25 12:01:40,371 - MeshIt-Workflow - INFO - Cancel computation requested by user.
+2025-06-25 12:01:40,371 - MeshIt-Workflow - INFO - Cancel computation requested by user.
+2025-06-25 12:01:40,371 - MeshIt-Workflow - INFO - Signaling worker thread to stop and quit.
+2025-06-25 12:01:40,371 - MeshIt-Workflow - INFO - Signaling worker thread to stop and quit.
+2025-06-25 12:01:40,372 - MeshIt-Workflow - INFO - Worker thread finished gracefully.
+2025-06-25 12:01:40,372 - MeshIt-Workflow - INFO - Worker thread finished gracefully.
+2025-06-25 12:01:50,714 - MeshIt-Workflow - INFO - Triggering global intersection computation.
+2025-06-25 12:01:50,714 - MeshIt-Workflow - INFO - Triggering global intersection computation.
+2025-06-25 12:01:50,714 - MeshIt-Workflow - INFO - Starting batch computation: intersections
+2025-06-25 12:01:50,714 - MeshIt-Workflow - INFO - Starting batch computation: intersections
+2025-06-25 12:01:50,726 - MeshIt-Workflow - INFO - Worker thread started for intersections.
+2025-06-25 12:01:50,726 - MeshIt-Workflow - INFO - Worker thread started for intersections.
+2025-06-25 12:01:50,727 - MeshIt-Workflow - INFO - Worker: Starting global intersection computation task.
+2025-06-25 12:01:50,727 - MeshIt-Workflow - INFO - Worker: Starting global intersection computation task.
+2025-06-25 12:01:50,727 - MeshIt-Workflow - INFO - Starting global intersection computation...
+2025-06-25 12:01:50,727 - MeshIt-Workflow - INFO - Starting global intersection computation...
+2025-06-25 12:01:50,727 - MeshIt-Workflow - INFO - Found 9 eligible datasets for intersection.
+2025-06-25 12:01:50,727 - MeshIt-Workflow - INFO - Found 9 eligible datasets for intersection.
+2025-06-25 12:01:50,730 - MeshIt-Workflow - INFO - Prepared intersection model with 9 surfaces.
+2025-06-25 12:01:50,730 - MeshIt-Workflow - INFO - Prepared intersection model with 9 surfaces.
+2025-06-25 12:01:50,731 - MeshIt-Workflow - INFO - Calling run_intersection_workflow...
+2025-06-25 12:01:50,731 - MeshIt-Workflow - INFO - Calling run_intersection_workflow...
+2025-06-25 12:01:54,166 - MeshIt-Workflow - ERROR - Error during run_intersection_workflow: unsupported operand type(s) for -: 'TriplePoint' and 'TriplePoint'
+Traceback (most recent call last):
+  File "C:\Users\Waqas Hussain\OneDrive - Università degli Studi di Milano-Bicocca\Documents\GitHub\MeshIt-master\meshit_workflow_gui.py", line 7322, in _compute_global_intersections
+    model = run_intersection_workflow(model, progress_callback, config=intersection_config)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Waqas Hussain\OneDrive - Università degli Studi di Milano-Bicocca\Documents\GitHub\MeshIt-master\meshit\intersection_utils.py", line 1838, in run_intersection_workflow
+    clusters = cluster_points(potential_tp_coords, tolerance)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Waqas Hussain\OneDrive - Università degli Studi di Milano-Bicocca\Documents\GitHub\MeshIt-master\meshit\intersection_utils.py", line 1733, in cluster_points
+    if (points[j] - cluster_point).length() < tolerance:
+        ~~~~~~~~~~^~~~~~~~~~~~~~~
+TypeError: unsupported operand type(s) for -: 'TriplePoint' and 'TriplePoint'
+2025-06-25 12:01:54,166 - MeshIt-Workflow - ERROR - Error during run_intersection_workflow: unsupported operand type(s) for -: 'TriplePoint' and 'TriplePoint'
+Traceback (most recent call last):
+  File "C:\Users\Waqas Hussain\OneDrive - Università degli Studi di Milano-Bicocca\Documents\GitHub\MeshIt-master\meshit_workflow_gui.py", line 7322, in _compute_global_intersections
+    model = run_intersection_workflow(model, progress_callback, config=intersection_config)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Waqas Hussain\OneDrive - Università degli Studi di Milano-Bicocca\Documents\GitHub\MeshIt-master\meshit\intersection_utils.py", line 1838, in run_intersection_workflow
+    clusters = cluster_points(potential_tp_coords, tolerance)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Waqas Hussain\OneDrive - Università degli Studi di Milano-Bicocca\Documents\GitHub\MeshIt-master\meshit\intersection_utils.py", line 1733, in cluster_points
+    if (points[j] - cluster_point).length() < tolerance:
+        ~~~~~~~~~~^~~~~~~~~~~~~~~
+TypeError: unsupported operand type(s) for -: 'TriplePoint' and 'TriplePoint'

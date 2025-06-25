@@ -419,7 +419,9 @@ class PreTetraConstraintManager:
             if b - a < 1:                # need at least 2 distinct points
                 continue
             seg = [v['coord'] for v in intersection_line[a:b + 1]]
-            if len(seg) >= 2 and seg[0] != seg[-1]:
+            if len(seg) >= 2:
+                # FIXED: Remove the seg[0] != seg[-1] filter that was rejecting closed segments
+                # Both open and closed segments are valid constraints for triangulation
                 segments.append(seg)
 
         return segments
