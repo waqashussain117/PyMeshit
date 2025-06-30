@@ -362,13 +362,14 @@ class TriangleWrapper:
         if self.gradient > 1.0:
             self.min_angle = max(20.0 - (self.gradient - 1.0) * 5.0, 10.0)
         
-        # Use MeshIt's exact triangle options: 'pzYYu'
+        # FIXED: Use relaxed triangle options to allow intersection point merging
         # p = Use PSLG (segments)
         # z = Number triangles from zero
-        # Y = Prohibit Steiner points on the boundary
-        # Y = Prohibit Steiner points on the interior
-        # u = Use the user-defined triangle size callback (triunsuitable in C++ version)
-        triangle_opts = 'pzYYu'
+        # Y = Prohibit Steiner points on the boundary (single Y, not YY)
+        # q = Quality mesh generation with minimum angle
+        # a = Maximum area constraint
+        # Note: Removed second Y to allow interior Steiner points for proper intersection handling
+        triangle_opts = f'pzYq{self.min_angle}a{area_constraint}'
         
         print(f"Using MeshIt's exact triangle options: '{triangle_opts}'")
         
