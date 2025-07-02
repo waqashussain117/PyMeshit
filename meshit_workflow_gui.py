@@ -8456,18 +8456,85 @@ segmentation, triangulation, and visualization.
         # Toolbar for 3D viewer controls
         toolbar = QHBoxLayout()
         
+        # Basic controls
         self.tetra_reset_view_btn = QPushButton("🔄 Reset View")
         self.tetra_fit_view_btn = QPushButton("📐 Fit View")
+        
+        # Visualization modes
         self.tetra_wireframe_check = QCheckBox("Wireframe")
         self.tetra_show_materials_check = QCheckBox("Materials")
+        self.tetra_show_internal_check = QCheckBox("Internal Structure")
+        
+        # Opacity control
+        opacity_label = QLabel("Opacity:")
+        self.tetra_opacity_slider = QSlider(Qt.Horizontal)
+        self.tetra_opacity_slider.setRange(10, 100)
+        self.tetra_opacity_slider.setValue(80)
+        self.tetra_opacity_slider.setMaximumWidth(100)
         
         toolbar.addWidget(self.tetra_reset_view_btn)
         toolbar.addWidget(self.tetra_fit_view_btn)
+        
+        # Add separator line
+        separator1 = QFrame()
+        separator1.setFrameShape(QFrame.VLine)
+        separator1.setFrameShadow(QFrame.Sunken)
+        toolbar.addWidget(separator1)
+        
         toolbar.addWidget(self.tetra_wireframe_check)
         toolbar.addWidget(self.tetra_show_materials_check)
+        toolbar.addWidget(self.tetra_show_internal_check)
+        
+        # Add separator line
+        separator2 = QFrame()
+        separator2.setFrameShape(QFrame.VLine)
+        separator2.setFrameShadow(QFrame.Sunken)
+        toolbar.addWidget(separator2)
+        
+        toolbar.addWidget(opacity_label)
+        toolbar.addWidget(self.tetra_opacity_slider)
         toolbar.addStretch()
         
         viz_layout.addLayout(toolbar)
+        
+        # Cutting plane controls (like C++ version)
+        cutting_group = QGroupBox("Cutting Planes (Internal View)")
+        cutting_layout = QHBoxLayout(cutting_group)
+        
+        # X-axis cutting
+        x_cut_layout = QVBoxLayout()
+        self.x_cut_enable = QCheckBox("X Cut")
+        self.x_cut_slider = QSlider(Qt.Horizontal)
+        self.x_cut_slider.setRange(0, 100)
+        self.x_cut_slider.setValue(50)
+        self.x_cut_slider.setEnabled(False)
+        x_cut_layout.addWidget(self.x_cut_enable)
+        x_cut_layout.addWidget(self.x_cut_slider)
+        cutting_layout.addLayout(x_cut_layout)
+        
+        # Y-axis cutting
+        y_cut_layout = QVBoxLayout()
+        self.y_cut_enable = QCheckBox("Y Cut")
+        self.y_cut_slider = QSlider(Qt.Horizontal)
+        self.y_cut_slider.setRange(0, 100)
+        self.y_cut_slider.setValue(50)
+        self.y_cut_slider.setEnabled(False)
+        y_cut_layout.addWidget(self.y_cut_enable)
+        y_cut_layout.addWidget(self.y_cut_slider)
+        cutting_layout.addLayout(y_cut_layout)
+        
+        # Z-axis cutting
+        z_cut_layout = QVBoxLayout()
+        self.z_cut_enable = QCheckBox("Z Cut")
+        self.z_cut_slider = QSlider(Qt.Horizontal)
+        self.z_cut_slider.setRange(0, 100)
+        self.z_cut_slider.setValue(50)
+        self.z_cut_slider.setEnabled(False)
+        z_cut_layout.addWidget(self.z_cut_enable)
+        z_cut_layout.addWidget(self.z_cut_slider)
+        cutting_layout.addLayout(z_cut_layout)
+        
+        viz_layout.addWidget(cutting_group)
         
         # 3D Viewer
         if HAVE_PYVISTA:
@@ -8477,13 +8544,26 @@ segmentation, triangulation, and visualization.
             self.tetra_plotter.set_background([0.15, 0.15, 0.2])
             viz_layout.addWidget(self.tetra_plotter.interactor)
             
-            # Connect toolbar buttons
+            # Connect controls
             self.tetra_reset_view_btn.clicked.connect(self.tetra_plotter.reset_camera)
             self.tetra_fit_view_btn.clicked.connect(lambda: self.tetra_plotter.reset_camera(render=True))
             self.tetra_wireframe_check.toggled.connect(self._toggle_tetra_wireframe)
             self.tetra_show_materials_check.toggled.connect(self._toggle_tetra_materials)
+            self.tetra_show_internal_check.toggled.connect(self._toggle_tetra_internal)
+            self.tetra_opacity_slider.valueChanged.connect(self._update_tetra_opacity)
             
-            logger.info("Tetra mesh 3D viewer initialized")
+            # Connect cutting plane controls
+            self.x_cut_enable.toggled.connect(lambda enabled: self.x_cut_slider.setEnabled(enabled))
+            self.y_cut_enable.toggled.connect(lambda enabled: self.y_cut_slider.setEnabled(enabled))
+            self.z_cut_enable.toggled.connect(lambda enabled: self.z_cut_slider.setEnabled(enabled))
+            self.x_cut_enable.toggled.connect(self._update_cutting_planes)
+            self.y_cut_enable.toggled.connect(self._update_cutting_planes)
+            self.z_cut_enable.toggled.connect(self._update_cutting_planes)
+            self.x_cut_slider.valueChanged.connect(self._update_cutting_planes)
+            self.y_cut_slider.valueChanged.connect(self._update_cutting_planes)
+            self.z_cut_slider.valueChanged.connect(self._update_cutting_planes)
+            
+            logger.info("Enhanced tetra mesh 3D viewer with cutting planes initialized")
         else:
             placeholder = QLabel("PyVista is required for 3D visualization.")
             placeholder.setAlignment(Qt.AlignCenter)
@@ -8687,11 +8767,12 @@ segmentation, triangulation, and visualization.
             self.tetra_plotter.add_text(f"Visualization error: {str(e)}", position='upper_edge', color='red')
 
     def _toggle_tetra_wireframe(self, enabled):
-        """Toggle wireframe display for loaded surfaces"""
+        """Toggle wireframe display for loaded surfaces and tetrahedral mesh"""
         if not self.tetra_plotter:
             return
             
         try:
+            # Handle wireframe for loaded surfaces
             for surface_idx in self.tetra_selected_surfaces:
                 actor = self.tetra_plotter.actors.get(f"surface_{surface_idx}")
                 if actor:
@@ -8699,14 +8780,71 @@ segmentation, triangulation, and visualization.
                         actor.prop.representation = 'wireframe'
                     else:
                         actor.prop.representation = 'surface'
-            self.tetra_plotter.render()
+            
+            # Handle wireframe for tetrahedral mesh if available
+            if hasattr(self, 'full_tetra_mesh') and self.full_tetra_mesh is not None:
+                self._refresh_tetrahedral_visualization()
+            else:
+                self.tetra_plotter.render()
+                
         except Exception as e:
             logger.error(f"Error toggling wireframe: {e}")
 
     def _toggle_tetra_materials(self, enabled):
-        """Toggle material ID display (placeholder for now)"""
-        # This will be implemented when tetrahedral mesh is generated
+        """Toggle material ID display"""
         logger.info(f"Material display toggled: {enabled}")
+        
+        # Update visualization if mesh is available
+        if hasattr(self, 'full_tetra_mesh') and self.full_tetra_mesh is not None:
+            self._refresh_tetrahedral_visualization()
+
+    def _toggle_tetra_internal(self, enabled):
+        """Toggle internal structure visualization"""
+        logger.info(f"Internal structure display toggled: {enabled}")
+        
+        # Update visualization if mesh is available
+        if hasattr(self, 'full_tetra_mesh') and self.full_tetra_mesh is not None:
+            self._refresh_tetrahedral_visualization()
+
+    def _update_tetra_opacity(self, value):
+        """Update tetrahedral mesh opacity"""
+        opacity = value / 100.0
+        logger.debug(f"Tetrahedral mesh opacity updated: {opacity}")
+        
+        # Update visualization if mesh is available
+        if hasattr(self, 'full_tetra_mesh') and self.full_tetra_mesh is not None:
+            self._refresh_tetrahedral_visualization()
+
+    def _update_cutting_planes(self):
+        """Update cutting plane visualization"""
+        logger.debug("Cutting planes updated")
+        
+        # Update visualization if mesh is available
+        if hasattr(self, 'full_tetra_mesh') and self.full_tetra_mesh is not None:
+            self._refresh_tetrahedral_visualization()
+
+    def _refresh_tetrahedral_visualization(self):
+        """Refresh the tetrahedral mesh visualization with current settings"""
+        if not self.tetra_plotter or not hasattr(self, 'full_tetra_mesh'):
+            return
+            
+        try:
+            # Clear existing tetrahedral mesh actors
+            actors_to_remove = []
+            for name in self.tetra_plotter.actors:
+                if 'tetrahedral' in name:
+                    actors_to_remove.append(name)
+            
+            for name in actors_to_remove:
+                self.tetra_plotter.remove_actor(name)
+            
+            # Re-add the visualization with current settings
+            self._add_tetrahedral_mesh_visualization(self.full_tetra_mesh)
+            
+            self.tetra_plotter.render()
+            
+        except Exception as e:
+            logger.error(f"Error refreshing tetrahedral visualization: {e}")
 
         # ------------------------------------------------------------------
     #  3-D viewer used in the Tetra-Mesh tab
@@ -8886,6 +9024,7 @@ segmentation, triangulation, and visualization.
             
         try:
             import pyvista as pv
+            import numpy as np
             
             self.tetra_plotter.clear()
             
@@ -8899,44 +9038,188 @@ segmentation, triangulation, and visualization.
                 self.tetra_plotter.add_text("No mesh data available", position='upper_edge', color='red')
                 return
             
-            # Extract surface for visualization
-            surface_mesh = mesh.extract_surface()
+            # Store full mesh for later use
+            self.full_tetra_mesh = mesh
             
-            # Check for material IDs
-            scalars = None
+            # Enhanced visualization like C++ version
+            self._add_tetrahedral_mesh_visualization(mesh)
+            
+            # Add colorbar if using materials
             if 'MaterialID' in mesh.cell_data:
-                scalars = 'MaterialID'
-                
-            # Add mesh to plotter
-            self.tetra_plotter.add_mesh(
-                surface_mesh,
-                scalars=scalars,
-                cmap='tab10' if scalars else None,
-                opacity=0.8,
-                show_edges=True,
-                edge_color='white',
-                line_width=0.5,
-                name='tetrahedral_mesh'
+                self.tetra_plotter.add_scalar_bar(title='Material ID', interactive=True)
+            
+            # Add coordinate axes
+            self.tetra_plotter.add_axes(
+                line_width=3,
+                cone_radius=0.6,
+                shaft_length=0.7,
+                tip_length=0.3,
+                ambient=0.5,
+                x_color='red',
+                y_color='green', 
+                z_color='blue'
             )
             
-            # Add colorbar if using scalars
-            if scalars:
-                self.tetra_plotter.add_scalar_bar(title='Material ID')
+            # Enable all controls
+            if hasattr(self, 'tetra_show_materials_check'):
+                self.tetra_show_materials_check.setEnabled(True)
+            if hasattr(self, 'tetra_show_internal_check'):
+                self.tetra_show_internal_check.setEnabled(True)
+            if hasattr(self, 'x_cut_enable'):
+                self.x_cut_enable.setEnabled(True)
+                self.y_cut_enable.setEnabled(True)
+                self.z_cut_enable.setEnabled(True)
             
-            self.tetra_plotter.add_axes()
             self.tetra_plotter.reset_camera()
             self.tetra_plotter.render()
             
-            # Enable material toggle
-            if hasattr(self, 'tetra_show_materials_check'):
-                self.tetra_show_materials_check.setEnabled(True)
-            
-            logger.info("Tetrahedral mesh visualized in tetra tab")
+            logger.info("Enhanced tetrahedral mesh visualized with internal structure support")
             
         except Exception as e:
             logger.error(f"Error visualizing tetrahedral mesh: {e}")
-            if hasattr(self, 'tetra_plotter'):
-                self.tetra_plotter.add_text(f"Visualization error: {str(e)}", position='upper_edge', color='red')
+            self.tetra_plotter.add_text(f"Visualization error: {str(e)}", position='upper_edge', color='red')
+
+    def _add_tetrahedral_mesh_visualization(self, mesh):
+        """Add tetrahedral mesh visualization with different modes"""
+        import pyvista as pv
+        import numpy as np
+        
+        # Get current settings
+        show_internal = getattr(self, 'tetra_show_internal_check', None) and self.tetra_show_internal_check.isChecked()
+        show_materials = getattr(self, 'tetra_show_materials_check', None) and self.tetra_show_materials_check.isChecked()
+        opacity = getattr(self, 'tetra_opacity_slider', None) and self.tetra_opacity_slider.value() / 100.0 or 0.8
+        
+        # Apply cutting planes if enabled
+        processed_mesh = self._apply_cutting_planes(mesh)
+        
+        if show_internal:
+            # Show internal structure (like C++ version)
+            self._add_internal_structure_visualization(processed_mesh, show_materials, opacity)
+        else:
+            # Show surface only (default)
+            self._add_surface_visualization(processed_mesh, show_materials, opacity)
+
+    def _add_surface_visualization(self, mesh, show_materials, opacity):
+        """Add surface-only visualization"""
+        import pyvista as pv
+        
+        # Extract surface
+        surface_mesh = mesh.extract_surface()
+        
+        # Configure scalars
+        scalars = None
+        cmap = None
+        if show_materials and 'MaterialID' in mesh.cell_data:
+            # Map material IDs from cells to surface
+            if hasattr(surface_mesh, 'cell_data') and 'MaterialID' in surface_mesh.cell_data:
+                scalars = 'MaterialID'
+                cmap = 'tab10'
+        
+        # Add surface mesh
+        self.tetra_plotter.add_mesh(
+            surface_mesh,
+            scalars=scalars,
+            cmap=cmap,
+            opacity=opacity,
+            show_edges=self.tetra_wireframe_check.isChecked() if hasattr(self, 'tetra_wireframe_check') else True,
+            edge_color='white',
+            line_width=0.5,
+            name='tetrahedral_surface'
+        )
+
+    def _add_internal_structure_visualization(self, mesh, show_materials, opacity):
+        """Add internal structure visualization like C++ version"""
+        import pyvista as pv
+        import numpy as np
+        
+        # Extract surface for outer boundary
+        surface_mesh = mesh.extract_surface()
+        
+        # Add semi-transparent surface
+        surface_scalars = None
+        if show_materials and 'MaterialID' in mesh.cell_data:
+            surface_scalars = 'MaterialID'
+        
+        self.tetra_plotter.add_mesh(
+            surface_mesh,
+            scalars=surface_scalars,
+            cmap='tab10' if surface_scalars else None,
+            opacity=max(0.3, opacity * 0.5),  # Make more transparent for internal view
+            show_edges=False,
+            name='tetrahedral_surface_internal'
+        )
+        
+        # Show internal structure by subsampling tetrahedra
+        if mesh.n_cells > 0:
+            # Sample internal tetrahedra (show every Nth tetrahedron for performance)
+            n_cells = mesh.n_cells
+            sample_rate = max(1, n_cells // 2000)  # Show max 2000 tetrahedra for performance
+            
+            # Get tetrahedral centers to filter internal ones
+            centers = mesh.cell_centers().points
+            bounds = mesh.bounds
+            
+            # Filter to show tetrahedra away from boundaries (internal ones)
+            margin = 0.1  # 10% margin from boundaries
+            x_margin = (bounds[1] - bounds[0]) * margin
+            y_margin = (bounds[3] - bounds[2]) * margin 
+            z_margin = (bounds[5] - bounds[4]) * margin
+            
+            internal_mask = (
+                (centers[:, 0] > bounds[0] + x_margin) & (centers[:, 0] < bounds[1] - x_margin) &
+                (centers[:, 1] > bounds[2] + y_margin) & (centers[:, 1] < bounds[3] - y_margin) &
+                (centers[:, 2] > bounds[4] + z_margin) & (centers[:, 2] < bounds[5] - z_margin)
+            )
+            
+            internal_indices = np.where(internal_mask)[0][::sample_rate]
+            
+            if len(internal_indices) > 0:
+                # Extract internal tetrahedra
+                internal_cells = mesh.extract_cells(internal_indices)
+                
+                # Add as wireframe to show internal structure
+                if show_materials and 'MaterialID' in internal_cells.cell_data:
+                    internal_scalars = 'MaterialID'
+                    internal_cmap = 'tab10'
+                else:
+                    internal_scalars = None
+                    internal_cmap = None
+                
+                self.tetra_plotter.add_mesh(
+                    internal_cells,
+                    style='wireframe',
+                    scalars=internal_scalars,
+                    cmap=internal_cmap,
+                    opacity=1.0,
+                    line_width=2,
+                    name='tetrahedral_internal'
+                )
+
+    def _apply_cutting_planes(self, mesh):
+        """Apply cutting planes to mesh like C++ version"""
+        if not hasattr(self, 'x_cut_enable'):
+            return mesh
+        
+        processed_mesh = mesh
+        bounds = mesh.bounds
+        
+        # Apply X cutting plane
+        if self.x_cut_enable.isChecked():
+            x_pos = bounds[0] + (bounds[1] - bounds[0]) * (self.x_cut_slider.value() / 100.0)
+            processed_mesh = processed_mesh.clip('x', value=x_pos)
+        
+        # Apply Y cutting plane  
+        if self.y_cut_enable.isChecked():
+            y_pos = bounds[2] + (bounds[3] - bounds[2]) * (self.y_cut_slider.value() / 100.0)
+            processed_mesh = processed_mesh.clip('y', value=y_pos)
+        
+        # Apply Z cutting plane
+        if self.z_cut_enable.isChecked():
+            z_pos = bounds[4] + (bounds[5] - bounds[4]) * (self.z_cut_slider.value() / 100.0)
+            processed_mesh = processed_mesh.clip('z', value=z_pos)
+        
+        return processed_mesh
+
 
     def _initialize_tetra_visualization(self):
         """Initialize the tetra mesh tab visualization with default settings."""

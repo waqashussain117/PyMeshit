@@ -50,7 +50,7 @@ class TetrahedralMeshGenerator:
         self.plc_edge_constraints = None
         self.plc_edge_markers = None
 
-    def generate_tetrahedral_mesh(self, tetgen_switches: str = "pq1.414aA") -> Optional[pv.UnstructuredGrid]:
+    def generate_tetrahedral_mesh(self, tetgen_switches: str = "pq1.414aAY") -> Optional[pv.UnstructuredGrid]:
         """
         Generate tetrahedral mesh from the provided conforming surface data.
         """
@@ -106,7 +106,7 @@ class TetrahedralMeshGenerator:
     def _build_plc_from_precomputed_meshes(self):
         """
         Builds the final PLC by combining pre-computed conforming meshes.
-        This is the correct, robust C++ workflow.
+        FIXED: Fault surfaces treated as internal constraints, not boundary facets.
         """
         logger.info("Building final PLC from pre-computed conforming meshes...")
 
@@ -116,10 +116,16 @@ class TetrahedralMeshGenerator:
         global_facet_markers = []
         edge_constraints = set()
 
-        # 1. Combine vertices and facets from each selected surface's conforming mesh.
-        for s_idx in self.selected_surfaces:
+        # CRITICAL FIX: Only boundary surfaces define the domain boundary
+        boundary_surfaces = (self.border_surface_indices | self.unit_surface_indices) & self.selected_surfaces
+        fault_surfaces = self.fault_surface_indices & self.selected_surfaces
+
+        logger.info(f"Processing {len(boundary_surfaces)} boundary surfaces, {len(fault_surfaces)} fault surfaces as internal constraints")
+
+        # 1. Process boundary surfaces (borders + units) - these define the domain
+        for s_idx in boundary_surfaces:
             if s_idx not in self.surface_data:
-                logger.warning(f"Surface {s_idx} selected but has no conforming mesh data. Skipping.")
+                logger.warning(f"Boundary surface {s_idx} selected but has no conforming mesh data. Skipping.")
                 continue
             
             conforming_mesh = self.surface_data[s_idx]
@@ -148,7 +154,47 @@ class TetrahedralMeshGenerator:
                         global_facets.append(global_tri)
                         global_facet_markers.append(s_idx)
 
-        # 2. Re-map intersection line constraints to the new global vertex indices.
+        # 2. Process fault surfaces - add vertices but not facets (they become internal constraints)
+        fault_edge_constraints = set()
+        for s_idx in fault_surfaces:
+            if s_idx not in self.surface_data:
+                logger.warning(f"Fault surface {s_idx} selected but has no conforming mesh data. Skipping.")
+                continue
+            
+            conforming_mesh = self.surface_data[s_idx]
+            local_vertices = conforming_mesh.get('vertices')
+            local_triangles = conforming_mesh.get('triangles')
+
+            if local_vertices is None or local_triangles is None or len(local_vertices) == 0:
+                continue
+
+            # Add fault vertices to global pool
+            local_to_global_map = {}
+            for local_idx, vertex in enumerate(local_vertices):
+                key = (round(vertex[0], 9), round(vertex[1], 9), round(vertex[2], 9))
+                global_idx = key_to_global_idx.get(key)
+                if global_idx is None:
+                    global_idx = len(global_vertices)
+                    key_to_global_idx[key] = global_idx
+                    global_vertices.append(list(vertex))
+                local_to_global_map[local_idx] = global_idx
+
+            # Convert fault triangles to edge constraints (internal discontinuities)
+            for tri in local_triangles:
+                global_tri = [local_to_global_map.get(v_idx) for v_idx in tri[:3]]
+                if all(v is not None for v in global_tri) and len(set(global_tri)) == 3:
+                    # Add triangle edges as constraints instead of the triangle as a facet
+                    for i in range(3):
+                        v1_idx = global_tri[i]
+                        v2_idx = global_tri[(i + 1) % 3]
+                        if v1_idx != v2_idx:
+                            edge_tuple = tuple(sorted((v1_idx, v2_idx)))
+                            fault_edge_constraints.add(edge_tuple)
+
+        logger.info(f"Added {len(fault_edge_constraints)} fault edge constraints from {len(fault_surfaces)} fault surfaces")
+
+        # 3. Re-map intersection line constraints with enhanced precision
+        constraint_point_failures = 0
         for s_idx in self.selected_surfaces:
             if s_idx >= len(self.datasets): continue
             
@@ -160,12 +206,26 @@ class TetrahedralMeshGenerator:
                     
                     gidx_line = []
                     for p in points:
+                        # Enhanced precision matching for constraint points
                         key = (round(p[0], 9), round(p[1], 9), round(p[2], 9))
                         gidx = key_to_global_idx.get(key)
                         if gidx is not None:
                             gidx_line.append(gidx)
                         else:
-                            logger.warning(f"Constraint point {key} not found in global vertex pool. This should not happen.")
+                            # Try with slightly relaxed precision for constraint points
+                            found = False
+                            for existing_key, existing_gidx in key_to_global_idx.items():
+                                if (abs(existing_key[0] - key[0]) < 1e-8 and 
+                                    abs(existing_key[1] - key[1]) < 1e-8 and 
+                                    abs(existing_key[2] - key[2]) < 1e-8):
+                                    gidx_line.append(existing_gidx)
+                                    found = True
+                                    break
+                            
+                            if not found:
+                                constraint_point_failures += 1
+                                if constraint_point_failures <= 5:  # Only log first few failures
+                                    logger.warning(f"Constraint point {key} not found in global vertex pool (surface {s_idx}).")
                     
                     if len(gidx_line) >= 2:
                         for i in range(len(gidx_line) - 1):
@@ -174,14 +234,20 @@ class TetrahedralMeshGenerator:
                                 edge_tuple = tuple(sorted((p1_gidx, p2_gidx)))
                                 edge_constraints.add(edge_tuple)
 
+        # Combine intersection and fault edge constraints
+        all_edge_constraints = edge_constraints | fault_edge_constraints
+
+        if constraint_point_failures > 5:
+            logger.warning(f"Total constraint point failures: {constraint_point_failures} (only first 5 logged)")
+
         # Finalize PLC data
         self.plc_vertices = np.asarray(global_vertices, dtype=np.float64)
         self.plc_facets = np.asarray(global_facets, dtype=np.int32)
         self.plc_facet_markers = np.asarray(global_facet_markers, dtype=np.int32)
-        self.plc_edge_constraints = np.asarray(list(edge_constraints), dtype=np.int32)
-        self.plc_edge_markers = np.arange(1, len(self.plc_edge_constraints) + 1, dtype=np.int32)
+        self.plc_edge_constraints = np.asarray(list(all_edge_constraints), dtype=np.int32) if all_edge_constraints else np.array([], dtype=np.int32).reshape(0, 2)
+        self.plc_edge_markers = np.arange(1, len(self.plc_edge_constraints) + 1, dtype=np.int32) if len(all_edge_constraints) > 0 else np.array([], dtype=np.int32)
 
-        logger.info(f"Final PLC created: {len(self.plc_vertices)} vertices, {len(self.plc_facets)} facets, {len(self.plc_edge_constraints)} edge constraints.")
+        logger.info(f"Final PLC created: {len(self.plc_vertices)} vertices, {len(self.plc_facets)} facets (boundary only), {len(self.plc_edge_constraints)} edge constraints ({len(edge_constraints)} intersection + {len(fault_edge_constraints)} fault).")
 
     def _prepare_material_regions(self) -> List[List[float]]:
         region_attributes_list = []
@@ -205,7 +271,10 @@ class TetrahedralMeshGenerator:
     def _run_tetgen_fallback_strategies(self, original_switches: str) -> Optional[pv.UnstructuredGrid]:
         logger.warning("Initial TetGen failed. Trying fallback strategies...")
         fallback_switches = [
-            "pq1.2aA", "pA", "p", "pzQ"
+            "pq1.2aAY",  # C++ command line style
+            "pAY",       # C++ GUI style
+            "pA",        # Basic (what worked before)
+            "pzQ"        # Last resort
         ]
         for switches in fallback_switches:
             try:
@@ -280,7 +349,7 @@ class TetrahedralMeshGenerator:
 def create_tetrahedral_mesh(datasets: List[Dict], selected_surfaces: set, 
                            border_surface_indices: set, unit_surface_indices: set, 
                            fault_surface_indices: set, materials: List[Dict] = None,
-                           tetgen_switches: str = "pq1.414aA") -> Optional[Dict]:
+                           tetgen_switches: str = "pq1.414aAY") -> Optional[Dict]:
     """
     Convenience function to create a tetrahedral mesh.
     """
