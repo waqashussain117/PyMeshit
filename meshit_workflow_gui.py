@@ -350,7 +350,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
         # Connect signals
         self.notebook.currentChanged.connect(self._on_tab_changed)
-        
+    
         # Show ready message
         self.statusBar().showMessage("MeshIt GUI Ready")
         
@@ -6349,6 +6349,7 @@ segmentation, triangulation, and visualization.
         Called whenever a checkbox in the segment tree changes.
         1) Propagate parent->children or child->parent states.
         2) Update visibility/colour of the corresponding 3-D actor(s).
+        3) Synchronize intersection line selections across surfaces.
         """
         if self._refine_updating_constraint_tree or column != 0:
             return
@@ -6377,6 +6378,20 @@ segmentation, triangulation, and visualization.
                 update_parent_state(parent)
 
             update_parent_state(item)
+
+            # -------- sync intersection selections across surfaces -----------
+            # Get the item data to check if it's an intersection group or a segment within an intersection group
+            data = item.data(0, Qt.UserRole)
+            if data:
+                # If it's an intersection group or a constraint within an intersection group
+                if data.get('type') == 'intersection_group' or (
+                    data.get('type') == 'constraint' and 
+                    item.parent() and 
+                    item.parent().data(0, Qt.UserRole) and 
+                    item.parent().data(0, Qt.UserRole).get('type') == 'intersection_group'
+                ):
+                    # Synchronize this intersection line selection across surfaces
+                    self._sync_intersection_selection_across_surfaces(item)
 
         finally:
             self._refine_updating_constraint_tree = False
@@ -11065,6 +11080,392 @@ segmentation, triangulation, and visualization.
         finally:
             self._refine_updating_constraint_tree = False
     
+    def _sync_intersection_selection_across_surfaces(self, changed_item):
+        """
+        Synchronize intersection line selections across surfaces.
+        When an intersection line is selected/deselected in one surface,
+        find the same intersection line in other surfaces and apply the same selection state.
+        
+        Args:
+            changed_item: The QTreeWidgetItem that was changed
+        """
+        # Skip if we don't have the necessary data structures
+        if not hasattr(self, "refined_intersections_for_visualization") or not hasattr(self, "refine_constraint_tree"):
+            return
+            
+        # Determine if we're dealing with an intersection group or a segment within an intersection group
+        data = changed_item.data(0, Qt.UserRole)
+        if not data:
+            return
+            
+        # Get the checked state that needs to be propagated
+        is_checked = changed_item.checkState(0) == Qt.Checked
+        
+        # Handle different item types
+        if data.get('type') == 'intersection_group':
+            # This is an intersection group item
+            surface_idx = data.get('surface_idx')
+            intersection_idx = -1
+            
+            # Extract the intersection index from the text (e.g., "Intersection 2")
+            item_text = changed_item.text(0)
+            try:
+                intersection_idx = int(item_text.split(" ")[-1])
+            except (ValueError, IndexError):
+                return
+                
+            # Get the intersection data for this surface and index
+            if surface_idx not in self.refined_intersections_for_visualization:
+                return
+                
+            if intersection_idx >= len(self.refined_intersections_for_visualization[surface_idx]):
+                return
+                
+            # Get the intersection data
+            intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+            
+            # Find all surfaces involved in this intersection
+            # We need to check both dataset_id1 and dataset_id2
+            dataset_id1 = intersection_data.get('dataset_id1')
+            dataset_id2 = intersection_data.get('dataset_id2')
+            
+            # Update both surfaces (except the current one)
+            if dataset_id1 is not None and dataset_id1 != surface_idx:
+                self._update_matching_intersection(dataset_id1, intersection_data, is_checked)
+                
+            if dataset_id2 is not None and dataset_id2 != surface_idx:
+                self._update_matching_intersection(dataset_id2, intersection_data, is_checked)
+                
+        elif data.get('type') == 'constraint' and changed_item.parent() and changed_item.parent().data(0, Qt.UserRole) and changed_item.parent().data(0, Qt.UserRole).get('type') == 'intersection_group':
+            # This is a segment within an intersection group
+            # Get the parent intersection group
+            intersection_group_item = changed_item.parent()
+            intersection_group_data = intersection_group_item.data(0, Qt.UserRole)
+            surface_idx = intersection_group_data.get('surface_idx')
+            
+            # Extract the intersection index from the text (e.g., "Intersection 2")
+            item_text = intersection_group_item.text(0)
+            try:
+                intersection_idx = int(item_text.split(" ")[-1])
+            except (ValueError, IndexError):
+                return
+                
+            # Get the intersection data for this surface and index
+            if surface_idx not in self.refined_intersections_for_visualization:
+                return
+                
+            if intersection_idx >= len(self.refined_intersections_for_visualization[surface_idx]):
+                return
+                
+            # Get the intersection data
+            intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+            
+            # Get the segment data
+            seg_uid = data.get('seg_uid')
+            if (surface_idx, seg_uid) not in self._refine_segment_map:
+                return
+                
+            segment_data = self._refine_segment_map[(surface_idx, seg_uid)]
+            segment_points = segment_data.get('points', [])
+            
+            # Find all surfaces involved in this intersection
+            dataset_id1 = intersection_data.get('dataset_id1')
+            dataset_id2 = intersection_data.get('dataset_id2')
+            
+            # Update segments in all related surfaces (except the current one)
+            if dataset_id1 is not None and dataset_id1 != surface_idx:
+                # Find matching segments in the first surface
+                for i in range(len(self.refined_intersections_for_visualization.get(dataset_id1, []))):
+                    self._update_matching_segment(dataset_id1, i, segment_points, is_checked)
+                
+            if dataset_id2 is not None and dataset_id2 != surface_idx:
+                # Find matching segments in the second surface
+                for i in range(len(self.refined_intersections_for_visualization.get(dataset_id2, []))):
+                    self._update_matching_segment(dataset_id2, i, segment_points, is_checked)
+    
+    def _update_matching_intersection(self, surface_idx, intersection_data, is_checked):
+        """
+        Update the selection state of a matching intersection line in another surface.
+        
+        Args:
+            surface_idx: The index of the surface to update
+            intersection_data: The intersection data to match
+            is_checked: Whether the intersection should be checked or unchecked
+        """
+        # Find the surface item in the tree
+        tree = self.refine_constraint_tree
+        surface_item = None
+        
+        for i in range(tree.topLevelItemCount()):
+            item = tree.topLevelItem(i)
+            item_data = item.data(0, Qt.UserRole)
+            if item_data and item_data.get('type') == 'surface' and item_data.get('surface_idx') == surface_idx:
+                surface_item = item
+                break
+                
+        if not surface_item:
+            return
+            
+        # Find the matching intersection group
+        for i in range(surface_item.childCount()):
+            group_item = surface_item.child(i)
+            group_data = group_item.data(0, Qt.UserRole)
+            
+            if group_data and group_data.get('type') == 'intersection_group':
+                # Find which intersection this is in the refined_intersections_for_visualization list
+                item_text = group_item.text(0)
+                try:
+                    intersection_idx = int(item_text.split(" ")[-1])
+                    
+                    # Check if this is the matching intersection
+                    if surface_idx in self.refined_intersections_for_visualization and intersection_idx < len(self.refined_intersections_for_visualization[surface_idx]):
+                        other_intersection = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+                        
+                        # Check if this is the same intersection (by comparing the two surfaces involved)
+                        if ((other_intersection.get('dataset_id1') == intersection_data.get('dataset_id1') and 
+                             other_intersection.get('dataset_id2') == intersection_data.get('dataset_id2')) or
+                            (other_intersection.get('dataset_id1') == intersection_data.get('dataset_id2') and 
+                             other_intersection.get('dataset_id2') == intersection_data.get('dataset_id1'))):
+                            
+                            # This is the matching intersection, update its checked state
+                            if group_item.checkState(0) != (Qt.Checked if is_checked else Qt.Unchecked):
+                                group_item.setCheckState(0, Qt.Checked if is_checked else Qt.Unchecked)
+                                
+                                # Also update all child segments
+                                for j in range(group_item.childCount()):
+                                    segment_item = group_item.child(j)
+                                    segment_item.setCheckState(0, Qt.Checked if is_checked else Qt.Unchecked)
+                                    
+                            return
+                            
+                except (ValueError, IndexError):
+                    continue
+    
+    def _update_matching_segment(self, surface_idx, intersection_idx, segment_points, is_checked):
+        """
+        Update the selection state of a matching segment in another surface.
+        
+        Args:
+            surface_idx: The index of the surface to update
+            intersection_idx: The index of the intersection containing the segment
+            segment_points: The points defining the segment to match
+            is_checked: Whether the segment should be checked or unchecked
+        """
+        # Skip if surface index is invalid
+        if surface_idx is None or surface_idx < 0:
+            return
+            
+        # Find the surface item in the tree
+        tree = self.refine_constraint_tree
+        surface_item = None
+        
+        for i in range(tree.topLevelItemCount()):
+            item = tree.topLevelItem(i)
+            item_data = item.data(0, Qt.UserRole)
+            if item_data and item_data.get('type') == 'surface' and item_data.get('surface_idx') == surface_idx:
+                surface_item = item
+                break
+                
+        if not surface_item:
+            return
+        
+        # Get the intersection data for this surface
+        if surface_idx not in self.refined_intersections_for_visualization:
+            return
+            
+        # Find all intersection groups in this surface
+        for i in range(surface_item.childCount()):
+            group_item = surface_item.child(i)
+            group_data = group_item.data(0, Qt.UserRole)
+            
+            if group_data and group_data.get('type') == 'intersection_group':
+                # Get the intersection index
+                item_text = group_item.text(0)
+                try:
+                    group_intersection_idx = int(item_text.split(" ")[-1])
+                    
+                    # Check if this is a valid intersection index
+                    if group_intersection_idx >= len(self.refined_intersections_for_visualization[surface_idx]):
+                        continue
+                        
+                    # Get the intersection data
+                    other_intersection = self.refined_intersections_for_visualization[surface_idx][group_intersection_idx]
+                    
+                    # Check all segments in this group
+                    for j in range(group_item.childCount()):
+                        segment_item = group_item.child(j)
+                        segment_data = segment_item.data(0, Qt.UserRole)
+                        
+                        if segment_data and segment_data.get('type') == 'constraint':
+                            seg_uid = segment_data.get('seg_uid')
+                            if (surface_idx, seg_uid) in self._refine_segment_map:
+                                other_segment_data = self._refine_segment_map[(surface_idx, seg_uid)]
+                                other_segment_points = other_segment_data.get('points', [])
+                                
+                                # Use more robust segment matching
+                                if self._are_segments_matching(segment_points, other_segment_points):
+                                    # This is the matching segment, update its checked state
+                                    current_state = segment_item.checkState(0)
+                                    target_state = Qt.Checked if is_checked else Qt.Unchecked
+                                    
+                                    if current_state != target_state:
+                                        # Block signals temporarily to prevent recursion
+                                        tree.blockSignals(True)
+                                        segment_item.setCheckState(0, target_state)
+                                        tree.blockSignals(False)
+                                        
+                                        # Update parent state if needed
+                                        self._update_parent_state_after_segment_change(segment_item)
+                                        
+                                        # Force visual update
+                                        self._apply_segment_state(surface_idx, seg_uid, is_checked)
+                                        
+                                    # We found a match, but continue searching for more potential matches
+                                    # instead of returning immediately
+                                
+                except (ValueError, IndexError):
+                    continue
+                    
+    def _update_parent_state_after_segment_change(self, segment_item):
+        """
+        Update the parent intersection group's checked state based on its children.
+        
+        Args:
+            segment_item: The segment item that was changed
+        """
+        parent = segment_item.parent()
+        if not parent:
+            return
+            
+        # Check if any children are checked
+        any_checked = False
+        for i in range(parent.childCount()):
+            if parent.child(i).checkState(0) == Qt.Checked:
+                any_checked = True
+                break
+                
+        # Update parent state
+        parent.setCheckState(0, Qt.Checked if any_checked else Qt.Unchecked)
+        
+        # Update grandparent (surface) state
+        grandparent = parent.parent()
+        if grandparent:
+            any_child_checked = False
+            for i in range(grandparent.childCount()):
+                if grandparent.child(i).checkState(0) == Qt.Checked:
+                    any_child_checked = True
+                    break
+                    
+            grandparent.setCheckState(0, Qt.Checked if any_child_checked else Qt.Unchecked)
+    
+    def _are_segments_matching(self, points1, points2, tolerance=1e-6):
+        """
+        Check if two segments match by comparing their endpoints.
+        Uses a more robust matching algorithm that works with different point formats
+        and handles potential numerical precision issues.
+        
+        Args:
+            points1: First segment points
+            points2: Second segment points
+            tolerance: Tolerance for point comparison (increased for better matching)
+            
+        Returns:
+            bool: True if segments match, False otherwise
+        """
+        # Handle empty or None points
+        if not points1 or not points2:
+            return False
+            
+        # For segments, we only need to check the endpoints (first and last points)
+        # This is more reliable than checking all points, especially for complex segments
+        if len(points1) >= 2 and len(points2) >= 2:
+            # Extract endpoints
+            p1_start, p1_end = points1[0], points1[-1]
+            p2_start, p2_end = points2[0], points2[-1]
+            
+            # Check if endpoints match in either order (forward or reverse)
+            forward_match = (self._are_points_matching(p1_start, p2_start, tolerance) and 
+                            self._are_points_matching(p1_end, p2_end, tolerance))
+            
+            reverse_match = (self._are_points_matching(p1_start, p2_end, tolerance) and 
+                            self._are_points_matching(p1_end, p2_start, tolerance))
+            
+            return forward_match or reverse_match
+            
+        # Fallback to full point-by-point comparison for segments with only one point
+        # (should be rare, but handled for completeness)
+        if len(points1) != len(points2):
+            return False
+            
+        # Check if points match in order
+        matches_forward = all(
+            self._are_points_matching(p1, p2, tolerance)
+            for p1, p2 in zip(points1, points2)
+        )
+        
+        # Check if points match in reverse order
+        matches_reverse = all(
+            self._are_points_matching(p1, p2, tolerance)
+            for p1, p2 in zip(points1, reversed(points2))
+        )
+        
+        return matches_forward or matches_reverse
+    
+    def _are_points_matching(self, p1, p2, tolerance=1e-6):
+        """
+        Check if two points match within tolerance.
+        Enhanced to handle different point formats and potential numerical precision issues.
+        
+        Args:
+            p1: First point
+            p2: Second point
+            tolerance: Tolerance for comparison (increased for better matching)
+            
+        Returns:
+            bool: True if points match, False otherwise
+        """
+        try:
+            # Handle Vector3D objects
+            if hasattr(p1, 'x') and hasattr(p1, 'y') and hasattr(p1, 'z'):
+                x1, y1, z1 = float(p1.x), float(p1.y), float(p1.z)
+            elif isinstance(p1, (list, tuple)) and len(p1) >= 3:
+                x1, y1, z1 = float(p1[0]), float(p1[1]), float(p1[2])
+            else:
+                # Can't extract coordinates
+                return False
+                
+            if hasattr(p2, 'x') and hasattr(p2, 'y') and hasattr(p2, 'z'):
+                x2, y2, z2 = float(p2.x), float(p2.y), float(p2.z)
+            elif isinstance(p2, (list, tuple)) and len(p2) >= 3:
+                x2, y2, z2 = float(p2[0]), float(p2[1]), float(p2[2])
+            else:
+                # Can't extract coordinates
+                return False
+            
+            # Round to fixed precision to avoid floating point comparison issues
+            # This is more robust than direct comparison with tolerance
+            x1_rounded = round(x1, 9)
+            y1_rounded = round(y1, 9)
+            z1_rounded = round(z1, 9)
+            
+            x2_rounded = round(x2, 9)
+            y2_rounded = round(y2, 9)
+            z2_rounded = round(z2, 9)
+            
+            # First try exact match with rounding
+            if (x1_rounded == x2_rounded and 
+                y1_rounded == y2_rounded and 
+                z1_rounded == z2_rounded):
+                return True
+                
+            # Fall back to tolerance-based comparison for near matches
+            return (abs(x1 - x2) < tolerance and 
+                    abs(y1 - y2) < tolerance and 
+                    abs(z1 - z2) < tolerance)
+                    
+        except (TypeError, ValueError, IndexError):
+            # Handle any conversion errors or invalid point formats
+            return False
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
