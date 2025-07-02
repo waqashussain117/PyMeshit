@@ -8463,7 +8463,7 @@ segmentation, triangulation, and visualization.
         # Visualization modes
         self.tetra_wireframe_check = QCheckBox("Wireframe")
         self.tetra_show_materials_check = QCheckBox("Materials")
-        self.tetra_show_internal_check = QCheckBox("Internal Structure")
+        self.tetra_show_internal_check = QCheckBox("Show Internal")
         
         # Opacity control
         opacity_label = QLabel("Opacity:")
@@ -8831,7 +8831,7 @@ segmentation, triangulation, and visualization.
         try:
             # Clear existing tetrahedral mesh actors
             actors_to_remove = []
-            for name in self.tetra_plotter.actors:
+            for name in list(self.tetra_plotter.actors.keys()):
                 if 'tetrahedral' in name:
                     actors_to_remove.append(name)
             
@@ -9080,27 +9080,28 @@ segmentation, triangulation, and visualization.
             self.tetra_plotter.add_text(f"Visualization error: {str(e)}", position='upper_edge', color='red')
 
     def _add_tetrahedral_mesh_visualization(self, mesh):
-        """Add tetrahedral mesh visualization with different modes"""
+        """Add tetrahedral mesh visualization like C++ version (surface + internal combined)"""
         import pyvista as pv
         import numpy as np
         
         # Get current settings
         show_internal = getattr(self, 'tetra_show_internal_check', None) and self.tetra_show_internal_check.isChecked()
         show_materials = getattr(self, 'tetra_show_materials_check', None) and self.tetra_show_materials_check.isChecked()
+        show_wireframe = getattr(self, 'tetra_wireframe_check', None) and self.tetra_wireframe_check.isChecked()
         opacity = getattr(self, 'tetra_opacity_slider', None) and self.tetra_opacity_slider.value() / 100.0 or 0.8
         
         # Apply cutting planes if enabled
         processed_mesh = self._apply_cutting_planes(mesh)
         
+        # Always show the surface boundary
+        self._add_surface_visualization(processed_mesh, show_materials, opacity, show_wireframe)
+        
+        # Additionally show internal structure if enabled
         if show_internal:
-            # Show internal structure (like C++ version)
             self._add_internal_structure_visualization(processed_mesh, show_materials, opacity)
-        else:
-            # Show surface only (default)
-            self._add_surface_visualization(processed_mesh, show_materials, opacity)
 
-    def _add_surface_visualization(self, mesh, show_materials, opacity):
-        """Add surface-only visualization"""
+    def _add_surface_visualization(self, mesh, show_materials, opacity, show_wireframe=False):
+        """Add surface visualization (external boundary)"""
         import pyvista as pv
         
         # Extract surface
@@ -9115,85 +9116,79 @@ segmentation, triangulation, and visualization.
                 scalars = 'MaterialID'
                 cmap = 'tab10'
         
-        # Add surface mesh
-        self.tetra_plotter.add_mesh(
-            surface_mesh,
-            scalars=scalars,
-            cmap=cmap,
-            opacity=opacity,
-            show_edges=self.tetra_wireframe_check.isChecked() if hasattr(self, 'tetra_wireframe_check') else True,
-            edge_color='white',
-            line_width=0.5,
-            name='tetrahedral_surface'
-        )
+        # Add surface mesh (external boundary)
+        if show_wireframe:
+            # Wireframe mode: show edges only
+            self.tetra_plotter.add_mesh(
+                surface_mesh,
+                style='wireframe',
+                scalars=scalars,
+                cmap=cmap,
+                opacity=1.0,
+                line_width=1.5,
+                name='tetrahedral_surface'
+            )
+        else:
+            # Solid mode: show faces with edges
+            self.tetra_plotter.add_mesh(
+                surface_mesh,
+                scalars=scalars,
+                cmap=cmap,
+                opacity=opacity,
+                show_edges=True,
+                edge_color='black',
+                line_width=0.5,
+                name='tetrahedral_surface'
+            )
 
     def _add_internal_structure_visualization(self, mesh, show_materials, opacity):
         """Add internal structure visualization like C++ version"""
         import pyvista as pv
         import numpy as np
         
-        # Extract surface for outer boundary
-        surface_mesh = mesh.extract_surface()
-        
-        # Add semi-transparent surface
-        surface_scalars = None
-        if show_materials and 'MaterialID' in mesh.cell_data:
-            surface_scalars = 'MaterialID'
-        
-        self.tetra_plotter.add_mesh(
-            surface_mesh,
-            scalars=surface_scalars,
-            cmap='tab10' if surface_scalars else None,
-            opacity=max(0.3, opacity * 0.5),  # Make more transparent for internal view
-            show_edges=False,
-            name='tetrahedral_surface_internal'
-        )
-        
-        # Show internal structure by subsampling tetrahedra
+        # Show internal structure throughout the entire volume (no gaps)
         if mesh.n_cells > 0:
-            # Sample internal tetrahedra (show every Nth tetrahedron for performance)
+            # Sample tetrahedra from the entire volume for performance
             n_cells = mesh.n_cells
-            sample_rate = max(1, n_cells // 2000)  # Show max 2000 tetrahedra for performance
+            sample_rate = max(1, n_cells // 2500)  # Show max 2500 tetrahedra for good coverage
             
-            # Get tetrahedral centers to filter internal ones
-            centers = mesh.cell_centers().points
-            bounds = mesh.bounds
+            # Sample every Nth tetrahedron throughout the entire volume (no boundary filtering)
+            sampled_indices = np.arange(0, n_cells, sample_rate)
             
-            # Filter to show tetrahedra away from boundaries (internal ones)
-            margin = 0.1  # 10% margin from boundaries
-            x_margin = (bounds[1] - bounds[0]) * margin
-            y_margin = (bounds[3] - bounds[2]) * margin 
-            z_margin = (bounds[5] - bounds[4]) * margin
-            
-            internal_mask = (
-                (centers[:, 0] > bounds[0] + x_margin) & (centers[:, 0] < bounds[1] - x_margin) &
-                (centers[:, 1] > bounds[2] + y_margin) & (centers[:, 1] < bounds[3] - y_margin) &
-                (centers[:, 2] > bounds[4] + z_margin) & (centers[:, 2] < bounds[5] - z_margin)
-            )
-            
-            internal_indices = np.where(internal_mask)[0][::sample_rate]
-            
-            if len(internal_indices) > 0:
-                # Extract internal tetrahedra
-                internal_cells = mesh.extract_cells(internal_indices)
+            if len(sampled_indices) > 0:
+                # Extract sampled tetrahedra from entire volume
+                internal_cells = mesh.extract_cells(sampled_indices)
                 
-                # Add as wireframe to show internal structure
-                if show_materials and 'MaterialID' in internal_cells.cell_data:
-                    internal_scalars = 'MaterialID'
-                    internal_cmap = 'tab10'
-                else:
-                    internal_scalars = None
-                    internal_cmap = None
-                
+                # Add tetrahedra as wireframe edges showing full connectivity
                 self.tetra_plotter.add_mesh(
                     internal_cells,
                     style='wireframe',
-                    scalars=internal_scalars,
-                    cmap=internal_cmap,
-                    opacity=1.0,
-                    line_width=2,
-                    name='tetrahedral_internal'
+                    color='lightblue',  # Softer color for better visibility
+                    opacity=0.6,
+                    line_width=0.8,
+                    name='tetrahedral_internal_wireframe'
                 )
+                
+                # Also add very transparent faces to show volume structure
+                if show_materials and 'MaterialID' in internal_cells.cell_data:
+                    # Show material colors on internal faces
+                    self.tetra_plotter.add_mesh(
+                        internal_cells,
+                        scalars='MaterialID',
+                        cmap='tab10',
+                        opacity=0.12,  # Very transparent to see through
+                        show_edges=False,
+                        name='tetrahedral_internal_faces'
+                    )
+                else:
+                    # Show uniform transparent faces if no materials
+                    self.tetra_plotter.add_mesh(
+                        internal_cells,
+                        color='lightgray',
+                        opacity=0.08,  # Extremely transparent
+                        show_edges=False,
+                        name='tetrahedral_internal_faces'
+                    )
 
     def _apply_cutting_planes(self, mesh):
         """Apply cutting planes to mesh like C++ version"""
