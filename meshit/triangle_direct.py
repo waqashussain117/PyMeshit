@@ -37,7 +37,7 @@ class DirectTriangleWrapper:
         self.base_size = base_size
         self.feature_points = None
         self.feature_sizes = None
-        self.logger = logging.getLogger("DirectTriangleWrapper")
+        self.logger = logging.getLogger("MeshIt-Workflow")
         self.triangle_opts = None  # Will store custom triangle options if set
         
     def set_feature_points(self, points: np.ndarray, sizes: np.ndarray):

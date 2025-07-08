@@ -89,6 +89,37 @@ class TetrahedralMeshGenerator:
             tet.tetrahedralize(switches=tetgen_switches)
             grid = tet.grid
             
+            # Step 6: CRITICAL FIX - Extract material attributes from TetGen
+            # The C++ version does: tetrahedronmarkerlist.append(out.tetrahedronattributelist[t])
+            if grid is not None and grid.n_cells > 0:
+                try:
+                    # Check if TetGen created material attributes
+                    if hasattr(tet, 'elem') and tet.elem is not None:
+                        # TetGen stores material attributes in element array
+                        if tet.elem.shape[1] > 4:  # Has attributes beyond vertex indices
+                            # Extract material attributes (usually column 4)
+                            material_attributes = tet.elem[:, 4].astype(int)
+                            grid.cell_data['MaterialID'] = material_attributes
+                            
+                            import numpy as np
+                            unique_materials = np.unique(material_attributes)
+                            logger.info(f"✓ Extracted TetGen material attributes: {unique_materials}")
+                        else:
+                            logger.warning("TetGen element array has no material attributes")
+                    elif hasattr(tet, 'tetrahedronattributelist') and tet.tetrahedronattributelist is not None:
+                        # Direct access to attribute list
+                        material_attributes = np.array(tet.tetrahedronattributelist, dtype=int)
+                        grid.cell_data['MaterialID'] = material_attributes
+                        
+                        unique_materials = np.unique(material_attributes)
+                        logger.info(f"✓ Extracted TetGen tetrahedronattributelist: {unique_materials}")
+                    else:
+                        logger.info("TetGen did not create material attributes - will use manual assignment")
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to extract TetGen material attributes: {e}")
+                    logger.info("Will use manual material assignment instead")
+            
             if grid is None or grid.n_cells == 0:
                 logger.error("TetGen ran but produced no tetrahedra.")
                 self._export_plc_for_debugging()
@@ -271,10 +302,11 @@ class TetrahedralMeshGenerator:
     def _run_tetgen_fallback_strategies(self, original_switches: str) -> Optional[pv.UnstructuredGrid]:
         logger.warning("Initial TetGen failed. Trying fallback strategies...")
         fallback_switches = [
-            "pq1.2aAY",  # C++ command line style
+            "pq1.2aAY",  # C++ command line style with materials
+            "pq1.2aA",   # Remove Y but keep A for materials  
             "pAY",       # C++ GUI style
-            "pA",        # Basic (what worked before)
-            "pzQ"        # Last resort
+            "pA",        # Basic with materials
+            "pzQ"        # Last resort (no materials)
         ]
         for switches in fallback_switches:
             try:
@@ -289,6 +321,26 @@ class TetrahedralMeshGenerator:
                 grid = tet.grid
                 if grid is not None and grid.n_cells > 0:
                     logger.info(f"✓ Fallback TetGen succeeded with '{switches}': {grid.n_cells} tetrahedra")
+                    
+                    # Extract material attributes for fallback too
+                    try:
+                        if hasattr(tet, 'elem') and tet.elem is not None and tet.elem.shape[1] > 4:
+                            material_attributes = tet.elem[:, 4].astype(int)
+                            grid.cell_data['MaterialID'] = material_attributes
+                            
+                            import numpy as np
+                            unique_materials = np.unique(material_attributes)
+                            logger.info(f"✓ Fallback: Extracted material attributes: {unique_materials}")
+                        elif hasattr(tet, 'tetrahedronattributelist') and tet.tetrahedronattributelist is not None:
+                            material_attributes = np.array(tet.tetrahedronattributelist, dtype=int)
+                            grid.cell_data['MaterialID'] = material_attributes
+                            
+                            import numpy as np
+                            unique_materials = np.unique(material_attributes)
+                            logger.info(f"✓ Fallback: Extracted tetrahedronattributelist: {unique_materials}")
+                    except Exception as e:
+                        logger.warning(f"Fallback: Failed to extract material attributes: {e}")
+                    
                     self.tetrahedral_mesh = grid
                     return grid
                 else:

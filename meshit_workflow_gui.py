@@ -8465,6 +8465,38 @@ segmentation, triangulation, and visualization.
         self.tetra_show_materials_check = QCheckBox("Materials")
         self.tetra_show_internal_check = QCheckBox("Show Internal")
         
+        # Material selection dropdown (like C++ version)
+        material_label = QLabel("Material:")
+        self.tetra_material_combo = QComboBox()
+        self.tetra_material_combo.setToolTip("Select material to visualize (All = show all materials)")
+        self.tetra_material_combo.setMinimumWidth(120)
+        
+        # Colormap selection dropdown
+        colormap_label = QLabel("Colormap:")
+        self.tetra_colormap_combo = QComboBox()
+        self.tetra_colormap_combo.setToolTip("Select colormap for material visualization")
+        self.tetra_colormap_combo.setMinimumWidth(100)
+        
+        # Add professional colormaps for geological/scientific visualization
+        geological_colormaps = [
+            ("Set1", "Qualitative - Distinct colors"),
+            ("tab10", "Qualitative - 10 distinct colors"), 
+            ("viridis", "Sequential - Blue to yellow"),
+            ("plasma", "Sequential - Purple to yellow"),
+            ("terrain", "Geographical - Earth tones"),
+            ("gist_earth", "Geological - Earth colors"),
+            ("coolwarm", "Diverging - Blue to red"),
+            ("RdYlBu", "Diverging - Red/Yellow/Blue"),
+            ("Spectral", "Diverging - Rainbow spectrum"),
+            ("tab20", "Qualitative - 20 distinct colors")
+        ]
+        
+        for cmap_name, description in geological_colormaps:
+            self.tetra_colormap_combo.addItem(f"{cmap_name} - {description}", cmap_name)
+        
+        # Set default to Set1
+        self.tetra_colormap_combo.setCurrentText("Set1 - Qualitative - Distinct colors")
+        
         # Opacity control
         opacity_label = QLabel("Opacity:")
         self.tetra_opacity_slider = QSlider(Qt.Horizontal)
@@ -8490,6 +8522,24 @@ segmentation, triangulation, and visualization.
         separator2.setFrameShape(QFrame.VLine)
         separator2.setFrameShadow(QFrame.Sunken)
         toolbar.addWidget(separator2)
+        
+        toolbar.addWidget(material_label)
+        toolbar.addWidget(self.tetra_material_combo)
+        
+        # Add separator line
+        separator3 = QFrame()
+        separator3.setFrameShape(QFrame.VLine)
+        separator3.setFrameShadow(QFrame.Sunken)
+        toolbar.addWidget(separator3)
+        
+        toolbar.addWidget(colormap_label)
+        toolbar.addWidget(self.tetra_colormap_combo)
+        
+        # Add separator line
+        separator4 = QFrame()
+        separator4.setFrameShape(QFrame.VLine)
+        separator4.setFrameShadow(QFrame.Sunken)
+        toolbar.addWidget(separator4)
         
         toolbar.addWidget(opacity_label)
         toolbar.addWidget(self.tetra_opacity_slider)
@@ -8551,6 +8601,8 @@ segmentation, triangulation, and visualization.
             self.tetra_show_materials_check.toggled.connect(self._toggle_tetra_materials)
             self.tetra_show_internal_check.toggled.connect(self._toggle_tetra_internal)
             self.tetra_opacity_slider.valueChanged.connect(self._update_tetra_opacity)
+            self.tetra_material_combo.currentTextChanged.connect(self._on_material_selection_changed)
+            self.tetra_colormap_combo.currentTextChanged.connect(self._on_colormap_changed)
             
             # Connect cutting plane controls
             self.x_cut_enable.toggled.connect(lambda enabled: self.x_cut_slider.setEnabled(enabled))
@@ -8996,6 +9048,26 @@ segmentation, triangulation, and visualization.
         
         if grid:
             self.tetrahedral_mesh = grid
+            
+            # MATERIAL ASSIGNMENT: Apply manual material assignment if needed
+            if not hasattr(grid, 'cell_data') or 'MaterialID' not in grid.cell_data:
+                logger.info("No MaterialID found in mesh - applying manual material assignment")
+                self._assign_materials_to_mesh(grid)
+            else:
+                # Debug: Check if MaterialID actually has meaningful data
+                import numpy as np
+                material_ids = grid.cell_data['MaterialID']
+                unique_materials = np.unique(material_ids)
+                logger.info(f"Found MaterialID in mesh: unique values = {unique_materials}")
+                
+                # If all materials are 0 or there's only one material, force manual assignment
+                if len(unique_materials) == 1 and unique_materials[0] == 0:
+                    logger.info("MaterialID contains only zeros - applying manual material assignment")
+                    self._assign_materials_to_mesh(grid)
+                elif len(self.tetra_materials) > 0 and len(unique_materials) < len(self.tetra_materials):
+                    logger.info(f"MaterialID has {len(unique_materials)} unique values but we need {len(self.tetra_materials)} - applying manual assignment")
+                    self._assign_materials_to_mesh(grid)
+            
             QMessageBox.information(self, "Success", "Tetrahedral mesh generated successfully!")
             self.export_mesh_btn.setEnabled(True)
             self._visualize_tetrahedral_mesh_in_tetra_tab()
@@ -9044,6 +9116,9 @@ segmentation, triangulation, and visualization.
             # Enhanced visualization like C++ version
             self._add_tetrahedral_mesh_visualization(mesh)
             
+            # Update material dropdown with available materials
+            self._update_material_dropdown()
+            
             # Add colorbar if using materials
             if 'MaterialID' in mesh.cell_data:
                 self.tetra_plotter.add_scalar_bar(title='Material ID', interactive=True)
@@ -9065,6 +9140,8 @@ segmentation, triangulation, and visualization.
                 self.tetra_show_materials_check.setEnabled(True)
             if hasattr(self, 'tetra_show_internal_check'):
                 self.tetra_show_internal_check.setEnabled(True)
+            if hasattr(self, 'tetra_material_combo'):
+                self.tetra_material_combo.setEnabled(True)
             if hasattr(self, 'x_cut_enable'):
                 self.x_cut_enable.setEnabled(True)
                 self.y_cut_enable.setEnabled(True)
@@ -9090,8 +9167,17 @@ segmentation, triangulation, and visualization.
         show_wireframe = getattr(self, 'tetra_wireframe_check', None) and self.tetra_wireframe_check.isChecked()
         opacity = getattr(self, 'tetra_opacity_slider', None) and self.tetra_opacity_slider.value() / 100.0 or 0.8
         
+        # Get selected material filter
+        selected_material_id = self._get_selected_material_id()
+        
+        # Apply material filtering if specific material is selected
+        if selected_material_id != -1:  # -1 means show all materials
+            processed_mesh = self._filter_mesh_by_material(mesh, selected_material_id)
+        else:
+            processed_mesh = mesh
+        
         # Apply cutting planes if enabled
-        processed_mesh = self._apply_cutting_planes(mesh)
+        processed_mesh = self._apply_cutting_planes(processed_mesh)
         
         # Always show the surface boundary
         self._add_surface_visualization(processed_mesh, show_materials, opacity, show_wireframe)
@@ -9114,7 +9200,7 @@ segmentation, triangulation, and visualization.
             # Map material IDs from cells to surface
             if hasattr(surface_mesh, 'cell_data') and 'MaterialID' in surface_mesh.cell_data:
                 scalars = 'MaterialID'
-                cmap = 'tab10'
+                cmap = self._get_selected_colormap()  # Use user-selected colormap
         
         # Add surface mesh (external boundary)
         if show_wireframe:
@@ -9175,7 +9261,7 @@ segmentation, triangulation, and visualization.
                     self.tetra_plotter.add_mesh(
                         internal_cells,
                         scalars='MaterialID',
-                        cmap='tab10',
+                        cmap=self._get_selected_colormap(),  # Use user-selected colormap
                         opacity=0.12,  # Very transparent to see through
                         show_edges=False,
                         name='tetrahedral_internal_faces'
@@ -9449,6 +9535,25 @@ segmentation, triangulation, and visualization.
                 self._assign_materials_to_mesh(grid)
             else:
                 logger.info("Materials successfully assigned by TetGen during execution")
+                
+            # FORCE manual assignment if no MaterialID data exists (fallback scenarios)
+            if not hasattr(grid, 'cell_data') or 'MaterialID' not in grid.cell_data:
+                logger.info("No MaterialID found in mesh - forcing manual material assignment")
+                self._assign_materials_to_mesh(grid)
+            else:
+                # Debug: Check if MaterialID actually has meaningful data
+                import numpy as np
+                material_ids = grid.cell_data['MaterialID']
+                unique_materials = np.unique(material_ids)
+                logger.info(f"Found MaterialID in mesh: unique values = {unique_materials}")
+                
+                # If all materials are 0 or there's only one material, force manual assignment
+                if len(unique_materials) == 1 and unique_materials[0] == 0:
+                    logger.info("MaterialID contains only zeros - forcing manual material assignment")
+                    self._assign_materials_to_mesh(grid)
+                elif len(unique_materials) < len(self.tetra_materials):
+                    logger.info(f"MaterialID has {len(unique_materials)} unique values but we need {len(self.tetra_materials)} - forcing manual assignment")
+                    self._assign_materials_to_mesh(grid)
 
             # refresh stats / viewers
             self._update_tetra_stats()
@@ -9510,6 +9615,317 @@ segmentation, triangulation, and visualization.
             return False
         except Exception:
             return False
+
+    def _assign_materials_to_mesh(self, grid) -> None:
+        """
+        Assign materials to tetrahedral elements using boundary-aware assignment.
+        This method respects surface boundaries and geological structures, similar to TetGen's
+        approach but applied as post-processing when TetGen fails.
+        """
+        try:
+            import numpy as np
+            import pyvista as pv
+            
+            if not self.tetra_materials:
+                logger.warning("No materials defined for assignment")
+                return
+            
+            # Get tetrahedron centers
+            n_cells = grid.n_cells
+            if n_cells == 0:
+                logger.warning("No tetrahedra found in mesh")
+                return
+            
+            # Calculate centroid of each tetrahedron
+            centers = grid.cell_centers()
+            tet_centers = centers.points
+            
+            # Prepare material seed points with classification
+            material_points = []
+            material_attributes = []
+            material_types = []
+            
+            for material in self.tetra_materials:
+                locations = material.get('locations', [])
+                attribute = material.get('attribute', 1)
+                material_name = material.get('name', '').lower()
+                
+                # Classify material type
+                if 'fault' in material_name:
+                    mat_type = 'fault'
+                else:
+                    mat_type = 'formation'
+                
+                for location in locations:
+                    if len(location) >= 3:
+                        material_points.append([float(location[0]), float(location[1]), float(location[2])])
+                        material_attributes.append(int(attribute))
+                        material_types.append(mat_type)
+            
+            if not material_points:
+                logger.warning("No valid material seed points found")
+                return
+            
+            material_points = np.array(material_points)
+            material_attributes = np.array(material_attributes)
+            
+            logger.info(f"Assigning materials to {n_cells} tetrahedra using {len(material_points)} seed points")
+            
+            # BOUNDARY-AWARE ASSIGNMENT
+            material_ids = self._boundary_aware_assignment(
+                tet_centers, material_points, material_attributes, material_types
+            )
+            
+            # Assign materials to mesh
+            grid.cell_data['MaterialID'] = material_ids
+            
+            # Validate assignment
+            unique_materials = np.unique(material_ids)
+            logger.info(f"Material assignment complete. Assigned material IDs: {unique_materials}")
+            
+            # Create material statistics
+            for mat_id in unique_materials:
+                count = np.sum(material_ids == mat_id)
+                percentage = (count / n_cells) * 100
+                logger.info(f"Material {mat_id}: {count} tetrahedra ({percentage:.1f}%)")
+                
+        except Exception as e:
+            logger.error(f"Failed to assign materials to mesh: {e}", exc_info=True)
+
+    def _boundary_aware_assignment(self, tet_centers, material_points, material_attributes, material_types):
+        """
+        Perform boundary-aware material assignment that respects geological layering.
+        """
+        import numpy as np
+        
+        n_tets = len(tet_centers)
+        assigned_materials = np.zeros(n_tets, dtype=int)
+        
+        # Separate formation and fault materials
+        formation_mask = np.array([t == 'formation' for t in material_types])
+        fault_mask = np.array([t == 'fault' for t in material_types])
+        
+        formation_points = material_points[formation_mask] if np.any(formation_mask) else np.array([]).reshape(0, 3)
+        formation_attrs = material_attributes[formation_mask] if np.any(formation_mask) else np.array([])
+        
+        fault_points = material_points[fault_mask] if np.any(fault_mask) else np.array([]).reshape(0, 3)
+        fault_attrs = material_attributes[fault_mask] if np.any(fault_mask) else np.array([])
+        
+        # 1. GEOLOGICAL LAYERING: Assign formations based on Z-coordinate layers
+        if len(formation_points) > 0:
+            # Sort formation materials by Z-coordinate (depth)
+            z_order = np.argsort(formation_points[:, 2])
+            sorted_formation_points = formation_points[z_order]
+            sorted_formation_attrs = formation_attrs[z_order]
+            
+            # Layer-based assignment with weighted distance
+            for i, center in enumerate(tet_centers):
+                center_z = center[2]
+                
+                # Find the appropriate geological layer
+                best_formation_idx = 0
+                min_weighted_distance = float('inf')
+                
+                for j, formation_point in enumerate(sorted_formation_points):
+                    formation_z = formation_point[2]
+                    
+                    # Calculate distances
+                    xyz_distance = np.sqrt(np.sum((formation_point - center) ** 2))
+                    z_distance = abs(formation_z - center_z)
+                    
+                    # Weighted distance: Z-distance matters more for geological layering
+                    weighted_distance = z_distance * 3.0 + xyz_distance * 0.5
+                    
+                    if weighted_distance < min_weighted_distance:
+                        min_weighted_distance = weighted_distance
+                        best_formation_idx = j
+                
+                assigned_materials[i] = sorted_formation_attrs[best_formation_idx]
+        
+        # 2. FAULT OVERRIDE: Tetrahedra near faults get fault materials
+        if len(fault_points) > 0:
+            fault_threshold = self._calculate_fault_threshold(tet_centers, fault_points)
+            
+            for i, center in enumerate(tet_centers):
+                # Calculate distance to nearest fault
+                fault_distances = np.sqrt(np.sum((fault_points - center) ** 2, axis=1))
+                min_fault_distance = np.min(fault_distances)
+                
+                # If tetrahedron is close to a fault, assign fault material
+                if min_fault_distance < fault_threshold:
+                    nearest_fault_idx = np.argmin(fault_distances)
+                    assigned_materials[i] = fault_attrs[nearest_fault_idx]
+        
+        # 3. FALLBACK: Simple distance-based assignment if no geological structure
+        if len(formation_points) == 0 and len(fault_points) == 0:
+            for i, center in enumerate(tet_centers):
+                distances = np.sqrt(np.sum((material_points - center) ** 2, axis=1))
+                closest_idx = np.argmin(distances)
+                assigned_materials[i] = material_attributes[closest_idx]
+        
+        return assigned_materials
+
+    def _calculate_fault_threshold(self, tet_centers, fault_points):
+        """Calculate an appropriate threshold for fault material assignment."""
+        import numpy as np
+        
+        # Calculate average spacing between tetrahedra (sampling for performance)
+        if len(tet_centers) > 100:
+            sample_size = 100
+            sample_indices = np.random.choice(len(tet_centers), sample_size, replace=False)
+            sample_centers = tet_centers[sample_indices]
+        else:
+            sample_centers = tet_centers
+        
+        # Calculate median distance to nearest neighbor
+        distances = []
+        for i, center in enumerate(sample_centers):
+            other_centers = np.delete(sample_centers, i, axis=0)
+            if len(other_centers) > 0:
+                dists = np.sqrt(np.sum((other_centers - center) ** 2, axis=1))
+                distances.append(np.min(dists))
+        
+        if distances:
+            median_spacing = np.median(distances)
+            # Fault threshold: 3-4 times the typical tetrahedra spacing  
+            fault_threshold = median_spacing * 3.5
+            logger.info(f"Fault assignment threshold: {fault_threshold:.3f} (median tet spacing: {median_spacing:.3f})")
+            return fault_threshold
+        else:
+            return 1.0  # Default fallback
+
+    def _update_material_dropdown(self):
+        """Update the material dropdown with available materials from the mesh."""
+        if not hasattr(self, 'tetra_material_combo'):
+            return
+            
+        try:
+            self.tetra_material_combo.blockSignals(True)
+            self.tetra_material_combo.clear()
+            
+            # Always add "All Materials" option
+            self.tetra_material_combo.addItem("All Materials")
+            
+            # First priority: Add materials from our tetra_materials list (user-defined materials)
+            if hasattr(self, 'tetra_materials') and self.tetra_materials:
+                for material in self.tetra_materials:
+                    material_name = material.get('name', f"Material {material.get('attribute', 1)}")
+                    self.tetra_material_combo.addItem(material_name)
+                    logger.debug(f"Added material from tetra_materials: {material_name}")
+            
+            # Second priority: If no user materials, check mesh MaterialID data
+            elif hasattr(self, 'tetrahedral_mesh') and self.tetrahedral_mesh:
+                mesh = self.tetrahedral_mesh
+                if isinstance(mesh, dict):
+                    mesh = mesh.get('pyvista_grid')
+                
+                if mesh and hasattr(mesh, 'cell_data') and 'MaterialID' in mesh.cell_data:
+                    import numpy as np
+                    material_ids = mesh.cell_data['MaterialID']
+                    unique_materials = np.unique(material_ids)
+                    
+                    for mat_id in sorted(unique_materials):
+                        material_name = f"Material {mat_id}"
+                        self.tetra_material_combo.addItem(material_name)
+                        logger.debug(f"Added material from mesh MaterialID: {material_name}")
+                        
+            self.tetra_material_combo.blockSignals(False)
+            logger.info(f"Updated material dropdown with {self.tetra_material_combo.count()} options")
+            
+        except Exception as e:
+            self.tetra_material_combo.blockSignals(False)
+            logger.error(f"Failed to update material dropdown: {e}")
+
+    def _on_material_selection_changed(self, material_name: str):
+        """Handle material selection change in dropdown."""
+        if not hasattr(self, 'tetrahedral_mesh') or not self.tetrahedral_mesh:
+            return
+            
+        try:
+            logger.info(f"Material selection changed to: {material_name}")
+            self._refresh_tetrahedral_visualization()
+        except Exception as e:
+            logger.error(f"Failed to handle material selection change: {e}")
+    
+    def _on_colormap_changed(self, colormap_text: str):
+        """Handle colormap selection change in dropdown."""
+        if not hasattr(self, 'tetrahedral_mesh') or not self.tetrahedral_mesh:
+            return
+            
+        try:
+            # Extract colormap name from dropdown text (before " - ")
+            colormap_name = colormap_text.split(" - ")[0] if " - " in colormap_text else colormap_text
+            logger.info(f"Colormap changed to: {colormap_name}")
+            self._refresh_tetrahedral_visualization()
+        except Exception as e:
+            logger.error(f"Failed to handle colormap change: {e}")
+
+    def _update_tetrahedral_visualization(self):
+        """Update the tetrahedral visualization (wrapper for refresh method)."""
+        self._refresh_tetrahedral_visualization()
+
+    def _get_selected_colormap(self) -> str:
+        """Get the currently selected colormap from the dropdown."""
+        if not hasattr(self, 'tetra_colormap_combo'):
+            return 'Set1'  # Default fallback
+            
+        colormap_text = self.tetra_colormap_combo.currentText()
+        # Extract colormap name from dropdown text (before " - ")
+        return colormap_text.split(" - ")[0] if " - " in colormap_text else colormap_text
+    
+    def _get_selected_material_id(self) -> int:
+        """Get the material ID corresponding to the selected material in dropdown."""
+        if not hasattr(self, 'tetra_material_combo'):
+            return -1  # Show all materials
+            
+        material_name = self.tetra_material_combo.currentText()
+        if material_name == "All Materials":
+            return -1  # Show all materials
+            
+        # Try to find material ID from our materials list
+        for material in self.tetra_materials:
+            if material.get('name', f'Material {material.get("attribute", 1)}') == material_name:
+                return material.get('attribute', 1)
+                
+        # Try to extract material ID from name (fallback)
+        if "Material " in material_name:
+            try:
+                return int(material_name.replace("Material ", ""))
+            except ValueError:
+                pass
+                
+        return -1  # Show all materials if can't determine
+
+    def _filter_mesh_by_material(self, mesh, material_id: int):
+        """Filter mesh to show only elements with specified material ID."""
+        try:
+            import numpy as np
+            import pyvista as pv
+            
+            if not hasattr(mesh, 'cell_data') or 'MaterialID' not in mesh.cell_data:
+                logger.warning("No MaterialID data in mesh - returning full mesh")
+                return mesh
+            
+            material_ids = mesh.cell_data['MaterialID']
+            material_mask = material_ids == material_id
+            
+            # Get indices of cells with the specified material
+            material_indices = np.where(material_mask)[0]
+            
+            if len(material_indices) == 0:
+                logger.warning(f"No cells found with material ID {material_id}")
+                # Return empty mesh
+                return pv.UnstructuredGrid()
+            
+            # Extract cells with the specified material
+            filtered_mesh = mesh.extract_cells(material_indices)
+            
+            logger.info(f"Filtered mesh: showing {len(material_indices)} cells with material ID {material_id}")
+            return filtered_mesh
+            
+        except Exception as e:
+            logger.error(f"Failed to filter mesh by material {material_id}: {e}")
+            return mesh
 
     
 
@@ -10182,7 +10598,7 @@ segmentation, triangulation, and visualization.
             }
             
             self.tetra_materials.append(material)
-            self._update_material_list()
+            self._refresh_material_list()
             
             # Select the new material
             self.material_list.setCurrentRow(len(self.tetra_materials) - 1)
@@ -10204,7 +10620,7 @@ segmentation, triangulation, and visualization.
             
             if reply == QMessageBox.Yes:
                 del self.tetra_materials[current_row]
-                self._update_material_list()
+                self._refresh_material_list()
                 
                 # Clear location list
                 if hasattr(self, 'material_location_list'):
@@ -10214,56 +10630,360 @@ segmentation, triangulation, and visualization.
 
     def _auto_place_materials(self) -> None:
         """
-        Creates one material per loaded surface and drops one seed-point at the
-        centroid of its constrained vertices.  Works whether the vertex list is a
-        Python list or a NumPy array.
+        Automatically assign materials based on surface classifications and the principle 
+        of one material per 3D subdomain. Uses surface classification (border, unit, fault)
+        to intelligently place materials in geological formations and assign materials to faults.
         """
-        if not self.datasets:
+        # Check if we're in tetra mesh tab with loaded surface data
+        if hasattr(self, 'tetra_surface_data') and self.tetra_surface_data:
+            surface_data = self.tetra_surface_data
+            data_source = "tetra_surface_data"
+        elif self.datasets:
+            surface_data = {i: ds for i, ds in enumerate(self.datasets)}
+            data_source = "datasets"
+        else:
             QMessageBox.warning(self, "No geometry",
                                 "Load or generate surfaces first.")
             return
 
-        # fresh start
-        self.tetra_materials.clear()
+        try:
+            import numpy as np
 
-        for ds_idx, ds in enumerate(self.datasets):
-            verts = ds.get("constrained_vertices", None)
-            if verts is None:
-                continue
+            # Fresh start
+            self.tetra_materials.clear()
 
-            # verts may be list-of-lists or a NumPy array
-            if isinstance(verts, np.ndarray):
-                if verts.size == 0:
+            # Get surface classifications
+            border_surfaces = self._get_border_surface_indices()
+            unit_surfaces = self._get_unit_surface_indices() 
+            fault_surfaces = self._get_fault_surface_indices()
+            
+            logger.info(f"Auto-materials using surface classifications: {len(border_surfaces)} borders, {len(unit_surfaces)} units, {len(fault_surfaces)} faults")
+            
+            # Get all surface bounds to determine the overall domain
+            all_bounds = []
+            valid_surfaces = []
+            
+            for surface_idx, surface_data_item in surface_data.items():
+                # Handle different data structures
+                if data_source == "tetra_surface_data":
+                    verts = surface_data_item.get("vertices", None)
+                    surface_name = surface_data_item.get("name", f"Surface_{surface_idx}")
+                else:
+                    verts = surface_data_item.get("constrained_vertices", None)
+                    surface_name = surface_data_item.get("name", f"Surface_{surface_idx}")
+                
+                if verts is None:
                     continue
-                verts_np = verts[:, :3]                       # keep xyz only
-            else:                                            # assume list/tuple
-                if len(verts) == 0:
-                    continue
-                verts_np = np.asarray(verts)[:, :3]
 
-            centroid = verts_np.mean(axis=0).tolist()
+                # Convert to numpy array if needed
+                if isinstance(verts, np.ndarray):
+                    if verts.size == 0:
+                        continue
+                    verts_np = verts[:, :3] if verts.shape[1] >= 3 else verts
+                else:
+                    if len(verts) == 0:
+                        continue
+                    verts_np = np.asarray(verts)
+                    if len(verts_np.shape) == 2 and verts_np.shape[1] >= 3:
+                        verts_np = verts_np[:, :3]
+                    elif len(verts_np.shape) == 1:
+                        continue  # Skip invalid data
+                
+                if len(verts_np) > 0 and len(verts_np.shape) == 2 and verts_np.shape[1] >= 3:
+                    surface_bounds = [
+                        np.min(verts_np[:, 0]), np.max(verts_np[:, 0]),  # x_min, x_max
+                        np.min(verts_np[:, 1]), np.max(verts_np[:, 1]),  # y_min, y_max
+                        np.min(verts_np[:, 2]), np.max(verts_np[:, 2])   # z_min, z_max
+                    ]
+                    all_bounds.append(surface_bounds)
+                    valid_surfaces.append((surface_idx, surface_data_item, verts_np, surface_name))
+            
+            if not valid_surfaces:
+                QMessageBox.warning(self, "No valid surfaces", "No surfaces with valid geometry found.")
+                return
+            
+            # Calculate overall domain bounds
+            all_bounds = np.array(all_bounds)
+            domain_bounds = [
+                np.min(all_bounds[:, 0]),  # overall x_min
+                np.max(all_bounds[:, 1]),  # overall x_max
+                np.min(all_bounds[:, 2]),  # overall y_min
+                np.max(all_bounds[:, 3]),  # overall y_max
+                np.min(all_bounds[:, 4]),  # overall z_min
+                np.max(all_bounds[:, 5])   # overall z_max
+            ]
+            
+            material_id = 1
+            
+            # 1. FAULT MATERIALS: Each fault gets its own material (like C++ version)
+            for fault_idx in fault_surfaces:
+                fault_surface = next((s for s in valid_surfaces if s[0] == fault_idx), None)
+                if fault_surface:
+                    surface_idx, surface_data_item, verts_np, surface_name = fault_surface
+                    # Place material seed point at center of fault
+                    fault_center = np.mean(verts_np, axis=0)
+                    self.tetra_materials.append({
+                        "name": f"Fault_{surface_name}",
+                        "locations": [fault_center.tolist()],
+                        "attribute": material_id
+                    })
+                    material_id += 1
+                    logger.info(f"Added fault material for {surface_name} at {fault_center}")
+            
+            # 2. GEOLOGICAL FORMATION MATERIALS: Detect subdomains between layers
+            # Filter to only unit and border surfaces for formation detection
+            formation_surfaces = [(s[0], s[1], s[2], s[3]) for s in valid_surfaces 
+                                if s[0] in (border_surfaces | unit_surfaces)]
+            
+            if formation_surfaces:
+                material_locations = self._detect_geological_subdomains(formation_surfaces, domain_bounds)
+                
+                # Create materials for each geological formation
+                for i, location in enumerate(material_locations):
+                    formation_name = self._get_formation_name(i, len(material_locations))
+                    
+                    self.tetra_materials.append({
+                        "name": formation_name,
+                        "locations": [location],
+                        "attribute": material_id
+                    })
+                    material_id += 1
+                    logger.info(f"Added formation material {formation_name} at {location}")
+            
+            # Ensure at least one material exists
+            if not self.tetra_materials:
+                center_location = [
+                    (domain_bounds[0] + domain_bounds[1]) / 2,
+                    (domain_bounds[2] + domain_bounds[3]) / 2,
+                    (domain_bounds[4] + domain_bounds[5]) / 2
+                ]
+                self.tetra_materials.append({
+                    "name": "Default_Formation",
+                    "locations": [center_location],
+                    "attribute": 1
+                })
 
-            self.tetra_materials.append({
-                "name"     : f"Material_{ds_idx + 1}",
-                "locations": [centroid],
-                "attribute": ds_idx + 1
-            })
+            self._refresh_material_list()
+            if hasattr(self, 'material_list') and self.material_list.count() > 0:
+                self.material_list.setCurrentRow(0)
 
-        # ensure at least one material exists
-        if not self.tetra_materials:
-            self.tetra_materials.append({
-                "name": "Material_1",
-                "locations": [self._calculate_default_location()],
-                "attribute": 1
-            })
+            QMessageBox.information(
+                self, "Auto Materials Complete",
+                f"Created {len(self.tetra_materials)} material(s):\n"
+                f"• {len(fault_surfaces)} fault materials\n"
+                f"• {len(self.tetra_materials) - len(fault_surfaces)} formation materials\n\n"
+                f"Each material represents a 3D subdomain or fault zone.\n"
+                f"Review and adjust material seed points as needed."
+            )
+            
+        except Exception as e:
+            logger.error(f"Auto material placement failed: {e}", exc_info=True)
+            QMessageBox.critical(self, "Auto Materials Error", f"Failed to automatically place materials:\n{str(e)}")
 
-        self.material_list.setCurrentRow(0)
-        self._refresh_material_list()
+    def _detect_geological_subdomains(self, formation_surfaces, domain_bounds):
+        """
+        Detect geological subdomains by analyzing surface arrangements (layered approach).
+        Places seed points in regions between surfaces that represent geological formations.
+        """
+        import numpy as np
+        
+        try:
+            material_locations = []
+            
+            # Strategy: Layered geological approach
+            # Sort surfaces by Z-coordinate to identify geological layers
+            surface_z_centers = []
+            for surface_idx, surface_data_item, verts_np, surface_name in formation_surfaces:
+                z_center = np.mean(verts_np[:, 2])
+                surface_z_centers.append((z_center, surface_idx, surface_name, verts_np))
+            
+            surface_z_centers.sort(key=lambda x: x[0])  # Sort by Z coordinate (depth)
+            
+            # If we have multiple surfaces at different Z levels, create layers
+            if len(surface_z_centers) >= 2:
+                z_coords = [item[0] for item in surface_z_centers]
+                
+                # Create materials in gaps between significant surfaces
+                for i in range(len(z_coords) - 1):
+                    z_mid = (z_coords[i] + z_coords[i + 1]) / 2
+                    gap_size = z_coords[i + 1] - z_coords[i]
+                    
+                    # Only create materials for significant gaps (> 10% of domain height)
+                    domain_height = domain_bounds[5] - domain_bounds[4]
+                    if gap_size > domain_height * 0.1:
+                        # Place seed point in the middle of the domain at this Z level
+                        x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+                        y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+                        material_locations.append([x_center, y_center, z_mid])
+                
+                # Add materials above top surface and below bottom surface
+                if len(material_locations) > 0:
+                    # Material above top surface
+                    z_top = z_coords[-1] + (domain_bounds[5] - z_coords[-1]) * 0.5
+                    if z_top < domain_bounds[5]:
+                        x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+                        y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+                        material_locations.append([x_center, y_center, z_top])
+                    
+                    # Material below bottom surface  
+                    z_bottom = z_coords[0] - (z_coords[0] - domain_bounds[4]) * 0.5
+                    if z_bottom > domain_bounds[4]:
+                        x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+                        y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+                        material_locations.insert(0, [x_center, y_center, z_bottom])
+            
+            # Fallback: If no layered structure, create materials in domain quadrants
+            if not material_locations:
+                x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+                y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+                z_upper = domain_bounds[4] + (domain_bounds[5] - domain_bounds[4]) * 0.75
+                z_lower = domain_bounds[4] + (domain_bounds[5] - domain_bounds[4]) * 0.25
+                
+                material_locations = [
+                    [x_center, y_center, z_upper],  # Upper formation
+                    [x_center, y_center, z_lower]   # Lower formation
+                ]
+            
+            return material_locations
+            
+        except Exception as e:
+            logger.error(f"Failed to detect geological subdomains: {e}")
+            # Fallback to simple center point
+            x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+            y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+            z_center = (domain_bounds[4] + domain_bounds[5]) / 2
+            return [[x_center, y_center, z_center]]
 
-        QMessageBox.information(
-            self, "Automatic placement",
-            f"Created {len(self.tetra_materials)} material(s) with one seed each."
-        )
+    def _get_formation_name(self, index: int, total_count: int) -> str:
+        """Generate appropriate geological formation names based on position."""
+        if total_count == 1:
+            return "Main_Formation"
+        elif total_count == 2:
+            return "Upper_Formation" if index == 1 else "Lower_Formation"
+        elif total_count == 3:
+            if index == 0:
+                return "Lower_Formation"
+            elif index == 1:
+                return "Middle_Formation"
+            else:
+                return "Upper_Formation"
+        else:
+            # More than 3 formations
+            if index == 0:
+                return "Lower_Formation"
+            elif index == total_count - 1:
+                return "Upper_Formation"
+            else:
+                return f"Middle_Formation_{index}"
+
+    def _detect_subdomains(self, valid_surfaces, domain_bounds):
+        """
+        Detect subdomains by analyzing surface arrangements and placing seed points
+        in areas that would form distinct 3D regions when meshed.
+        """
+        import numpy as np
+        
+        try:
+            material_locations = []
+            
+            # Strategy 1: Layered approach (for geological models)
+            # Sort surfaces by Z-coordinate to identify layers
+            surface_z_centers = []
+            for ds_idx, ds, verts_np in valid_surfaces:
+                z_center = np.mean(verts_np[:, 2])
+                surface_z_centers.append((z_center, ds_idx, ds, verts_np))
+            
+            surface_z_centers.sort(key=lambda x: x[0])  # Sort by Z coordinate
+            
+            # If we have multiple surfaces at different Z levels, create layers
+            if len(surface_z_centers) >= 2:
+                z_coords = [item[0] for item in surface_z_centers]
+                z_gaps = []
+                
+                for i in range(len(z_coords) - 1):
+                    gap = z_coords[i + 1] - z_coords[i]
+                    z_gaps.append((gap, (z_coords[i] + z_coords[i + 1]) / 2))
+                
+                # Create materials in significant gaps between surfaces
+                significant_gaps = [gap for gap in z_gaps if gap[0] > (domain_bounds[5] - domain_bounds[4]) * 0.1]
+                
+                for gap_size, z_mid in significant_gaps:
+                    # Place seed point in the middle of the domain at this Z level
+                    x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+                    y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+                    material_locations.append([x_center, y_center, z_mid])
+                
+                # Add materials above and below the surface stack
+                if len(significant_gaps) > 0:
+                    # Material above top surface
+                    z_top = z_coords[-1] + (domain_bounds[5] - z_coords[-1]) * 0.5
+                    if z_top < domain_bounds[5]:
+                        x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+                        y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+                        material_locations.append([x_center, y_center, z_top])
+                    
+                    # Material below bottom surface
+                    z_bottom = z_coords[0] - (z_coords[0] - domain_bounds[4]) * 0.5
+                    if z_bottom > domain_bounds[4]:
+                        x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+                        y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+                        material_locations.append([x_center, y_center, z_bottom])
+            
+            # Strategy 2: Grid-based approach if layered approach doesn't work well
+            if len(material_locations) < 2:
+                material_locations.clear()
+                
+                # Create a 2x2x2 grid of seed points (up to 8 subdomains)
+                x_positions = [
+                    domain_bounds[0] + (domain_bounds[1] - domain_bounds[0]) * 0.25,
+                    domain_bounds[0] + (domain_bounds[1] - domain_bounds[0]) * 0.75
+                ]
+                y_positions = [
+                    domain_bounds[2] + (domain_bounds[3] - domain_bounds[2]) * 0.25,
+                    domain_bounds[2] + (domain_bounds[3] - domain_bounds[2]) * 0.75
+                ]
+                z_positions = [
+                    domain_bounds[4] + (domain_bounds[5] - domain_bounds[4]) * 0.25,
+                    domain_bounds[4] + (domain_bounds[5] - domain_bounds[4]) * 0.75
+                ]
+                
+                # Limit to reasonable number of subdomains
+                max_materials = min(6, len(valid_surfaces) + 1)
+                count = 0
+                
+                for z in z_positions:
+                    for y in y_positions:
+                        for x in x_positions:
+                            if count >= max_materials:
+                                break
+                            material_locations.append([x, y, z])
+                            count += 1
+                        if count >= max_materials:
+                            break
+                    if count >= max_materials:
+                        break
+            
+            # Ensure we have at least one material
+            if not material_locations:
+                center_location = [
+                    (domain_bounds[0] + domain_bounds[1]) / 2,
+                    (domain_bounds[2] + domain_bounds[3]) / 2,
+                    (domain_bounds[4] + domain_bounds[5]) / 2
+                ]
+                material_locations.append(center_location)
+            
+            logger.info(f"Detected {len(material_locations)} subdomains with material seed points")
+            return material_locations
+            
+        except Exception as e:
+            logger.error(f"Subdomain detection failed: {e}")
+            # Fallback: single material at domain center
+            center_location = [
+                (domain_bounds[0] + domain_bounds[1]) / 2,
+                (domain_bounds[2] + domain_bounds[3]) / 2,
+                (domain_bounds[4] + domain_bounds[5]) / 2
+            ]
+            return [center_location]
 
     
     def _update_tetra_stats(self):
