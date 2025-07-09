@@ -10225,7 +10225,7 @@ segmentation, triangulation, and visualization.
                     # Only assign fault material if significantly close to fault
                     influence_factor = 1.0 - (min_fault_distance / fault_threshold)
                     if influence_factor > 0.3:  # Minimum 30% influence required
-                    assigned_materials[i] = fault_attrs[nearest_fault_idx]
+                        assigned_materials[i] = fault_attrs[nearest_fault_idx]
         
         # 3. ENHANCED FALLBACK: Distance-based assignment with constraint awareness
         if len(formation_points) == 0 and len(fault_points) == 0:
