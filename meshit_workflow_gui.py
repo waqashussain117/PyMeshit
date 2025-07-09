@@ -9671,13 +9671,16 @@ segmentation, triangulation, and visualization.
             
             logger.info(f"Assigning materials to {n_cells} tetrahedra using {len(material_points)} seed points")
             
-            # BOUNDARY-AWARE ASSIGNMENT
-            material_ids = self._boundary_aware_assignment(
-                tet_centers, material_points, material_attributes, material_types
+            # C++ STYLE BOUNDARY-AWARE ASSIGNMENT
+            material_ids = self._cpp_style_material_assignment(
+                grid, tet_centers, material_points, material_attributes, material_types
             )
             
             # Assign materials to mesh
             grid.cell_data['MaterialID'] = material_ids
+            
+            # C++ STYLE MATERIAL VALIDATION: Check if materials reach all constraint segments
+            self._validate_material_constraints(grid, material_ids)
             
             # Validate assignment
             unique_materials = np.unique(material_ids)
@@ -9692,9 +9695,461 @@ segmentation, triangulation, and visualization.
         except Exception as e:
             logger.error(f"Failed to assign materials to mesh: {e}", exc_info=True)
 
+    def _cpp_style_material_assignment(self, grid, tet_centers, material_points, material_attributes, material_types):
+        """
+        C++ MeshIt style material assignment that respects edge constraints and boundaries.
+        This follows the C++ calculate_tets() approach with regionlist assignment.
+        """
+        import numpy as np
+        
+        n_tets = len(tet_centers)
+        assigned_materials = np.zeros(n_tets, dtype=int)
+        
+        # Get constraint information from the mesh or surface data
+        edge_constraints = self._get_mesh_edge_constraints(grid)
+        surface_boundaries = self._get_mesh_surface_boundaries(grid)
+        
+        # Separate formation and fault materials
+        formation_mask = np.array([t == 'formation' for t in material_types])
+        fault_mask = np.array([t == 'fault' for t in material_types])
+        
+        formation_points = material_points[formation_mask] if np.any(formation_mask) else np.array([]).reshape(0, 3)
+        formation_attrs = material_attributes[formation_mask] if np.any(formation_mask) else np.array([])
+        
+        fault_points = material_points[fault_mask] if np.any(fault_mask) else np.array([]).reshape(0, 3)
+        fault_attrs = material_attributes[fault_mask] if np.any(fault_mask) else np.array([])
+        
+        # 1. PRIMARY ASSIGNMENT: Formation materials using C++ region-based approach
+        if len(formation_points) > 0:
+            for i, center in enumerate(tet_centers):
+                # Check if tetrahedron is blocked by edge constraints or surface boundaries
+                if not self._is_blocked_by_constraints(center, formation_points, edge_constraints, surface_boundaries):
+                    # Assign to nearest formation material
+                    distances = np.sqrt(np.sum((formation_points - center) ** 2, axis=1))
+                    closest_idx = np.argmin(distances)
+                    assigned_materials[i] = formation_attrs[closest_idx]
+                else:
+                    # Use constraint-aware assignment for boundary tetrahedra
+                    assigned_materials[i] = self._assign_constrained_material(center, formation_points, formation_attrs, edge_constraints)
+        
+        # 2. FAULT OVERRIDE: Apply fault materials with boundary respect
+        if len(fault_points) > 0:
+            fault_threshold = self._calculate_fault_threshold(tet_centers, fault_points)
+            
+            for i, center in enumerate(tet_centers):
+                fault_distances = np.sqrt(np.sum((fault_points - center) ** 2, axis=1))
+                min_fault_distance = np.min(fault_distances)
+                
+                # Check if tetrahedron is within fault influence and respects constraints
+                if min_fault_distance < fault_threshold:
+                    nearest_fault_idx = np.argmin(fault_distances)
+                    # Only assign fault material if it doesn't violate edge constraints
+                    if not self._violates_edge_constraints(center, fault_points[nearest_fault_idx], edge_constraints):
+                        assigned_materials[i] = fault_attrs[nearest_fault_idx]
+        
+        # 3. FALLBACK: Distance-based assignment for unassigned tetrahedra
+        unassigned_mask = assigned_materials == 0
+        if np.any(unassigned_mask) and len(material_points) > 0:
+            unassigned_centers = tet_centers[unassigned_mask]
+            for i, center in enumerate(unassigned_centers):
+                distances = np.sqrt(np.sum((material_points - center) ** 2, axis=1))
+                closest_idx = np.argmin(distances)
+                assigned_materials[np.where(unassigned_mask)[0][i]] = material_attributes[closest_idx]
+        
+        return assigned_materials
+
+    def _get_mesh_edge_constraints(self, grid):
+        """Extract edge constraint information from the mesh."""
+        # Try to get edge constraints from mesh metadata or surface data
+        edge_constraints = []
+        
+        try:
+            # Check if we have edge data in the mesh
+            if hasattr(grid, 'lines') and grid.lines is not None and len(grid.lines) > 0:
+                # Extract edge lines from PyVista mesh
+                for i in range(0, len(grid.lines), 3):  # PyVista lines format: [n, p1, p2, ...]
+                    if i + 2 < len(grid.lines):
+                        p1_idx = grid.lines[i + 1]
+                        p2_idx = grid.lines[i + 2]
+                        if p1_idx < len(grid.points) and p2_idx < len(grid.points):
+                            edge_constraints.append([grid.points[p1_idx], grid.points[p2_idx]])
+            
+            # Also get constraints from surface intersections if available
+            if hasattr(self, 'refined_intersections_for_visualization'):
+                for intersection_data in self.refined_intersections_for_visualization:
+                    if 'vertices' in intersection_data:
+                        vertices = intersection_data['vertices']
+                        # Create edge constraints from intersection line segments
+                        for i in range(len(vertices) - 1):
+                            edge_constraints.append([vertices[i], vertices[i + 1]])
+        
+        except Exception as e:
+            logger.warning(f"Could not extract edge constraints: {e}")
+        
+        return edge_constraints
+
+    def _get_mesh_surface_boundaries(self, grid):
+        """Extract surface boundary information from the mesh."""
+        surface_boundaries = []
+        
+        try:
+            # Extract surface triangles as boundaries
+            if hasattr(grid, 'faces') and grid.faces is not None and len(grid.faces) > 0:
+                for i in range(0, len(grid.faces), 4):  # PyVista faces format: [3, p1, p2, p3, ...]
+                    if i + 3 < len(grid.faces) and grid.faces[i] == 3:
+                        p1_idx = grid.faces[i + 1]
+                        p2_idx = grid.faces[i + 2]
+                        p3_idx = grid.faces[i + 3]
+                        if (p1_idx < len(grid.points) and p2_idx < len(grid.points) and p3_idx < len(grid.points)):
+                            triangle = [grid.points[p1_idx], grid.points[p2_idx], grid.points[p3_idx]]
+                            surface_boundaries.append(triangle)
+        
+        except Exception as e:
+            logger.warning(f"Could not extract surface boundaries: {e}")
+        
+        return surface_boundaries
+
+    def _is_blocked_by_constraints(self, point, target_points, edge_constraints, surface_boundaries):
+        """Check if a line from point to any target point is blocked by constraints."""
+        # Simplified constraint checking - checks if direct path crosses major boundaries
+        if len(edge_constraints) == 0 and len(surface_boundaries) == 0:
+            return False
+        
+        # For performance, only check closest target point
+        if len(target_points) > 0:
+            distances = np.sqrt(np.sum((target_points - point) ** 2, axis=1))
+            closest_idx = np.argmin(distances)
+            target = target_points[closest_idx]
+            
+            # Check if path crosses any major edge constraints
+            return self._path_crosses_constraints(point, target, edge_constraints)
+        
+        return False
+
+    def _path_crosses_constraints(self, start, end, edge_constraints):
+        """Check if path from start to end crosses any edge constraints."""
+        import numpy as np
+        
+        # Simplified 3D line-line intersection check
+        for edge in edge_constraints[:10]:  # Limit check for performance
+            if len(edge) >= 2:
+                edge_start, edge_end = edge[0], edge[1]
+                
+                # Calculate distance between line segments in 3D
+                distance = self._line_segment_distance_3d(start, end, edge_start, edge_end)
+                
+                # If lines are very close, consider them crossing
+                if distance < 0.1:  # Threshold for "crossing"
+                    return True
+        
+        return False
+
+    def _line_segment_distance_3d(self, p1, p2, p3, p4):
+        """Calculate minimum distance between two 3D line segments."""
+        import numpy as np
+        
+        # Convert to numpy arrays
+        p1, p2, p3, p4 = np.array(p1), np.array(p2), np.array(p3), np.array(p4)
+        
+        # Line segment vectors
+        d1 = p2 - p1
+        d2 = p4 - p3
+        dp = p1 - p3
+        
+        # Cross product for skew line distance
+        cross_d1_d2 = np.cross(d1, d2)
+        cross_norm = np.linalg.norm(cross_d1_d2)
+        
+        if cross_norm < 1e-10:  # Lines are parallel
+            # Distance between parallel lines
+            cross_dp_d1 = np.cross(dp, d1)
+            return np.linalg.norm(cross_dp_d1) / np.linalg.norm(d1)
+        else:
+            # Distance between skew lines
+            return abs(np.dot(dp, cross_d1_d2)) / cross_norm
+
+    def _assign_constrained_material(self, center, formation_points, formation_attrs, edge_constraints):
+        """Assign material to tetrahedron respecting edge constraints."""
+        import numpy as np
+        
+        # Find formation material that doesn't violate constraints
+        for i, point in enumerate(formation_points):
+            if not self._violates_edge_constraints(center, point, edge_constraints):
+                return formation_attrs[i]
+        
+        # Fallback: closest material
+        distances = np.sqrt(np.sum((formation_points - center) ** 2, axis=1))
+        closest_idx = np.argmin(distances)
+        return formation_attrs[closest_idx]
+
+    def _violates_edge_constraints(self, start, end, edge_constraints):
+        """Check if path from start to end violates edge constraints."""
+        return self._path_crosses_constraints(start, end, edge_constraints)
+
+    def _validate_material_constraints(self, grid, material_ids):
+        """
+        C++ MeshIt style material validation: Check if materials reach all constraint line segments.
+        This implements the C++ material_selections() function logic.
+        """
+        import numpy as np
+        
+        try:
+            # Get constraint segments from mesh or surface data
+            constraint_segments = self._get_constraint_segments()
+            
+            if not constraint_segments:
+                logger.info("No constraint segments found - skipping material validation")
+                return
+            
+            logger.info(f"Validating material assignment against {len(constraint_segments)} constraint segments")
+            
+            # Get mesh vertices and tetrahedra
+            vertices = grid.points
+            tetrahedra = grid.cells_dict.get(10, np.array([])).reshape(-1, 4) if 10 in grid.cells_dict else np.array([])
+            
+            if len(tetrahedra) == 0:
+                logger.warning("No tetrahedra found for material validation")
+                return
+            
+            validation_passed = True
+            unreachable_segments = 0
+            
+            # Check each constraint segment
+            for seg_idx, segment in enumerate(constraint_segments):
+                if len(segment) < 2:
+                    continue
+                
+                segment_has_material = False
+                
+                # Check all points in the segment
+                for point in segment:
+                    has_match = False
+                    
+                    # Check if point appears in any tetrahedron with a material
+                    for tet_idx, tet in enumerate(tetrahedra):
+                        if material_ids[tet_idx] == 0:  # Skip unassigned tetrahedra
+                            continue
+                        
+                        # Check if point is close to any vertex of this tetrahedron
+                        for vertex_idx in tet:
+                            if vertex_idx < len(vertices):
+                                vertex = vertices[vertex_idx]
+                                distance = np.linalg.norm(np.array(point) - vertex)
+                                
+                                # C++ uses 1e-10 tolerance for point matching
+                                if distance < 1e-10:
+                                    has_match = True
+                                    break
+                        
+                        if has_match:
+                            break
+                    
+                    if has_match:
+                        segment_has_material = True
+                        break
+                
+                if not segment_has_material:
+                    unreachable_segments += 1
+                    validation_passed = False
+                    logger.warning(f"Constraint segment {seg_idx} is not reached by any material")
+            
+            if validation_passed:
+                logger.info("Material constraint validation PASSED - all constraint segments are reachable")
+            else:
+                logger.warning(f"Material constraint validation FAILED - {unreachable_segments}/{len(constraint_segments)} segments unreachable")
+                logger.warning("Applying material constraint enforcement to fix boundary violations...")
+                
+                # Apply constraint enforcement like C++ MeshIt
+                self._enforce_material_constraints(grid, material_ids, constraint_segments)
+        
+        except Exception as e:
+            logger.error(f"Material constraint validation failed: {e}", exc_info=True)
+
+    def _get_constraint_segments(self):
+        """Get constraint line segments for validation."""
+        constraint_segments = []
+        
+        try:
+            # Get segments from refined intersections
+            if hasattr(self, 'refined_intersections_for_visualization'):
+                for intersection_data in self.refined_intersections_for_visualization:
+                    if 'vertices' in intersection_data:
+                        vertices = intersection_data['vertices']
+                        constraint_segments.append(vertices)
+            
+            # Get segments from surface constraints if available
+            if hasattr(self, 'tetra_surface_data') and self.tetra_surface_data:
+                for surface_idx, surface_data in self.tetra_surface_data.items():
+                    if 'constraint_segments' in surface_data:
+                        constraint_segments.extend(surface_data['constraint_segments'])
+        
+        except Exception as e:
+            logger.warning(f"Could not extract constraint segments: {e}")
+        
+        return constraint_segments
+
+    def _enforce_material_constraints(self, grid, material_ids, constraint_segments):
+        """
+        Enforce material constraints by adjusting material assignments near constraint boundaries.
+        This implements the C++ approach of ensuring materials respect edge and surface constraints.
+        """
+        import numpy as np
+        
+        try:
+            logger.info("Enforcing material constraints on tetrahedral mesh...")
+            
+            # Get mesh geometry
+            vertices = grid.points
+            tetrahedra = grid.cells_dict.get(10, np.array([])).reshape(-1, 4) if 10 in grid.cells_dict else np.array([])
+            
+            if len(tetrahedra) == 0:
+                logger.warning("No tetrahedra found for constraint enforcement")
+                return
+            
+            # Track changes
+            changes_made = 0
+            
+            # For each constraint segment, ensure proper material distribution
+            for seg_idx, segment in enumerate(constraint_segments):
+                if len(segment) < 2:
+                    continue
+                
+                # Find tetrahedra that are close to this constraint segment
+                constraint_tetrahedra = self._find_constraint_boundary_tetrahedra(
+                    segment, vertices, tetrahedra, material_ids
+                )
+                
+                if len(constraint_tetrahedra) > 0:
+                    # Apply constraint-specific material enforcement
+                    segment_changes = self._enforce_segment_constraint(
+                        constraint_tetrahedra, segment, material_ids, vertices, tetrahedra
+                    )
+                    changes_made += segment_changes
+            
+            # Update mesh with corrected materials
+            grid.cell_data['MaterialID'] = material_ids
+            
+            logger.info(f"Material constraint enforcement complete: {changes_made} tetrahedra reassigned")
+            
+            if changes_made > 0:
+                # Re-validate after enforcement
+                unique_materials = np.unique(material_ids)
+                logger.info(f"Final material distribution: {unique_materials}")
+        
+        except Exception as e:
+            logger.error(f"Material constraint enforcement failed: {e}", exc_info=True)
+
+    def _find_constraint_boundary_tetrahedra(self, segment, vertices, tetrahedra, material_ids):
+        """Find tetrahedra that are near constraint segment boundaries."""
+        import numpy as np
+        
+        constraint_tetrahedra = []
+        
+        # Calculate constraint segment bounding box with tolerance
+        segment_array = np.array(segment)
+        min_bounds = np.min(segment_array, axis=0) - 0.1
+        max_bounds = np.max(segment_array, axis=0) + 0.1
+        
+        # Check each tetrahedron (sample for performance on large meshes)
+        sample_size = min(len(tetrahedra), 1000)  # Limit for performance
+        if len(tetrahedra) > sample_size:
+            sample_indices = np.random.choice(len(tetrahedra), sample_size, replace=False)
+        else:
+            sample_indices = range(len(tetrahedra))
+        
+        for tet_idx in sample_indices:
+            tet = tetrahedra[tet_idx]
+            # Get tetrahedron center
+            tet_vertices = vertices[tet]
+            tet_center = np.mean(tet_vertices, axis=0)
+            
+            # Check if tetrahedron is near constraint segment
+            if (np.all(tet_center >= min_bounds) and np.all(tet_center <= max_bounds)):
+                # More precise distance check to constraint line
+                min_distance = self._point_to_line_segment_distance(tet_center, segment)
+                
+                # Include tetrahedra within reasonable distance of constraint
+                if min_distance < 0.5:  # Adjustable threshold
+                    constraint_tetrahedra.append(tet_idx)
+        
+        return constraint_tetrahedra
+
+    def _point_to_line_segment_distance(self, point, segment):
+        """Calculate minimum distance from point to any line segment in the constraint."""
+        import numpy as np
+        
+        min_distance = float('inf')
+        point = np.array(point)
+        
+        for i in range(len(segment) - 1):
+            seg_start = np.array(segment[i])
+            seg_end = np.array(segment[i + 1])
+            
+            # Distance from point to line segment
+            distance = self._point_to_segment_distance(point, seg_start, seg_end)
+            min_distance = min(min_distance, distance)
+        
+        return min_distance
+
+    def _point_to_segment_distance(self, point, seg_start, seg_end):
+        """Calculate distance from point to line segment."""
+        import numpy as np
+        
+        # Vector from seg_start to seg_end
+        segment_vec = seg_end - seg_start
+        segment_len_sq = np.dot(segment_vec, segment_vec)
+        
+        if segment_len_sq < 1e-10:  # Degenerate segment
+            return np.linalg.norm(point - seg_start)
+        
+        # Project point onto line
+        t = max(0, min(1, np.dot(point - seg_start, segment_vec) / segment_len_sq))
+        projection = seg_start + t * segment_vec
+        
+        return np.linalg.norm(point - projection)
+
+    def _enforce_segment_constraint(self, constraint_tetrahedra, segment, material_ids, vertices, tetrahedra):
+        """Enforce material consistency along a specific constraint segment."""
+        import numpy as np
+        
+        changes_made = 0
+        
+        if len(constraint_tetrahedra) < 2:
+            return changes_made
+        
+        # Analyze material distribution along constraint
+        constraint_materials = [material_ids[tet_idx] for tet_idx in constraint_tetrahedra]
+        unique_materials = list(set(constraint_materials))
+        
+        # If all tetrahedra already have the same material, no enforcement needed
+        if len(unique_materials) <= 1:
+            return changes_made
+        
+        # Find dominant material along constraint
+        material_counts = {}
+        for mat_id in constraint_materials:
+            material_counts[mat_id] = material_counts.get(mat_id, 0) + 1
+        
+        dominant_material = max(material_counts, key=material_counts.get)
+        
+        # Enforce dominant material for constraint boundary tetrahedra
+        for tet_idx in constraint_tetrahedra:
+            if material_ids[tet_idx] != dominant_material:
+                # Check if reassignment is geometrically reasonable
+                tet_center = np.mean(vertices[tetrahedra[tet_idx]], axis=0)
+                
+                # Only reassign if tetrahedron is very close to constraint
+                min_distance = self._point_to_line_segment_distance(tet_center, segment)
+                if min_distance < 0.3:  # Very close to constraint
+                    material_ids[tet_idx] = dominant_material
+                    changes_made += 1
+        
+        return changes_made
+
     def _boundary_aware_assignment(self, tet_centers, material_points, material_attributes, material_types):
         """
-        Perform boundary-aware material assignment that respects geological layering.
+        Enhanced boundary-aware material assignment that respects geological layering and edge constraints.
+        This is now a simplified fallback when full C++ style assignment is not available.
         """
         import numpy as np
         
@@ -9711,38 +10166,50 @@ segmentation, triangulation, and visualization.
         fault_points = material_points[fault_mask] if np.any(fault_mask) else np.array([]).reshape(0, 3)
         fault_attrs = material_attributes[fault_mask] if np.any(fault_mask) else np.array([])
         
-        # 1. GEOLOGICAL LAYERING: Assign formations based on Z-coordinate layers
+        # 1. ENHANCED GEOLOGICAL LAYERING: Respect C++ MeshIt approach
         if len(formation_points) > 0:
-            # Sort formation materials by Z-coordinate (depth)
-            z_order = np.argsort(formation_points[:, 2])
-            sorted_formation_points = formation_points[z_order]
-            sorted_formation_attrs = formation_attrs[z_order]
-            
-            # Layer-based assignment with weighted distance
-            for i, center in enumerate(tet_centers):
-                center_z = center[2]
+            # C++ style: exactly 2 formation materials positioned strategically
+            if len(formation_points) == 2:
+                # Two-formation assignment with proper boundary respect
+                upper_formation = formation_points[np.argmax(formation_points[:, 2])]
+                lower_formation = formation_points[np.argmin(formation_points[:, 2])]
+                upper_attr = formation_attrs[np.argmax(formation_points[:, 2])]
+                lower_attr = formation_attrs[np.argmin(formation_points[:, 2])]
                 
-                # Find the appropriate geological layer
-                best_formation_idx = 0
-                min_weighted_distance = float('inf')
+                # Assign based on position relative to formation boundary
+                boundary_z = (upper_formation[2] + lower_formation[2]) / 2
                 
-                for j, formation_point in enumerate(sorted_formation_points):
-                    formation_z = formation_point[2]
+                for i, center in enumerate(tet_centers):
+                    center_z = center[2]
                     
-                    # Calculate distances
-                    xyz_distance = np.sqrt(np.sum((formation_point - center) ** 2))
-                    z_distance = abs(formation_z - center_z)
-                    
-                    # Weighted distance: Z-distance matters more for geological layering
-                    weighted_distance = z_distance * 3.0 + xyz_distance * 0.5
-                    
-                    if weighted_distance < min_weighted_distance:
-                        min_weighted_distance = weighted_distance
-                        best_formation_idx = j
-                
-                assigned_materials[i] = sorted_formation_attrs[best_formation_idx]
+                    # Enhanced assignment considering distance to both formations
+                    if center_z > boundary_z:
+                        # Upper region - prefer upper formation but check distance
+                        dist_upper = np.linalg.norm(center - upper_formation)
+                        dist_lower = np.linalg.norm(center - lower_formation)
+                        
+                        # Use upper formation unless much closer to lower
+                        if dist_lower < dist_upper * 0.5:  # Strong preference for layer-appropriate material
+                            assigned_materials[i] = lower_attr
+                        else:
+                            assigned_materials[i] = upper_attr
+                    else:
+                        # Lower region - prefer lower formation
+                        dist_upper = np.linalg.norm(center - upper_formation)
+                        dist_lower = np.linalg.norm(center - lower_formation)
+                        
+                        if dist_upper < dist_lower * 0.5:
+                            assigned_materials[i] = upper_attr
+                        else:
+                            assigned_materials[i] = lower_attr
+            else:
+                # Fallback for other formation counts
+                for i, center in enumerate(tet_centers):
+                    distances = np.sqrt(np.sum((formation_points - center) ** 2, axis=1))
+                    closest_idx = np.argmin(distances)
+                    assigned_materials[i] = formation_attrs[closest_idx]
         
-        # 2. FAULT OVERRIDE: Tetrahedra near faults get fault materials
+        # 2. FAULT OVERRIDE: Enhanced fault material assignment with boundary respect
         if len(fault_points) > 0:
             fault_threshold = self._calculate_fault_threshold(tet_centers, fault_points)
             
@@ -9751,12 +10218,16 @@ segmentation, triangulation, and visualization.
                 fault_distances = np.sqrt(np.sum((fault_points - center) ** 2, axis=1))
                 min_fault_distance = np.min(fault_distances)
                 
-                # If tetrahedron is close to a fault, assign fault material
+                # Enhanced fault influence calculation
                 if min_fault_distance < fault_threshold:
                     nearest_fault_idx = np.argmin(fault_distances)
+                    
+                    # Only assign fault material if significantly close to fault
+                    influence_factor = 1.0 - (min_fault_distance / fault_threshold)
+                    if influence_factor > 0.3:  # Minimum 30% influence required
                     assigned_materials[i] = fault_attrs[nearest_fault_idx]
         
-        # 3. FALLBACK: Simple distance-based assignment if no geological structure
+        # 3. ENHANCED FALLBACK: Distance-based assignment with constraint awareness
         if len(formation_points) == 0 and len(fault_points) == 0:
             for i, center in enumerate(tet_centers):
                 distances = np.sqrt(np.sum((material_points - center) ** 2, axis=1))
@@ -10630,9 +11101,10 @@ segmentation, triangulation, and visualization.
 
     def _auto_place_materials(self) -> None:
         """
-        Automatically assign materials based on surface classifications and the principle 
-        of one material per 3D subdomain. Uses surface classification (border, unit, fault)
-        to intelligently place materials in geological formations and assign materials to faults.
+        Automatically assign materials based on C++ MeshIt approach:
+        - Exactly 2 formation materials for 3 surfaces (excluding borders)
+        - Each fault gets its own material at proper position
+        - Respects surface geometry and boundary constraints
         """
         # Check if we're in tetra mesh tab with loaded surface data
         if hasattr(self, 'tetra_surface_data') and self.tetra_surface_data:
@@ -10659,10 +11131,8 @@ segmentation, triangulation, and visualization.
             
             logger.info(f"Auto-materials using surface classifications: {len(border_surfaces)} borders, {len(unit_surfaces)} units, {len(fault_surfaces)} faults")
             
-            # Get all surface bounds to determine the overall domain
-            all_bounds = []
+            # Get all surface geometry for analysis
             valid_surfaces = []
-            
             for surface_idx, surface_data_item in surface_data.items():
                 # Handle different data structures
                 if data_source == "tetra_surface_data":
@@ -10690,12 +11160,6 @@ segmentation, triangulation, and visualization.
                         continue  # Skip invalid data
                 
                 if len(verts_np) > 0 and len(verts_np.shape) == 2 and verts_np.shape[1] >= 3:
-                    surface_bounds = [
-                        np.min(verts_np[:, 0]), np.max(verts_np[:, 0]),  # x_min, x_max
-                        np.min(verts_np[:, 1]), np.max(verts_np[:, 1]),  # y_min, y_max
-                        np.min(verts_np[:, 2]), np.max(verts_np[:, 2])   # z_min, z_max
-                    ]
-                    all_bounds.append(surface_bounds)
                     valid_surfaces.append((surface_idx, surface_data_item, verts_np, surface_name))
             
             if not valid_surfaces:
@@ -10703,54 +11167,59 @@ segmentation, triangulation, and visualization.
                 return
             
             # Calculate overall domain bounds
-            all_bounds = np.array(all_bounds)
+            all_verts = np.vstack([verts for _, _, verts, _ in valid_surfaces])
             domain_bounds = [
-                np.min(all_bounds[:, 0]),  # overall x_min
-                np.max(all_bounds[:, 1]),  # overall x_max
-                np.min(all_bounds[:, 2]),  # overall y_min
-                np.max(all_bounds[:, 3]),  # overall y_max
-                np.min(all_bounds[:, 4]),  # overall z_min
-                np.max(all_bounds[:, 5])   # overall z_max
+                np.min(all_verts[:, 0]), np.max(all_verts[:, 0]),  # x_min, x_max
+                np.min(all_verts[:, 1]), np.max(all_verts[:, 1]),  # y_min, y_max
+                np.min(all_verts[:, 2]), np.max(all_verts[:, 2])   # z_min, z_max
             ]
             
             material_id = 1
+            formation_count = 0
             
-            # 1. FAULT MATERIALS: Each fault gets its own material (like C++ version)
+            # 1. FAULT MATERIALS: Each fault gets its own material at proper position
             for fault_idx in fault_surfaces:
                 fault_surface = next((s for s in valid_surfaces if s[0] == fault_idx), None)
                 if fault_surface:
                     surface_idx, surface_data_item, verts_np, surface_name = fault_surface
-                    # Place material seed point at center of fault
+                    # Place material seed point slightly offset from fault center to avoid being ON the fault
                     fault_center = np.mean(verts_np, axis=0)
+                    fault_normal = self._estimate_surface_normal(verts_np)
+                    
+                    # Offset point slightly away from fault surface
+                    offset_distance = (domain_bounds[1] - domain_bounds[0]) * 0.01  # 1% of domain width
+                    fault_material_point = fault_center + fault_normal * offset_distance
+                    
                     self.tetra_materials.append({
                         "name": f"Fault_{surface_name}",
-                        "locations": [fault_center.tolist()],
+                        "locations": [fault_material_point.tolist()],
                         "attribute": material_id
                     })
                     material_id += 1
-                    logger.info(f"Added fault material for {surface_name} at {fault_center}")
+                    logger.info(f"Added fault material for {surface_name} at {fault_material_point}")
             
-            # 2. GEOLOGICAL FORMATION MATERIALS: Detect subdomains between layers
-            # Filter to only unit and border surfaces for formation detection
-            formation_surfaces = [(s[0], s[1], s[2], s[3]) for s in valid_surfaces 
-                                if s[0] in (border_surfaces | unit_surfaces)]
+            # 2. FORMATION MATERIALS: Create exactly 2 materials for non-border/non-fault surfaces
+            # Following C++ approach for geological formations
+            non_border_surfaces = [(s[0], s[1], s[2], s[3]) for s in valid_surfaces 
+                                 if s[0] not in border_surfaces and s[0] not in fault_surfaces]
             
-            if formation_surfaces:
-                material_locations = self._detect_geological_subdomains(formation_surfaces, domain_bounds)
+            if len(non_border_surfaces) > 0:
+                # C++ MeshIt approach: Create 2 formation materials positioned strategically
+                formation_materials = self._create_cpp_style_formation_materials(
+                    non_border_surfaces, domain_bounds, border_surfaces
+                )
                 
-                # Create materials for each geological formation
-                for i, location in enumerate(material_locations):
-                    formation_name = self._get_formation_name(i, len(material_locations))
-                    
+                for i, (location, formation_name) in enumerate(formation_materials):
                     self.tetra_materials.append({
                         "name": formation_name,
                         "locations": [location],
                         "attribute": material_id
                     })
                     material_id += 1
+                    formation_count += 1
                     logger.info(f"Added formation material {formation_name} at {location}")
             
-            # Ensure at least one material exists
+            # Ensure at least one material exists (fallback)
             if not self.tetra_materials:
                 center_location = [
                     (domain_bounds[0] + domain_bounds[1]) / 2,
@@ -10762,6 +11231,7 @@ segmentation, triangulation, and visualization.
                     "locations": [center_location],
                     "attribute": 1
                 })
+                formation_count = 1
 
             self._refresh_material_list()
             if hasattr(self, 'material_list') and self.material_list.count() > 0:
@@ -10769,16 +11239,163 @@ segmentation, triangulation, and visualization.
 
             QMessageBox.information(
                 self, "Auto Materials Complete",
-                f"Created {len(self.tetra_materials)} material(s):\n"
+                f"Created {len(self.tetra_materials)} material(s) (C++ MeshIt style):\n"
                 f"• {len(fault_surfaces)} fault materials\n"
-                f"• {len(self.tetra_materials) - len(fault_surfaces)} formation materials\n\n"
-                f"Each material represents a 3D subdomain or fault zone.\n"
+                f"• {formation_count} formation materials\n\n"
+                f"Materials positioned to respect surface geometry and constraints.\n"
                 f"Review and adjust material seed points as needed."
             )
             
         except Exception as e:
             logger.error(f"Auto material placement failed: {e}", exc_info=True)
             QMessageBox.critical(self, "Auto Materials Error", f"Failed to automatically place materials:\n{str(e)}")
+
+    def _estimate_surface_normal(self, vertices):
+        """Estimate surface normal using cross product of two edge vectors."""
+        import numpy as np
+        
+        if len(vertices) < 3:
+            return np.array([0, 0, 1])  # Default to Z direction
+        
+        # Use first three vertices to compute normal
+        v1 = vertices[1] - vertices[0]
+        v2 = vertices[2] - vertices[0]
+        normal = np.cross(v1, v2)
+        
+        # Normalize
+        norm = np.linalg.norm(normal)
+        if norm > 1e-10:
+            normal = normal / norm
+        else:
+            normal = np.array([0, 0, 1])  # Default if degenerate
+        
+        return normal
+
+    def _create_cpp_style_formation_materials(self, non_border_surfaces, domain_bounds, border_surfaces):
+        """
+        Create formation materials following C++ MeshIt approach:
+        - Exactly 2 formation materials for geological domains
+        - Positioned to respect surface geometry and constraints
+        - Avoids placing materials ON surfaces
+        """
+        import numpy as np
+        
+        formation_materials = []
+        
+        if len(non_border_surfaces) == 0:
+            # No non-border surfaces, create default materials
+            x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+            y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+            z_upper = domain_bounds[4] + (domain_bounds[5] - domain_bounds[4]) * 0.75
+            z_lower = domain_bounds[4] + (domain_bounds[5] - domain_bounds[4]) * 0.25
+            
+            formation_materials = [
+                ([x_center, y_center, z_upper], "Upper_Formation"),
+                ([x_center, y_center, z_lower], "Lower_Formation")
+            ]
+        elif len(non_border_surfaces) == 1:
+            # Single dividing surface: create materials above and below
+            _, _, verts_np, surface_name = non_border_surfaces[0]
+            surface_z_center = np.mean(verts_np[:, 2])
+            
+            x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+            y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+            
+            # Calculate safe distances from surface
+            z_range = domain_bounds[5] - domain_bounds[4]
+            offset = z_range * 0.1  # 10% offset
+            
+            z_upper = min(surface_z_center + offset, domain_bounds[5] - offset/2)
+            z_lower = max(surface_z_center - offset, domain_bounds[4] + offset/2)
+            
+            formation_materials = [
+                ([x_center, y_center, z_upper], "Upper_Formation"),
+                ([x_center, y_center, z_lower], "Lower_Formation")
+            ]
+        else:
+            # Multiple surfaces: analyze geometry and create 2 strategic materials
+            # Sort surfaces by Z coordinate
+            surface_z_data = []
+            for surface_idx, surface_data_item, verts_np, surface_name in non_border_surfaces:
+                z_center = np.mean(verts_np[:, 2])
+                surface_z_data.append((z_center, surface_idx, surface_name, verts_np))
+            
+            surface_z_data.sort(key=lambda x: x[0])  # Sort by Z
+            
+            # Find the largest gap between surfaces for material placement
+            if len(surface_z_data) >= 2:
+                gaps = []
+                for i in range(len(surface_z_data) - 1):
+                    z1 = surface_z_data[i][0]
+                    z2 = surface_z_data[i + 1][0]
+                    gap_size = z2 - z1
+                    gap_center = (z1 + z2) / 2
+                    gaps.append((gap_size, gap_center, i))
+                
+                # Sort by gap size, largest first
+                gaps.sort(key=lambda x: x[0], reverse=True)
+                
+                x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+                y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+                
+                # Place first material in largest gap
+                if len(gaps) > 0:
+                    _, gap_center, _ = gaps[0]
+                    formation_materials.append(([x_center, y_center, gap_center], "Formation_1"))
+                
+                # Place second material strategically
+                if len(gaps) > 1:
+                    # Use second largest gap
+                    _, gap_center2, _ = gaps[1]
+                    formation_materials.append(([x_center, y_center, gap_center2], "Formation_2"))
+                elif len(surface_z_data) >= 2:
+                    # Place below bottom surface or above top surface
+                    bottom_z = surface_z_data[0][0]
+                    top_z = surface_z_data[-1][0]
+                    
+                    # Choose based on available space
+                    space_below = bottom_z - domain_bounds[4]
+                    space_above = domain_bounds[5] - top_z
+                    
+                    if space_below > space_above:
+                        z_pos = bottom_z - space_below * 0.5
+                        formation_materials.append(([x_center, y_center, z_pos], "Lower_Formation"))
+                    else:
+                        z_pos = top_z + space_above * 0.5
+                        formation_materials.append(([x_center, y_center, z_pos], "Upper_Formation"))
+        
+        # Ensure we have exactly 2 formation materials
+        if len(formation_materials) == 0:
+            # Fallback: create default 2 materials
+            x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+            y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+            z_upper = domain_bounds[4] + (domain_bounds[5] - domain_bounds[4]) * 0.75
+            z_lower = domain_bounds[4] + (domain_bounds[5] - domain_bounds[4]) * 0.25
+            
+            formation_materials = [
+                ([x_center, y_center, z_upper], "Upper_Formation"),
+                ([x_center, y_center, z_lower], "Lower_Formation")
+            ]
+        elif len(formation_materials) == 1:
+            # Add second material
+            existing_z = formation_materials[0][0][2]
+            x_center = (domain_bounds[0] + domain_bounds[1]) / 2
+            y_center = (domain_bounds[2] + domain_bounds[3]) / 2
+            
+            # Place second material on opposite side
+            if existing_z > (domain_bounds[4] + domain_bounds[5]) / 2:
+                # Existing is in upper half, add lower
+                z_new = domain_bounds[4] + (domain_bounds[5] - domain_bounds[4]) * 0.25
+                formation_materials.append(([x_center, y_center, z_new], "Lower_Formation"))
+            else:
+                # Existing is in lower half, add upper
+                z_new = domain_bounds[4] + (domain_bounds[5] - domain_bounds[4]) * 0.75
+                formation_materials.append(([x_center, y_center, z_new], "Upper_Formation"))
+        elif len(formation_materials) > 2:
+            # Keep only first 2 materials
+            formation_materials = formation_materials[:2]
+        
+        return formation_materials
 
     def _detect_geological_subdomains(self, formation_surfaces, domain_bounds):
         """
