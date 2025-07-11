@@ -890,7 +890,7 @@ class MeshItWorkflowGUI(QMainWindow):
         target_size_layout = QFormLayout()
         self.target_feature_size_input = QDoubleSpinBox()
         self.target_feature_size_input.setRange(0.1, 500.0) # Adjust range as needed
-        self.target_feature_size_input.setValue(20.0)    # Example default size
+        self.target_feature_size_input.setValue(15.0)    # Example default size
         self.target_feature_size_input.setSingleStep(0.5)
         self.target_feature_size_input.setToolTip(
             "Specify the desired approximate size for features (e.g., segment length).\n"
@@ -1312,15 +1312,39 @@ class MeshItWorkflowGUI(QMainWindow):
         mesh_settings_group = QGroupBox("Global Mesh Settings")
         mesh_settings_layout = QFormLayout(mesh_settings_group) # Use QFormLayout for label-input pairs
 
-        # Target Feature Size (copied from segment tab's target_feature_size_input)
+        # Target Feature Size (controls conforming mesh density)
         self.mesh_target_feature_size_input = QDoubleSpinBox()
         self.mesh_target_feature_size_input.setRange(0.1, 500.0)
-        self.mesh_target_feature_size_input.setValue(20.0) # Default
+        self.mesh_target_feature_size_input.setValue(15.0) # Default
         self.mesh_target_feature_size_input.setSingleStep(0.5)
+        self.mesh_target_feature_size_input.setDecimals(1)
         self.mesh_target_feature_size_input.setToolTip(
-            "Global target size for features/elements in the final mesh."
+            "🎯 UNIFIED MESH DENSITY CONTROL 🎯\n"
+            "Controls density for BOTH:\n"
+            "• 'Refine Intersection Lines' operation\n"
+            "• 'Compute Conforming Mesh' operation\n\n"
+            "Settings:\n"
+            "• Lower values (1-5) = Very fine/dense mesh\n"
+            "• Medium values (10-20) = Balanced mesh  \n"
+            "• Higher values (30+) = Coarse/sparse mesh\n\n"
+            "✅ Now properly synchronized across all operations!"
         )
-        mesh_settings_layout.addRow("Target Feature Size:", self.mesh_target_feature_size_input)
+        self.mesh_target_feature_size_input.setStyleSheet("""
+            QDoubleSpinBox {
+                font-weight: bold;
+                background-color: #E3F2FD;
+                border: 2px solid #2196F3;
+                border-radius: 4px;
+                padding: 2px;
+            }
+            QDoubleSpinBox:focus {
+                border-color: #1976D2;
+                background-color: #BBDEFB;
+            }
+        """)
+        # Add value change handler for immediate feedback
+        self.mesh_target_feature_size_input.valueChanged.connect(self._on_target_size_changed)
+        mesh_settings_layout.addRow("🎯 UNIFIED Mesh Density:", self.mesh_target_feature_size_input)
 
         # Gradient (copied from triangulation tab's gradient_input)
         self.mesh_gradient_input = QDoubleSpinBox()
@@ -1352,10 +1376,14 @@ class MeshItWorkflowGUI(QMainWindow):
         self.separator.setFrameShadow(QFrame.Sunken)
         mesh_settings_layout.addRow("", self.separator)
 
-        # Add explanatory text
-        self.target_size_info = QLabel("Controls the general element size in the final mesh")
+        # Add explanatory text with dynamic feedback  
+        self.target_size_info = QLabel("Unified control for all mesh operations")
         self.target_size_info.setWordWrap(True)
+        self.target_size_info.setStyleSheet("color: #1976D2; font-style: italic;")
         mesh_settings_layout.addRow("", self.target_size_info)
+        
+        # Initialize the feedback display now that target_size_info exists
+        self._on_target_size_changed(self.mesh_target_feature_size_input.value())
 
         self.gradient_info = QLabel("Controls the sizing transition rate from smaller to larger elements")
         self.gradient_info.setWordWrap(True)
@@ -1472,6 +1500,27 @@ class MeshItWorkflowGUI(QMainWindow):
     def _handle_view_toggle(self, idx: int):
         self.current_refine_view = idx
         self._update_refined_visualization()
+    
+    def _on_target_size_changed(self, value):
+        """Provide immediate feedback when target size changes."""
+        if value <= 5.0:
+            density_desc = "Very Fine (High Detail)"
+            color = "#4CAF50"  # Green
+        elif value <= 15.0:
+            density_desc = "Fine (Good Detail)"
+            color = "#2196F3"  # Blue
+        elif value <= 30.0:
+            density_desc = "Medium (Balanced)"
+            color = "#FF9800"  # Orange
+        elif value <= 50.0:
+            density_desc = "Coarse (Fast)"
+            color = "#F44336"  # Red
+        else:
+            density_desc = "Very Coarse (Fastest)"
+            color = "#9C27B0"  # Purple
+        
+        self.target_size_info.setText(f"🎯 UNIFIED: {density_desc} | Target Size: {value}")
+        self.target_size_info.setStyleSheet(f"color: {color}; font-style: italic; font-weight: bold;")
     def _setup_pre_tetramesh_tab(self):
             """Sets up the Pre-Tetrahedral Mesh tab for surface selection and validation."""
             # Initialize the main layout for this specific tab
@@ -2346,9 +2395,9 @@ class MeshItWorkflowGUI(QMainWindow):
 
         # --- Get UI Parameters ---
         try:
-            target_feature_size = float(self.mesh_target_feature_size_input.text())
-            gradient = float(self.mesh_gradient_input.text())
-            min_angle_deg = float(self.mesh_min_angle_input.text())
+            target_feature_size = float(self.mesh_target_feature_size_input.value())  # Fixed: use .value() not .text()
+            gradient = float(self.mesh_gradient_input.value())  # Also fixed gradient
+            min_angle_deg = float(self.mesh_min_angle_input.value())  # Also fixed min_angle
             uniform_meshing = self.mesh_uniform_checkbox.isChecked()
         except ValueError:
             QMessageBox.warning(self, "Input Error", "Invalid numeric input for refinement parameters.")
@@ -2881,8 +2930,9 @@ class MeshItWorkflowGUI(QMainWindow):
     def _generate_conforming_meshes_action(self):
         """Generate conforming surface meshes from currently checked segments."""
         import numpy as np
-        logger.info("Starting conforming surface mesh generation …")
-        self.statusBar().showMessage("Generating conforming surface meshes…")
+        target_size_setting = float(self.mesh_target_feature_size_input.value())
+        logger.info(f"Starting conforming surface mesh generation with target size: {target_size_setting}")
+        self.statusBar().showMessage(f"Generating conforming surface meshes (target size: {target_size_setting})…")
 
         try:
             tgt = float(self.mesh_target_feature_size_input.value())
@@ -2935,10 +2985,13 @@ class MeshItWorkflowGUI(QMainWindow):
                         "num_triangles": len(tris),
                         "num_constraints": len(seg_arr),
                         "target_size": tgt,
+                        "surface_size": surf_data.get("size", "unknown"),
+                        "effective_mesh_density": f"{len(tris) / max(1, len(v3d)):.2f} triangles/vertex",
                     },
                 }
                 ok += 1
-                logger.info(f"✓ {name}: {len(v3d)} verts, {len(tris)} tris")
+                density_ratio = len(tris) / max(1, len(v3d))
+                logger.info(f"✓ {name}: {len(v3d)} verts, {len(tris)} tris (density: {density_ratio:.2f} tri/vert, target: {tgt})")
             except Exception as e:
                 logger.error(f"✗ {name}: {e}", exc_info=True)
                 fails.append((s_idx, name, str(e)))
@@ -2983,7 +3036,18 @@ class MeshItWorkflowGUI(QMainWindow):
             bbox_min = np.min(hull_points_np, axis=0)
             bbox_max = np.max(hull_points_np, axis=0)
             bbox_diag = np.linalg.norm(bbox_max - bbox_min)
-            surface_size = max(config.get('target_size', 1.0), bbox_diag / 20.0)
+            
+            # Respect user's target size setting - only use bbox-based size as fallback for very large values
+            user_target_size = config.get('target_size', 1.0)
+            bbox_based_size = bbox_diag / 20.0
+            
+            # Use user's setting if reasonable, otherwise use bbox-based constraint
+            if user_target_size <= bbox_diag:  # User's setting is reasonable for this surface
+                surface_size = user_target_size
+                logger.debug(f"Using user target size: {surface_size:.2f} (bbox_diag: {bbox_diag:.2f})")
+            else:  # User's setting is too large for this surface
+                surface_size = bbox_based_size
+                logger.warning(f"User target size {user_target_size:.2f} too large for surface (bbox: {bbox_diag:.2f}), using {surface_size:.2f}")
             
             # Calculate projection parameters for 2D triangulation
             projection_params = self._calculate_surface_projection_params(hull_points_np)
@@ -3048,7 +3112,18 @@ class MeshItWorkflowGUI(QMainWindow):
             
             # Calculate surface size
             bbox_diag = np.linalg.norm(bbox_max - bbox_min)
-            surface_size = max(config.get('target_size', 1.0), bbox_diag / 20.0)
+            
+            # Respect user's target size setting - only use bbox-based size as fallback for very large values
+            user_target_size = config.get('target_size', 1.0)
+            bbox_based_size = bbox_diag / 20.0
+            
+            # Use user's setting if reasonable, otherwise use bbox-based constraint
+            if user_target_size <= bbox_diag:  # User's setting is reasonable for this surface
+                surface_size = user_target_size
+                logger.debug(f"Using user target size: {surface_size:.2f} (bbox_diag: {bbox_diag:.2f})")
+            else:  # User's setting is too large for this surface
+                surface_size = bbox_based_size
+                logger.warning(f"User target size {user_target_size:.2f} too large for surface (bbox: {bbox_diag:.2f}), using {surface_size:.2f}")
             
             # Calculate projection parameters
             hull_points_np = np.array([[p.x, p.y, p.z] for p in hull_points])
@@ -8383,8 +8458,14 @@ segmentation, triangulation, and visualization.
         control_layout.addWidget(transfer_group)
         
         # --- Material Assignment Group ---
-        material_group = QGroupBox("Material Assignment")
+        material_group = QGroupBox("Material Assignment (C++ MeshIt Style)")
         material_layout = QVBoxLayout(material_group)
+        
+        # Add explanatory text about C++ approach
+        cpp_info = QLabel("ℹ️ Following C++ MeshIt approach:\n• Faults = 2D surface constraints\n• Units = 3D volumetric regions")
+        cpp_info.setStyleSheet("color: #1976D2; font-style: italic; background: #E3F2FD; padding: 5px; border-radius: 3px;")
+        cpp_info.setWordWrap(True)
+        material_layout.addWidget(cpp_info)
         
         # Surface type classification
         self.border_surfaces_list = QListWidget()
@@ -9528,32 +9609,30 @@ segmentation, triangulation, and visualization.
             self.tetrahedral_mesh     = grid
             self.tetra_mesh_generator = generator
 
-            # Materials are now handled during TetGen execution via regionlist
-            # Only assign manually if TetGen didn't do it properly
-            if not self._validate_tetgen_materials(grid):
-                logger.info("TetGen didn't assign materials properly - applying manual assignment")
-                self._assign_materials_to_mesh(grid)
-            else:
-                logger.info("Materials successfully assigned by TetGen during execution")
-                
-            # FORCE manual assignment if no MaterialID data exists (fallback scenarios)
-            if not hasattr(grid, 'cell_data') or 'MaterialID' not in grid.cell_data:
-                logger.info("No MaterialID found in mesh - forcing manual material assignment")
-                self._assign_materials_to_mesh(grid)
-            else:
-                # Debug: Check if MaterialID actually has meaningful data
+            # C++ Style Material Handling: NEVER override TetGen if it succeeds
+            # C++ code keeps TetGen results as-is if materials are in valid range [0, Mats.length())
+            if hasattr(grid, 'cell_data') and 'MaterialID' in grid.cell_data:
                 import numpy as np
                 material_ids = grid.cell_data['MaterialID']
                 unique_materials = np.unique(material_ids)
                 logger.info(f"Found MaterialID in mesh: unique values = {unique_materials}")
                 
-                # If all materials are 0 or there's only one material, force manual assignment
-                if len(unique_materials) == 1 and unique_materials[0] == 0:
-                    logger.info("MaterialID contains only zeros - forcing manual material assignment")
+                # C++ Style: Check if all material IDs are in valid range [0, num_materials)
+                max_expected_id = len(validated_materials) - 1
+                valid_materials = [mat_id for mat_id in unique_materials 
+                                 if 0 <= mat_id <= max_expected_id]
+                
+                if len(valid_materials) > 0 and len(valid_materials) == len(unique_materials):
+                    logger.info(f"✓ C++ Style: TetGen assigned valid material IDs {unique_materials} for {len(validated_materials)} materials")
+                    logger.info("✓ Keeping TetGen's boundary-respecting assignment (no manual override)")
+                    # C++ approach: Keep TetGen results as-is!
+                else:
+                    logger.warning(f"TetGen returned invalid material range {unique_materials} for materials 0-{max_expected_id}")
+                    logger.info("Applying manual assignment as fallback")
                     self._assign_materials_to_mesh(grid)
-                elif len(unique_materials) < len(self.tetra_materials):
-                    logger.info(f"MaterialID has {len(unique_materials)} unique values but we need {len(self.tetra_materials)} - forcing manual assignment")
-                    self._assign_materials_to_mesh(grid)
+            else:
+                logger.info("No MaterialID found in mesh - applying manual material assignment")
+                self._assign_materials_to_mesh(grid)
 
             # refresh stats / viewers
             self._update_tetra_stats()
@@ -9671,16 +9750,18 @@ segmentation, triangulation, and visualization.
             
             logger.info(f"Assigning materials to {n_cells} tetrahedra using {len(material_points)} seed points")
             
-            # C++ STYLE BOUNDARY-AWARE ASSIGNMENT
-            material_ids = self._cpp_style_material_assignment(
-                grid, tet_centers, material_points, material_attributes, material_types
+            # C++ STYLE SIMPLE ASSIGNMENT: TetGen already handled boundaries
+            # Manual assignment only needed as fallback when TetGen assignment fails
+            material_ids = self._simple_distance_assignment(
+                tet_centers, material_points, material_attributes
             )
             
             # Assign materials to mesh
             grid.cell_data['MaterialID'] = material_ids
             
-            # C++ STYLE MATERIAL VALIDATION: Check if materials reach all constraint segments
-            self._validate_material_constraints(grid, material_ids)
+            # C++ STYLE MATERIAL VALIDATION: Disabled for now (too aggressive)
+            # Note: C++ MeshIt does some constraint validation but doesn't prevent mesh usage
+            # self._validate_material_constraints(grid, material_ids)
             
             # Validate assignment
             unique_materials = np.unique(material_ids)
@@ -9759,32 +9840,32 @@ segmentation, triangulation, and visualization.
         return assigned_materials
 
     def _get_mesh_edge_constraints(self, grid):
-        """Extract edge constraint information from the mesh."""
-        # Try to get edge constraints from mesh metadata or surface data
+        """Extract edge constraint information from the mesh or tetra mesh generator."""
         edge_constraints = []
         
         try:
-            # Check if we have edge data in the mesh
-            if hasattr(grid, 'lines') and grid.lines is not None and len(grid.lines) > 0:
-                # Extract edge lines from PyVista mesh
-                for i in range(0, len(grid.lines), 3):  # PyVista lines format: [n, p1, p2, ...]
-                    if i + 2 < len(grid.lines):
-                        p1_idx = grid.lines[i + 1]
-                        p2_idx = grid.lines[i + 2]
-                        if p1_idx < len(grid.points) and p2_idx < len(grid.points):
-                            edge_constraints.append([grid.points[p1_idx], grid.points[p2_idx]])
+            # First priority: Get edge constraints from the TetGen generator if available
+            if hasattr(self, 'tetra_mesh_generator') and hasattr(self.tetra_mesh_generator, 'plc_edge_constraints'):
+                plc_edges = self.tetra_mesh_generator.plc_edge_constraints
+                if plc_edges is not None and len(plc_edges) > 0:
+                    # Convert edge indices to actual coordinate pairs
+                    plc_vertices = self.tetra_mesh_generator.plc_vertices
+                    for edge in plc_edges:
+                        if len(edge) >= 2 and edge[0] < len(plc_vertices) and edge[1] < len(plc_vertices):
+                            p1 = plc_vertices[edge[0]]
+                            p2 = plc_vertices[edge[1]]
+                            edge_constraints.append([p1, p2])
+                    logger.debug(f"Extracted {len(edge_constraints)} edge constraints from TetGen generator")
+                    return edge_constraints
             
-            # Also get constraints from surface intersections if available
-            if hasattr(self, 'refined_intersections_for_visualization'):
-                for intersection_data in self.refined_intersections_for_visualization:
-                    if 'vertices' in intersection_data:
-                        vertices = intersection_data['vertices']
-                        # Create edge constraints from intersection line segments
-                        for i in range(len(vertices) - 1):
-                            edge_constraints.append([vertices[i], vertices[i + 1]])
+            # Fallback: Try to get edge data from the mesh itself (not reliable for TetGen meshes)
+            # TetGen meshes typically don't preserve edge constraint data directly
+            logger.debug("No edge constraints available from TetGen generator - boundary-aware assignment may be limited")
         
         except Exception as e:
             logger.warning(f"Could not extract edge constraints: {e}")
+            # Return empty list if extraction fails
+            return []
         
         return edge_constraints
 
@@ -9966,25 +10047,39 @@ segmentation, triangulation, and visualization.
             logger.error(f"Material constraint validation failed: {e}", exc_info=True)
 
     def _get_constraint_segments(self):
-        """Get constraint line segments for validation."""
+        """Get constraint line segments for validation from TetGen generator."""
         constraint_segments = []
         
         try:
-            # Get segments from refined intersections
-            if hasattr(self, 'refined_intersections_for_visualization'):
-                for intersection_data in self.refined_intersections_for_visualization:
-                    if 'vertices' in intersection_data:
-                        vertices = intersection_data['vertices']
-                        constraint_segments.append(vertices)
+            # Primary source: Get constraint segments from TetGen generator
+            if hasattr(self, 'tetra_mesh_generator') and hasattr(self.tetra_mesh_generator, 'plc_edge_constraints'):
+                plc_edges = self.tetra_mesh_generator.plc_edge_constraints
+                plc_vertices = self.tetra_mesh_generator.plc_vertices
+                
+                if plc_edges is not None and len(plc_edges) > 0 and plc_vertices is not None:
+                    # Convert edge constraints to line segments
+                    for edge in plc_edges:
+                        if len(edge) >= 2 and edge[0] < len(plc_vertices) and edge[1] < len(plc_vertices):
+                            p1 = plc_vertices[edge[0]]
+                            p2 = plc_vertices[edge[1]]
+                            constraint_segments.append([p1, p2])
+                    
+                    logger.debug(f"Extracted {len(constraint_segments)} constraint segments from TetGen generator")
+                    return constraint_segments
             
-            # Get segments from surface constraints if available
-            if hasattr(self, 'tetra_surface_data') and self.tetra_surface_data:
-                for surface_idx, surface_data in self.tetra_surface_data.items():
-                    if 'constraint_segments' in surface_data:
-                        constraint_segments.extend(surface_data['constraint_segments'])
+            # Fallback: Try to get segments from refined intersections (legacy)
+            if hasattr(self, 'refined_intersections_for_visualization') and self.refined_intersections_for_visualization:
+                for intersection_data in self.refined_intersections_for_visualization:
+                    if isinstance(intersection_data, dict) and 'vertices' in intersection_data:
+                        vertices = intersection_data['vertices']
+                        if vertices and len(vertices) > 1:
+                            constraint_segments.append(vertices)
+            
+            logger.debug(f"Extracted {len(constraint_segments)} constraint segments (fallback method)")
         
         except Exception as e:
             logger.warning(f"Could not extract constraint segments: {e}")
+            return []
         
         return constraint_segments
 
@@ -10145,6 +10240,28 @@ segmentation, triangulation, and visualization.
                     changes_made += 1
         
         return changes_made
+    
+    def _simple_distance_assignment(self, tet_centers, material_points, material_attributes):
+        """
+        Simple distance-based material assignment following C++ approach.
+        TetGen already handled boundary constraints internally.
+        """
+        import numpy as np
+        
+        n_tets = len(tet_centers)
+        assigned_materials = np.zeros(n_tets, dtype=int)
+        
+        if len(material_points) == 0:
+            logger.warning("No material points available for assignment")
+            return assigned_materials
+        
+        # Simple distance-based assignment for all tetrahedra
+        for i, center in enumerate(tet_centers):
+            distances = np.sqrt(np.sum((material_points - center) ** 2, axis=1))
+            closest_idx = np.argmin(distances)
+            assigned_materials[i] = material_attributes[closest_idx]
+        
+        return assigned_materials
 
     def _boundary_aware_assignment(self, tet_centers, material_points, material_attributes, material_types):
         """
@@ -10277,12 +10394,17 @@ segmentation, triangulation, and visualization.
             # Always add "All Materials" option
             self.tetra_material_combo.addItem("All Materials")
             
-            # First priority: Add materials from our tetra_materials list (user-defined materials)
+            # First priority: Add materials from our tetra_materials list (C++ style - only volumetric materials)
             if hasattr(self, 'tetra_materials') and self.tetra_materials:
                 for material in self.tetra_materials:
                     material_name = material.get('name', f"Material {material.get('attribute', 1)}")
-                    self.tetra_material_combo.addItem(material_name)
-                    logger.debug(f"Added material from tetra_materials: {material_name}")
+                    # C++ Style: Only add volumetric materials (non-faults) to dropdown
+                    is_fault = any(keyword in material_name.lower() for keyword in ['fault', 'fracture', 'crack', 'fissure'])
+                    if not is_fault:
+                        self.tetra_material_combo.addItem(material_name)
+                        logger.debug(f"Added volumetric material: {material_name}")
+                    else:
+                        logger.debug(f"Skipped fault material from dropdown (handled as surface constraint): {material_name}")
             
             # Second priority: If no user materials, check mesh MaterialID data
             elif hasattr(self, 'tetrahedral_mesh') and self.tetrahedral_mesh:

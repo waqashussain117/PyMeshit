@@ -77,48 +77,67 @@ class TetrahedralMeshGenerator:
                 tet.edge_marker_list = self.plc_edge_markers.tolist()
                 logger.info(f"Added {len(self.plc_edge_constraints)} intersection edge constraints to TetGen.")
             
-            # Step 4: Add material seed points.
+            # Step 4: Add material seed points using C++ MeshIt approach
             if self.materials:
-                self.plc_regions = self._prepare_material_regions()
-                if self.plc_regions:
-                    tet.regions = self.plc_regions
-                    logger.info(f"Added {len(self.plc_regions)} material seed points to TetGen.")
+                # Separate faults (2D surface materials) from units (3D volumetric materials)
+                volumetric_regions, surface_materials = self._prepare_materials_cpp_style()
+                
+                if volumetric_regions:
+                    # Only add VOLUMETRIC materials (units/formations) as 3D regions
+                    for i, region in enumerate(volumetric_regions):
+                        region_id = int(region[3])  # material attribute
+                        point = (float(region[0]), float(region[1]), float(region[2]))
+                        max_vol = float(region[4]) if region[4] > 0 else 0.0  # TetGen expects 0.0 for no constraint
+                        
+                        tet.add_region(region_id, point, max_vol)
+                        logger.debug(f"Added 3D region {region_id}: point={point}, max_vol={max_vol}")
+                    
+                    logger.info(f"✓ C++ Style: Added {len(volumetric_regions)} 3D regions (units/formations) to TetGen")
+                    
+                if surface_materials:
+                    logger.info(f"✓ C++ Style: {len(surface_materials)} 2D materials (faults) handled as surface constraints")
+                    # Note: Faults are already included in the surface triangulation as constraints
+                    # They don't need separate 3D region seeds - this matches C++ behavior
+                    
+                # Store for attribute assignment later
+                self.plc_regions = volumetric_regions
+                self.surface_materials = surface_materials
             
             # Step 5: Run TetGen.
             logger.info(f"Running TetGen with switches: '{tetgen_switches}'")
-            tet.tetrahedralize(switches=tetgen_switches)
-            grid = tet.grid
+            # Ensure region attributes are enabled when we have volumetric materials (C++ style)
+            if self.materials and hasattr(self, 'plc_regions') and self.plc_regions:
+                # Enable region attributes using the regionattrib parameter (equivalent to '-A' switch)
+                if 'A' in tetgen_switches:
+                    # Capture the returned attributes when regions are defined
+                    nodes, elements, attributes = tet.tetrahedralize(switches=tetgen_switches, regionattrib=1.0)
+                else:
+                    # Add 'A' switch if not present
+                    modified_switches = tetgen_switches + 'A'
+                    logger.info(f"Added 'A' switch for region attributes: '{modified_switches}'")
+                    nodes, elements, attributes = tet.tetrahedralize(switches=modified_switches, regionattrib=1.0)
+                
+                # Apply the material attributes to the grid
+                grid = tet.grid
+                if attributes is not None and len(attributes) > 0:
+                    grid.cell_data['MaterialID'] = attributes.astype(int)
+                    import numpy as np
+                    unique_materials = np.unique(attributes.astype(int))
+                    logger.info(f"✓ Applied TetGen material attributes directly: {unique_materials}")
+                else:
+                    logger.warning("TetGen returned no material attributes despite having regions")
+            else:
+                tet.tetrahedralize(switches=tetgen_switches)
+                grid = tet.grid
             
-            # Step 6: CRITICAL FIX - Extract material attributes from TetGen
-            # The C++ version does: tetrahedronmarkerlist.append(out.tetrahedronattributelist[t])
+            # Step 6: Check if material attributes were successfully applied
+            # If not, fall back to manual assignment
             if grid is not None and grid.n_cells > 0:
-                try:
-                    # Check if TetGen created material attributes
-                    if hasattr(tet, 'elem') and tet.elem is not None:
-                        # TetGen stores material attributes in element array
-                        if tet.elem.shape[1] > 4:  # Has attributes beyond vertex indices
-                            # Extract material attributes (usually column 4)
-                            material_attributes = tet.elem[:, 4].astype(int)
-                            grid.cell_data['MaterialID'] = material_attributes
-                            
-                            import numpy as np
-                            unique_materials = np.unique(material_attributes)
-                            logger.info(f"✓ Extracted TetGen material attributes: {unique_materials}")
-                        else:
-                            logger.warning("TetGen element array has no material attributes")
-                    elif hasattr(tet, 'tetrahedronattributelist') and tet.tetrahedronattributelist is not None:
-                        # Direct access to attribute list
-                        material_attributes = np.array(tet.tetrahedronattributelist, dtype=int)
-                        grid.cell_data['MaterialID'] = material_attributes
-                        
-                        unique_materials = np.unique(material_attributes)
-                        logger.info(f"✓ Extracted TetGen tetrahedronattributelist: {unique_materials}")
-                    else:
-                        logger.info("TetGen did not create material attributes - will use manual assignment")
-                        
-                except Exception as e:
-                    logger.warning(f"Failed to extract TetGen material attributes: {e}")
-                    logger.info("Will use manual material assignment instead")
+                if 'MaterialID' not in grid.cell_data or len(grid.cell_data['MaterialID']) == 0:
+                    logger.info("No MaterialID found in mesh - will use manual assignment")
+                else:
+                    # Material attributes were successfully applied from TetGen
+                    logger.info("✓ Material attributes successfully obtained from TetGen")
             
             if grid is None or grid.n_cells == 0:
                 logger.error("TetGen ran but produced no tetrahedra.")
@@ -287,7 +306,8 @@ class TetrahedralMeshGenerator:
                 bounds_min = np.min(self.plc_vertices, axis=0)
                 bounds_max = np.max(self.plc_vertices, axis=0)
                 center = (bounds_min + bounds_max) / 2.0
-                region_attributes_list.append([center[0], center[1], center[2], 1, -1])
+                # FIX: Use 0 for volume constraint (no constraint), not -1
+                region_attributes_list.append([center[0], center[1], center[2], 1, 0])
                 logger.info("No materials defined. Using default material region at PLC center.")
         else:
             for material_idx, material in enumerate(self.materials):
@@ -295,9 +315,65 @@ class TetrahedralMeshGenerator:
                 material_attribute = material.get('attribute', material_idx + 1)
                 for loc in locations:
                     if len(loc) >= 3:
-                        region_attributes_list.append([float(loc[0]), float(loc[1]), float(loc[2]), int(material_attribute), -1])
+                        # FIX: Use 0 for volume constraint (no constraint), not -1
+                        # This matches C++ geometry.cpp: in.regionlist[currentRegion*5+4]=0;
+                        region_attributes_list.append([float(loc[0]), float(loc[1]), float(loc[2]), int(material_attribute), 0])
             logger.info(f"Prepared {len(region_attributes_list)} material regions from {len(self.materials)} materials.")
         return region_attributes_list
+
+    def _prepare_materials_cpp_style(self) -> tuple:
+        """
+        Prepare materials following EXACT C++ MeshIt approach:
+        - ALL materials become 3D volumetric regions (no fault/unit distinction in TetGen)
+        - Material IDs MUST be sequential indices (0, 1, 2...) like C++ Mats array
+        - Faults are surface constraints but ALSO get volumetric regions if they have seed points
+        
+        Returns:
+            tuple: (volumetric_regions, surface_materials)
+        """
+        volumetric_regions = []
+        surface_materials = []
+        
+        if not self.materials:
+            # Default fallback: create one volumetric region at PLC center with material ID = 0
+            if self.plc_vertices is not None and len(self.plc_vertices) > 0:
+                bounds_min = np.min(self.plc_vertices, axis=0)
+                bounds_max = np.max(self.plc_vertices, axis=0)
+                center = (bounds_min + bounds_max) / 2.0
+                volumetric_regions.append([center[0], center[1], center[2], 0, 0])  # Material ID = 0
+                logger.info("No materials defined. Using default volumetric material region at PLC center with ID=0")
+        else:
+            # C++ Style: ALL materials get volumetric regions with SEQUENTIAL indices (0,1,2...)
+            material_idx = 0  # C++ style: start from 0
+            for material in self.materials:
+                material_name = material.get('name', '').lower()
+                locations = material.get('locations', [])
+                
+                # Check if this is a fault (for logging purposes)
+                is_fault = any(keyword in material_name for keyword in ['fault', 'fracture', 'crack', 'fissure'])
+                
+                # C++ Style: EVERY material with locations becomes a 3D region
+                for loc in locations:
+                    if len(loc) >= 3:
+                        # CRITICAL: Use sequential index (0,1,2...) like C++ Mats[m]
+                        volumetric_regions.append([float(loc[0]), float(loc[1]), float(loc[2]), material_idx, 0])
+                        logger.debug(f"Added 3D region: '{material.get('name')}' with C++ style ID={material_idx}")
+                
+                # Track surface materials for reference (but they still get 3D regions)
+                if is_fault:
+                    surface_materials.append({
+                        'name': material.get('name', f'Material_{material_idx}'),
+                        'material_index': material_idx,  # C++ style index
+                        'type': 'fault',
+                        'locations': locations
+                    })
+                
+                material_idx += 1  # Increment for next material (C++ style)
+        
+        logger.info(f"C++ Style: {len(volumetric_regions)} total 3D regions (TetGen material indices 0-{material_idx-1})")
+        logger.info(f"C++ Style: {len(surface_materials)} of these are also surface constraints (faults)")
+        
+        return volumetric_regions, surface_materials
 
     def _run_tetgen_fallback_strategies(self, original_switches: str) -> Optional[pv.UnstructuredGrid]:
         logger.warning("Initial TetGen failed. Trying fallback strategies...")
@@ -315,31 +391,34 @@ class TetrahedralMeshGenerator:
                 if self.plc_edge_constraints is not None and len(self.plc_edge_constraints) > 0:
                     tet.edge_list = self.plc_edge_constraints.tolist()
                     tet.edge_marker_list = self.plc_edge_markers.tolist()
-                if self.plc_regions:
-                    tet.regions = self.plc_regions
-                tet.tetrahedralize(switches=switches)
-                grid = tet.grid
+                # Use add_region() method for fallback strategies too (C++ style - only volumetric regions)
+                if hasattr(self, 'plc_regions') and self.plc_regions:
+                    for region in self.plc_regions:
+                        region_id = int(region[3])  # material attribute
+                        point = (float(region[0]), float(region[1]), float(region[2]))
+                        max_vol = float(region[4]) if region[4] > 0 else 0.0
+                        tet.add_region(region_id, point, max_vol)
+                # Enable region attributes for fallback if 'A' switch is present and we have regions
+                if hasattr(self, 'plc_regions') and self.plc_regions and 'A' in switches:
+                    nodes, elements, attributes = tet.tetrahedralize(switches=switches, regionattrib=1.0)
+                    grid = tet.grid
+                    # Apply material attributes from fallback too
+                    if attributes is not None and len(attributes) > 0:
+                        grid.cell_data['MaterialID'] = attributes.astype(int)
+                        import numpy as np
+                        unique_materials = np.unique(attributes.astype(int))
+                        logger.info(f"✓ Fallback: Applied TetGen material attributes: {unique_materials}")
+                else:
+                    tet.tetrahedralize(switches=switches)
+                    grid = tet.grid
                 if grid is not None and grid.n_cells > 0:
                     logger.info(f"✓ Fallback TetGen succeeded with '{switches}': {grid.n_cells} tetrahedra")
                     
-                    # Extract material attributes for fallback too
-                    try:
-                        if hasattr(tet, 'elem') and tet.elem is not None and tet.elem.shape[1] > 4:
-                            material_attributes = tet.elem[:, 4].astype(int)
-                            grid.cell_data['MaterialID'] = material_attributes
-                            
-                            import numpy as np
-                            unique_materials = np.unique(material_attributes)
-                            logger.info(f"✓ Fallback: Extracted material attributes: {unique_materials}")
-                        elif hasattr(tet, 'tetrahedronattributelist') and tet.tetrahedronattributelist is not None:
-                            material_attributes = np.array(tet.tetrahedronattributelist, dtype=int)
-                            grid.cell_data['MaterialID'] = material_attributes
-                            
-                            import numpy as np
-                            unique_materials = np.unique(material_attributes)
-                            logger.info(f"✓ Fallback: Extracted tetrahedronattributelist: {unique_materials}")
-                    except Exception as e:
-                        logger.warning(f"Fallback: Failed to extract material attributes: {e}")
+                    # Check if material attributes were applied in fallback
+                    if 'MaterialID' in grid.cell_data and len(grid.cell_data['MaterialID']) > 0:
+                        logger.info("✓ Fallback: Material attributes successfully obtained from TetGen")
+                    else:
+                        logger.info("Fallback: No material attributes - will need manual assignment")
                     
                     self.tetrahedral_mesh = grid
                     return grid

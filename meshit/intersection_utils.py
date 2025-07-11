@@ -2304,11 +2304,19 @@ def run_constrained_triangulation_py(
     min_angle = config.get('min_angle', 20.0)
     target_size = config.get('target_size', 20.0)
     
-    # Calculate base_size from the 2D points
+    # Use target_size from GUI instead of auto-calculating from diagonal
+    base_size = target_size
+    
+    # Only fall back to diagonal-based calculation if target_size is unreasonable
     min_coords = np.min(plc_points_2d, axis=0)
     max_coords = np.max(plc_points_2d, axis=0)
     diagonal = np.sqrt(np.sum((max_coords - min_coords) ** 2))
-    base_size = diagonal / 15.0  # MeshIt's scaling approach
+    
+    if base_size > diagonal or base_size <= 0:
+        base_size = diagonal / 15.0  # Fallback for unreasonable target_size
+        logger.warning(f"Target size {target_size:.2f} unreasonable for surface (diagonal: {diagonal:.2f}), using fallback: {base_size:.2f}")
+    else:
+        logger.info(f"Using user target size: {base_size:.2f} (surface diagonal: {diagonal:.2f})")
     
     logger.info(f"Using DirectTriangleWrapper approach: gradient={gradient}, min_angle={min_angle}, base_size={base_size:.4f}")
 
