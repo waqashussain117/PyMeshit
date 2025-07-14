@@ -9145,9 +9145,17 @@ segmentation, triangulation, and visualization.
                 if len(unique_materials) == 1 and unique_materials[0] == 0:
                     logger.info("MaterialID contains only zeros - applying manual material assignment")
                     self._assign_materials_to_mesh(grid)
-                elif len(self.tetra_materials) > 0 and len(unique_materials) < len(self.tetra_materials):
-                    logger.info(f"MaterialID has {len(unique_materials)} unique values but we need {len(self.tetra_materials)} - applying manual assignment")
-                    self._assign_materials_to_mesh(grid)
+                else:
+                    # ✅ CRITICAL FIX: Only count FORMATION materials that TetGen actually processes
+                    # Faults are surface constraints only, NOT volumetric regions
+                    formation_materials = [m for m in self.tetra_materials if m.get('type', 'FORMATION') != 'FAULT']
+                    expected_materials = len(formation_materials)
+                    
+                    if len(unique_materials) < expected_materials:
+                        logger.info(f"MaterialID has {len(unique_materials)} unique values but we need {expected_materials} formations - applying manual assignment")
+                        self._assign_materials_to_mesh(grid)
+                    else:
+                        logger.info(f"✅ TetGen material assignment successful: {len(unique_materials)} materials match {expected_materials} formations")
             
             QMessageBox.information(self, "Success", "Tetrahedral mesh generated successfully!")
             self.export_mesh_btn.setEnabled(True)
@@ -10394,17 +10402,19 @@ segmentation, triangulation, and visualization.
             # Always add "All Materials" option
             self.tetra_material_combo.addItem("All Materials")
             
-            # First priority: Add materials from our tetra_materials list (C++ style - only volumetric materials)
+            # *** CRITICAL FIX: Add ALL materials (faults and formations) like C++ MeshIt ***
             if hasattr(self, 'tetra_materials') and self.tetra_materials:
-                for material in self.tetra_materials:
-                    material_name = material.get('name', f"Material {material.get('attribute', 1)}")
-                    # C++ Style: Only add volumetric materials (non-faults) to dropdown
-                    is_fault = any(keyword in material_name.lower() for keyword in ['fault', 'fracture', 'crack', 'fissure'])
-                    if not is_fault:
-                        self.tetra_material_combo.addItem(material_name)
-                        logger.debug(f"Added volumetric material: {material_name}")
-                    else:
-                        logger.debug(f"Skipped fault material from dropdown (handled as surface constraint): {material_name}")
+                # Sort materials by their attribute (sequential ID) for consistent ordering
+                sorted_materials = sorted(self.tetra_materials, key=lambda m: m.get('attribute', 0))
+                for material in sorted_materials:
+                    material_id = material.get('attribute', 0)
+                    material_name = material.get('name', f"Material_{material_id}")
+                    material_type = material.get('type', 'UNKNOWN')
+                    
+                    # C++ Style: ALL materials appear in dropdown with proper naming
+                    dropdown_name = f"{material_name} (ID {material_id})"
+                    self.tetra_material_combo.addItem(dropdown_name)
+                    logger.debug(f"Added material to dropdown: {dropdown_name} [{material_type}]")
             
             # Second priority: If no user materials, check mesh MaterialID data
             elif hasattr(self, 'tetrahedral_mesh') and self.tetrahedral_mesh:
@@ -10475,12 +10485,20 @@ segmentation, triangulation, and visualization.
         if material_name == "All Materials":
             return -1  # Show all materials
             
-        # Try to find material ID from our materials list
-        for material in self.tetra_materials:
-            if material.get('name', f'Material {material.get("attribute", 1)}') == material_name:
-                return material.get('attribute', 1)
+        # *** FIXED: Extract material ID from dropdown format "MaterialName (ID X)" ***
+        import re
+        id_match = re.search(r'\(ID (\d+)\)', material_name)
+        if id_match:
+            return int(id_match.group(1))
+            
+        # Try to find material ID from our materials list (backup)
+        if hasattr(self, 'tetra_materials') and self.tetra_materials:
+            for material in self.tetra_materials:
+                material_display_name = f"{material.get('name', 'Material_' + str(material.get('attribute', 0)))} (ID {material.get('attribute', 0)})"
+                if material_display_name == material_name:
+                    return material.get('attribute', 0)
                 
-        # Try to extract material ID from name (fallback)
+        # Legacy fallback for "Material X" format
         if "Material " in material_name:
             try:
                 return int(material_name.replace("Material ", ""))
@@ -10490,7 +10508,10 @@ segmentation, triangulation, and visualization.
         return -1  # Show all materials if can't determine
 
     def _filter_mesh_by_material(self, mesh, material_id: int):
-        """Filter mesh to show only elements with specified material ID."""
+        """
+        Filter mesh to show only elements with specified material ID.
+        *** CRITICAL: Different visualization for faults vs formations like C++ MeshIt ***
+        """
         try:
             import numpy as np
             import pyvista as pv
@@ -10499,26 +10520,182 @@ segmentation, triangulation, and visualization.
                 logger.warning("No MaterialID data in mesh - returning full mesh")
                 return mesh
             
-            material_ids = mesh.cell_data['MaterialID']
-            material_mask = material_ids == material_id
+            # *** C++ STYLE VISUALIZATION: Check if this is a fault first ***
+            material_type = self._get_material_type_by_id(material_id)
             
-            # Get indices of cells with the specified material
-            material_indices = np.where(material_mask)[0]
-            
-            if len(material_indices) == 0:
-                logger.warning(f"No cells found with material ID {material_id}")
-                # Return empty mesh
-                return pv.UnstructuredGrid()
-            
-            # Extract cells with the specified material
-            filtered_mesh = mesh.extract_cells(material_indices)
-            
-            logger.info(f"Filtered mesh: showing {len(material_indices)} cells with material ID {material_id}")
-            return filtered_mesh
+            if material_type == "FAULT":
+                # ✅ FAULT: Use TetGen constraint surface triangles (C++ MeshIt style)
+                fault_mesh = self._extract_fault_surface_from_tetgen(material_id)
+                if fault_mesh is not None and fault_mesh.n_cells > 0:
+                    logger.info(f"✅ Material {material_id} (Fault): Using TetGen constraint surface with {fault_mesh.n_cells} triangles")
+                    return fault_mesh
+                else:
+                    logger.warning(f"No constraint surface found for fault material {material_id}")
+                    return pv.UnstructuredGrid()  # Empty mesh
+            else:
+                # FORMATION: Show as volume tetrahedra
+                material_ids = mesh.cell_data['MaterialID']
+                material_mask = material_ids == material_id
+                
+                # Get indices of cells with the specified material
+                material_indices = np.where(material_mask)[0]
+                
+                if len(material_indices) == 0:
+                    logger.warning(f"No tetrahedra found with formation material ID {material_id}")
+                    return pv.UnstructuredGrid()
+                
+                # Extract cells with the specified material
+                filtered_mesh = mesh.extract_cells(material_indices)
+                logger.info(f"Material {material_id} (Formation): Showing {len(material_indices)} volume tetrahedra")
+                return filtered_mesh
             
         except Exception as e:
             logger.error(f"Failed to filter mesh by material {material_id}: {e}")
             return mesh
+
+    def _extract_fault_surface_from_tetgen(self, material_id: int):
+        """
+        Return PolyData for fault ``material_id`` using, in priority:
+        1. direct TetGen faces/markers
+        2. sub-grid extraction
+        3. PLC fallback
+        """
+        import numpy as np
+        import pyvista as pv
+        import inspect, logging
+
+        log = logging.getLogger("MeshIt-Workflow")
+
+        # ---------------- helpers ---------------- #
+        def _arr(obj):
+            """arrayify attr or zero-arg callable, else None"""
+            if obj is None:
+                return None
+            try:
+                if callable(obj) and len(inspect.signature(obj).parameters) == 0:
+                    obj = obj()
+                return np.asarray(obj)
+            except Exception:
+                return None
+
+        def _faces_ok(a):
+            return a is not None and a.ndim == 2 and a.shape[1] == 3
+
+        def _marks_ok(a, n):
+            return a is not None and a.ndim == 1 and len(a) == n
+
+        def _build(pd_pts, tris):
+            faces = np.hstack((np.full((tris.shape[0], 1), 3, np.int32), tris)).ravel()
+            return pv.PolyData(pd_pts, faces)
+
+        # --------------- common data ------------- #
+        gen = getattr(self, "tetra_mesh_generator", None)
+        tet = getattr(gen, "tetgen_object", None)
+        if tet is None:
+            return None
+
+        plc_marker = None
+        fault_marker_map = getattr(gen, "fault_surface_markers", {})
+        for mat in getattr(self, "tetra_materials", []):
+            if mat.get("attribute") == material_id and mat.get("type") == "FAULT":
+                name = mat.get("name", "").lower().removeprefix("fault_")
+                break
+        else:
+            return None
+
+        for mk, sidx in fault_marker_map.items():
+            if self.datasets[sidx]["name"].lower() == name:
+                plc_marker = mk
+                break
+        if plc_marker is None:
+            return None
+
+        # --------------- direct probe ------------- #
+        known_face_names   = ("f", "faces", "trifaces", "triangle_faces",
+                              "shellfaces", "triface_list")
+        known_marker_names = ("face_markers", "trifacemarkers", "facetmarkerlist",
+                              "face_marker_list", "shell_face_markers",
+                              "triface_markers", "face_attributes")
+
+        faces = None
+        marks = None
+        for fn in known_face_names:
+            faces = _arr(getattr(tet, fn, None))
+            if _faces_ok(faces):
+                break
+        for mn in known_marker_names:
+            marks = _arr(getattr(tet, mn, None))
+            if marks is not None:
+                break
+
+        if _faces_ok(faces) and _marks_ok(marks, len(faces)):
+            idx = np.where(marks == plc_marker)[0]
+            if idx.size:
+                pts = _arr(getattr(tet, "v", None)) \
+                      or _arr(getattr(tet, "points", None)) \
+                      or _arr(getattr(tet, "node", None))
+                if pts is not None:
+                    log.info("Direct TetGen arrays (%s/%s) used for fault marker %s.",
+                             fn, mn, plc_marker)
+                    return _build(pts, faces[idx])
+                log.info("Face/marker pair found but point array missing – skipping.")
+            else:
+                log.info("Face/marker pair found but marker %s not present.", plc_marker)
+        else:
+            log.info("No suitable faces/markers arrays found on TetGen object.")
+
+        # ---------- derive from sub-grid ---------- #
+        grid = getattr(gen, "tetrahedral_mesh", None)
+        if isinstance(grid, pv.UnstructuredGrid) and "MaterialID" in grid.cell_data:
+            sel = np.where(grid.cell_data["MaterialID"] == material_id)[0]
+            if sel.size:
+                surf = grid.extract_cells(sel).extract_surface().triangulate()
+                if surf.n_cells:
+                    log.info("Fault surface derived from tetrahedral sub-grid.")
+                    return surf
+
+        # -------------- PLC fallback -------------- #
+        plc_f = getattr(gen, "plc_facets", None)
+        plc_m = getattr(gen, "plc_facet_markers", None)
+        plc_v = getattr(gen, "plc_vertices", None)
+        if plc_f is not None and plc_m is not None:
+            idx = np.where(plc_m == plc_marker)[0]
+            if idx.size:
+                log.info("PLC fallback used for fault marker %s.", plc_marker)
+                return _build(plc_v, plc_f[idx].astype(np.int32))
+
+        log.warning("Unable to extract fault surface for material %s – returning None.",
+                    material_id)
+        return None
+    def _get_material_type_by_id(self, material_id: int) -> str:
+        """Get material type (FAULT or FORMATION) by material ID."""
+        if hasattr(self, 'tetra_materials') and self.tetra_materials:
+            for material in self.tetra_materials:
+                if material.get('attribute', 0) == material_id:
+                    return material.get('type', 'FORMATION')
+        return 'FORMATION'  # Default to formation
+        
+    def _extract_surface_for_material(self, material_mesh, material_id: int):
+        """
+        Extract surface triangles for fault materials (C++ MeshIt style).
+        Faults are thin 3D volumes that should appear as 2D surfaces.
+        """
+        try:
+            import pyvista as pv
+            
+            # Extract the outer surface of the fault volume
+            surface_mesh = material_mesh.extract_geometry()
+            
+            # If it's still a 3D mesh, extract the boundary
+            if hasattr(surface_mesh, 'extract_surface'):
+                surface_mesh = surface_mesh.extract_surface()
+            
+            logger.info(f"Found {surface_mesh.n_cells} boundary triangles for material ID {material_id}")
+            return surface_mesh
+            
+        except Exception as e:
+            logger.error(f"Failed to extract surface for material {material_id}: {e}")
+            return material_mesh
 
     
 
@@ -11246,12 +11423,10 @@ segmentation, triangulation, and visualization.
             # Fresh start
             self.tetra_materials.clear()
 
-            # Get surface classifications
-            border_surfaces = self._get_border_surface_indices()
-            unit_surfaces = self._get_unit_surface_indices() 
-            fault_surfaces = self._get_fault_surface_indices()
-            
-            logger.info(f"Auto-materials using surface classifications: {len(border_surfaces)} borders, {len(unit_surfaces)} units, {len(fault_surfaces)} faults")
+            # *** CRITICAL FIX: Auto-classify surfaces by names (not broken UI methods) ***
+            border_surfaces = set()
+            unit_surfaces = set()
+            fault_surfaces = set()
             
             # Get all surface geometry for analysis
             valid_surfaces = []
@@ -11283,10 +11458,21 @@ segmentation, triangulation, and visualization.
                 
                 if len(verts_np) > 0 and len(verts_np.shape) == 2 and verts_np.shape[1] >= 3:
                     valid_surfaces.append((surface_idx, surface_data_item, verts_np, surface_name))
+                    
+                    # *** FIXED: Auto-classify based on surface names ***
+                    name_lower = surface_name.lower()
+                    if any(keyword in name_lower for keyword in ["border", "boundary", "outer", "convex"]):
+                        border_surfaces.add(surface_idx)
+                    elif any(keyword in name_lower for keyword in ["fault", "fracture", "crack"]):
+                        fault_surfaces.add(surface_idx)
+                    else:
+                        unit_surfaces.add(surface_idx)  # Everything else (including .dat files)
             
             if not valid_surfaces:
                 QMessageBox.warning(self, "No valid surfaces", "No surfaces with valid geometry found.")
                 return
+            
+            logger.info(f"Auto-classified surfaces: {len(border_surfaces)} borders, {len(unit_surfaces)} units, {len(fault_surfaces)} faults")
             
             # Calculate overall domain bounds
             all_verts = np.vstack([verts for _, _, verts, _ in valid_surfaces])
@@ -11296,7 +11482,8 @@ segmentation, triangulation, and visualization.
                 np.min(all_verts[:, 2]), np.max(all_verts[:, 2])   # z_min, z_max
             ]
             
-            material_id = 1
+            # *** CRITICAL FIX: Use sequential material IDs starting from 0 (C++ style) ***
+            material_id = 0  # C++ style: start from 0
             formation_count = 0
             
             # 1. FAULT MATERIALS: Each fault gets its own material at proper position
@@ -11315,9 +11502,10 @@ segmentation, triangulation, and visualization.
                     self.tetra_materials.append({
                         "name": f"Fault_{surface_name}",
                         "locations": [fault_material_point.tolist()],
-                        "attribute": material_id
+                        "attribute": material_id,  # Sequential ID
+                        "type": "FAULT"  # Mark type for visualization
                     })
-                    material_id += 1
+                    material_id += 1  # Increment for next material
                     logger.info(f"Added fault material for {surface_name} at {fault_material_point}")
             
             # 2. FORMATION MATERIALS: Create exactly 2 materials for non-border/non-fault surfaces
@@ -11335,9 +11523,10 @@ segmentation, triangulation, and visualization.
                     self.tetra_materials.append({
                         "name": formation_name,
                         "locations": [location],
-                        "attribute": material_id
+                        "attribute": material_id,  # Sequential ID
+                        "type": "FORMATION"  # Mark type for visualization
                     })
-                    material_id += 1
+                    material_id += 1  # Increment for next material
                     formation_count += 1
                     logger.info(f"Added formation material {formation_name} at {location}")
             
@@ -11351,7 +11540,8 @@ segmentation, triangulation, and visualization.
                 self.tetra_materials.append({
                     "name": "Default_Formation",
                     "locations": [center_location],
-                    "attribute": 1
+                    "attribute": 0,  # Start from 0
+                    "type": "FORMATION"
                 })
                 formation_count = 1
 
@@ -11364,6 +11554,7 @@ segmentation, triangulation, and visualization.
                 f"Created {len(self.tetra_materials)} material(s) (C++ MeshIt style):\n"
                 f"• {len(fault_surfaces)} fault materials\n"
                 f"• {formation_count} formation materials\n\n"
+                f"ALL materials are 3D volumetric regions with sequential IDs 0-{material_id-1}.\n"
                 f"Materials positioned to respect surface geometry and constraints.\n"
                 f"Review and adjust material seed points as needed."
             )

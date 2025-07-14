@@ -146,6 +146,11 @@ class TetrahedralMeshGenerator:
             
             logger.info(f"✓ TetGen succeeded: {grid.n_cells} tetrahedra generated.")
             self.tetrahedral_mesh = grid
+            
+            # ✅ CRITICAL: Store TetGen object to access constraint surface triangles (C++ style)
+            self.tetgen_object = tet
+            logger.debug(f"Stored TetGen object for constraint surface access")
+            
             return grid
             
         except Exception as e:
@@ -204,13 +209,16 @@ class TetrahedralMeshGenerator:
                         global_facets.append(global_tri)
                         global_facet_markers.append(s_idx)
 
-        # 2. Process fault surfaces - add vertices but not facets (they become internal constraints)
+        # 2. ✅ CRITICAL FIX: Process fault surfaces as constraint facets (C++ style) 
+        # This preserves fault triangles for visualization instead of converting to edges
         fault_edge_constraints = set()
-        for s_idx in fault_surfaces:
+        fault_surface_marker_mapping = {}  # Track which marker corresponds to which fault surface
+        
+        for fault_idx, s_idx in enumerate(fault_surfaces):
             if s_idx not in self.surface_data:
                 logger.warning(f"Fault surface {s_idx} selected but has no conforming mesh data. Skipping.")
                 continue
-            
+
             conforming_mesh = self.surface_data[s_idx]
             local_vertices = conforming_mesh.get('vertices')
             local_triangles = conforming_mesh.get('triangles')
@@ -229,11 +237,18 @@ class TetrahedralMeshGenerator:
                     global_vertices.append(list(vertex))
                 local_to_global_map[local_idx] = global_idx
 
-            # Convert fault triangles to edge constraints (internal discontinuities)
+            # ✅ C++ STYLE: Add fault triangles as constraint facets with unique markers
+            fault_marker = 1000 + fault_idx  # Use high marker values to distinguish from boundaries
+            fault_surface_marker_mapping[fault_marker] = s_idx
+            
             for tri in local_triangles:
                 global_tri = [local_to_global_map.get(v_idx) for v_idx in tri[:3]]
                 if all(v is not None for v in global_tri) and len(set(global_tri)) == 3:
-                    # Add triangle edges as constraints instead of the triangle as a facet
+                    # ✅ Add triangle as constraint facet (preserves triangulation for C++ style visualization)
+                    global_facets.append(global_tri)
+                    global_facet_markers.append(fault_marker)
+                    
+                    # Also add edges as constraints for TetGen edge list
                     for i in range(3):
                         v1_idx = global_tri[i]
                         v2_idx = global_tri[(i + 1) % 3]
@@ -241,6 +256,8 @@ class TetrahedralMeshGenerator:
                             edge_tuple = tuple(sorted((v1_idx, v2_idx)))
                             fault_edge_constraints.add(edge_tuple)
 
+        self.fault_surface_markers = fault_surface_marker_mapping  # Store for visualization
+        logger.info(f"✅ Added {len([m for m in global_facet_markers if m >= 1000])} fault constraint facets from {len(fault_surfaces)} fault surfaces")
         logger.info(f"Added {len(fault_edge_constraints)} fault edge constraints from {len(fault_surfaces)} fault surfaces")
 
         # 3. Re-map intersection line constraints with enhanced precision
@@ -324,9 +341,10 @@ class TetrahedralMeshGenerator:
     def _prepare_materials_cpp_style(self) -> tuple:
         """
         Prepare materials following EXACT C++ MeshIt approach:
-        - ALL materials become 3D volumetric regions (no fault/unit distinction in TetGen)
+        - ONLY FORMATIONS become 3D volumetric regions (units/formations)
+        - FAULTS are ONLY surface constraints (NO volumetric regions)
         - Material IDs MUST be sequential indices (0, 1, 2...) like C++ Mats array
-        - Faults are surface constraints but ALSO get volumetric regions if they have seed points
+        - This matches C++ where faults are facetmarkerlist[], formations are regionlist[]
         
         Returns:
             tuple: (volumetric_regions, surface_materials)
@@ -344,34 +362,35 @@ class TetrahedralMeshGenerator:
                 logger.info("No materials defined. Using default volumetric material region at PLC center with ID=0")
         else:
             # C++ Style: ALL materials get volumetric regions with SEQUENTIAL indices (0,1,2...)
-            material_idx = 0  # C++ style: start from 0
-            for material in self.materials:
+            # CRITICAL: Sort materials by their attribute to ensure sequential ordering!
+            sorted_materials = sorted(self.materials, key=lambda m: m.get('attribute', 0))
+            
+            for material in sorted_materials:
                 material_name = material.get('name', '').lower()
+                material_type = material.get('type', 'FORMATION')
                 locations = material.get('locations', [])
+                material_attribute = material.get('attribute', 0)  # Use material's attribute as ID
                 
-                # Check if this is a fault (for logging purposes)
-                is_fault = any(keyword in material_name for keyword in ['fault', 'fracture', 'crack', 'fissure'])
+                # Check if this is a fault
+                is_fault = (material_type == 'FAULT' or 
+                           any(keyword in material_name for keyword in ['fault', 'fracture', 'crack', 'fissure']))
                 
-                # C++ Style: EVERY material with locations becomes a 3D region
+                if is_fault:
+                    # CRITICAL: Faults are ONLY surface constraints - NO volumetric regions!
+                    surface_materials.append(material)
+                    logger.debug(f"Material {material_attribute} '{material_name}' -> FAULT (surface constraint only)")
+                    continue
+                
+                # ONLY formations/units get volumetric regions
                 for loc in locations:
                     if len(loc) >= 3:
-                        # CRITICAL: Use sequential index (0,1,2...) like C++ Mats[m]
-                        volumetric_regions.append([float(loc[0]), float(loc[1]), float(loc[2]), material_idx, 0])
-                        logger.debug(f"Added 3D region: '{material.get('name')}' with C++ style ID={material_idx}")
-                
-                # Track surface materials for reference (but they still get 3D regions)
-                if is_fault:
-                    surface_materials.append({
-                        'name': material.get('name', f'Material_{material_idx}'),
-                        'material_index': material_idx,  # C++ style index
-                        'type': 'fault',
-                        'locations': locations
-                    })
-                
-                material_idx += 1  # Increment for next material (C++ style)
+                        # CRITICAL: Use the material's attribute directly (already sequential 0,1,2...)
+                        volumetric_regions.append([float(loc[0]), float(loc[1]), float(loc[2]), material_attribute, 0])
+                        logger.debug(f"Added 3D region: '{material.get('name')}' with C++ style ID={material_attribute}")
         
-        logger.info(f"C++ Style: {len(volumetric_regions)} total 3D regions (TetGen material indices 0-{material_idx-1})")
-        logger.info(f"C++ Style: {len(surface_materials)} of these are also surface constraints (faults)")
+        max_material_id = max([int(region[3]) for region in volumetric_regions]) if volumetric_regions else -1
+        logger.info(f"✓ TRUE C++ Style: {len(volumetric_regions)} volumetric regions (formations only, TetGen indices 0-{max_material_id})")
+        logger.info(f"✓ TRUE C++ Style: {len(surface_materials)} surface materials (faults only, surface constraints)")
         
         return volumetric_regions, surface_materials
 
