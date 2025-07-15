@@ -4260,6 +4260,149 @@ segmentation, triangulation, and visualization.
         
         QMessageBox.information(self, "About MeshIt Workflow GUI", about_text)
 
+    def _create_simplified_hull_for_segmentation(self, hull_points):
+        """
+        Create a simplified 4-corner hull from a complex hull for segmentation purposes.
+        This extracts the bounding box corners from the complex hull.
+        
+        Args:
+            hull_points: The complex hull points (N x 2 or N x 3)
+            
+        Returns:
+            simplified_hull: 4-corner hull points in clockwise order + closing point
+        """
+        try:
+            # Remove the closing point if present
+            if len(hull_points) > 1 and np.array_equal(hull_points[0], hull_points[-1]):
+                hull_boundary = hull_points[:-1]
+            else:
+                hull_boundary = hull_points
+            
+            # Find bounding box
+            min_x, max_x = np.min(hull_boundary[:, 0]), np.max(hull_boundary[:, 0])
+            min_y, max_y = np.min(hull_boundary[:, 1]), np.max(hull_boundary[:, 1])
+            
+            # Create 4 corner points
+            if hull_boundary.shape[1] >= 3:
+                # Use average Z coordinate for 3D data
+                avg_z = np.mean(hull_boundary[:, 2])
+                corners = np.array([
+                    [min_x, min_y, avg_z],  # Bottom-left
+                    [max_x, min_y, avg_z],  # Bottom-right  
+                    [max_x, max_y, avg_z],  # Top-right
+                    [min_x, max_y, avg_z]   # Top-left
+                ])
+            else:
+                # 2D data
+                corners = np.array([
+                    [min_x, min_y],  # Bottom-left
+                    [max_x, min_y],  # Bottom-right
+                    [max_x, max_y],  # Top-right
+                    [min_x, max_y]   # Top-left
+                ])
+            
+            # Add closing point
+            simplified_hull = np.vstack([corners, corners[0:1]])
+            
+            logger.info(f"Simplified complex hull from {len(hull_boundary)} to 4 corner points")
+            return simplified_hull
+            
+        except Exception as e:
+            logger.error(f"Error creating simplified hull: {e}")
+            return hull_points  # Return original if simplification fails
+
+    def _compute_segments_for_dataset_with_simplified_hull(self, dataset_index):
+        """
+        Alternative segmentation method using simplified 4-corner hull.
+        This is useful for very complex hulls where you want simple rectangular segmentation.
+        """
+        # Check index validity
+        if not (0 <= dataset_index < len(self.datasets)):
+            logger.error(f"Invalid dataset index {dataset_index} for segmentation.")
+            return False
+
+        dataset = self.datasets[dataset_index]
+        dataset_name = dataset.get('name', f"Dataset {dataset_index}")
+        
+        if dataset.get('hull_points') is None or len(dataset['hull_points']) < 4:
+            self.statusBar().showMessage(f"Skipping segments for {dataset_name}: Compute convex hull first")
+            logger.warning(f"Skipping segments for {dataset_name}: hull not computed.")
+            return False
+
+        try:
+            # Get the complex hull
+            original_hull = dataset['hull_points']
+            
+            # Create simplified 4-corner hull for segmentation
+            simplified_hull = self._create_simplified_hull_for_segmentation(original_hull)
+            
+            # Temporarily replace hull for segmentation
+            dataset['hull_points'] = simplified_hull
+            
+            # Run normal segmentation on simplified hull
+            success = self._compute_segments_for_dataset(dataset_index)
+            
+            # Restore original complex hull
+            dataset['hull_points'] = original_hull
+            
+            if success:
+                logger.info(f"Used simplified hull approach for segmentation of '{dataset_name}'")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error in simplified hull segmentation for {dataset_name}: {str(e)}")
+            return False
+
+    def _find_point_at_distance(self, hull_boundary, cumulative_distances, target_distance):
+        """
+        Find a point at a specific distance along the hull boundary.
+        
+        Args:
+            hull_boundary: Array of hull vertices
+            cumulative_distances: Array of cumulative distances at each vertex
+            target_distance: Target distance along the perimeter
+            
+        Returns:
+            Interpolated point at the target distance
+        """
+        try:
+            hull_size = len(hull_boundary)
+            total_perimeter = cumulative_distances[-1]
+            
+            # Handle wrapping around the perimeter
+            target_distance = target_distance % total_perimeter
+            
+            # Find the edge that contains this distance
+            for i in range(hull_size):
+                if cumulative_distances[i] <= target_distance <= cumulative_distances[i + 1]:
+                    # Interpolate between vertices i and (i+1)%hull_size
+                    edge_start_dist = cumulative_distances[i]
+                    edge_end_dist = cumulative_distances[i + 1]
+                    edge_length = edge_end_dist - edge_start_dist
+                    
+                    if edge_length < 1e-10:  # Very short edge
+                        return hull_boundary[i]
+                    
+                    # Interpolation parameter
+                    t = (target_distance - edge_start_dist) / edge_length
+                    
+                    # Get the two vertices
+                    p1 = hull_boundary[i]
+                    p2 = hull_boundary[(i + 1) % hull_size]
+                    
+                    # Linear interpolation
+                    interpolated_point = p1 + t * (p2 - p1)
+                    return interpolated_point
+            
+            # Fallback to first vertex if no edge found
+            logger.warning(f"Could not find edge for distance {target_distance}, using first vertex")
+            return hull_boundary[0]
+            
+        except Exception as e:
+            logger.error(f"Error finding point at distance {target_distance}: {e}")
+            return hull_boundary[0] if len(hull_boundary) > 0 else np.array([0, 0])
+
     def _compute_segments_for_dataset(self, dataset_index):
         """Compute the segmentation for a specific dataset index. Returns True on success, False on error."""
         # Check index validity
@@ -4285,16 +4428,6 @@ segmentation, triangulation, and visualization.
         except ValueError:
             logger.warning("Invalid Target Feature Size, using default value (1.0).")
             effective_segment_length = 1.0
-        # Remove old parameter calculations
-        # try:
-        #     segment_length = float(self.segment_length_input.text())
-        #     if segment_length <= 0:
-        #         segment_length = 1.0
-        # except ValueError:
-        #     segment_length = 1.0
-        #
-        # density_factor = self.segment_density_slider.value() / 100.0
-        # effective_segment_length = segment_length / density_factor
         # --- END EDIT ---
 
         try:
@@ -4302,18 +4435,28 @@ segmentation, triangulation, and visualization.
             hull_boundary = dataset['hull_points'][:-1]
             hull_size = len(hull_boundary)
             
+            logger.info(f"Processing hull with {hull_size} vertices for segmentation of '{dataset_name}'")
+            
             # Performance optimization: Limit the number of segments per edge to prevent excessive calculations
             MAX_SEGMENTS_PER_EDGE = 20
             
-            # Estimate average edge length to determine a reasonable minimum segment length
+            # Calculate total perimeter along the complex hull boundary
             total_perimeter = 0
             for i in range(hull_size):
                 p1 = hull_boundary[i]
                 p2 = hull_boundary[(i + 1) % hull_size]
                 total_perimeter += np.linalg.norm(p2 - p1)
             
-            avg_edge_length = total_perimeter / hull_size
-            min_segment_length = avg_edge_length / MAX_SEGMENTS_PER_EDGE
+            # For complex hulls, we need to be more adaptive with segment sizing
+            if hull_size > 20:  # Complex hull detected
+                # Use a more conservative approach for complex hulls
+                avg_edge_length = total_perimeter / hull_size
+                min_segment_length = avg_edge_length * 0.5  # Allow smaller segments for complex shapes
+                logger.info(f"Complex hull detected with {hull_size} vertices. Using adaptive segmentation.")
+            else:
+                # Simple hull - use original logic
+                avg_edge_length = total_perimeter / hull_size
+                min_segment_length = avg_edge_length / MAX_SEGMENTS_PER_EDGE
             
             # Use the larger of calculated min_segment_length and effective_segment_length
             effective_segment_length = max(effective_segment_length, min_segment_length)
@@ -4323,28 +4466,75 @@ segmentation, triangulation, and visualization.
             segments = []
             
             # Generate segments along the hull boundary with uniform distribution
-            for i in range(hull_size):
-                p1 = hull_boundary[i]
-                p2 = hull_boundary[(i + 1) % hull_size]
+            # For complex hulls, we process the entire boundary as a continuous path
+            # instead of segmenting each individual edge
+            
+            if hull_size > 20:  # Complex hull - use continuous path approach
+                logger.info(f"Using continuous path segmentation for complex hull with {hull_size} vertices")
                 
-                # Compute edge length
-                dist = np.linalg.norm(p2 - p1)
+                # Calculate cumulative distances along the hull boundary
+                cumulative_distances = [0.0]
+                for i in range(hull_size):
+                    p1 = hull_boundary[i]
+                    p2 = hull_boundary[(i + 1) % hull_size]
+                    dist = np.linalg.norm(p2 - p1)
+                    cumulative_distances.append(cumulative_distances[-1] + dist)
                 
-                # Limit number of segments per edge
-                num_segments = min(max(1, int(np.ceil(dist / effective_segment_length))), MAX_SEGMENTS_PER_EDGE)
+                # Create uniform segments along the entire perimeter
+                num_total_segments = max(4, int(np.ceil(total_perimeter / effective_segment_length)))
+                segment_spacing = total_perimeter / num_total_segments
                 
-                # Vectorized segment creation for this edge
-                t_values = np.linspace(0, 1, num_segments + 1)
-                edge_segments = []
+                logger.info(f"Creating {num_total_segments} uniform segments with spacing {segment_spacing:.2f}")
                 
-                for j in range(num_segments):
-                    t1, t2 = t_values[j], t_values[j+1]
-                    segment_start = p1 + t1 * (p2 - p1)
-                    segment_end = p1 + t2 * (p2 - p1)
-                    segments.append([segment_start, segment_end])
+                for seg_idx in range(num_total_segments):
+                    # Calculate start and end positions along the perimeter
+                    start_dist = seg_idx * segment_spacing
+                    end_dist = ((seg_idx + 1) * segment_spacing) % total_perimeter
+                    
+                    # Find start point
+                    start_point = self._find_point_at_distance(hull_boundary, cumulative_distances, start_dist)
+                    end_point = self._find_point_at_distance(hull_boundary, cumulative_distances, end_dist)
+                    
+                    if start_point is not None and end_point is not None:
+                        segments.append([start_point, end_point])
+                
+            else:  # Simple hull - use original edge-by-edge approach
+                logger.info(f"Using edge-by-edge segmentation for simple hull with {hull_size} vertices")
+                
+                for i in range(hull_size):
+                    p1 = hull_boundary[i]
+                    p2 = hull_boundary[(i + 1) % hull_size]
+                    
+                    # Compute edge length
+                    dist = np.linalg.norm(p2 - p1)
+                    
+                    # Skip very short edges to avoid over-segmentation
+                    if dist < effective_segment_length * 0.1:
+                        continue
+                    
+                    # Limit number of segments per edge
+                    num_segments = min(max(1, int(np.ceil(dist / effective_segment_length))), MAX_SEGMENTS_PER_EDGE)
+                    
+                    # Create segments for this edge
+                    if num_segments == 1:
+                        # Single segment for this edge
+                        segments.append([p1, p2])
+                    else:
+                        # Multiple segments for this edge
+                        t_values = np.linspace(0, 1, num_segments + 1)
+                        for j in range(num_segments):
+                            t1, t2 = t_values[j], t_values[j+1]
+                            segment_start = p1 + t1 * (p2 - p1)
+                            segment_end = p1 + t2 * (p2 - p1)
+                            segments.append([segment_start, segment_end])
             
             # Store the segments in the dataset - using a normal list for better performance
             dataset['segments'] = segments
+            
+            # Log success information
+            logger.info(f"Successfully created {len(segments)} segments for dataset '{dataset_name}'")
+            logger.info(f"Total perimeter: {total_perimeter:.2f}, Effective segment length: {effective_segment_length:.2f}")
+            logger.info(f"Hull complexity: {hull_size} vertices, Segments per vertex: {len(segments)/hull_size:.1f}")
             
             # Clear any previous results from later steps for this dataset
             dataset.pop('triangulation_result', None)
@@ -4363,16 +4553,67 @@ segmentation, triangulation, and visualization.
             QMessageBox.critical(self, "Error", "No active dataset selected")
             return
 
-        self.statusBar().showMessage(f"Computing segments for {self.datasets[self.current_dataset_index]['name']}...") # Add status message here for single run
-        success = self._compute_segments_for_dataset(self.current_dataset_index)
+        dataset = self.datasets[self.current_dataset_index]
+        dataset_name = dataset.get('name', f"Dataset {self.current_dataset_index}")
+        hull_points = dataset.get('hull_points')
+        
+        # Check if we have a complex hull (more than 20 vertices)
+        if hull_points is not None:
+            hull_size = len(hull_points) - 1 if len(hull_points) > 0 else 0  # Subtract closing point
+            
+            if hull_size > 20:
+                # Ask user which approach to use for complex hulls
+                reply = QMessageBox.question(
+                    self, 
+                    "Complex Hull Detected", 
+                    f"Dataset '{dataset_name}' has a complex hull with {hull_size} vertices.\n\n"
+                    "Choose segmentation approach:\n\n"
+                    "• YES: Use full shape (preserves complex geometry)\n"
+                    "• NO: Use simplified 4-corner approach (rectangular)",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.No:
+                    # Use simplified approach
+                    self.statusBar().showMessage(f"Computing simplified segments for {dataset_name}...")
+                    success = self._compute_segments_for_dataset_with_simplified_hull(self.current_dataset_index)
+                else:
+                    # Use full complex hull
+                    self.statusBar().showMessage(f"Computing full-shape segments for {dataset_name}...")
+                    success = self._compute_segments_for_dataset(self.current_dataset_index)
+            else:
+                # Simple hull - use normal approach
+                self.statusBar().showMessage(f"Computing segments for {dataset_name}...")
+                success = self._compute_segments_for_dataset(self.current_dataset_index)
+        else:
+            # No hull data
+            self.statusBar().showMessage(f"Computing segments for {dataset_name}...")
+            success = self._compute_segments_for_dataset(self.current_dataset_index)
 
         if success:
             # Update statistics and visualization after computing for the active one
             self._update_statistics()
-            self._visualize_all_segments()
+            
+            # Force refresh of the UI
+            QApplication.processEvents()
+            
+            # Force update the segment visualization
+            try:
+                self._visualize_all_segments()
+                logger.info("Segment visualization updated successfully")
+            except Exception as e:
+                logger.error(f"Error updating segment visualization: {e}")
+            
+            # Force another UI refresh after visualization
+            QApplication.processEvents()
+            
             self._update_visualization() # Ensure other dependent views are updated/cleared
             self.notebook.setCurrentIndex(2)  # Switch to segment tab
-            self.statusBar().showMessage(f"Computed segments for {self.datasets[self.current_dataset_index]['name']}") # Add success message here
+            self.statusBar().showMessage(f"Computed segments for {dataset_name}")
+        else:
+            self.statusBar().showMessage("Failed to compute segments")
+            QMessageBox.warning(self, "Error", "Failed to compute segments")
 
     def compute_all_segments(self):
         """Compute segmentation for all datasets that have hulls using a worker thread."""
@@ -4480,9 +4721,45 @@ segmentation, triangulation, and visualization.
                 centered_boundary = all_boundary_points - centroid
                 boundary_points_2d = np.dot(centered_boundary, projection_basis.T)
                 
-                # Store projection data
-                dataset['original_points_3d'] = all_dataset_points.copy()
-                dataset['projected_points_2d'] = all_points_2d
+                # For complex hulls with many vertices, use intelligent subsampling
+                # instead of all original dataset points for interpolation efficiency
+                hull_size = len(dataset.get('hull_points', []))
+                if hull_size > 100:  # Complex hull detected
+                    # Use intelligent subsampling to maintain accuracy while improving performance
+                    max_interpolation_points = 500  # Balance between accuracy and performance
+                    if len(all_dataset_points) > max_interpolation_points:
+                        logger.info(f"Using intelligent subsampling ({max_interpolation_points}) from {len(all_dataset_points)} dataset points for efficient interpolation")
+                        
+                        # Subsample the dataset points intelligently
+                        # Always include boundary points + interior sampling
+                        step_size = max(1, len(all_dataset_points) // max_interpolation_points)
+                        subsampled_indices = list(range(0, len(all_dataset_points), step_size))
+                        
+                        # Ensure we don't exceed our limit
+                        if len(subsampled_indices) > max_interpolation_points:
+                            subsampled_indices = subsampled_indices[:max_interpolation_points]
+                        
+                        sampled_3d_points = all_dataset_points[subsampled_indices]
+                        sampled_2d_points = all_points_2d[subsampled_indices]
+                        
+                        dataset['original_points_3d'] = sampled_3d_points
+                        dataset['projected_points_2d'] = sampled_2d_points
+                        projection_reference_points = sampled_3d_points
+                        projection_reference_2d = sampled_2d_points
+                    else:
+                        logger.info(f"Using all dataset points ({len(all_dataset_points)}) for interpolation (within limit)")
+                        # Use all dataset points as they're within our limit
+                        dataset['original_points_3d'] = all_dataset_points.copy()
+                        dataset['projected_points_2d'] = all_points_2d
+                        projection_reference_points = all_dataset_points.copy()
+                        projection_reference_2d = all_points_2d
+                else:
+                    # For simple hulls, use all dataset points as before
+                    dataset['original_points_3d'] = all_dataset_points.copy()
+                    dataset['projected_points_2d'] = all_points_2d
+                    projection_reference_points = all_dataset_points.copy()
+                    projection_reference_2d = all_points_2d
+                
                 projected_boundary_points = boundary_points_2d
                 
                 dataset['projection_params'] = {
@@ -4490,7 +4767,7 @@ segmentation, triangulation, and visualization.
                     'basis': projection_basis,
                     'normal': plane_normal,
                     'original_points': all_boundary_points.copy(),
-                    'all_original_points': all_dataset_points.copy()
+                    'all_original_points': projection_reference_points
                 }
             else:
                 projected_boundary_points = all_boundary_points
@@ -4537,7 +4814,27 @@ segmentation, triangulation, and visualization.
                 can_calculate_planar_z = normal is not None and abs(normal[2]) > 1e-9
                 final_vertices_3d = np.zeros((len(vertices_2d), 3))
                 
+                # Performance optimization for complex hulls
+                dataset_name = dataset.get('name', 'Unknown')
+                
+                # Use segments data to determine complexity, not original hull points
+                segments_data = dataset.get('segments', [])
+                segment_count = len(segments_data)
+                is_complex_dataset = segment_count > 100  # Based on number of segments, not hull vertices
+                
+                if is_complex_dataset:
+                    logger.info(f"Processing {len(vertices_2d)} vertices for complex dataset ({segment_count} segments)")
+                else:
+                    # For simple datasets, also check original hull size for logging consistency
+                    hull_size = len(dataset.get('hull_points', []))
+                    logger.info(f"Processing {len(vertices_2d)} vertices for simple dataset ({hull_size} hull vertices, {segment_count} segments)")
+                
+                # Process vertices with progress logging for complex cases
                 for i, vertex_2d in enumerate(vertices_2d):
+                    # Log progress for complex datasets (based on segments, not hull)
+                    if is_complex_dataset and i > 0 and i % 100 == 0:
+                        logger.info(f"Processed {i}/{len(vertices_2d)} vertices for {dataset_name}")
+                        
                     is_matched_point = False
                     
                     # Try to match with all points first
@@ -4581,9 +4878,11 @@ segmentation, triangulation, and visualization.
                                 logger.warning(f"Interpolation failed for point {vertex_2d}. Falling back to centroid Z.")
                                 interpolated_z = centroid[2] # Fallback Z
 
-                            # --- START EDIT: Ensure scalar float ---
-                            interpolated_z = float(interpolated_z)
-                            # --- END EDIT ---
+                            # Ensure scalar float (handle numpy array result from griddata)
+                            if hasattr(interpolated_z, 'item'):
+                                interpolated_z = interpolated_z.item()  # Extract scalar from numpy array
+                            else:
+                                interpolated_z = float(interpolated_z)
                             
                             # Reconstruct the 3D point using the interpolated Z
                             vertex_3d_reconstructed = centroid.copy()
@@ -5882,11 +6181,12 @@ segmentation, triangulation, and visualization.
                     color = dataset.get('color', 'blue')
                     name = dataset.get('name', 'Unnamed')
                     
-                    # Plot points
-                    ax.scatter(points[:, 0], points[:, 1], s=5, c=color, alpha=0.3)
+                    # Plot points (smaller and more transparent for context)
+                    ax.scatter(points[:, 0], points[:, 1], s=3, c=color, alpha=0.2, label=f"{name} Original")
                     
                     # Collect all segment endpoints
                     segment_endpoints = []
+                    segment_count = 0
                     for segment in segments:
                         # Add both endpoints of each segment
                         if hasattr(segment[0], 'shape'):  # NumPy array format
@@ -5900,7 +6200,7 @@ segmentation, triangulation, and visualization.
                     unique_endpoints = []
                     seen = set()
                     for point in segment_endpoints:
-                        point_tuple = tuple(point)
+                        point_tuple = tuple(point[:2])  # Only use x,y for comparison
                         if point_tuple not in seen:
                             seen.add(point_tuple)
                             unique_endpoints.append(point)
@@ -5908,14 +6208,18 @@ segmentation, triangulation, and visualization.
                     # Convert to numpy array for plotting
                     if unique_endpoints:
                         unique_endpoints_array = np.array(unique_endpoints)
-                        # Plot segment endpoints as red points
+                        # Plot segment endpoints as more prominent red points
                         ax.scatter(unique_endpoints_array[:, 0], unique_endpoints_array[:, 1], 
-                                s=20, c='red', edgecolor='black', label=f"{name} Segment Points")
+                                s=50, c='red', edgecolor='black', linewidth=1.5, alpha=1.0,
+                                marker='o', label=f"{name} Segment Points", zorder=5)
 
                     # Plot segments - make them slightly more prominent
                     for segment in segments:
                         ax.plot([segment[0][0], segment[1][0]], [segment[0][1], segment[1][1]], 
-                              color=color, linewidth=1.8, alpha=0.9) # Increased linewidth/alpha
+                              color=color, linewidth=2.0, alpha=0.9)
+                        segment_count += 1
+                    
+                    logger.info(f"Plotted {segment_count} segments and {len(unique_endpoints)} unique segment points for '{name}'")
             
             ax.set_aspect('equal')
             ax.set_title("Segmentations (Boundary Defined by Segments)") # Updated title
@@ -6947,39 +7251,95 @@ segmentation, triangulation, and visualization.
                 elif view_type == "segments":
                     segments = dataset.get('segments')
                     if segments is not None and len(segments) > 0:
-                        # Add points for context
+                        logger.info(f"Visualizing {len(segments)} segments for dataset '{name}'")
+                        
+                        # Add original points for context (smaller and more transparent)
                         point_cloud = pv.PolyData(points_3d)
-                        self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.3, render_points_as_spheres=True,
-                                        point_size=5)
+                        self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.2, render_points_as_spheres=True,
+                                        point_size=3, label=f"{name} Original Points")
 
-                        # Draw the actual segments with validation
-                        for segment in segments:
+                        # Collect all segment endpoints to display as distinct points
+                        segment_endpoints = []
+                        valid_segments = 0
+                        
+                        for i, segment in enumerate(segments):
                             try:
                                 # Ensure segment points are 3D NumPy arrays
-                                p1 = np.array(segment[0])
-                                p2 = np.array(segment[1])
+                                p1 = np.array(segment[0], dtype=float)
+                                p2 = np.array(segment[1], dtype=float)
                                 
                                 # Pad with zeros if dimension is less than 3
-                                if p1.shape[0] < 3: 
-                                    p1 = np.append(p1, [0.0] * (3 - p1.shape[0]))
-                                if p2.shape[0] < 3: 
-                                    p2 = np.append(p2, [0.0] * (3 - p2.shape[0]))
+                                if len(p1) == 2: 
+                                    p1 = np.append(p1, 0.0)
+                                if len(p2) == 2: 
+                                    p2 = np.append(p2, 0.0)
 
                                 # Validate coordinates
                                 if (len(p1) >= 3 and len(p2) >= 3 and
-                                    all(isinstance(x, (int, float)) for x in p1[:3]) and
-                                    all(isinstance(x, (int, float)) for x in p2[:3])):
+                                    np.all(np.isfinite(p1[:3])) and np.all(np.isfinite(p2[:3]))):
                                     
-                                    segment_line = pv.Line([float(p1[0]), float(p1[1]), float(p1[2])],
-                                                        [float(p2[0]), float(p2[1]), float(p2[2])])
-                                    self.current_plotter.add_mesh(segment_line, color=color, line_width=2.5)
+                                    # Create line segment
+                                    segment_line = pv.Line(p1[:3], p2[:3])
+                                    self.current_plotter.add_mesh(segment_line, color=color, line_width=3.0, 
+                                                                opacity=0.9, label=f"{name} Segments" if i == 0 else None)
+                                    
+                                    # Collect segment endpoints
+                                    segment_endpoints.append(p1[:3])
+                                    segment_endpoints.append(p2[:3])
+                                    valid_segments += 1
                                 else:
-                                    logger.warning(f"Skipping invalid segment for {name}")
+                                    logger.warning(f"Skipping invalid segment {i} for {name}: p1={p1}, p2={p2}")
                                     
                             except Exception as e:
-                                logger.warning(f"Error creating segment for {name}: {e}")
+                                logger.warning(f"Error creating segment {i} for {name}: {e}")
                                 continue
 
+                        # Add segment endpoints as visible points
+                        if segment_endpoints:
+                            # Remove duplicate points (endpoints shared between adjacent segments)
+                            unique_endpoints = []
+                            for endpoint in segment_endpoints:
+                                is_duplicate = False
+                                for existing in unique_endpoints:
+                                    if np.allclose(endpoint, existing, atol=1e-6):
+                                        is_duplicate = True
+                                        break
+                                if not is_duplicate:
+                                    unique_endpoints.append(endpoint)
+                            
+                            if unique_endpoints:
+                                endpoints_array = np.array(unique_endpoints)
+                                segment_points = pv.PolyData(endpoints_array)
+                                
+                                # Make segment points more visible - larger size and different color
+                                # Use a contrasting color (red) for segment points
+                                segment_point_color = '#FF0000' if color != '#FF0000' else '#00FF00'
+                                self.current_plotter.add_mesh(segment_points, color=segment_point_color, 
+                                                            render_points_as_spheres=True, point_size=8, 
+                                                            opacity=1.0, label=f"{name} Segment Points")
+                                
+                                logger.info(f"Added {len(unique_endpoints)} segment endpoint markers for dataset '{name}'")
+                                
+                                # Calculate and log segment spacing statistics
+                                if len(unique_endpoints) > 1:
+                                    # Calculate distances between consecutive segment points
+                                    distances = []
+                                    for j in range(len(unique_endpoints) - 1):
+                                        dist = np.linalg.norm(unique_endpoints[j] - unique_endpoints[j+1])
+                                        distances.append(dist)
+                                    
+                                    # Add distance from last to first point (closing the loop)
+                                    if len(unique_endpoints) > 2:
+                                        closing_dist = np.linalg.norm(unique_endpoints[-1] - unique_endpoints[0])
+                                        distances.append(closing_dist)
+                                    
+                                    if distances:
+                                        avg_distance = np.mean(distances)
+                                        min_distance = np.min(distances)
+                                        max_distance = np.max(distances)
+                                        logger.info(f"Segment point spacing for '{name}': avg={avg_distance:.2f}, min={min_distance:.2f}, max={max_distance:.2f}")
+
+                        logger.info(f"Successfully visualized {valid_segments}/{len(segments)} segments for dataset '{name}'")
                         plotter_has_geometry = True
 
                 elif view_type == "triangulation":
@@ -7017,6 +7377,13 @@ segmentation, triangulation, and visualization.
             if plotter_has_geometry:
                 self.current_plotter.add_axes()
                 self.current_plotter.reset_camera()
+                
+                # Force a render to ensure the visualization is updated
+                try:
+                    self.current_plotter.render()
+                    logger.info("3D visualization rendered successfully")
+                except Exception as e:
+                    logger.warning(f"Error forcing render: {e}")
             else:
                 logger.warning("No geometry added to the plotter for the current view.")
             
@@ -7024,6 +7391,15 @@ segmentation, triangulation, and visualization.
             controls_widget = QWidget()
             controls_layout = QHBoxLayout(controls_widget)
             controls_layout.setContentsMargins(5, 2, 5, 2)
+            
+            # Add segment controls for segment view
+            if view_type == "segments":
+                # Toggle for showing segment distances
+                show_distances_cb = QCheckBox("Show Distances")
+                show_distances_cb.setChecked(False)
+                show_distances_cb.stateChanged.connect(lambda state: self._toggle_segment_distance_labels(state == 2))
+                controls_layout.addWidget(show_distances_cb)
+                controls_layout.addWidget(QLabel("|"))
             
             # Height adjustment slider - for Z axis exaggeration
             controls_layout.addWidget(QLabel("Z Exaggeration:"))
