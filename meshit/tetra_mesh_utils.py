@@ -90,7 +90,7 @@ class TetrahedralMeshGenerator:
                         max_vol = float(region[4]) if region[4] > 0 else 0.0  # TetGen expects 0.0 for no constraint
                         
                         tet.add_region(region_id, point, max_vol)
-                        logger.debug(f"Added 3D region {region_id}: point={point}, max_vol={max_vol}")
+                        logger.info(f"Added 3D region {region_id}: point={point}, max_vol={max_vol}")
                     
                     logger.info(f"✓ C++ Style: Added {len(volumetric_regions)} 3D regions (units/formations) to TetGen")
                     
@@ -149,7 +149,7 @@ class TetrahedralMeshGenerator:
             
             # ✅ CRITICAL: Store TetGen object to access constraint surface triangles (C++ style)
             self.tetgen_object = tet
-            logger.debug(f"Stored TetGen object for constraint surface access")
+            logger.info(f"Stored TetGen object for constraint surface access")
             
             return grid
             
@@ -378,7 +378,7 @@ class TetrahedralMeshGenerator:
                 if is_fault:
                     # CRITICAL: Faults are ONLY surface constraints - NO volumetric regions!
                     surface_materials.append(material)
-                    logger.debug(f"Material {material_attribute} '{material_name}' -> FAULT (surface constraint only)")
+                    logger.info(f"Material {material_attribute} '{material_name}' -> FAULT (surface constraint only)")
                     continue
                 
                 # ONLY formations/units get volumetric regions
@@ -386,7 +386,7 @@ class TetrahedralMeshGenerator:
                     if len(loc) >= 3:
                         # CRITICAL: Use the material's attribute directly (already sequential 0,1,2...)
                         volumetric_regions.append([float(loc[0]), float(loc[1]), float(loc[2]), material_attribute, 0])
-                        logger.debug(f"Added 3D region: '{material.get('name')}' with C++ style ID={material_attribute}")
+                        logger.info(f"Added 3D region: '{material.get('name')}' with C++ style ID={material_attribute}")
         
         max_material_id = max([int(region[3]) for region in volumetric_regions]) if volumetric_regions else -1
         logger.info(f"✓ TRUE C++ Style: {len(volumetric_regions)} volumetric regions (formations only, TetGen indices 0-{max_material_id})")

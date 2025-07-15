@@ -495,15 +495,15 @@ class DirectTriangleWrapper:
             self.logger.info(f"Using custom Triangle options: '{tri_options}'")
         
         # --- Add detailed logging before the call --- 
-        self.logger.debug(f"Calling tr.triangulate with options: '{tri_options}'")
-        self.logger.debug(f"Input vertices shape: {tri_input.get('vertices', np.empty(0)).shape}")
-        self.logger.debug(f"Input segments shape: {tri_input.get('segments', np.empty(0)).shape}")
-        self.logger.debug(f"Input holes shape: {tri_input.get('holes', np.empty(0)).shape}")
+        self.logger.info(f"Calling tr.triangulate with options: '{tri_options}'")
+        self.logger.info(f"Input vertices shape: {tri_input.get('vertices', np.empty(0)).shape}")
+        self.logger.info(f"Input segments shape: {tri_input.get('segments', np.empty(0)).shape}")
+        self.logger.info(f"Input holes shape: {tri_input.get('holes', np.empty(0)).shape}")
         # Log first few vertices/segments if they exist
         if 'vertices' in tri_input and len(tri_input['vertices']) > 0:
-            self.logger.debug(f"First 3 vertices:\n{tri_input['vertices'][:3]}")
+            self.logger.info(f"First 3 vertices:\n{tri_input['vertices'][:3]}")
         if 'segments' in tri_input and len(tri_input['segments']) > 0:
-            self.logger.debug(f"First 3 segments:\n{tri_input['segments'][:3]}")
+            self.logger.info(f"First 3 segments:\n{tri_input['segments'][:3]}")
         # --- End detailed logging --- 
         
         try:

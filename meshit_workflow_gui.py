@@ -44,6 +44,7 @@ from PyQt5.QtGui import QFont, QIcon, QColor, QPalette, QPixmap
 # Add these imports at the top of meshit_workflow_gui.py
 from meshit.intersection_utils import run_constrained_triangulation_py
 from scipy.spatial.distance import pdist, squareform
+import itertools
 import gc
 import atexit
 from PyQt5.QtWidgets import (QDockWidget, QListWidget, QListWidgetItem,
@@ -3869,101 +3870,239 @@ class MeshItWorkflowGUI(QMainWindow):
     
     
     
-    def _compute_hull_for_dataset(self, dataset_index):
-        """Compute the convex hull for a specific dataset index. Returns True on success, False on error."""
-        # Check index validity
+     #------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 1) Sub-sampling helper
+    # -------------------------------------------------------------------------
+    def _subsample_points_for_hull(self, points: np.ndarray, max_points: int = 50) -> np.ndarray:
+        """
+        Return ≤ `max_points` points while ALWAYS preserving every true hull
+        vertex.  Interior points are randomly thinned only if necessary.
+        """
+        from scipy.spatial import ConvexHull
+
+        n_pts = len(points)
+        if n_pts <= max_points:
+            return points
+
+        # --- keep all hull vertices ------------------------------------------------
+        hull_idx = np.unique(ConvexHull(points).vertices)
+        boundary = points[hull_idx]
+
+        if len(boundary) >= max_points:          # still too many → uniform stride
+            step = max(1, len(boundary) // max_points)
+            return boundary[::step][:max_points]
+
+        # --- add a few interior samples to reach target ---------------------------
+        remain = max_points - len(boundary)
+        interior_mask = np.ones(n_pts, bool)
+        interior_mask[hull_idx] = False
+        interior_idx = np.where(interior_mask)[0]
+
+        if remain and len(interior_idx):
+            chosen = np.random.choice(interior_idx,
+                                    size=min(remain, len(interior_idx)),
+                                    replace=False)
+            return np.vstack([boundary, points[chosen]])
+
+        return boundary
+    
+    # -------------------------------------------------------------------------
+    # 2) Quasi-planar check (helper)
+    # -------------------------------------------------------------------------
+    def _is_quasi_planar(self, points: np.ndarray, tol: float = 0.5) -> bool:
+        """
+        Treat cloud as planar when smallest PCA singular value is far smaller
+        than the next one (sheet-like geometry).
+        """
+        centred = points - points.mean(axis=0)
+        _, s, _ = np.linalg.svd(centred, full_matrices=False)
+        return s[-1] / s[-2] < tol
+    def _pca_project(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Centre the cloud, compute PCA, and return the 2-D projection onto the
+        first two principal components.
+        """
+        cen = points.mean(axis=0)
+        u, _, vh = np.linalg.svd(points - cen, full_matrices=False)
+        proj2d = (points - cen) @ vh[:2].T    # (N,2) projection
+        return cen, proj2d
+
+            # ------------------------------------------------------------------------
+    # 2.  Main hull computation
+    # ------------------------------------------------------------------------
+        # ------------------------------------------------------------------------
+    # 2.  Main hull computation
+    # ------------------------------------------------------------------------
+        # ------------------------------------------------------------------------
+    # 2.  Main hull computation (CORRECTED)
+    # ------------------------------------------------------------------------
+        # ------------------------------------------------------------------------
+    # 2.  Main hull computation (CORRECTED for non-convex boundaries)
+    # ------------------------------------------------------------------------
+
+    def _rdp_simplify(self, points, epsilon):
+        """
+        Simplifies a 2D or 3D polyline using the Ramer-Douglas-Peucker algorithm.
+        """
+        if len(points) < 3:
+            return points
+
+        dmax = 0.0
+        index = 0
+        
+        # Find the point with the maximum distance to the line segment connecting the start and end points.
+        p1 = points[0]
+        p_end = points[-1]
+        line_vec = p_end - p1
+        norm_line_vec = np.linalg.norm(line_vec)
+        if norm_line_vec < 1e-12: # Start and end points are the same
+            return points[[0]]
+
+        for i in range(1, len(points) - 1):
+            point_vec = points[i] - p1
+            
+            # This cross product method is robust for both 2D (implicitly promoting to 3D) and 3D points.
+            # For 2D, this is equivalent to calculating the area of the parallelogram.
+            d = np.linalg.norm(np.cross(line_vec, point_vec)) / norm_line_vec
+
+            if d > dmax:
+                index = i
+                dmax = d
+
+        # If max distance is greater than epsilon, recursively simplify the two sub-lines.
+        if dmax > epsilon:
+            rec_results1 = self._rdp_simplify(points[:index + 1], epsilon)
+            rec_results2 = self._rdp_simplify(points[index:], epsilon)
+
+            # Combine the results, removing the duplicated middle point.
+            result = np.vstack((rec_results1[:-1], rec_results2))
+        else:
+            # All intermediate points are within the tolerance, so the line segment is the simplification.
+            result = np.array([points[0], points[-1]])
+            
+        return result
+
+    def _compute_hull_for_dataset(self, dataset_index: int) -> bool:
+        """
+        Compute (and store) the boundary poly-line for the selected dataset.
+        For 2D data, this is the convex hull.
+        For 3D sheet-like data, this finds the ordered "rim" or "outline" by:
+            1. Projecting all points to a 2D plane.
+            2. Performing a Delaunay triangulation on the 2D points.
+            3. Identifying the boundary edges (edges belonging to only one triangle).
+            4. Stitching these edges into a continuous, ordered polyline.
+
+        Returns
+        -------
+        bool
+            True  -> hull stored in dataset['hull_points']
+            False -> error (logged)
+        """
+        from scipy.spatial import ConvexHull, Delaunay
+        import traceback
+
+        # ------------ Basic checks ------------------------------------------------
         if not (0 <= dataset_index < len(self.datasets)):
-            logger.error(f"Invalid dataset index {dataset_index} for hull computation.")
+            logger.error("Invalid dataset index %s for hull computation", dataset_index)
             return False
 
-        dataset = self.datasets[dataset_index]
-        dataset_name = dataset.get('name', f"Dataset {dataset_index}")
-        # self.statusBar().showMessage(f"Computing hull for {dataset_name}...") # Remove status update
-        
-        if dataset.get('points') is None or len(dataset['points']) < 3:
-            self.statusBar().showMessage(f"Error: Need at least 3 points for hull in {dataset_name}")
-            logger.warning(f"Skipping hull for {dataset_name}: needs >= 3 points.")
-            return False # Indicate error or skip
-        
-        try:
-            # Get points
-            points = dataset['points']
-            
-            # For 3D computations, we need to handle the hull differently
-            if points.shape[1] >= 3:
-                # Check if points are roughly planar (most real-world datasets are)
-                # 1. Center points
-                centroid = np.mean(points, axis=0)
-                centered = points - centroid
-                
-                # 2. Get dominant plane using PCA/SVD
-                u, s, vh = np.linalg.svd(centered, full_matrices=False)
-                # The smallest singular value/component tells us how planar the data is
-                normal = vh[2]  # This is the approximate normal to the best-fitting plane
-                
-                # For highly planar data (ratio of smallest to second smallest singular value is small)
-                if s[2] / s[1] < 0.2:  # Threshold can be adjusted
-                    logger.debug(f"Points in {dataset_name} are mostly planar, using projected hull")
-                    # Project points onto a plane defined by first two principal components
-                    projected = np.dot(centered, vh[:2].T)
-                    
-                    # Compute 2D convex hull on projected points
-                    from scipy.spatial import ConvexHull
-                    hull_2d = ConvexHull(projected)
-                    
-                    # Map hull vertices back to 3D
-                    hull_indices = hull_2d.vertices
-                    hull_points = points[hull_indices]
-                    
-                    # Ensure the hull is closed
-                    if not np.array_equal(hull_points[0], hull_points[-1]):
-                        hull_points = np.vstack([hull_points, hull_points[0]])
-                else:
-                    # For truly 3D point clouds, use 3D convex hull
-                    logger.debug(f"Points in {dataset_name} are 3D, using 3D convex hull")
-                    from scipy.spatial import ConvexHull
-                    hull_3d = ConvexHull(points)
-                    
-                    # Extract unique vertices from the hull
-                    # 3D hulls use triangular faces, so we need to get unique vertices
-                    hull_indices = []
-                    for simplex in hull_3d.simplices:
-                        for idx in simplex:
-                            if idx not in hull_indices:
-                                hull_indices.append(idx)
-                    
-                    # Extract hull points in original order
-                    hull_points = points[hull_indices]
-                    
-                    # For visualization purposes, we'll close the hull by adding the first point again
-                    hull_points = np.vstack([hull_points, hull_points[0]])
-            else:
-                # Standard 2D hull computation
-                from scipy.spatial import ConvexHull
-                hull = ConvexHull(points)
-                
-                # Extract hull points
-                hull_points = points[hull.vertices]
-                
-                # Close the hull
-                hull_points = np.append(hull_points, [hull_points[0]], axis=0)
-            
-            # Store in dataset
-            dataset['hull_points'] = hull_points
-            
-            # Clear any previous results from later steps for this dataset
-            dataset.pop('segments', None)
-            dataset.pop('triangulation_result', None)
-            
-            return True # Indicate success
-            
-        except Exception as e:
-            # self.statusBar().showMessage(f"Error computing hull for {dataset_name}: {str(e)}") # Remove status update
-            logger.error(f"Error computing hull for {dataset_name}: {str(e)}")
-            # Optionally show message box for individual errors during batch?
-            # QMessageBox.critical(self, "Hull Error", f"Error computing hull for {dataset_name}: {str(e)}")
-            return False # Indicate error
+        ds = self.datasets[dataset_index]
+        pts = ds.get("points")
+        if pts is None or len(pts) < 3:
+            logger.warning("Dataset %s needs ≥3 points for hull", dataset_index)
+            return False
 
+        dim = pts.shape[1]
+        try:
+            # ======================================================================
+            # 2-D CASE: Convex hull is correct and efficient here.
+            # ======================================================================
+            if dim == 2:
+                hull_on_plane = ConvexHull(pts)
+                hull_pts = pts[hull_on_plane.vertices]
+
+            # ======================================================================
+            # 3-D CASE: Use Delaunay triangulation to find the true boundary.
+            # ======================================================================
+            else: # dim >= 3
+                # 1. Project all 3D points onto their best-fit 2D plane.
+                _centroid, projected_pts_2d = self._pca_project(pts)
+
+                # 2. Perform Delaunay triangulation on the 2D projected points.
+                tri = Delaunay(projected_pts_2d)
+
+                # 3. Find the boundary edges. These are edges that appear only once.
+                edges = set()
+                # A map from vertex index to the list of edges it is part of.
+                edge_map = {}
+
+                for i, simplex in enumerate(tri.simplices):
+                    for j in range(3):
+                        p1_idx = simplex[j]
+                        p2_idx = simplex[(j + 1) % 3]
+                        
+                        # Canonical edge representation (sorted indices)
+                        edge = tuple(sorted((p1_idx, p2_idx)))
+                        
+                        if p1_idx not in edge_map: edge_map[p1_idx] = []
+                        if p2_idx not in edge_map: edge_map[p2_idx] = []
+                        edge_map[p1_idx].append(edge)
+                        edge_map[p2_idx].append(edge)
+                        
+                        if edge in edges:
+                            # This edge is shared, so it's not a boundary edge.
+                            edges.remove(edge)
+                        else:
+                            # First time we see this edge.
+                            edges.add(edge)
+                
+                # 4. Stitch the unordered boundary edges into a continuous path.
+                if not edges:
+                    logger.warning("Delaunay method found no boundary edges. Falling back to convex hull.")
+                    hull_on_plane = ConvexHull(projected_pts_2d)
+                    hull_pts = pts[hull_on_plane.vertices]
+                else:
+                    # Start the walk.
+                    ordered_indices = []
+                    current_edge = edges.pop()
+                    ordered_indices.extend(list(current_edge))
+                    
+                    while edges:
+                        last_point_idx = ordered_indices[-1]
+                        found_next = False
+                        # Find the next edge connected to the last point.
+                        for edge in edges:
+                            if last_point_idx in edge:
+                                next_point_idx = edge[1] if edge[0] == last_point_idx else edge[0]
+                                ordered_indices.append(next_point_idx)
+                                edges.remove(edge)
+                                found_next = True
+                                break
+                        if not found_next:
+                            logger.warning("Boundary walk broken. The result might be incomplete or have multiple loops.")
+                            break
+                    
+                    # 5. Create the final ordered polyline from the original 3D points.
+                    hull_pts = pts[ordered_indices]
+
+            # ------------ Close the poly-line for visualization -----------------
+            if len(hull_pts) > 0 and not np.array_equal(hull_pts[0], hull_pts[-1]):
+                hull_pts = np.vstack([hull_pts, hull_pts[0:1]])
+
+            # ------------ Store result and cleanup ------------------------------
+            ds["hull_points"] = hull_pts
+            ds.pop("segments", None)
+            ds.pop("triangulation_result", None)
+            logger.info(f"Successfully computed boundary for '{ds.get('name')}' with {len(hull_pts)-1} vertices.")
+            return True
+
+        except Exception as exc:
+            logger.error(f"Hull/Boundary computation failed for dataset {dataset_index}: {exc}")
+            logger.debug(traceback.format_exc())
+            return False
+
+    
     def compute_hull(self):
         """Compute the convex hull of the loaded points for the *active* dataset (primarily for context menu)"""
         # Check if we have an active dataset

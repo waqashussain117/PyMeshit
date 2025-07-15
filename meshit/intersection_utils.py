@@ -2061,7 +2061,7 @@ def refine_intersection_line_by_length(intersection, target_length, min_angle_de
     # Always keep first point (even if DEFAULT - it becomes an anchor)
     first_point = original_points[0]
     anchor_points.append(first_point)
-    logger.debug(f"Anchor: FIRST point ({first_point.x:.3f}, {first_point.y:.3f}, {first_point.z:.3f}) "
+    logger.info(f"Anchor: FIRST point ({first_point.x:.3f}, {first_point.y:.3f}, {first_point.z:.3f}) "
                 f"Type: {getattr(first_point, 'point_type', 'DEFAULT')}")
     
     # Keep middle points only if they are NOT "DEFAULT"
@@ -2071,10 +2071,10 @@ def refine_intersection_line_by_length(intersection, target_length, min_angle_de
         
         if point_type and point_type != "DEFAULT":
             anchor_points.append(point)
-            logger.debug(f"Anchor: SPECIAL point ({point.x:.3f}, {point.y:.3f}, {point.z:.3f}) "
+            logger.info(f"Anchor: SPECIAL point ({point.x:.3f}, {point.y:.3f}, {point.z:.3f}) "
                         f"Type: {point_type}")
         else:
-            logger.debug(f"Removed: DEFAULT point ({point.x:.3f}, {point.y:.3f}, {point.z:.3f})")
+            logger.info(f"Removed: DEFAULT point ({point.x:.3f}, {point.y:.3f}, {point.z:.3f})")
     
     # Always keep last point (even if DEFAULT - it becomes an anchor)
     if len(original_points) > 1:
@@ -2082,7 +2082,7 @@ def refine_intersection_line_by_length(intersection, target_length, min_angle_de
         # Avoid duplicating if it's the same as first (closed loop)
         if (last_point - anchor_points[0]).length() > 1e-8:
             anchor_points.append(last_point)
-            logger.debug(f"Anchor: LAST point ({last_point.x:.3f}, {last_point.y:.3f}, {last_point.z:.3f}) "
+            logger.info(f"Anchor: LAST point ({last_point.x:.3f}, {last_point.y:.3f}, {last_point.z:.3f}) "
                         f"Type: {getattr(last_point, 'point_type', 'DEFAULT')}")
     
     logger.info(f"Anchor points after filtering: {len(anchor_points)}")
@@ -2113,7 +2113,7 @@ def refine_intersection_line_by_length(intersection, target_length, min_angle_de
         else:
             num_subdivisions = max(1, math.ceil(segment_length / target_length)) # 1 means at least one subdivision
         
-        logger.debug(f"Segment {i}: length={segment_length:.3f}, subdivisions={num_subdivisions}")
+        logger.info(f"Segment {i}: length={segment_length:.3f}, subdivisions={num_subdivisions}")
         
         # Add intermediate points
         for j in range(1, num_subdivisions):
@@ -2123,7 +2123,7 @@ def refine_intersection_line_by_length(intersection, target_length, min_angle_de
             if hasattr(new_point, 'type'):
                 new_point.type = "DEFAULT"
             refined_points.append(new_point)
-            logger.debug(f"  Added subdivision point ({new_point.x:.3f}, {new_point.y:.3f}, {new_point.z:.3f})")
+            logger.info(f"  Added subdivision point ({new_point.x:.3f}, {new_point.y:.3f}, {new_point.z:.3f})")
         
         # Add the next anchor point
         refined_points.append(p2)
@@ -2216,7 +2216,7 @@ def prepare_plc_for_surface_triangulation(surface_data, intersections_on_surface
     # ----------------------------------------------------------------
     hull_points = surface_data.get('hull_points', [])
     if hull_points:
-        logger.debug(f"Processing hull with {len(hull_points)} points")
+        logger.info(f"Processing hull with {len(hull_points)} points")
         hull_indices = [add_point_to_plc(p) for p in hull_points]
         
         # Create closed loop segments for hull
@@ -2234,7 +2234,7 @@ def prepare_plc_for_surface_triangulation(surface_data, intersections_on_surface
         if not intersection_points:
             continue
                 
-        logger.debug(f"Processing intersection line {line_idx} with {len(intersection_points)} points")
+        logger.info(f"Processing intersection line {line_idx} with {len(intersection_points)} points")
         line_indices = [add_point_to_plc(p) for p in intersection_points]
         
         # Create segments for intersection polyline
@@ -2365,7 +2365,7 @@ def run_constrained_triangulation_py(
         
         final_vertices_3d = np.zeros((len(vertices_2d), 3))
         
-        logger.debug(f"Reconstructing {len(vertices_2d)} vertices from 2D to 3D...")
+        logger.info(f"Reconstructing {len(vertices_2d)} vertices from 2D to 3D...")
         
         for i, vertex_2d in enumerate(vertices_2d):
             is_matched_point = False
