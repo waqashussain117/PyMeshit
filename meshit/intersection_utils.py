@@ -29,7 +29,7 @@ except ImportError:
     HAVE_PYVISTA_UTILS = False
     logging.warning("PyVista not available in intersection_utils. PyVista triangulation fallback disabled.")
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("MeshIt-Workflow")
 
 class Vector3D:
     """Simple 3D vector class compatible with MeshIt's Vector3D"""
@@ -74,6 +74,10 @@ class Vector3D:
     
     def length(self):
         return np.sqrt(self.x * self.x + self.y * self.y + self.z * self.z)
+    
+    def length_squared(self):
+        """Return the squared length of the vector (avoids sqrt operation)"""
+        return self.x * self.x + self.y * self.y + self.z * self.z
     
     def normalized(self):
         length = self.length()
@@ -400,6 +404,9 @@ def append_non_existing_segment(segments, p1, p2):
     segments.append((p1, p2))
 
 
+# ####################################################################
+# START OF MODIFIED SECTION 1: tri_tri_intersect_with_isectline
+# ####################################################################
 def tri_tri_intersect_with_isectline(tri1, tri2):
     """
     Fast triangle-triangle intersection test matching C++ MeshIt implementation.
@@ -413,8 +420,17 @@ def tri_tri_intersect_with_isectline(tri1, tri2):
     Returns:
         Tuple of (point1, point2) defining the intersection line, or (None, None) if no intersection
     """
-    # C++ MeshIt constants
-    EPSILON = 1e-12
+    # C++ MeshIt constants - use adaptive epsilon for curved surfaces
+    # Start with tighter epsilon and adjust based on triangle size
+    base_epsilon = 1e-14
+    
+    # Calculate triangle sizes to adapt epsilon
+    tri1_size = max((tri1.v2 - tri1.v1).length(), (tri1.v3 - tri1.v1).length(), (tri1.v3 - tri1.v2).length())
+    tri2_size = max((tri2.v2 - tri2.v1).length(), (tri2.v3 - tri2.v1).length(), (tri2.v3 - tri2.v2).length())
+    avg_tri_size = (tri1_size + tri2_size) * 0.5
+    
+    # Adaptive epsilon based on triangle size (helps with curved surfaces)
+    EPSILON = max(base_epsilon, avg_tri_size * 1e-12)
     
     # 1. Compute plane equation (p1) of triangle T1=(V0,V1,V2)
     # p1: N1.X+d1=0
@@ -555,6 +571,9 @@ def tri_tri_intersect_with_isectline(tri1, tri2):
     pt2.type = "INTERSECTION_POINT"
     
     return pt1, pt2
+# ##################################################################
+# END OF MODIFIED SECTION 1
+# ##################################################################
 
 
 def compute_intervals_isectline(tri, vv0, vv1, vv2, d0, d1, d2, d0d1, d0d2, isect, isectpoint):
@@ -597,10 +616,8 @@ def isect2(v0, v1, v2, vv0, vv1, vv2, d0, d1, d2, isect, isectpoint):
 
 def triangle_triangle_intersection(tri1: Triangle, tri2: Triangle) -> List[Vector3D]:
     """
-    Calculate intersection between two triangles.
-    
-    This implementation finds the actual line of intersection between two triangles
-    by checking for intersections between the edges of each triangle and the face of the other.
+    Calculate intersection between two triangles using robust Möller's algorithm.
+    This directly calls the C++ ported tri_tri_intersect_with_isectline function.
     
     Args:
         tri1: First triangle
@@ -609,75 +626,27 @@ def triangle_triangle_intersection(tri1: Triangle, tri2: Triangle) -> List[Vecto
     Returns:
         List of intersection points (empty if no intersection)
     """
-    # Implementation based on Möller's algorithm
-    # First, get the edges of both triangles
-    tri1_edges = [
-        (tri1.v1, tri1.v2),
-        (tri1.v2, tri1.v3),
-        (tri1.v3, tri1.v1)
-    ]
+    # Use the robust triangle-triangle intersection algorithm
+    pt1, pt2 = tri_tri_intersect_with_isectline(tri1, tri2)
     
-    tri2_edges = [
-        (tri2.v1, tri2.v2),
-        (tri2.v2, tri2.v3),
-        (tri2.v3, tri2.v1)
-    ]
+    if pt1 is not None and pt2 is not None:
+        # Check if we have a valid line segment with meaningful length
+        segment_length = (pt1 - pt2).length()
+        if segment_length > 1e-6:  # More reasonable tolerance for actual intersections
+            # Additional validation: ensure intersection points are actually within both triangles
+            if (tri1.contains_point(pt1) and tri1.contains_point(pt2)) or \
+               (tri2.contains_point(pt1) and tri2.contains_point(pt2)) or \
+               (tri1.contains_point(pt1) and tri2.contains_point(pt2)) or \
+               (tri1.contains_point(pt2) and tri2.contains_point(pt1)):
+                return [pt1, pt2]
+            else:
+                # This is likely a false positive intersection
+                return []
+        else:
+            # Degenerate case - single point intersection or very small segment
+            return []
     
-    # Check if the triangles are coplanar (within a small tolerance)
-    normal1 = tri1.normal()
-    normal2 = tri2.normal()
-    if abs(normal1.dot(normal2)) > 0.999:  # Nearly parallel normals
-        # Coplanar triangles - we'd need to find the polygon intersection
-        # This is complex, so for now return empty list
-        return []
-    
-    intersection_points = []
-    
-    # Check for intersections between edges of tri1 and the face of tri2
-    for edge in tri1_edges:
-        p1, p2 = edge
-        intersection = line_triangle_intersection(p1, p2, tri2)
-        if intersection:
-            # Check if this point is already in our list (avoid duplicates)
-            is_duplicate = False
-            for point in intersection_points:
-                if (point - intersection).length() < 1e-8:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                intersection_points.append(intersection)
-    
-    # Check for intersections between edges of tri2 and the face of tri1
-    for edge in tri2_edges:
-        p1, p2 = edge
-        intersection = line_triangle_intersection(p1, p2, tri1)
-        if intersection:
-            # Check if this point is already in our list (avoid duplicates)
-            is_duplicate = False
-            for point in intersection_points:
-                if (point - intersection).length() < 1e-8:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                intersection_points.append(intersection)
-    
-    # Sort the intersection points to form a line segment if there are exactly two points
-    if len(intersection_points) == 2:
-        return intersection_points
-    elif len(intersection_points) > 2:
-        # If we have more than 2 points (rare, but possible due to numerical issues),
-        # find the two furthest points to define the intersection line
-        max_dist = -1
-        furthest_pair = (0, 1)
-        for i in range(len(intersection_points)):
-            for j in range(i+1, len(intersection_points)):
-                dist = (intersection_points[i] - intersection_points[j]).length()
-                if dist > max_dist:
-                    max_dist = dist
-                    furthest_pair = (i, j)
-        return [intersection_points[furthest_pair[0]], intersection_points[furthest_pair[1]]]
-    
-    return intersection_points
+    return []
 
 
 def line_triangle_intersection(
@@ -723,7 +692,7 @@ def line_triangle_intersection(
     return None
 
 
-def calculate_surface_surface_intersection(surface1_idx: int, surface2_idx: int, model) -> Optional[Intersection]:
+def calculate_surface_surface_intersection(surface1_idx: int, surface2_idx: int, model):
     """
     Calculate intersections between two surfaces using spatial subdivision for efficiency.
     
@@ -733,10 +702,15 @@ def calculate_surface_surface_intersection(surface1_idx: int, surface2_idx: int,
         model: MeshItModel instance containing surfaces
         
     Returns:
-        Intersection object or None if no intersections found
+        Single Intersection object, list of Intersection objects, or None if no intersections found
     """
+    logger.info(f"=== PYTHON FUNCTION CALLED: calculate_surface_surface_intersection({surface1_idx}, {surface2_idx}) ===")
+    
     surface1 = model.surfaces[surface1_idx]
     surface2 = model.surfaces[surface2_idx]
+    
+    logger.info(f"Surface1 vertices: {len(surface1.vertices)}, triangles: {len(surface1.triangles)}")
+    logger.info(f"Surface2 vertices: {len(surface2.vertices)}, triangles: {len(surface2.triangles)}")
     
     # Early rejection test using bounding boxes
     if hasattr(surface1, 'bounds') and hasattr(surface2, 'bounds'):
@@ -833,38 +807,194 @@ def calculate_surface_surface_intersection(surface1_idx: int, surface2_idx: int,
         # Direct testing for small number of triangles
         for tri1 in box.T1s:
             for tri2 in box.T2s:
-                isectpt1, isectpt2 = tri_tri_intersect_with_isectline(tri1, tri2)
-                if isectpt1 and isectpt2:
-                    append_non_existing_segment(intersection_segments, isectpt1, isectpt2)
+                # Use the robust triangle-triangle intersection 
+                intersection_points = triangle_triangle_intersection(tri1, tri2)
+                if len(intersection_points) >= 2:
+                    # Check if this is a meaningful intersection (not just touching at edges)
+                    p1, p2 = intersection_points[0], intersection_points[1]
+                    segment_length_squared = (p2 - p1).length_squared()
+                    
+                    # Only accept intersections with meaningful length (not just point contacts)
+                    if segment_length_squared > 1e-20:
+                        append_non_existing_segment(intersection_segments, p1, p2)
+                # Skip single point intersections - they're usually just edge contacts
     
     # If we found any intersections, create an Intersection object
     if intersection_segments:
-        intersection = Intersection(surface1_idx, surface2_idx, False)
+        logger.info(f"Surface {surface1_idx}-{surface2_idx}: Found {len(intersection_segments)} intersection segments")
+        for i, seg in enumerate(intersection_segments):
+            if len(seg) >= 2:
+                logger.info(f"  Segment {i}: ({seg[0].x:.3f},{seg[0].y:.3f},{seg[0].z:.3f}) -> ({seg[1].x:.3f},{seg[1].y:.3f},{seg[1].z:.3f})")
         
-        # Flatten segments into points while preserving order
-        intersection_points = []
-        for segment in intersection_segments:
-            for point in segment:
-                # Check if this point is already in our list (with tolerance)
-                is_duplicate = False
-                for existing_point in intersection_points:
-                    if (existing_point - point).length() < 1e-8:
-                        is_duplicate = True
-                        break
-                
-                if not is_duplicate:
-                    intersection_points.append(point)
+        # Connect intersection segments into continuous curves (like C++ does)
+        connected_curves = connect_intersection_segments(intersection_segments)
         
-        # Sort points to form a continuous polyline
-        sorted_points = sort_intersection_points(intersection_points)
+        logger.info(f"Surface {surface1_idx}-{surface2_idx}: Connected into {len(connected_curves)} curves")
         
-        # Add sorted points to the intersection
-        for point in sorted_points:
-            intersection.add_point(point)
-            
-        return intersection
+        # Return multiple intersection objects - one for each curve
+        # This matches the C++ behavior where each curve is a separate intersection
+        if len(connected_curves) == 1:
+            # Single curve - return as single intersection (backward compatibility)
+            intersection = Intersection(surface1_idx, surface2_idx, False)
+            for point in connected_curves[0]:
+                intersection.add_point(point)
+            return intersection
+        else:
+            # Multiple curves - return as list of intersections
+            # Note: This changes the return type, but it's necessary for correct visualization
+            intersections = []
+            for curve_idx, curve in enumerate(connected_curves):
+                intersection = Intersection(surface1_idx, surface2_idx, False)
+                for point in curve:
+                    intersection.add_point(point)
+                intersections.append(intersection)
+            return intersections
     
     return None
+
+# ####################################################################
+# START OF MODIFIED SECTION 2: connect_intersection_segments
+# ####################################################################
+def connect_intersection_segments(segments, tolerance=1e-10):
+    """
+    Connect intersection segments into continuous curves, following C++ MeshIt approach.
+    This processes segments iteratively like C++ GenerateFirstSplineOfSegments, creating
+    separate intersection lines for disconnected regions.
+    """
+    if not segments:
+        return []
+    
+    logger.info(f"Starting segment connection with {len(segments)} input segments")
+    
+    # First, validate and filter segments using C++ appendNonExistingSegment logic
+    # Convert to flat list of points (like C++ input->Ns)
+    validated_points = []
+    for i, segment in enumerate(segments):
+        if len(segment) >= 2:
+            p1, p2 = segment[0], segment[1]
+            
+            # C++ check: points are identical --> not a segment
+            if (p1 - p2).length_squared() < 1e-24:
+                logger.info(f"Segment {i} rejected: identical points")
+                continue
+                
+            # C++ check: prevent duplicate segments
+            is_duplicate = False
+            for j in range(0, len(validated_points), 2):
+                if j + 1 < len(validated_points):
+                    ep1, ep2 = validated_points[j], validated_points[j + 1]
+                    # Check both orientations
+                    if ((p1 - ep1).length_squared() < 1e-24 and (p2 - ep2).length_squared() < 1e-24) or \
+                       ((p2 - ep1).length_squared() < 1e-24 and (p1 - ep2).length_squared() < 1e-24):
+                        is_duplicate = True
+                        break
+            
+            if not is_duplicate:
+                validated_points.extend([p1, p2])
+                logger.info(f"Segment {i} accepted: ({p1.x:.3f},{p1.y:.3f},{p1.z:.3f}) -> ({p2.x:.3f},{p2.y:.3f},{p2.z:.3f})")
+            else:
+                logger.info(f"Segment {i} rejected: duplicate")
+    
+    if not validated_points:
+        logger.info("No valid segments found after filtering")
+        return []
+    
+    logger.info(f"After filtering: {len(validated_points)//2} valid segments")
+    
+    # Process segments iteratively like C++ GenerateFirstSplineOfSegments
+    curves = []
+    curve_count = 0
+    
+    # Use C++ MeshIt's exact tolerance: 1e-12 for squared distance comparison
+    connect_tolerance_squared = 1e-12
+    
+    # Continue while there are segments to process (like C++ while loop)
+    while len(validated_points) >= 2:
+        curve_count += 1
+        logger.info(f"Starting curve {curve_count} with {len(validated_points)//2} segments remaining")
+        
+        # Start a new curve with the first available segment
+        curve = [validated_points[0], validated_points[1]]
+        logger.info(f"Curve {curve_count} initial segment: ({curve[0].x:.3f},{curve[0].y:.3f},{curve[0].z:.3f}) -> ({curve[1].x:.3f},{curve[1].y:.3f},{curve[1].z:.3f})")
+        
+        # Remove the used segment (like C++ removeAt)
+        validated_points.pop(1)
+        validated_points.pop(0)
+        
+
+        
+        # Try to extend the curve at the beginning (like C++ first reloop)
+        extended_count = 0
+        extended = True
+        while extended:
+            extended = False
+            n = 0
+            while n < len(validated_points):
+                dist_squared = (validated_points[n] - curve[0]).length_squared()
+                if dist_squared < connect_tolerance_squared:
+                    if n % 2 == 0:  # Even index - this is the first point of a segment
+                        curve.insert(0, validated_points[n + 1])
+                        validated_points.pop(n + 1)
+                        validated_points.pop(n)
+                        extended = True
+                        extended_count += 1
+                        logger.info(f"Curve {curve_count} extended at beginning (extension #{extended_count})")
+                        break
+                    else:  # Odd index - this is the second point of a segment
+                        curve.insert(0, validated_points[n - 1])
+                        validated_points.pop(n)
+                        validated_points.pop(n - 1)
+                        extended = True
+                        extended_count += 1
+                        logger.info(f"Curve {curve_count} extended at beginning (extension #{extended_count})")
+                        break
+                n += 1
+        
+        # Try to extend the curve at the end (like C++ second reloop)
+        extended = True
+        while extended:
+            extended = False
+            n = 0
+            while n < len(validated_points):
+                dist_squared = (validated_points[n] - curve[-1]).length_squared()
+                if dist_squared < connect_tolerance_squared:
+                    if n % 2 == 0:  # Even index - this is the first point of a segment
+                        curve.append(validated_points[n + 1])
+                        validated_points.pop(n + 1)
+                        validated_points.pop(n)
+                        extended = True
+                        extended_count += 1
+                        logger.info(f"Curve {curve_count} extended at end (extension #{extended_count})")
+                        break
+                    else:  # Odd index - this is the second point of a segment
+                        curve.append(validated_points[n - 1])
+                        validated_points.pop(n)
+                        validated_points.pop(n - 1)
+                        extended = True
+                        extended_count += 1
+                        logger.info(f"Curve {curve_count} extended at end (extension #{extended_count})")
+                        break
+                n += 1
+        
+        # Clean up the curve by removing duplicate consecutive points
+        cleaned_curve = [curve[0]]
+        for point in curve[1:]:
+            if (point - cleaned_curve[-1]).length_squared() > tolerance * tolerance:
+                cleaned_curve.append(point)
+        
+        if len(cleaned_curve) >= 2:
+            curves.append(cleaned_curve)
+            logger.info(f"Curve {curve_count} completed: {len(cleaned_curve)} points, {extended_count} extensions")
+            logger.info(f"  Start: ({cleaned_curve[0].x:.3f},{cleaned_curve[0].y:.3f},{cleaned_curve[0].z:.3f})")
+            logger.info(f"  End: ({cleaned_curve[-1].x:.3f},{cleaned_curve[-1].y:.3f},{cleaned_curve[-1].z:.3f})")
+        else:
+            logger.info(f"Curve {curve_count} rejected: too short after cleanup")
+    
+    logger.info(f"Segment connection complete: {len(curves)} curves created from original {len(segments)} segments")
+    return curves
+# ##################################################################
+# END OF MODIFIED SECTION 2
+# ##################################################################
 
 
 def calculate_skew_line_transversal(p1: Vector3D, p2: Vector3D, p3: Vector3D, p4: Vector3D) -> Optional[Vector3D]:
@@ -1754,7 +1884,7 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
             pt_type = getattr(pt, 'point_type', getattr(pt, 'type', "DEFAULT"))
             if pt_type != "DEFAULT":
                 special_count += 1
-                logger.info(f"  Special hull point: ({pt.x:.3f}, {pt.y:.3f}, {pt.z:.3f}) type={pt_type}")
+                # logger.info(f"  Special hull point: ({pt.x:.3f}, {pt.y:.3f}, {pt.z:.3f}) type={pt_type}")
         
         logger.info(f"Convex hull alignment complete for surface {surface_idx}: {special_count} special points out of {len(surface.convex_hull)} total")
 
@@ -1876,7 +2006,14 @@ def run_intersection_workflow(model, progress_callback=None, tolerance=1e-5, con
                 futures_ss.append(executor.submit(calculate_surface_surface_intersection, s1, s2, model))
         for future in concurrent.futures.as_completed(futures_ss):
             result = future.result()
-            if result: model.intersections.append(result)
+            if result:
+                # Handle both single intersection and list of intersections
+                if isinstance(result, list):
+                    # Multiple curves - add each intersection separately
+                    model.intersections.extend(result)
+                else:
+                    # Single curve - add as before
+                    model.intersections.append(result)
     report_progress(">...Surface-Surface finished")
 
     # --- Optional: Polyline-Surface Intersections ---
@@ -2736,7 +2873,7 @@ def calculate_constraint_sizes(constraints: List[ConstraintSegment],
         # Update individual point sizes
         for point in constraint.points:
             if hasattr(point, 'size'):
-                point.size = min_size
+                point.size = min(point.size, min_size)
             else:
                 setattr(point, 'size', min_size)
 
@@ -3035,7 +3172,7 @@ def integrate_constraint_processing_workflow(model, config: Dict = None) -> None
                 
                 assign_point_types_and_sizes(all_points, surface_data['size'])
             
-            logger.info(f"Processed constraints for surface {surface_idx}: {len(constraints)} constraint segments")
+            # logger.info(f"Processed constraints for surface {surface_idx}: {len(constraints)} constraint segments")
             
         except Exception as e:
             logger.error(f"Error processing constraints for surface {surface_idx}: {e}")

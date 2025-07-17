@@ -7962,6 +7962,7 @@ segmentation, triangulation, and visualization.
                 self.intersections = []
                 self.triple_points = []
                 self.original_indices = {} # Map model surface index back to original dataset index
+                self.is_polyline = {} # Map surface index to whether it's a polyline (False for all surfaces)
         
         model = ModelWrapper()
         
@@ -8051,6 +8052,7 @@ segmentation, triangulation, and visualization.
                 model_surface_index = len(model.surfaces)
                 model.surfaces.append(surface)
                 model.original_indices[model_surface_index] = original_index # Store mapping
+                model.is_polyline[model_surface_index] = False # All surfaces are not polylines
                 logger.debug(f"Added dataset {original_index} as model surface {model_surface_index}")
             else:
                 # Log if checks fail
@@ -8074,12 +8076,15 @@ segmentation, triangulation, and visualization.
         # --- Run the intersection workflow --- 
         try:
             logger.info("Calling run_intersection_workflow...")
-            # Configure constraint processing for intersection workflow
+            # Configure constraint processing for intersection workflow with enhanced curved surface detection
             intersection_config = {
                 'use_constraint_processing': True,
                 'type_based_sizing': True,
                 'hierarchical_constraints': True,
-                'gradient': 2.0
+                'gradient': 2.0,
+                'use_enhanced_curved_detection': True,  # Enable enhanced curved surface detection
+                'adaptive_sampling': True,               # Enable adaptive sampling for curved surfaces
+                'max_subdivisions': 3                    # Maximum subdivision levels for adaptive sampling
             }
             model = run_intersection_workflow(model, progress_callback, config=intersection_config)
             logger.info("run_intersection_workflow finished.")
@@ -8332,6 +8337,7 @@ segmentation, triangulation, and visualization.
                             continue
                 
                 # Create line segments from valid points
+                line_points = np.array(valid_points) if valid_points else None
                 for i in range(len(valid_points) - 1):
                     segment = pv.Line(valid_points[i], valid_points[i + 1])
                     plotter.add_mesh(segment, color='#FF0000', line_width=6) 
@@ -8356,7 +8362,7 @@ segmentation, triangulation, and visualization.
             plotter.add_axes()
             plotter.reset_camera()
             # Zoom slightly on the selected intersection line (optional)
-            if selected_intersection['points'] and len(selected_intersection['points']) >= 2:
+            if selected_intersection['points'] and len(selected_intersection['points']) >= 2 and line_points is not None and len(line_points) > 0:
                  try:
                       plotter.camera.focal_point = np.mean(line_points, axis=0)
                       # plotter.camera.zoom(1.5) # Adjust zoom factor as needed
@@ -8643,6 +8649,7 @@ segmentation, triangulation, and visualization.
                         continue
                 
                 # Create line segments from valid points
+                line_points = np.array(valid_points) if valid_points else None
                 if len(valid_points) >= 2:
                     for i in range(len(valid_points) - 1):
                         point_a = valid_points[i]
@@ -8678,7 +8685,7 @@ segmentation, triangulation, and visualization.
             plotter.add_axes()
             plotter.reset_camera()
             # Zoom slightly on the selected intersection line (optional)
-            if selected_intersection['points'] and len(selected_intersection['points']) >= 2:
+            if selected_intersection['points'] and len(selected_intersection['points']) >= 2 and line_points is not None and len(line_points) > 0:
                  try:
                       plotter.camera.focal_point = np.mean(line_points, axis=0)
                       # plotter.camera.zoom(1.5) # Adjust zoom factor as needed
