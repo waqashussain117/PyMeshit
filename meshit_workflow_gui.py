@@ -284,6 +284,10 @@ class MeshItWorkflowGUI(QMainWindow):
         self.current_plotter = None
         self.pv_plotter = None
         
+        # Visualization optimization - prevent duplicate rendering
+        self.segmentation_visualized = False  # Track if segmentation is already visualized
+        self.current_visualization_tab = None  # Track which tab is currently active for visualization
+        
         # Initialize legend widgets
         self.file_legend_widget = None
         self.hull_legend_widget = None
@@ -5801,6 +5805,26 @@ segmentation, triangulation, and visualization.
         self.file_viz_placeholder.setAlignment(Qt.AlignCenter)
         self.file_viz_layout.addWidget(self.file_viz_placeholder)
     
+    def _should_skip_segmentation_visualization(self, current_tab):
+        """
+        Check if segmentation visualization should be skipped to prevent duplication.
+        Returns True if segmentation is already visualized in a previous tab.
+        """
+        # If we're in triangulation tab and segmentation is already visualized, skip it
+        if current_tab == "triangulation" and self.segmentation_visualized:
+            return True
+        return False
+    
+    def _mark_segmentation_visualized(self, tab_name):
+        """Mark that segmentation has been visualized in the specified tab."""
+        self.segmentation_visualized = True
+        self.current_visualization_tab = tab_name
+    
+    def _clear_segmentation_visualization_flag(self):
+        """Clear the segmentation visualization flag when data changes."""
+        self.segmentation_visualized = False
+        self.current_visualization_tab = None
+    
     def _update_visualization(self):
         """Update all visualizations based on loaded datasets"""
         # Check if we have any datasets
@@ -5814,6 +5838,9 @@ segmentation, triangulation, and visualization.
         if not visible_datasets:
             self._clear_visualizations()
             return
+        
+        # Clear segmentation visualization flag when updating all visualizations
+        self._clear_segmentation_visualization_flag()
         
         # Update points visualization
         self._visualize_all_points()
@@ -5874,6 +5901,9 @@ segmentation, triangulation, and visualization.
                 # Add to datasets
                 self.datasets.append(dataset)
                 self.current_dataset_index = len(self.datasets) - 1
+                
+                # Clear visualization flags when new data is loaded
+                self._clear_segmentation_visualization_flag()
                 
                 # Update UI
                 self._update_dataset_list()
@@ -6140,6 +6170,9 @@ segmentation, triangulation, and visualization.
             self._clear_segment_plot()
             return
         
+        # Mark that segmentation is being visualized in this tab
+        self._mark_segmentation_visualized("segmentation")
+        
         # Clear existing visualization
         while self.segment_viz_layout.count():
             item = self.segment_viz_layout.takeAt(0)
@@ -6247,6 +6280,9 @@ segmentation, triangulation, and visualization.
     
     def _visualize_all_triangulations(self):
         """Visualize all visible datasets' triangulations"""
+        # Check if we should skip segmentation visualization to prevent duplication
+        skip_segmentation = self._should_skip_segmentation_visualization("triangulation")
+        
         # Get visible datasets with triangulations
         visible_datasets = [d for d in self.datasets if d.get('visible', True) and d.get('triangulation_result') is not None]
         
@@ -7482,11 +7518,16 @@ segmentation, triangulation, and visualization.
             else: self._clear_hull_plot(); self.statusBar().showMessage("No visible hulls computed.")
         elif current_tab_widget == self.segment_tab:  # Segment tab
             needs_update = any(d.get('visible', True) and d.get('segments') is not None for d in self.datasets)
-            if needs_update: self._visualize_all_segments()
+            if needs_update: 
+                # Clear flag before visualizing in segmentation tab
+                self._clear_segmentation_visualization_flag()
+                self._visualize_all_segments()
             else: self._clear_segment_plot(); self.statusBar().showMessage("No visible segments computed.")
         elif current_tab_widget == self.triangulation_tab:  # Triangulation tab
             needs_update = any(d.get('visible', True) and d.get('triangulation_result') is not None for d in self.datasets)
-            if needs_update: self._visualize_all_triangulations()
+            if needs_update: 
+                # Only visualize triangulation, skip segments if already visualized
+                self._visualize_all_triangulations()
             else: self._clear_triangulation_plot(); self.statusBar().showMessage("No visible triangulations computed.")
         elif current_tab_widget == self.intersection_tab:  # Intersection tab
             has_intersections = hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections)
@@ -7751,9 +7792,11 @@ segmentation, triangulation, and visualization.
         logger.debug("Thread and worker references cleared.")
 
         self._enable_compute_buttons()
-        # Update visualization and stats - This happens via QTimer in _compute_global_intersections for intersections
+        # OPTIMIZATION: Update visualization only for current tab instead of all tabs
         if not is_intersection_task:
-            self._update_visualization() 
+            # Only update visualization for the currently active tab to reduce load
+            current_index = self.notebook.currentIndex()
+            self._on_tab_changed(current_index)  # This will update only the current tab
             self._update_statistics()
         else:
             # For intersections, the updates are already scheduled via QTimer.singleShot
