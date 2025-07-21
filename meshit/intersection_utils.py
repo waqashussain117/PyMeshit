@@ -2216,18 +2216,59 @@ def refine_intersection_line_by_length(intersection, target_length, min_angle_de
     # Always keep last point (even if DEFAULT - it becomes an anchor)
     if len(original_points) > 1:
         last_point = original_points[-1]
-        # Avoid duplicating if it's the same as first (closed loop)
-        if (last_point - anchor_points[0]).length() > 1e-8:
+        # For closed loops (circular intersections), we need to detect if this is a closed curve
+        # and handle it properly instead of removing the last point
+        distance_to_first = (last_point - anchor_points[0]).length()
+        is_closed_loop = distance_to_first < 1e-6
+        
+        if is_closed_loop:
+            logger.info(f"Detected CLOSED LOOP: last point ({last_point.x:.3f}, {last_point.y:.3f}, {last_point.z:.3f}) "
+                        f"is {distance_to_first:.2e} from first point - preserving closed structure")
+            # For closed loops, we still add the last point but mark it specially
+            last_point.point_type = "LOOP_END"
+            anchor_points.append(last_point)
+        else:
             anchor_points.append(last_point)
             logger.info(f"Anchor: LAST point ({last_point.x:.3f}, {last_point.y:.3f}, {last_point.z:.3f}) "
                         f"Type: {getattr(last_point, 'point_type', 'DEFAULT')}")
     
     logger.info(f"Anchor points after filtering: {len(anchor_points)}")
     
+    # Special handling for circular intersections with insufficient anchor points
+    # If we have very few anchor points but many original points, it might be a circular intersection
+    # where most points were marked as DEFAULT but we need to preserve the shape
+    if len(anchor_points) < 3 and len(original_points) > 6:
+        logger.info("CIRCULAR INTERSECTION DETECTED: Few anchor points but many original points")
+        logger.info("Using enhanced preservation strategy for circular geometry")
+        
+        # For circular intersections, preserve more points by using a sampling strategy
+        # Take every nth point to maintain the circular shape
+        sampling_interval = max(1, len(original_points) // 8)  # Sample ~8 points around the circle
+        anchor_points = []
+        
+        for i in range(0, len(original_points), sampling_interval):
+            point = original_points[i]
+            # Mark sampled points as special to preserve them
+            point.point_type = "CIRCULAR_SAMPLE"
+            anchor_points.append(point)
+            logger.info(f"Circular sample: ({point.x:.3f}, {point.y:.3f}, {point.z:.3f})")
+        
+        # Always include the last point for closed loops
+        if len(original_points) > 1:
+            last_point = original_points[-1]
+            if (last_point - anchor_points[0]).length() < 1e-6:
+                last_point.point_type = "CIRCULAR_LOOP_END"
+            else:
+                last_point.point_type = "CIRCULAR_END"
+            anchor_points.append(last_point)
+        
+        logger.info(f"Enhanced anchor points for circular intersection: {len(anchor_points)}")
+    
     # Step 2: Subdivide segments between anchor points
     refined_points = []
     
     if not anchor_points:
+        logger.warning("No anchor points available - returning original points")
         return original_points
     
     refined_points.append(anchor_points[0])
@@ -2283,19 +2324,32 @@ def refine_intersection_line_by_length(intersection, target_length, min_angle_de
             if hasattr(first_p, 'type'):
                 first_p.type = first_p.point_type
         
-        # Handle last point
+        # Handle last point - special handling for closed loops
         if len(refined_points) > 1:
             last_p = refined_points[-1]
             lp_type = getattr(last_p, 'point_type', "DEFAULT")
             if lp_type is None:
                 lp_type = "DEFAULT"
-            if lp_type == "DEFAULT" or "END_POINT" not in lp_type:
-                if lp_type == "DEFAULT":
-                    last_p.point_type = "END_POINT"
-                else:
-                    last_p.point_type = f"{lp_type}_END_POINT"
-                if hasattr(last_p, 'type'):
-                    last_p.type = last_p.point_type
+            
+            # Check if this is a closed loop (circular intersection)
+            distance_to_first = (last_p - refined_points[0]).length()
+            is_closed_loop = distance_to_first < 1e-6
+            
+            if is_closed_loop:
+                # For closed loops, preserve the loop structure
+                if "LOOP_END" not in lp_type and "CIRCULAR" not in lp_type:
+                    last_p.point_type = f"{lp_type}_LOOP_END"
+                logger.info(f"Preserved closed loop structure: last point type = {last_p.point_type}")
+            else:
+                # Regular open line handling
+                if lp_type == "DEFAULT" or "END_POINT" not in lp_type:
+                    if lp_type == "DEFAULT":
+                        last_p.point_type = "END_POINT"
+                    else:
+                        last_p.point_type = f"{lp_type}_END_POINT"
+            
+            if hasattr(last_p, 'type'):
+                last_p.type = last_p.point_type
         else:
             # Single point case
             refined_points[0].point_type = "START_POINT_END_POINT"
@@ -2792,6 +2846,7 @@ def calculate_constraints_for_surface(surface_data: Dict, intersections_on_surfa
 def split_line_at_special_points(points: List[Vector3D], default_size: float) -> List[List[Vector3D]]:
     """
     Split a line at special points (non-DEFAULT types) following C++ logic.
+    Enhanced to handle circular/closed loop intersections properly.
     
     This implements the C++ constraint segmentation logic where lines are split
     at points that have special types (TRIPLE_POINT, INTERSECTION_POINT, etc.)
@@ -2806,13 +2861,64 @@ def split_line_at_special_points(points: List[Vector3D], default_size: float) ->
     if len(points) < 2:
         return [points] if points else []
     
+    # Check if this is a closed loop (circular intersection)
+    is_closed_loop = False
+    if len(points) > 2:
+        # Handle both Vector3D objects and [x,y,z,type] arrays
+        first_point = points[0]
+        last_point = points[-1]
+        
+        # Convert to Vector3D if needed for distance calculation
+        if isinstance(first_point, list):
+            first_vec = Vector3D(first_point[0], first_point[1], first_point[2])
+            last_vec = Vector3D(last_point[0], last_point[1], last_point[2])
+            distance_first_to_last = (first_vec - last_vec).length()
+            
+            # Check for special loop markers in the type field
+            last_point_type = last_point[3] if len(last_point) > 3 else "DEFAULT"
+        else:
+            # Vector3D objects
+            distance_first_to_last = (first_point - last_point).length()
+            last_point_type = getattr(last_point, 'point_type', getattr(last_point, 'type', "DEFAULT"))
+        
+        is_closed_loop = distance_first_to_last < 1e-4  # More relaxed tolerance for circular intersections
+        
+        logger.info(f"SEGMENTATION: Distance first to last: {distance_first_to_last:.6e}, threshold: 1e-4")
+        
+        # Also check for special loop markers from refinement
+        if ("LOOP_END" in last_point_type or "CIRCULAR" in last_point_type or
+            "CIRCULAR_SAMPLE" in last_point_type):
+            is_closed_loop = True
+            
+        # Additional check: if we have CIRCULAR_SAMPLE points anywhere in the line, it's likely circular
+        if not is_closed_loop:
+            for point in points:
+                if isinstance(point, list):
+                    point_type = point[3] if len(point) > 3 else "DEFAULT"
+                else:
+                    point_type = getattr(point, 'point_type', getattr(point, 'type', "DEFAULT"))
+                
+                if "CIRCULAR" in point_type:
+                    is_closed_loop = True
+                    logger.info(f"SEGMENTATION: Detected circular intersection from point type: {point_type}")
+                    break
+    
+    logger.info(f"SEGMENTATION: Processing {len(points)} points, closed_loop={is_closed_loop}")
+    if is_closed_loop:
+        logger.info("SEGMENTATION: *** CIRCULAR INTERSECTION DETECTED - Will add closing segment ***")
+    
     segments = []
     last_pos = 0
     
     # Iterate through points looking for special points or end of line
     for n in range(1, len(points)):
         point = points[n]
-        point_type = getattr(point, 'point_type', getattr(point, 'type', "DEFAULT"))
+        
+        # Handle both Vector3D objects and [x,y,z,type] arrays
+        if isinstance(point, list):
+            point_type = point[3] if len(point) > 3 else "DEFAULT"
+        else:
+            point_type = getattr(point, 'point_type', getattr(point, 'type', "DEFAULT"))
         
         # Split at special points or at the end of the line
         if point_type != "DEFAULT" or n == len(points) - 1:
@@ -2820,12 +2926,35 @@ def split_line_at_special_points(points: List[Vector3D], default_size: float) ->
             segment_points = points[last_pos:n+1]
             if len(segment_points) >= 2:
                 segments.append(segment_points)
+                logger.info(f"SEGMENTATION: Added segment {len(segments)} with {len(segment_points)} points")
             last_pos = n
+    
+    # CRITICAL FIX: For closed loops, add the closing segment
+    if is_closed_loop and len(points) > 2:
+        # Create the closing segment from last point back to first point
+        # Handle both Vector3D objects and [x,y,z,type] arrays
+        if isinstance(points[0], list):
+            # For [x,y,z,type] arrays, create Vector3D objects for the closing segment
+            last_vec = Vector3D(points[-1][0], points[-1][1], points[-1][2])
+            first_vec = Vector3D(points[0][0], points[0][1], points[0][2])
+            # Copy type information if available
+            if len(points[-1]) > 3:
+                last_vec.point_type = points[-1][3]
+            if len(points[0]) > 3:
+                first_vec.point_type = points[0][3]
+            closing_segment = [last_vec, first_vec]
+        else:
+            # For Vector3D objects, use directly
+            closing_segment = [points[-1], points[0]]
+        
+        segments.append(closing_segment)
+        logger.info(f"SEGMENTATION: Added CLOSING segment for circular intersection with {len(closing_segment)} points")
     
     # Handle case where no special points were found
     if not segments and len(points) >= 2:
         segments.append(points)
     
+    logger.info(f"SEGMENTATION: Generated {len(segments)} total segments")
     return segments
 
 def calculate_constraint_sizes(constraints: List[ConstraintSegment], 
