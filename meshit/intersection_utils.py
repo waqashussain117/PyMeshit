@@ -1845,36 +1845,33 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
         if final_count != original_count:
             logger.info(f"Cleaned convex hull: {original_count} -> {final_count} points")
         
-        # Refine the hull by length (like C++ RefineByLength)
-        target_length = getattr(surface, 'size', 0.1)
-        if target_length > 1e-6:
-            refined_hull = []
-            
+                # -------------------------------------------------------------
+        # Split any edge longer than 1.3*target_len.
+        # Do NOT remove existing vertices – keeps topology intact.
+        # -------------------------------------------------------------
+        tgt = getattr(surface, "size", 0.1)
+        if tgt > 1e-6:
+            refined = []
             for i in range(len(surface.convex_hull)):
                 p1 = surface.convex_hull[i]
                 p2 = surface.convex_hull[(i + 1) % len(surface.convex_hull)]
-                
-                # Always add the current point
-                refined_hull.append(p1)
-                
-                # Check if we need to add intermediate points
-                segment_length = (p2 - p1).length()
-                if segment_length > target_length * 1.2:  # Add buffer to avoid tiny segments
-                    num_segments = max(1, int(round(segment_length / target_length)))
-                    segment_vector = (p2 - p1) / num_segments
-                    
-                    # Add intermediate points
-                    for j in range(1, num_segments):
-                        new_point = Vector3D(
-                            p1.x + segment_vector.x * j,
-                            p1.y + segment_vector.y * j,
-                            p1.z + segment_vector.z * j,
-                            point_type="DEFAULT"
+
+                refined.append(p1)                    # always keep vertex
+
+                seg_len = (p2 - p1).length()
+                if seg_len > 1.3 * tgt:               # oversize → split
+                    n_seg = max(1, round(seg_len / tgt))
+                    step = (p2 - p1) / n_seg
+                    for k in range(1, n_seg):
+                        refined.append(
+                            Vector3D(p1.x + step.x * k,
+                                     p1.y + step.y * k,
+                                     p1.z + step.z * k,
+                                     point_type="DEFAULT")
                         )
-                        refined_hull.append(new_point)
-            
-            surface.convex_hull = refined_hull
-            surface.convex_hull = clean_identical_points(surface.convex_hull)
+
+            surface.convex_hull = clean_identical_points(refined)
+            logger.info(f"Refined hull → {len(surface.convex_hull)} pts")
             
             logger.info(f"Refined convex hull for surface {surface_idx}: final count = {len(surface.convex_hull)} points")
         
@@ -1885,6 +1882,7 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
             if pt_type != "DEFAULT":
                 special_count += 1
                 # logger.info(f"  Special hull point: ({pt.x:.3f}, {pt.y:.3f}, {pt.z:.3f}) type={pt_type}")
+        surface.hull_points = surface.convex_hull[:]  # shallow copy
         
         logger.info(f"Convex hull alignment complete for surface {surface_idx}: {special_count} special points out of {len(surface.convex_hull)} total")
 
@@ -2162,206 +2160,152 @@ import math # Ensure math is imported
 
 # ... (Vector3D, Intersection, compute_angle_between_segments, clean_identical_points - assumed to be present) ...
 
-def refine_intersection_line_by_length(intersection, target_length, min_angle_deg=20.0, uniform_meshing=True):
+def refine_intersection_line_by_length(intersection,
+                                       target_length,
+                                       min_angle_deg: float = 20.0,
+                                       uniform_meshing: bool = True):
     """
-    Refines an intersection line by length following the C++ MeshIt RefineByLength logic.
-    
-    C++ Algorithm:
-    1. Remove all points with type "DEFAULT" 
-    2. Keep only special points (TRIPLE_POINT, SPECIAL_POINT, etc.) as anchor points
-    3. Subdivide segments between anchor points to target_length
-    4. New subdivision points are marked as "DEFAULT"
-    
-    Args:
-        intersection: Intersection object to refine
-        target_length: Target segment length
-        min_angle_deg: Minimum angle for mesh quality (not used for point classification)
-        uniform_meshing: If True, use round(); if False, use ceil()
-    
-    Returns:
-        List of refined points
+    Python re-implementation of C++ MeshIt::C_Line::RefineByLength()
+    enhanced for curved / circular intersection lines.
+
+    • Removes intermediary DEFAULT points, keeping “special” anchors
+    • Sub-divides between anchors so that chord length ≈ target_length
+      – **Subdivision is carried out on the original poly-line arc-length
+        (like getPointAtPos in C++), so curved geometry is preserved.**
+    • Handles closed loops and huge convex-hulls automatically.
+
+    Returns
+    -------
+    List[Vector3D]  (also written back to intersection.points)
     """
-    if not intersection.points or len(intersection.points) < 2:
-        logger.info("REFINE_LINE: Not enough points to refine.")
-        return intersection.points if hasattr(intersection, 'points') else []
 
-    logger.info("==================================================")
-    logger.info(f"REFINE_LINE (C++ Logic): TargetLen={target_length:.3f}")
-    logger.info(f"Original points count: {len(intersection.points)}")
+    # ------------------------------------------------------------------
+    # quick sanity
+    # ------------------------------------------------------------------
+    if not getattr(intersection, "points", None) or len(intersection.points) < 2:
+        return intersection.points
 
-    original_points = intersection.points
-    
-    # Step 1: Create anchor line - remove all DEFAULT points, keep only special points
-    # This mirrors the C++ logic exactly
-    anchor_points = []
-    
-    # Always keep first point (even if DEFAULT - it becomes an anchor)
-    first_point = original_points[0]
-    anchor_points.append(first_point)
-    logger.info(f"Anchor: FIRST point ({first_point.x:.3f}, {first_point.y:.3f}, {first_point.z:.3f}) "
-                f"Type: {getattr(first_point, 'point_type', 'DEFAULT')}")
-    
-    # Keep middle points only if they are NOT "DEFAULT"
-    for i in range(1, len(original_points) - 1):
-        point = original_points[i]
-        point_type = getattr(point, 'point_type', None)
-        
-        if point_type and point_type != "DEFAULT":
-            anchor_points.append(point)
-            logger.info(f"Anchor: SPECIAL point ({point.x:.3f}, {point.y:.3f}, {point.z:.3f}) "
-                        f"Type: {point_type}")
-        else:
-            logger.info(f"Removed: DEFAULT point ({point.x:.3f}, {point.y:.3f}, {point.z:.3f})")
-    
-    # Always keep last point (even if DEFAULT - it becomes an anchor)
-    if len(original_points) > 1:
-        last_point = original_points[-1]
-        # For closed loops (circular intersections), we need to detect if this is a closed curve
-        # and handle it properly instead of removing the last point
-        distance_to_first = (last_point - anchor_points[0]).length()
-        is_closed_loop = distance_to_first < 1e-6
-        
-        if is_closed_loop:
-            logger.info(f"Detected CLOSED LOOP: last point ({last_point.x:.3f}, {last_point.y:.3f}, {last_point.z:.3f}) "
-                        f"is {distance_to_first:.2e} from first point - preserving closed structure")
-            # For closed loops, we still add the last point but mark it specially
-            last_point.point_type = "LOOP_END"
-            anchor_points.append(last_point)
-        else:
-            anchor_points.append(last_point)
-            logger.info(f"Anchor: LAST point ({last_point.x:.3f}, {last_point.y:.3f}, {last_point.z:.3f}) "
-                        f"Type: {getattr(last_point, 'point_type', 'DEFAULT')}")
-    
-    logger.info(f"Anchor points after filtering: {len(anchor_points)}")
-    
-    # Special handling for circular intersections with insufficient anchor points
-    # If we have very few anchor points but many original points, it might be a circular intersection
-    # where most points were marked as DEFAULT but we need to preserve the shape
-    if len(anchor_points) < 3 and len(original_points) > 6:
-        logger.info("CIRCULAR INTERSECTION DETECTED: Few anchor points but many original points")
-        logger.info("Using enhanced preservation strategy for circular geometry")
-        
-        # For circular intersections, preserve more points by using a sampling strategy
-        # Take every nth point to maintain the circular shape
-        sampling_interval = max(1, len(original_points) // 8)  # Sample ~8 points around the circle
-        anchor_points = []
-        
-        for i in range(0, len(original_points), sampling_interval):
-            point = original_points[i]
-            # Mark sampled points as special to preserve them
-            point.point_type = "CIRCULAR_SAMPLE"
-            anchor_points.append(point)
-            logger.info(f"Circular sample: ({point.x:.3f}, {point.y:.3f}, {point.z:.3f})")
-        
-        # Always include the last point for closed loops
-        if len(original_points) > 1:
-            last_point = original_points[-1]
-            if (last_point - anchor_points[0]).length() < 1e-6:
-                last_point.point_type = "CIRCULAR_LOOP_END"
-            else:
-                last_point.point_type = "CIRCULAR_END"
-            anchor_points.append(last_point)
-        
-        logger.info(f"Enhanced anchor points for circular intersection: {len(anchor_points)}")
-    
-    # Step 2: Subdivide segments between anchor points
-    refined_points = []
-    
-    if not anchor_points:
-        logger.warning("No anchor points available - returning original points")
-        return original_points
-    
-    refined_points.append(anchor_points[0])
-    
-    for i in range(len(anchor_points) - 1):
-        p1 = anchor_points[i]
-        p2 = anchor_points[i + 1]
-        
-        segment_vec = p2 - p1
-        segment_length = segment_vec.length()
-        
-        if segment_length < 1e-7:  # Skip zero-length segments
+    original_pts: list[Vector3D] = intersection.points
+
+    # ------------------------------------------------------------------
+    # helpers  –  miniature versions of C++  NsPos & getPointAtPos
+    # ------------------------------------------------------------------
+    def _cum_dist(pts):
+        """Cumulative arc-length positions of the poly-line."""
+        out = [0.0]
+        for i in range(1, len(pts)):
+            out.append(out[-1] + (pts[i] - pts[i - 1]).length())
+        return out
+
+    def _point_at_pos(pts, cum, s):
+        """
+        Interpolated point at cumulative position *s* (0 ≤ s ≤ cum[-1]).
+        """
+        if s <= 0.0:
+            base = pts[0]
+            return Vector3D(base.x, base.y, base.z, point_type="DEFAULT")
+        if s >= cum[-1]:
+            base = pts[-1]
+            return Vector3D(base.x, base.y, base.z, point_type="DEFAULT")
+
+        import bisect
+        idx = bisect.bisect_left(cum, s)
+        # exact hit
+        if cum[idx] == s:
+            base = pts[idx]
+            return Vector3D(base.x, base.y, base.z, point_type="DEFAULT")
+
+        s0, s1 = cum[idx - 1], cum[idx]
+        t = (s - s0) / (s1 - s0)
+        p0, p1 = pts[idx - 1], pts[idx]
+        interp = p0 + (p1 - p0) * t
+        return Vector3D(interp.x, interp.y, interp.z, point_type="DEFAULT")
+
+    cum_dist = _cum_dist(original_pts)
+    if cum_dist[-1] < 1e-9:                 # degenerate
+        return original_pts
+
+    # ------------------------------------------------------------------
+    # STEP-1  build anchor list  (keep first/last, all non-DEFAULT between)
+    # ------------------------------------------------------------------
+    anchors: list[Vector3D] = []
+    anchors.append(original_pts[0])         # first – even if DEFAULT
+
+    for p in original_pts[1:-1]:
+        ptype = getattr(p, "point_type", getattr(p, "type", "DEFAULT"))
+        if ptype and ptype != "DEFAULT":
+            anchors.append(p)
+
+    anchors.append(original_pts[-1])        # last
+
+    # extra safeguard for near-circular curves where all pts were DEFAULT
+    if len(anchors) < 3 and len(original_pts) > 6:
+        span = max(1, len(original_pts)//8)
+        anchors = [original_pts[i] for i in range(0, len(original_pts), span)]
+        anchors.append(original_pts[-1])
+
+    # ------------------------------------------------------------------
+    # map each anchor → its cumulative arc-length pos
+    # ------------------------------------------------------------------
+    anchor_pos = []
+    pos_lookup = {id(pt): idx for idx, pt in enumerate(original_pts)}
+    for a in anchors:
+        idx = pos_lookup.get(id(a))
+        # fallback on coordinate match
+        if idx is None:
+            idx = next((i for i, q in enumerate(original_pts)
+                        if (q - a).length() < 1e-9), 0)
+        anchor_pos.append(cum_dist[idx])
+
+    # ------------------------------------------------------------------
+    # STEP-2  produce refined list
+    # ------------------------------------------------------------------
+    refined: list[Vector3D] = [anchors[0]]
+    for i in range(len(anchors) - 1):
+        s0, s1 = anchor_pos[i], anchor_pos[i + 1]
+        seg_len = s1 - s0
+        if seg_len < 1e-7:
             continue
-            
-        # Calculate number of subdivisions
-        if target_length < 1e-7:
-            num_subdivisions = 1
-        elif uniform_meshing:
-            num_subdivisions = max(1, round(segment_length / target_length)) # 1 means at least one subdivision
-        else:
-            num_subdivisions = max(1, math.ceil(segment_length / target_length)) # 1 means at least one subdivision
-        
-        logger.info(f"Segment {i}: length={segment_length:.3f}, subdivisions={num_subdivisions}")
-        
-        # Add intermediate points
-        for j in range(1, num_subdivisions):
-            t = j / num_subdivisions
-            new_point = p1 + segment_vec * t
-            new_point.point_type = "DEFAULT"  # New subdivision points are DEFAULT
-            if hasattr(new_point, 'type'):
-                new_point.type = "DEFAULT"
-            refined_points.append(new_point)
-            logger.info(f"  Added subdivision point ({new_point.x:.3f}, {new_point.y:.3f}, {new_point.z:.3f})")
-        
-        # Add the next anchor point
-        refined_points.append(p2)
-    
-    # Clean up any potential duplicates
-    refined_points = clean_identical_points(refined_points)
-    
-    # Step 3: Assign proper start/end types
-    if refined_points:
-        # Handle first point
-        first_p = refined_points[0]
-        fp_type = getattr(first_p, 'point_type', "DEFAULT")
-        if fp_type is None:
-            fp_type = "DEFAULT"
-        if fp_type == "DEFAULT" or "START_POINT" not in fp_type:
-            if fp_type == "DEFAULT":
-                first_p.point_type = "START_POINT"
+
+        ratio = seg_len / max(target_length, 1e-9)
+        pts_cnt = (round(ratio) if uniform_meshing
+                   else math.ceil(ratio))
+        pts_cnt = max(1, pts_cnt)
+        step = seg_len / pts_cnt
+
+        # insert intermediate samples
+        for k in range(1, pts_cnt):
+            s = s0 + step * k
+            refined.append(_point_at_pos(original_pts, cum_dist, s))
+
+        refined.append(anchors[i + 1])
+
+    refined = clean_identical_points(refined)
+
+    # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+    # STEP-3  tag start / end  (and guarantee closed-loop duplication)
+    # ------------------------------------------------------------------
+    if refined:
+        refined[0].point_type = refined[0].type = "START_POINT"
+
+        closed = (refined[-1] - refined[0]).length() < 1e-8
+        if closed:
+            # keep BOTH points: first = START_POINT, last = LOOP_END
+            if refined[-1] is refined[0]:
+                # they are actually the same object – append a clone
+                p0 = refined[0]
+                refined.append(
+                    Vector3D(p0.x, p0.y, p0.z, point_type="LOOP_END")
+                )
             else:
-                first_p.point_type = f"{fp_type}_START_POINT"
-            if hasattr(first_p, 'type'):
-                first_p.type = first_p.point_type
-        
-        # Handle last point - special handling for closed loops
-        if len(refined_points) > 1:
-            last_p = refined_points[-1]
-            lp_type = getattr(last_p, 'point_type', "DEFAULT")
-            if lp_type is None:
-                lp_type = "DEFAULT"
-            
-            # Check if this is a closed loop (circular intersection)
-            distance_to_first = (last_p - refined_points[0]).length()
-            is_closed_loop = distance_to_first < 1e-6
-            
-            if is_closed_loop:
-                # For closed loops, preserve the loop structure
-                if "LOOP_END" not in lp_type and "CIRCULAR" not in lp_type:
-                    last_p.point_type = f"{lp_type}_LOOP_END"
-                logger.info(f"Preserved closed loop structure: last point type = {last_p.point_type}")
-            else:
-                # Regular open line handling
-                if lp_type == "DEFAULT" or "END_POINT" not in lp_type:
-                    if lp_type == "DEFAULT":
-                        last_p.point_type = "END_POINT"
-                    else:
-                        last_p.point_type = f"{lp_type}_END_POINT"
-            
-            if hasattr(last_p, 'type'):
-                last_p.type = last_p.point_type
+                refined[-1].point_type = refined[-1].type = "LOOP_END"
         else:
-            # Single point case
-            refined_points[0].point_type = "START_POINT_END_POINT"
-            if hasattr(refined_points[0], 'type'):
-                refined_points[0].type = "START_POINT_END_POINT"
-    
-    logger.info(f"Final refined points count: {len(refined_points)}")
-    
-    # Update the intersection object
-    intersection.points = refined_points
-    
-    return refined_points
+            refined[-1].point_type = refined[-1].type = "END_POINT"
+
+    # write back & return
+    intersection.points = refined
+    return refined
 
 def prepare_plc_for_surface_triangulation(surface_data, intersections_on_surface_data, config):
     """
@@ -2756,91 +2700,83 @@ class GradientControl:
         
         return adjusted_sizes
 
-def calculate_constraints_for_surface(surface_data: Dict, intersections_on_surface: List[Dict]) -> List[ConstraintSegment]:
+def calculate_constraints_for_surface(surface_data: Dict,
+                                      intersections_on_surface: List[Dict]
+                                      ) -> List[ConstraintSegment]:
     """
-    Calculate constraint segments for a surface following C++ MeshIt logic.
-    
-    This function implements the C++ calculate_Constraints() logic:
-    1. Split lines at special points (non-DEFAULT types)
-    2. Create constraint segments between special points
-    3. Assign proper types and sizes
-    
-    Args:
-        surface_data: Dictionary containing surface information including convex_hull
-        intersections_on_surface: List of intersection data for this surface
-        
-    Returns:
-        List of ConstraintSegment objects
+    Build ConstraintSegment objects for one surface.
+
+    Enhancements
+    ------------
+    • Uses surface_data['hull_points'] (refined hull from
+      align_intersections_to_convex_hull) when available, otherwise falls
+      back to surface_data['convex_hull'].
+    • Resamples very long hull edges so that every edge ≈ surface.size.
+    • Splits both hull and intersection lines at every non-DEFAULT point
+      using split_line_at_special_points().
     """
-    constraints = []
-    rgb_counter = [0, 0, 0]  # RGB color counter for visualization
-    
-    def increment_rgb(rgb: List[int]) -> None:
-        """Increment RGB counter for unique constraint colors"""
+    logger = logging.getLogger(__name__)
+    constraints: List[ConstraintSegment] = []
+    rgb = [0, 0, 0]          # simple colour counter ─ R→G→B rollover
+
+    def bump():
         rgb[0] += 1
         if rgb[0] > 255:
-            rgb[0] = 0
-            rgb[1] += 1
+            rgb[0] = 0; rgb[1] += 1
             if rgb[1] > 255:
-                rgb[1] = 0
-                rgb[2] += 1
-                if rgb[2] > 255:
-                    rgb[2] = 0
-    
-    # Process convex hull constraints
-    hull_points = surface_data.get('hull_points', [])
-    if hull_points and len(hull_points) > 1:
-        hull_constraints = split_line_at_special_points(hull_points, surface_data.get('size', 1.0))
-        for constraint_points in hull_constraints:
-            if len(constraint_points) >= 2:
-                # Check if this hull segment contains special points (non-DEFAULT)
-                has_special_points = any(
-                    hasattr(pt, 'type') and pt.type and pt.type != "DEFAULT" 
-                    for pt in constraint_points
-                )
-                
-                constraint = ConstraintSegment(
-                    points=constraint_points,
-                    constraint_type="SEGMENTS" if has_special_points else "UNDEFINED",  # Mark as SEGMENTS if has special points
-                    size=surface_data.get('size', 1.0),
-                    rgb=(rgb_counter[0], rgb_counter[1], rgb_counter[2])
-                )
-                constraints.append(constraint)
-                increment_rgb(rgb_counter)
-    
-    # Process intersection constraints
-    for intersection_data in intersections_on_surface:
-        intersection_points = intersection_data.get('points', [])
-        if not intersection_points:
-            continue
+                rgb[1] = 0; rgb[2] = (rgb[2] + 1) % 256
 
-        intersection_size = intersection_data.get('size', surface_data.get('size', 1.0))
-        
-        if len(intersection_points) == 1:
-            # Single point constraint
-            constraint = ConstraintSegment(
-                points=intersection_points,
-                constraint_type="SEGMENTS",  # Mark intersection points as SEGMENTS
-                size=intersection_size,
-                rgb=(rgb_counter[0], rgb_counter[1], rgb_counter[2])
+    # ──────────────────────────────────────────────────────────
+    # 1.  HULL
+    # ──────────────────────────────────────────────────────────
+    hull_pts = (surface_data.get("hull_points")
+                or surface_data.get("convex_hull")
+                or [])
+    if hull_pts and len(hull_pts) > 1:
+        tgt = surface_data.get("size", 1.0)
+
+        # resample long edges
+        resampled = []
+        for i in range(len(hull_pts)):
+            p1 = hull_pts[i]
+            p2 = hull_pts[(i + 1) % len(hull_pts)]
+            resampled.append(p1)
+            seg_len = (p2 - p1).length()
+            if seg_len > tgt * 1.2:
+                n = max(1, round(seg_len / tgt))
+                step = (p2 - p1) / n
+                for k in range(1, n):
+                    resampled.append(p1 + step * k)
+        hull_pts = clean_identical_points(resampled)
+
+        for seg_pts in split_line_at_special_points(hull_pts, tgt):
+            constraints.append(
+                ConstraintSegment(points=seg_pts,
+                                  constraint_type="SEGMENTS",
+                                  size=tgt,
+                                  rgb=tuple(rgb))
             )
-            constraints.append(constraint)
-            increment_rgb(rgb_counter)
-        else:
-            # Multi-point constraint - split at special points
-            intersection_constraints = split_line_at_special_points(intersection_points, intersection_size)
-            for constraint_points in intersection_constraints:
-                if len(constraint_points) >= 2:
-                    constraint = ConstraintSegment(
-                        points=constraint_points,
-                        constraint_type="SEGMENTS",  # Mark intersection lines as SEGMENTS
-                        size=intersection_size,
-                        rgb=(rgb_counter[0], rgb_counter[1], rgb_counter[2])
-                    )
-                    constraints.append(constraint)
-                    increment_rgb(rgb_counter)
+            bump()
 
-    logger.info(f"Generated {len(constraints)} constraint segments for surface")
+    # ──────────────────────────────────────────────────────────
+    # 2.  INTERSECTION LINES
+    # ──────────────────────────────────────────────────────────
+    for inter in intersections_on_surface:
+        pts = inter.get("points", [])
+        if len(pts) < 2:
+            continue
+        size = inter.get("size", surface_data.get("size", 1.0))
+        for seg_pts in split_line_at_special_points(pts, size):
+            constraints.append(
+                ConstraintSegment(points=seg_pts,
+                                  constraint_type="SEGMENTS",
+                                  size=size,
+                                  rgb=tuple(rgb))
+            )
+            bump()
+
+    logger.info(f"Generated {len(constraints)} constraint segments "
+                f"for surface '{surface_data.get('name', '?')}'")
     return constraints
 
 def split_line_at_special_points(points: List[Vector3D], default_size: float) -> List[List[Vector3D]]:

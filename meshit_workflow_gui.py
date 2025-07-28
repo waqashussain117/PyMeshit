@@ -2782,38 +2782,89 @@ class MeshItWorkflowGUI(QMainWindow):
             if primary_key_ds not in self.datasets_intersections:
                  self.datasets_intersections[primary_key_ds] = []
             
-            # Check if this specific intersection is already added under this key to avoid exact duplicates
-            already_added = False
-            for existing_entry in self.datasets_intersections[primary_key_ds]:
-                if (existing_entry['dataset_id1'] == original_id1 and \
-                    existing_entry['dataset_id2'] == original_id2 and \
-                    existing_entry['is_polyline_mesh'] == intersection.is_polyline_mesh) or \
-                   (existing_entry['dataset_id1'] == original_id2 and \
-                    existing_entry['dataset_id2'] == original_id1 and \
-                    existing_entry['is_polyline_mesh'] == intersection.is_polyline_mesh) :
-                    # A more robust check might compare point lists if order can vary
-                    if len(existing_entry['points']) == len(intersection_entry['points']):
-                         already_added = True # Simple check, assume it's the same
-                         break
+                        # ---------------------------------------------------------
+            # Geometry-aware duplicate check
+            # ---------------------------------------------------------
+            def _same_intersection(e1, e2, tol=1e-8):
+                # 1) same dataset pair (order-independent) and same polyline flag
+                if {e1['dataset_id1'], e1['dataset_id2']} != \
+                   {e2['dataset_id1'], e2['dataset_id2']}:
+                    return False
+                if e1['is_polyline_mesh'] != e2['is_polyline_mesh']:
+                    return False
+
+                pts1, pts2 = e1['points'], e2['points']
+                if len(pts1) != len(pts2):
+                    return False
+
+                # 2) endpoints must match (allow reversed order)
+                def _close(p, q):
+                    return (abs(p[0] - q[0]) < tol and
+                            abs(p[1] - q[1]) < tol and
+                            abs(p[2] - q[2]) < tol)
+
+                ends_match = (_close(pts1[0], pts2[0]) and _close(pts1[-1], pts2[-1])) or \
+                             (_close(pts1[0], pts2[-1]) and _close(pts1[-1], pts2[0]))
+                if not ends_match:
+                    return False
+
+                # 3) cheap interior–shape test: centroid distance
+                import numpy as np
+                c1 = np.mean(np.asarray(pts1)[:, :3], axis=0)
+                c2 = np.mean(np.asarray(pts2)[:, :3], axis=0)
+                return np.linalg.norm(c1 - c2) < tol
+
+            already_added = any(
+                _same_intersection(existing, intersection_entry)
+                for existing in self.datasets_intersections[primary_key_ds]
+            )
+
             if not already_added:
                 self.datasets_intersections[primary_key_ds].append(intersection_entry)
 
-            # Store for self.refined_intersections_for_visualization (visualization helper)
-            # This is keyed by *each* dataset involved.
-            for vis_key_id in [original_id1, original_id2]:
+                        # ---------------------------------------------------------
+            # Store in the VIS-layer dictionary
+            # ---------------------------------------------------------
+            for vis_key_id in (original_id1, original_id2):
+
                 if vis_key_id not in self.refined_intersections_for_visualization:
                     self.refined_intersections_for_visualization[vis_key_id] = []
-                # Add if not already present for this specific vis_key_id
-                # (to prevent adding the same intersection twice if original_id1 == original_id2, or if processing from other partner)
+
+                # geometry-aware duplicate test (order-agnostic)
+                def _same_line(a_pts, b_pts, tol=1e-8):
+                    """Return True iff the two polylines are identical
+                    (forward or reversed order) – every point must match."""
+                    if len(a_pts) != len(b_pts):
+                        return False
+
+                    def _close(p, q):
+                        return (abs(p[0] - q[0]) < tol and
+                                abs(p[1] - q[1]) < tol and
+                                abs(p[2] - q[2]) < tol)
+
+                    # forward
+                    if all(_close(pa, pb) for pa, pb in zip(a_pts, b_pts)):
+                        return True
+                    # reversed
+                    if all(_close(pa, pb) for pa, pb in zip(a_pts, reversed(b_pts))):
+                        return True
+                    return False
+                    # centroid test
+                    import numpy as np
+                    c1 = np.mean(np.asarray(a_pts)[:, :3], axis=0)
+                    c2 = np.mean(np.asarray(b_pts)[:, :3], axis=0)
+                    return np.linalg.norm(c1 - c2) < tol
+
                 vis_already_added = any(
-                    ie['dataset_id1'] == intersection_entry['dataset_id1'] and
-                    ie['dataset_id2'] == intersection_entry['dataset_id2'] and
-                    ie['is_polyline_mesh'] == intersection_entry['is_polyline_mesh'] and
-                    len(ie['points']) == len(intersection_entry['points']) # simple identity check
+                    _same_line(intersection_entry['points'], ie['points']) and
+                    ie['is_polyline_mesh'] == intersection_entry['is_polyline_mesh']
                     for ie in self.refined_intersections_for_visualization[vis_key_id]
                 )
+
                 if not vis_already_added:
-                     self.refined_intersections_for_visualization[vis_key_id].append(intersection_entry.copy())
+                    self.refined_intersections_for_visualization[vis_key_id].append(
+                        intersection_entry.copy()
+                    )
 
         # --- NEW: Sync special convex hull points from intersections to hulls ---
         for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
@@ -3207,25 +3258,21 @@ class MeshItWorkflowGUI(QMainWindow):
         
         return unique_intersections
 
-    def _are_intersection_lines_duplicate(self, points1, points2, tolerance=1e-8):
-        """
-        Check if two intersection lines are duplicates based on their endpoints.
-        """
-        if len(points1) != len(points2):
+    def _are_intersection_lines_duplicate(self, pts1, pts2, tol=1e-8):
+        """True iff two intersection polylines are identical point-by-point."""
+        if len(pts1) != len(pts2):
             return False
-        
-        # Check if points match in order or reverse order
-        matches_forward = all(
-            (p1 - p2).length() < tolerance
-            for p1, p2 in zip(points1, points2)
-        )
-        
-        matches_reverse = all(
-            (p1 - p2).length() < tolerance
-            for p1, p2 in zip(points1, reversed(points2))
-        )
-        
-        return matches_forward or matches_reverse
+
+        def _close(pa, pb):
+            return (abs(pa.x - pb.x) < tol and
+                    abs(pa.y - pb.y) < tol and
+                    abs(pa.z - pb.z) < tol)
+
+        forward = all(_close(a, b) for a, b in zip(pts1, pts2))
+        if forward:
+            return True
+        reverse = all(_close(a, b) for a, b in zip(pts1, reversed(pts2)))
+        return reverse
 
     def _find_intersections_for_surface_with_constraints(self, surface_idx):
         """

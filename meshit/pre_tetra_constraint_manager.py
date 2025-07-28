@@ -398,16 +398,23 @@ class PreTetraConstraintManager:
 
     def _segment_at_special_points(self, intersection_line: List[dict]) -> List[List[list]]:
         """
-        Split a poly-line wherever a vertex's type != DEFAULT.
+        Split a poly-line wherever a vertex’s ``type`` ≠ “DEFAULT”.
 
-        Rule:  a special vertex is the *end* of the segment before the split
-               and the *start* of the segment after it.
+        • a *special* vertex is the *end* of the previous segment **and**
+          the *start* of the next one (MeshIt C++ logic)  
+        • for closed loops we make sure the final wrap-around segment
+          (last → first) is always present  
+        • if the line contains **no** special vertices we decompose it
+          into simple edge pairs so every consecutive point becomes its
+          own constraint-segment
         """
 
         if len(intersection_line) < 2:
             return []
 
-        # collect indices of split points (first / last always included)
+        # ------------------------------------------------------------------
+        # 1.  find split indices  (first / last are always split points)
+        # ------------------------------------------------------------------
         split_idx = {0, len(intersection_line) - 1}
         split_idx.update(i for i, v in enumerate(intersection_line)
                          if v['type'] != 'DEFAULT')
@@ -415,14 +422,59 @@ class PreTetraConstraintManager:
         ordered = sorted(split_idx)
         segments: List[List[list]] = []
 
+        # ------------------------------------------------------------------
+        # 2.  build preliminary segments between split points
+        # ------------------------------------------------------------------
         for a, b in zip(ordered[:-1], ordered[1:]):
-            if b - a < 1:                # need at least 2 distinct points
+            if b - a < 1:          # need at least 2 distinct vertices
                 continue
             seg = [v['coord'] for v in intersection_line[a:b + 1]]
             if len(seg) >= 2:
-                # FIXED: Remove the seg[0] != seg[-1] filter that was rejecting closed segments
-                # Both open and closed segments are valid constraints for triangulation
                 segments.append(seg)
+
+        # ------------------------------------------------------------------
+        # 3.  guarantee the *closing* edge of a loop is present
+        # ------------------------------------------------------------------
+        if len(intersection_line) >= 3:
+            p_first = intersection_line[0]['coord']
+            p_last  = intersection_line[-1]['coord']
+
+            # treat as closed if the ends meet (within relaxed tol)
+            is_closed = (p_first - p_last).length() < 1e-3
+
+            if is_closed:
+                def _has_closing() -> bool:
+                    for s in segments:
+                        if (((s[0] - p_first).length() < 1e-6 and
+                             (s[-1] - p_last ).length() < 1e-6) or
+                            ((s[0] - p_last ).length() < 1e-6 and
+                             (s[-1] - p_first).length() < 1e-6)):
+                            return True
+                    return False
+
+                if not _has_closing():
+                    segments.append([p_last, p_first])
+
+        # ------------------------------------------------------------------
+        # 4.  fallback – no special points  ⇒  explode into edge pairs
+        # ------------------------------------------------------------------
+        if len(segments) == 1 and len(segments[0]) == len(intersection_line):
+            expanded: List[List[list]] = []
+            for i in range(len(intersection_line) - 1):
+                a_pt = intersection_line[i]['coord']
+                b_pt = intersection_line[i + 1]['coord']
+                if (a_pt - b_pt).length() > 1e-8:          # skip zero-length
+                    expanded.append([a_pt, b_pt])
+
+            # plus closing edge for genuine loops
+            if (intersection_line[0]['coord'] - intersection_line[-1]['coord']).length() < 1e-3:
+                a_pt = intersection_line[-1]['coord']
+                b_pt = intersection_line[0]['coord']
+                if (a_pt - b_pt).length() > 1e-8:
+                    expanded.append([a_pt, b_pt])
+
+            if expanded:
+                segments = expanded
 
         return segments
     def _create_hull_segments(self, hull: List[list]) -> List[List[list]]:
