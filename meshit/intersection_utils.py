@@ -2817,15 +2817,55 @@ def split_line_at_special_points(points: List[Vector3D], default_size: float) ->
             distance_first_to_last = (first_point - last_point).length()
             last_point_type = getattr(last_point, 'point_type', getattr(last_point, 'type', "DEFAULT"))
         
-        is_closed_loop = distance_first_to_last < 1e-4  # More relaxed tolerance for circular intersections
+        # ENHANCED CIRCULAR DETECTION: Multiple criteria for circular intersections
+        
+        # Criteria 1: Very close first and last points (mathematical closure)
+        close_endpoints = distance_first_to_last < 1e-4
+        
+        # Criteria 2: Special loop markers from refinement
+        has_loop_markers = ("LOOP_END" in last_point_type or "CIRCULAR" in last_point_type or
+                           "CIRCULAR_SAMPLE" in last_point_type)
+        
+        # Criteria 3: Geometric analysis - check if points form a roughly circular path
+        is_geometric_circle = False
+        if len(points) > 10:  # Need enough points for geometric analysis
+            try:
+                # Calculate centroid of all points
+                if isinstance(points[0], list):
+                    coords = [[p[0], p[1], p[2]] for p in points]
+                else:
+                    coords = [[p.x, p.y, p.z] for p in points]
+                
+                import numpy as np
+                coords_array = np.array(coords)
+                centroid = np.mean(coords_array, axis=0)
+                
+                # Calculate distances from centroid to each point
+                distances = [np.linalg.norm(coord - centroid) for coord in coords_array]
+                
+                # Check if distances are roughly consistent (circular pattern)
+                mean_radius = np.mean(distances)
+                radius_std = np.std(distances)
+                radius_variation = radius_std / mean_radius if mean_radius > 0 else float('inf')
+                
+                # If variation in radius is small, it's likely a circle
+                if radius_variation < 0.2:  # 20% variation tolerance
+                    # Additional check: first and last points should be close when projected onto circle
+                    first_radius = distances[0]
+                    last_radius = distances[-1]
+                    if abs(first_radius - last_radius) / mean_radius < 0.1:  # Radii are similar
+                        is_geometric_circle = True
+                        logger.info(f"SEGMENTATION: Detected geometric circle - radius_variation: {radius_variation:.3f}, mean_radius: {mean_radius:.3f}")
+                        
+            except Exception as e:
+                logger.warning(f"SEGMENTATION: Error in geometric circle detection: {e}")
+        
+        # Combine all criteria
+        is_closed_loop = close_endpoints or has_loop_markers or is_geometric_circle
         
         logger.info(f"SEGMENTATION: Distance first to last: {distance_first_to_last:.6e}, threshold: 1e-4")
+        logger.info(f"SEGMENTATION: Close endpoints: {close_endpoints}, Loop markers: {has_loop_markers}, Geometric circle: {is_geometric_circle}")
         
-        # Also check for special loop markers from refinement
-        if ("LOOP_END" in last_point_type or "CIRCULAR" in last_point_type or
-            "CIRCULAR_SAMPLE" in last_point_type):
-            is_closed_loop = True
-            
         # Additional check: if we have CIRCULAR_SAMPLE points anywhere in the line, it's likely circular
         if not is_closed_loop:
             for point in points:
@@ -3069,6 +3109,25 @@ def prepare_constrained_triangulation_input(surface_data: Dict,
             
         elif len(constraint.points) > 1:
             # Multi-point constraint - add ALL points without deduplication
+            # Check if this is a circular constraint (closing segment needed)
+            is_circular = False
+            if len(constraint.points) > 2:
+                first_point = constraint.points[0]
+                last_point = constraint.points[-1]
+                
+                # Check distance between first and last points
+                distance = (first_point - last_point).length()
+                
+                # Check for loop markers from refinement
+                last_point_type = getattr(last_point, 'point_type', getattr(last_point, 'type', "DEFAULT"))
+                
+                # Mark as circular if close distance or special loop markers
+                if (distance < 1e-4 or "LOOP_END" in last_point_type or 
+                    "CIRCULAR" in last_point_type):
+                    is_circular = True
+                    logger.info(f"🔄 CIRCULAR CONSTRAINT DETECTED: distance={distance:.6e}, last_type={last_point_type}")
+            
+            # Process regular segments (i to i+1)
             for i in range(len(constraint.points) - 1):
                 p1 = constraint.points[i]
                 p2 = constraint.points[i + 1]
@@ -3101,6 +3160,34 @@ def prepare_constrained_triangulation_input(surface_data: Dict,
                 
                 # Add segment
                 segments.append([p1_index, p2_index])
+            
+            # CRITICAL FIX: Add closing segment for circular constraints
+            if is_circular and len(constraint.points) > 2:
+                # Add closing segment from last point back to first point
+                last_point = constraint.points[-1]
+                first_point = constraint.points[0]
+                
+                # Add last point
+                last_index = point_index
+                all_points.append({
+                    'point': last_point,
+                    'size': constraint.size,
+                    'index': last_index
+                })
+                point_index += 1
+                
+                # Add first point (as closing point)
+                first_index = point_index
+                all_points.append({
+                    'point': first_point,
+                    'size': constraint.size,
+                    'index': first_index
+                })
+                point_index += 1
+                
+                # Add closing segment
+                segments.append([last_index, first_index])
+                logger.info(f"🔄 ADDED CLOSING SEGMENT for circular constraint: last->first")
     
     # If no constraints were processed, fall back to convex hull
     if not all_points:

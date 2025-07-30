@@ -5,7 +5,7 @@ import logging
 import tetgen
 import pyvista as pv
 from typing import Dict, List, Tuple, Optional, Any, Union
-
+from meshit.intersection_utils import Vector3D
 logger = logging.getLogger("MeshIt-Workflow")
 
 
@@ -164,7 +164,14 @@ class TetrahedralMeshGenerator:
         FIXED: Fault surfaces treated as internal constraints, not boundary facets.
         """
         logger.info("Building final PLC from pre-computed conforming meshes...")
-
+        # ────────────────────────────────────────────────────────────
+        def _xyz(pt) -> List[float]:
+            """Return [x,y,z] from *any* point representation."""
+            if isinstance(pt, Vector3D):
+                return [float(pt.x), float(pt.y), float(pt.z)]
+            # list / tuple / np.ndarray / anything indexable
+            return [float(pt[0]), float(pt[1]), float(pt[2])]
+        # ────────────────────────────────────────────────────────────
         key_to_global_idx = {}
         global_vertices = []
         global_facets = []
@@ -197,7 +204,7 @@ class TetrahedralMeshGenerator:
                 if global_idx is None:
                     global_idx = len(global_vertices)
                     key_to_global_idx[key] = global_idx
-                    global_vertices.append(list(vertex))
+                    global_vertices.append(_xyz(vertex)) 
                 local_to_global_map[local_idx] = global_idx
 
             for tri in local_triangles:
@@ -234,7 +241,7 @@ class TetrahedralMeshGenerator:
                 if global_idx is None:
                     global_idx = len(global_vertices)
                     key_to_global_idx[key] = global_idx
-                    global_vertices.append(list(vertex))
+                    global_vertices.append(_xyz(vertex)) 
                 local_to_global_map[local_idx] = global_idx
 
             # ✅ C++ STYLE: Add fault triangles as constraint facets with unique markers
@@ -273,27 +280,17 @@ class TetrahedralMeshGenerator:
                     
                     gidx_line = []
                     for p in points:
-                        # Enhanced precision matching for constraint points
-                        key = (round(p[0], 9), round(p[1], 9), round(p[2], 9))
+                        key = (round(p[0], 9),
+                               round(p[1], 9),
+                               round(p[2], 9))
+
                         gidx = key_to_global_idx.get(key)
-                        if gidx is not None:
-                            gidx_line.append(gidx)
-                        else:
-                            # Try with slightly relaxed precision for constraint points
-                            found = False
-                            for existing_key, existing_gidx in key_to_global_idx.items():
-                                if (abs(existing_key[0] - key[0]) < 1e-8 and 
-                                    abs(existing_key[1] - key[1]) < 1e-8 and 
-                                    abs(existing_key[2] - key[2]) < 1e-8):
-                                    gidx_line.append(existing_gidx)
-                                    found = True
-                                    break
-                            
-                            if not found:
-                                constraint_point_failures += 1
-                                if constraint_point_failures <= 5:  # Only log first few failures
-                                    logger.warning(f"Constraint point {key} not found in global vertex pool (surface {s_idx}).")
-                    
+                        if gidx is None:
+                            # --- C++-style behaviour: unconditionally add ---
+                            gidx = len(global_vertices)
+                            key_to_global_idx[key] = gidx
+                            global_vertices.append(_xyz(p))
+                        gidx_line.append(gidx)
                     if len(gidx_line) >= 2:
                         for i in range(len(gidx_line) - 1):
                             p1_gidx, p2_gidx = gidx_line[i], gidx_line[i+1]
