@@ -162,16 +162,12 @@ class ComputationWorker(QObject):
 
         for i in datasets_with_hulls_indices:
             if not self._is_running:
-                 logger.info(f"Worker: Segment computation loop canceled at index {i}.")
                  break
             dataset_name = self.gui.datasets[i].get('name', f"Dataset {i}")
-            logger.debug(f"Worker: Computing segments for '{dataset_name}' (index {i}).")
              # Moved the check inside the loop iteration
             if not self._is_running:
-                 logger.info(f"Worker: Segment computation canceled just before processing index {i}.")
                  break
             success = self.gui._compute_segments_for_dataset(i) # Call GUI's compute method
-            logger.debug(f"Worker: Segment computation for index {i} finished (Success: {success}).")
             self.dataset_finished.emit(i, dataset_name, success)
             if success:
                 success_count += 1
@@ -4364,6 +4360,48 @@ segmentation, triangulation, and visualization.
             logger.error(f"Error in simplified hull segmentation for {dataset_name}: {str(e)}")
             return False
 
+    def _find_point_at_distance_fast(self, hull_boundary, cumulative_distances, target_distance):
+        """
+        Optimized version of _find_point_at_distance for better performance.
+        Uses binary search for faster lookup in large hulls.
+        """
+        hull_size = len(hull_boundary)
+        total_perimeter = cumulative_distances[-1]
+        
+        # Handle wrapping around the perimeter
+        target_distance = target_distance % total_perimeter
+        
+        # Binary search for the containing edge (faster for large hulls)
+        left, right = 0, hull_size
+        while left < right - 1:
+            mid = (left + right) // 2
+            if cumulative_distances[mid] <= target_distance:
+                left = mid
+            else:
+                right = mid
+        
+        i = left
+        if i >= hull_size:
+            i = 0
+            
+        # Interpolate between vertices i and (i+1)%hull_size
+        edge_start_dist = cumulative_distances[i]
+        edge_end_dist = cumulative_distances[i + 1]
+        edge_length = edge_end_dist - edge_start_dist
+        
+        if edge_length < 1e-10:  # Very short edge
+            return hull_boundary[i]
+        
+        # Interpolation parameter
+        t = (target_distance - edge_start_dist) / edge_length
+        
+        # Get the two vertices
+        p1 = hull_boundary[i]
+        p2 = hull_boundary[(i + 1) % hull_size]
+        
+        # Linear interpolation
+        return p1 + t * (p2 - p1)
+
     def _find_point_at_distance(self, hull_boundary, cumulative_distances, target_distance):
         """
         Find a point at a specific distance along the hull boundary.
@@ -4462,7 +4500,6 @@ segmentation, triangulation, and visualization.
                 # Use a more conservative approach for complex hulls
                 avg_edge_length = total_perimeter / hull_size
                 min_segment_length = avg_edge_length * 0.5  # Allow smaller segments for complex shapes
-                logger.info(f"Complex hull detected with {hull_size} vertices. Using adaptive segmentation.")
             else:
                 # Simple hull - use original logic
                 avg_edge_length = total_perimeter / hull_size
@@ -4494,16 +4531,16 @@ segmentation, triangulation, and visualization.
                 num_total_segments = max(4, int(np.ceil(total_perimeter / effective_segment_length)))
                 segment_spacing = total_perimeter / num_total_segments
                 
-                logger.info(f"Creating {num_total_segments} uniform segments with spacing {segment_spacing:.2f}")
-                
+                # Optimized segment creation - pre-allocate and compute in batch
+                segments = []
                 for seg_idx in range(num_total_segments):
                     # Calculate start and end positions along the perimeter
                     start_dist = seg_idx * segment_spacing
                     end_dist = ((seg_idx + 1) * segment_spacing) % total_perimeter
                     
-                    # Find start point
-                    start_point = self._find_point_at_distance(hull_boundary, cumulative_distances, start_dist)
-                    end_point = self._find_point_at_distance(hull_boundary, cumulative_distances, end_dist)
+                    # Find start and end points (optimized version)
+                    start_point = self._find_point_at_distance_fast(hull_boundary, cumulative_distances, start_dist)
+                    end_point = self._find_point_at_distance_fast(hull_boundary, cumulative_distances, end_dist)
                     
                     if start_point is not None and end_point is not None:
                         segments.append([start_point, end_point])
@@ -4541,10 +4578,8 @@ segmentation, triangulation, and visualization.
             # Store the segments in the dataset - using a normal list for better performance
             dataset['segments'] = segments
             
-            # Log success information
+            # Log success information (reduced logging for performance)
             logger.info(f"Successfully created {len(segments)} segments for dataset '{dataset_name}'")
-            logger.info(f"Total perimeter: {total_perimeter:.2f}, Effective segment length: {effective_segment_length:.2f}")
-            logger.info(f"Hull complexity: {hull_size} vertices, Segments per vertex: {len(segments)/hull_size:.1f}")
             
             # Clear any previous results from later steps for this dataset
             dataset.pop('triangulation_result', None)
@@ -7349,88 +7384,79 @@ segmentation, triangulation, and visualization.
                         self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.2, render_points_as_spheres=True,
                                         point_size=3, label=f"{name} Original Points")
 
-                        # Collect all segment endpoints to display as distinct points
-                        segment_endpoints = []
-                        valid_segments = 0
-                        
-                        for i, segment in enumerate(segments):
-                            try:
-                                # Ensure segment points are 3D NumPy arrays
-                                p1 = np.array(segment[0], dtype=float)
-                                p2 = np.array(segment[1], dtype=float)
-                                
-                                # Pad with zeros if dimension is less than 3
-                                if len(p1) == 2: 
-                                    p1 = np.append(p1, 0.0)
-                                if len(p2) == 2: 
-                                    p2 = np.append(p2, 0.0)
-
-                                # Validate coordinates
-                                if (len(p1) >= 3 and len(p2) >= 3 and
-                                    np.all(np.isfinite(p1[:3])) and np.all(np.isfinite(p2[:3]))):
-                                    
-                                    # Create line segment
-                                    segment_line = pv.Line(p1[:3], p2[:3])
-                                    self.current_plotter.add_mesh(segment_line, color=color, line_width=3.0, 
-                                                                opacity=0.9, label=f"{name} Segments" if i == 0 else None)
-                                    
-                                    # Collect segment endpoints
-                                    segment_endpoints.append(p1[:3])
-                                    segment_endpoints.append(p2[:3])
-                                    valid_segments += 1
-                                else:
-                                    logger.warning(f"Skipping invalid segment {i} for {name}: p1={p1}, p2={p2}")
-                                    
-                            except Exception as e:
-                                logger.warning(f"Error creating segment {i} for {name}: {e}")
-                                continue
-
-                        # Add segment endpoints as visible points
-                        if segment_endpoints:
-                            # Remove duplicate points (endpoints shared between adjacent segments)
-                            unique_endpoints = []
-                            for endpoint in segment_endpoints:
-                                is_duplicate = False
-                                for existing in unique_endpoints:
-                                    if np.allclose(endpoint, existing, atol=1e-6):
-                                        is_duplicate = True
-                                        break
-                                if not is_duplicate:
-                                    unique_endpoints.append(endpoint)
+                        # OPTIMIZED: Batch process all segments into single line mesh
+                        if segments:
+                            # Pre-allocate arrays for all line points and connectivity
+                            total_lines = len(segments)
+                            line_points = np.zeros((total_lines * 2, 3))  # 2 points per line
+                            line_connectivity = np.zeros(total_lines * 3, dtype=int)  # [2, p1_idx, p2_idx] per line
                             
-                            if unique_endpoints:
-                                endpoints_array = np.array(unique_endpoints)
-                                segment_points = pv.PolyData(endpoints_array)
-                                
-                                # Make segment points more visible - larger size and different color
-                                # Use a contrasting color (red) for segment points
-                                segment_point_color = '#FF0000' if color != '#FF0000' else '#00FF00'
-                                self.current_plotter.add_mesh(segment_points, color=segment_point_color, 
-                                                            render_points_as_spheres=True, point_size=8, 
-                                                            opacity=1.0, label=f"{name} Segment Points")
-                                
-                                logger.info(f"Added {len(unique_endpoints)} segment endpoint markers for dataset '{name}'")
-                                
-                                # Calculate and log segment spacing statistics
-                                if len(unique_endpoints) > 1:
-                                    # Calculate distances between consecutive segment points
-                                    distances = []
-                                    for j in range(len(unique_endpoints) - 1):
-                                        dist = np.linalg.norm(unique_endpoints[j] - unique_endpoints[j+1])
-                                        distances.append(dist)
+                            valid_lines = 0
+                            segment_endpoints_set = set()  # Use set for fast deduplication
+                            
+                            for i, segment in enumerate(segments):
+                                try:
+                                    # Ensure segment points are 3D NumPy arrays
+                                    p1 = np.array(segment[0], dtype=float)
+                                    p2 = np.array(segment[1], dtype=float)
                                     
-                                    # Add distance from last to first point (closing the loop)
-                                    if len(unique_endpoints) > 2:
-                                        closing_dist = np.linalg.norm(unique_endpoints[-1] - unique_endpoints[0])
-                                        distances.append(closing_dist)
-                                    
-                                    if distances:
-                                        avg_distance = np.mean(distances)
-                                        min_distance = np.min(distances)
-                                        max_distance = np.max(distances)
-                                        logger.info(f"Segment point spacing for '{name}': avg={avg_distance:.2f}, min={min_distance:.2f}, max={max_distance:.2f}")
+                                    # Pad with zeros if dimension is less than 3
+                                    if len(p1) == 2: 
+                                        p1 = np.append(p1, 0.0)
+                                    if len(p2) == 2: 
+                                        p2 = np.append(p2, 0.0)
 
-                        logger.info(f"Successfully visualized {valid_segments}/{len(segments)} segments for dataset '{name}'")
+                                    # Validate coordinates
+                                    if (len(p1) >= 3 and len(p2) >= 3 and
+                                        np.all(np.isfinite(p1[:3])) and np.all(np.isfinite(p2[:3]))):
+                                        
+                                        # Add to batch arrays
+                                        point_idx = valid_lines * 2
+                                        line_points[point_idx] = p1[:3]
+                                        line_points[point_idx + 1] = p2[:3]
+                                        
+                                        # Line connectivity: [2, point1_index, point2_index]
+                                        conn_idx = valid_lines * 3
+                                        line_connectivity[conn_idx] = 2
+                                        line_connectivity[conn_idx + 1] = point_idx
+                                        line_connectivity[conn_idx + 2] = point_idx + 1
+                                        
+                                        # Collect endpoints for markers (use tuples for set)
+                                        segment_endpoints_set.add(tuple(p1[:3]))
+                                        segment_endpoints_set.add(tuple(p2[:3]))
+                                        
+                                        valid_lines += 1
+                                        
+                                except Exception as e:
+                                    logger.warning(f"Error processing segment {i} for {name}: {e}")
+                                    continue
+
+                            # Create single mesh for all segments if we have valid lines
+                            if valid_lines > 0:
+                                # Trim arrays to actual size
+                                line_points = line_points[:valid_lines * 2]
+                                line_connectivity = line_connectivity[:valid_lines * 3]
+                                
+                                # Create PolyData with all segments at once
+                                segments_mesh = pv.PolyData(line_points, lines=line_connectivity)
+                                self.current_plotter.add_mesh(segments_mesh, color=color, line_width=3.0, 
+                                                            opacity=0.9, label=f"{name} Segments")
+                                
+                                # Add segment endpoints as visible points (batch processed)
+                                if segment_endpoints_set:
+                                    unique_endpoints = np.array(list(segment_endpoints_set))
+                                    segment_points = pv.PolyData(unique_endpoints)
+                                    
+                                    # Make segment points more visible
+                                    segment_point_color = '#FF0000' if color != '#FF0000' else '#00FF00'
+                                    self.current_plotter.add_mesh(segment_points, color=segment_point_color, 
+                                                                render_points_as_spheres=True, point_size=8, 
+                                                                opacity=1.0, label=f"{name} Segment Points")
+                                    
+                                    logger.info(f"Added {len(unique_endpoints)} segment endpoint markers for dataset '{name}'")
+
+                                logger.info(f"Successfully visualized {valid_lines}/{len(segments)} segments for dataset '{name}'")
+                        
                         plotter_has_geometry = True
 
                 elif view_type == "triangulation":
