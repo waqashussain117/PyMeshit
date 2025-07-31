@@ -1648,7 +1648,7 @@ def make_corners_special(convex_hull: List[Vector3D], angle_threshold_deg: float
     
     Args:
         convex_hull: List of Vector3D points forming the convex hull
-        angle_threshold_deg: Angle threshold in degrees (points with angles > this are marked special)
+        angle_threshold_deg: Angle threshold in degrees (points with angles < this are marked special/CORNER)
     
     Returns:
         Modified convex hull with special points marked
@@ -1657,11 +1657,11 @@ def make_corners_special(convex_hull: List[Vector3D], angle_threshold_deg: float
         return convex_hull
     
     # Convert threshold to radians and to dot product value
-    # For angles > threshold, the dot product will be < cos(threshold)
+    # For sharp angles < threshold, the dot product will be > cos(threshold)
     angle_threshold_rad = math.radians(angle_threshold_deg)
     dot_threshold = math.cos(angle_threshold_rad)
     
-    logger.info(f"Making corners special with angle threshold {angle_threshold_deg}° (dot < {dot_threshold:.3f})")
+    logger.info(f"Making corners special with angle threshold {angle_threshold_deg}° (dot > {dot_threshold:.3f} for sharp corners)")
     
     special_count = 0
     
@@ -1693,9 +1693,10 @@ def make_corners_special(convex_hull: List[Vector3D], angle_threshold_deg: float
             # Calculate dot product
             dot_product = diff1_norm.dot(diff2_norm)
             
-            # Check if angle is sharp enough (dot product < threshold means angle > threshold)
-            # In C++: if (alpha > (-0.5*SQUAREROOTTWO)) which is approximately -0.707 (135°)
-            if dot_product < dot_threshold:
+            # Check if angle is sharp enough (C++ condition: alpha > -0.707 means angle < 135°)
+            # In C++: if (alpha > (-0.5*SQUAREROOTTWO)) marks SHARP corners (< 135°)
+            # So we need: dot_product > dot_threshold for angles < 135°
+            if dot_product > dot_threshold:
                 curr_pt.point_type = "CORNER"
                 if hasattr(curr_pt, 'type'):
                     curr_pt.type = "CORNER"
@@ -1708,7 +1709,7 @@ def make_corners_special(convex_hull: List[Vector3D], angle_threshold_deg: float
                         convex_hull[-1].type = "CORNER"
                 
                 angle_deg = math.degrees(math.acos(max(-1.0, min(1.0, dot_product))))
-                logger.info(f"*** Found CORNER point at ({curr_pt.x:.3f}, {curr_pt.y:.3f}, {curr_pt.z:.3f}) with angle {angle_deg:.1f}° ***")
+                logger.info(f"*** Found CORNER point at ({curr_pt.x:.3f}, {curr_pt.y:.3f}, {curr_pt.z:.3f}) with sharp angle {angle_deg:.1f}° ***")
     
     logger.info(f"Identified {special_count} corner points on convex hull")
     return convex_hull
@@ -1740,6 +1741,87 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
         return
     
     logger.info(f"Aligning intersections to convex hull for surface {surface_idx}")
+    
+    original_hull_size = len(surface.convex_hull)
+    logger.info(f"Original hull size for surface {surface_idx}: {original_hull_size} points")
+    
+    # Simplify overly complex hulls before processing (similar to C++ MeshIt approach)
+    MAX_HULL_POINTS = 100  # Reasonable limit for hull complexity
+    if original_hull_size > MAX_HULL_POINTS:
+        logger.info(f"Hull with {original_hull_size} points is too complex, applying simplification...")
+        
+        # Use the same target size logic as hull refinement for consistent sizing
+        tgt = getattr(surface, "size", 0.1)
+        if tgt <= 1e-6:
+            tgt = 0.1
+            
+        logger.info(f"Using target size {tgt:.6f} for hull simplification")
+        
+        # Calculate total perimeter of the hull
+        total_perimeter = 0.0
+        for i in range(original_hull_size):
+            p1 = surface.convex_hull[i]
+            p2 = surface.convex_hull[(i + 1) % original_hull_size]
+            total_perimeter += (p2 - p1).length()
+        
+        # Calculate target number of points based on perimeter and target size
+        target_points = max(8, min(MAX_HULL_POINTS, int(total_perimeter / tgt)))
+        logger.info(f"Hull perimeter: {total_perimeter:.3f}, target points: {target_points}")
+        
+        if target_points < original_hull_size:
+            # Simplify by sampling points at regular intervals along the perimeter
+            simplified_hull = []
+            target_spacing = total_perimeter / target_points
+            current_distance = 0.0
+            next_target = 0.0
+            
+            # Always include first point
+            simplified_hull.append(surface.convex_hull[0])
+            next_target = target_spacing
+            
+            for i in range(original_hull_size):
+                p1 = surface.convex_hull[i]
+                p2 = surface.convex_hull[(i + 1) % original_hull_size]
+                segment_length = (p2 - p1).length()
+                
+                # Check if we need to add points along this segment
+                while current_distance + segment_length >= next_target and len(simplified_hull) < target_points:
+                    # Calculate interpolation factor
+                    remaining_distance = next_target - current_distance
+                    t = remaining_distance / segment_length if segment_length > 1e-10 else 0.0
+                    
+                    # Create interpolated point
+                    interp_point = Vector3D(
+                        p1.x + t * (p2.x - p1.x),
+                        p1.y + t * (p2.y - p1.y),
+                        p1.z + t * (p2.z - p1.z)
+                    )
+                    
+                    # Preserve corner points if they're close to the interpolated point
+                    pt_type = getattr(p1, 'point_type', getattr(p1, 'type', "DEFAULT"))
+                    if pt_type == "CORNER" and t < 0.1:
+                        simplified_hull.append(p1)
+                    elif i == original_hull_size - 1:  # Last segment, check p2 for corner
+                        pt_type2 = getattr(p2, 'point_type', getattr(p2, 'type', "DEFAULT"))
+                        if pt_type2 == "CORNER" and t > 0.9:
+                            simplified_hull.append(p2)
+                        else:
+                            simplified_hull.append(interp_point)
+                    else:
+                        simplified_hull.append(interp_point)
+                    
+                    next_target += target_spacing
+                
+                current_distance += segment_length
+            
+            # Ensure we have a reasonable number of points
+            if len(simplified_hull) >= 3:
+                surface.convex_hull = simplified_hull
+                logger.info(f"Simplified hull from {original_hull_size} to {len(surface.convex_hull)} points using target size {tgt:.6f}")
+            else:
+                logger.warning(f"Hull simplification resulted in too few points ({len(simplified_hull)}), keeping original")
+        else:
+            logger.info(f"Hull already has appropriate size ({original_hull_size} points for target {target_points})")
     
     # Process all intersections that involve this surface
     for intersection_idx, intersection in enumerate(model.intersections):
@@ -1850,8 +1932,14 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
         # Do NOT remove existing vertices – keeps topology intact.
         # -------------------------------------------------------------
         tgt = getattr(surface, "size", 0.1)
+        logger.info(f"Hull refinement for surface {surface_idx}: target size = {tgt:.6f}, hull length = {len(surface.convex_hull)} points")
+        
         if tgt > 1e-6:
             refined = []
+            segments_refined = 0
+            total_segments = len(surface.convex_hull)
+            segment_lengths = []
+            
             for i in range(len(surface.convex_hull)):
                 p1 = surface.convex_hull[i]
                 p2 = surface.convex_hull[(i + 1) % len(surface.convex_hull)]
@@ -1859,9 +1947,13 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
                 refined.append(p1)                    # always keep vertex
 
                 seg_len = (p2 - p1).length()
+                segment_lengths.append(seg_len)
+                
                 if seg_len > 1.3 * tgt:               # oversize → split
                     n_seg = max(1, round(seg_len / tgt))
                     step = (p2 - p1) / n_seg
+                    segments_refined += 1
+                    
                     for k in range(1, n_seg):
                         refined.append(
                             Vector3D(p1.x + step.x * k,
@@ -1870,7 +1962,14 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
                                      point_type="DEFAULT")
                         )
 
+            # Log segment length statistics
+            if segment_lengths:
+                min_len, max_len, avg_len = min(segment_lengths), max(segment_lengths), sum(segment_lengths)/len(segment_lengths)
+                threshold = 1.3 * tgt
+                logger.info(f"Hull segments: min={min_len:.6f}, max={max_len:.6f}, avg={avg_len:.6f}, threshold={threshold:.6f}")
+            
             surface.convex_hull = clean_identical_points(refined)
+            logger.info(f"Hull refinement result: {segments_refined}/{total_segments} segments refined, {len(refined)} → {len(surface.convex_hull)} points")
             logger.info(f"Refined hull → {len(surface.convex_hull)} pts")
             
             logger.info(f"Refined convex hull for surface {surface_idx}: final count = {len(surface.convex_hull)} points")
@@ -2462,13 +2561,14 @@ def run_constrained_triangulation_py(
         base_size=base_size
     )
 
-    # Run triangulation using DirectTriangleWrapper (uniform=True for consistency)
+    # Run triangulation using DirectTriangleWrapper (FAST PERFORMANCE OPTIMIZATIONS)
     triangulation_result = triangulator.triangulate(
         points=plc_points_2d,
         segments=plc_segments_indices,
         holes=plc_holes_2d,
         uniform=True,  # Use uniform approach like triangulation tab
-        create_transition=True  # Enable enhanced transition point generation
+        create_transition=False,  # PERFORMANCE: Disable expensive transition points
+        create_feature_points=False  # PERFORMANCE: Disable expensive feature points
     )
 
     if triangulation_result is None or 'vertices' not in triangulation_result or 'triangles' not in triangulation_result:
@@ -2500,55 +2600,73 @@ def run_constrained_triangulation_py(
         
         final_vertices_3d = np.zeros((len(vertices_2d), 3))
         
-        logger.info(f"Reconstructing {len(vertices_2d)} vertices from 2D to 3D...")
+        logger.info(f"FAST reconstructing {len(vertices_2d)} vertices from 2D to 3D...")
         
+        # PERFORMANCE OPTIMIZATION: Use KDTree for O(log N) vertex matching instead of O(N²)
+        from scipy.spatial import cKDTree
+        original_kdtree = cKDTree(original_projected_2d)
+        tolerance = 1e-12
+        
+        # Collect unmatched vertices for batch interpolation
+        unmatched_indices = []
+        unmatched_vertices_2d = []
+        
+        # Fast vertex matching using spatial indexing
         for i, vertex_2d in enumerate(vertices_2d):
-            is_matched_point = False
+            # FAST: O(log N) lookup instead of O(N) linear search
+            distances, indices = original_kdtree.query(vertex_2d, k=1)
             
-            # Try to match with original 3D points first (high precision)
-            for j, orig_proj_2d in enumerate(original_projected_2d):
-                if np.allclose(vertex_2d, orig_proj_2d, atol=1e-12):  # High precision matching
-                    final_vertices_3d[i] = original_3d_points_for_plc[j]
-                    is_matched_point = True
-                    break
+            if distances < tolerance and indices < len(original_3d_points_for_plc):
+                final_vertices_3d[i] = original_3d_points_for_plc[indices]
+            else:
+                # Collect for batch interpolation
+                unmatched_indices.append(i)
+                unmatched_vertices_2d.append(vertex_2d)
+        
+        # PERFORMANCE: Batch interpolation for all unmatched vertices
+        if unmatched_indices:
+            logger.info(f"FAST batch interpolating Z values for {len(unmatched_indices)} unmatched vertices")
             
-            # For new Steiner points, use sophisticated interpolation
-            if not is_matched_point:
-                # Extract Z values from original points
-                original_z = original_3d_points_for_plc[:, 2]
-                
-                # Interpolate Z value using original 2D projections
-                from scipy.spatial import distance
+            # Extract Z values from original points
+            original_z = original_3d_points_for_plc[:, 2]
+            
+            # Batch interpolation - much faster than individual calls
+            unmatched_array = np.array(unmatched_vertices_2d)
+            
+            try:
                 from scipy.interpolate import griddata
+                # Batch linear interpolation
+                interpolated_z_values = griddata(original_projected_2d, original_z, unmatched_array, method='linear')
                 
-                try:
-                    # Use linear interpolation first
-                    interpolated_z = griddata(original_projected_2d, original_z, vertex_2d, method='linear')
-                    if np.isnan(interpolated_z):
-                        # Fallback to nearest neighbor
-                        interpolated_z = griddata(original_projected_2d, original_z, vertex_2d, method='nearest')
+                # Handle NaN values with nearest neighbor fallback
+                nan_mask = np.isnan(interpolated_z_values)
+                if np.any(nan_mask):
+                    interpolated_z_values[nan_mask] = griddata(original_projected_2d, original_z, unmatched_array[nan_mask], method='nearest')
+                
+                # Apply interpolated Z values to final vertices
+                for idx, vertex_idx in enumerate(unmatched_indices):
+                    vertex_2d = unmatched_vertices_2d[idx]
+                    interpolated_z = interpolated_z_values[idx]
                     
+                    # Handle remaining NaN values
                     if np.isnan(interpolated_z):
-                        # Final fallback to centroid Z
-                        interpolated_z = centroid[2]
-                        logger.warning(f"Interpolation failed for vertex {i}, using centroid Z")
-                    
-                    # Ensure scalar
-                    interpolated_z = float(interpolated_z)
+                        interpolated_z = centroid[2]  # Fallback to centroid Z
                     
                     # Reconstruct 3D point
                     vertex_3d = centroid.copy()
                     vertex_3d += vertex_2d[0] * basis[0]
                     vertex_3d += vertex_2d[1] * basis[1]
-                    vertex_3d[2] = interpolated_z
+                    vertex_3d[2] = float(interpolated_z)
                     
-                    final_vertices_3d[i] = vertex_3d
+                    final_vertices_3d[vertex_idx] = vertex_3d
                     
-                except Exception as e:
-                    logger.warning(f"Z interpolation failed for vertex {i}: {e}. Using plane projection.")
-                    # Ultimate fallback - simple plane projection
+            except Exception as e:
+                logger.warning(f"Batch Z interpolation failed: {e}. Using planar projection for {len(unmatched_indices)} vertices.")
+                # Fallback to simple plane projection for all unmatched
+                for vertex_idx in unmatched_indices:
+                    vertex_2d = vertices_2d[vertex_idx]
                     vertex_3d = centroid + vertex_2d[0] * basis[0] + vertex_2d[1] * basis[1]
-                    final_vertices_3d[i] = vertex_3d
+                    final_vertices_3d[vertex_idx] = vertex_3d
 
     # --- vertex deduplication with high precision (matching triangulation tab) -----
     def vkey(vec):
@@ -2586,17 +2704,22 @@ def run_constrained_triangulation_py(
 
 def _run_basic_triangle_fallback(plc_points_2d, plc_segments_indices, plc_holes_2d, 
                                 surface_projection_params, original_3d_points_for_plc, config):
-    """Fallback to basic Triangle library if DirectTriangleWrapper is not available"""
-    logger.warning("Using basic Triangle fallback (DirectTriangleWrapper not available)")
+    """PERFORMANCE-OPTIMIZED fallback to basic Triangle library if DirectTriangleWrapper is not available"""
+    logger.warning("Using FAST basic Triangle fallback (DirectTriangleWrapper not available)")
     
     import triangle as tr
     tri_input = {"vertices": plc_points_2d, "segments": plc_segments_indices}
     if plc_holes_2d is not None and len(plc_holes_2d) > 0:
         tri_input["holes"] = plc_holes_2d
 
-    # Use basic Triangle options
-    opts = "pzq20.0a100.0"
-    logger.info(f"Running basic triangle with options: {opts}")
+    # PERFORMANCE: Use fast Triangle options similar to DirectTriangleWrapper
+    target_size = config.get('target_size', 20.0)
+    min_angle = config.get('min_angle', 20.0)
+    area_constraint = target_size * target_size * 0.5
+    
+    # Simplified fast options - no complex callbacks
+    opts = f"pzq{min_angle:.1f}a{area_constraint:.8f}"
+    logger.info(f"Running FAST basic triangle with options: {opts}")
     tri_res = tr.triangulate(tri_input, opts=opts)
 
     vertices_2d = tri_res.get("vertices")
