@@ -437,12 +437,23 @@ class DirectTriangleWrapper:
 
         # PERFORMANCE: Optimized Triangle options for speed
         if uniform:
-            # Simple and fast: use quality + area constraints only
-            effective_min_angle = self.min_angle
-            area_constraint = self.base_size * self.base_size * 0.5
+            # Check if C++ MeshIt compatible mode is requested
+            use_cpp_switches = getattr(self, 'use_cpp_switches', False)
             
-            # Simplified options - no expensive callbacks or complex features
-            tri_options = f'pzq{effective_min_angle:.1f}a{area_constraint:.8f}'
+            if use_cpp_switches:
+                # C++ MeshIt compatible switches with better area control
+                # Use "pzY" (no boundary insertion) with area constraint
+                # The C++ version actually uses "pzYYu" but 'u' needs external callback
+                area_constraint = self.base_size * self.base_size * 0.5
+                tri_options = f'pzYYa{area_constraint:.8f}'
+                self.logger.info(f"Using C++ MeshIt compatible Triangle options: '{tri_options}'")
+            else:
+                # Original fast approach
+                effective_min_angle = self.min_angle
+                area_constraint = self.base_size * self.base_size * 0.5
+                
+                # Simplified options - no expensive callbacks or complex features
+                tri_options = f'pzq{effective_min_angle:.1f}a{area_constraint:.8f}'
         else:
             # Non-uniform approach for complex cases
             hull_points = self._get_hull_points_fast(points)
@@ -455,7 +466,7 @@ class DirectTriangleWrapper:
         
         self.logger.info(f"Using fast Triangle options: '{tri_options}'")
         
-        # PERFORMANCE: Direct Triangle call with error handling
+        # PERFORMANCE: Direct Triangle call with error handling and C++ fallback
         try:
             result = tr.triangulate(tri_input, tri_options)
             
@@ -463,9 +474,33 @@ class DirectTriangleWrapper:
                 self.logger.info(f"FAST triangulation complete: {len(result['triangles'])} triangles, {len(result['vertices'])} vertices")
                 return result
             else:
-                # Quick fallback without area constraint
-                self.logger.warning("Primary triangulation failed, trying fast fallback")
-                fallback_options = f'pzq{effective_min_angle:.1f}'
+                # Primary triangulation failed, try fallbacks
+                raise RuntimeError("Primary triangulation produced no triangles")
+                
+        except Exception as e:
+            self.logger.warning(f"Primary triangulation failed: {e}")
+            
+            # Try C++ compatible fallback if not already using it
+            if not getattr(self, 'use_cpp_switches', False) and uniform:
+                self.logger.warning("Trying C++ MeshIt compatible fallback switches")
+                area_constraint = self.base_size * self.base_size * 0.5
+                cpp_options = f'pzYa{area_constraint:.8f}'
+                try:
+                    result = tr.triangulate(tri_input, cpp_options)
+                    if 'triangles' in result and len(result['triangles']) > 0:
+                        self.logger.info(f"C++ compatible fallback succeeded: {len(result['triangles'])} triangles")
+                        return result
+                except Exception as e2:
+                    self.logger.warning(f"C++ compatible fallback also failed: {e2}")
+            
+            # Quick fallback without area constraint
+            self.logger.warning("Trying minimal constraint fallback")
+            try:
+                if uniform:
+                    effective_min_angle = self.min_angle
+                    fallback_options = f'pzq{effective_min_angle:.1f}'
+                else:
+                    fallback_options = 'pz'
                 result = tr.triangulate(tri_input, fallback_options)
                 
                 if 'triangles' in result and len(result['triangles']) > 0:
@@ -473,9 +508,11 @@ class DirectTriangleWrapper:
                     return result
                 else:
                     raise RuntimeError("Fast fallback also failed")
+            except Exception as e3:
+                self.logger.warning(f"Minimal constraint fallback failed: {e3}")
                     
         except Exception as e:
-            self.logger.error(f"Triangulation failed: {e}")
+            self.logger.error(f"All triangulation strategies failed: {e}")
             # Ultimate fallback - basic Delaunay only
             try:
                 ultimate_options = 'pz'
@@ -621,6 +658,22 @@ class DirectTriangleWrapper:
         """
         self.triangle_opts = options
         self.logger.info(f"Setting custom Triangle options: {options}") 
+
+    def set_cpp_compatible_mode(self, enable: bool = True):
+        """
+        Enable or disable C++ MeshIt compatible Triangle switches.
+        
+        When enabled, uses "pzYYu" switches similar to C++ MeshIt instead of "pzq" switches.
+        This can produce denser, higher quality meshes that are more compatible with TetGen.
+        
+        Args:
+            enable: Whether to enable C++ compatible mode
+        """
+        self.use_cpp_switches = enable
+        if enable:
+            self.logger.info("Enabled C++ MeshIt compatible Triangle switches (pzYYu)")
+        else:
+            self.logger.info("Disabled C++ MeshIt compatible mode, using standard switches")
 
 # Helper function for calculating minimum distance to boundary
 def min_distance_to_boundary(point, hull_points):

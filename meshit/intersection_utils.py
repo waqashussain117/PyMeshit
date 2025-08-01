@@ -2538,17 +2538,27 @@ def run_constrained_triangulation_py(
     min_angle = config.get('min_angle', 20.0)
     target_size = config.get('target_size', 20.0)
     
-    # Use target_size from GUI instead of auto-calculating from diagonal
-    base_size = target_size
-    
-    # Only fall back to diagonal-based calculation if target_size is unreasonable
+    # CRITICAL FIX: If target size is too large, it creates sparse meshes that fail in TetGen
+    # Automatically reduce target size for complex surfaces
     min_coords = np.min(plc_points_2d, axis=0)
     max_coords = np.max(plc_points_2d, axis=0)
     diagonal = np.sqrt(np.sum((max_coords - min_coords) ** 2))
     
-    if base_size > diagonal or base_size <= 0:
+    # If target size would create very sparse mesh, reduce it
+    max_reasonable_size = diagonal / 10.0  # Ensure at least 10 elements across diagonal
+    if target_size > max_reasonable_size:
+        old_target = target_size
+        target_size = max_reasonable_size
+        logger.warning(f"Target size {old_target:.2f} too large for complex surface (diagonal: {diagonal:.2f})")
+        logger.warning(f"Automatically reduced to {target_size:.2f} to prevent TetGen issues")
+    
+    # Use target_size from GUI (possibly adjusted)
+    base_size = target_size
+    
+    # Only fall back to diagonal-based calculation if target_size is unreasonable
+    if base_size <= 0:
         base_size = diagonal / 15.0  # Fallback for unreasonable target_size
-        logger.warning(f"Target size {target_size:.2f} unreasonable for surface (diagonal: {diagonal:.2f}), using fallback: {base_size:.2f}")
+        logger.warning(f"Target size {target_size:.2f} unreasonable, using fallback: {base_size:.2f}")
     else:
         logger.info(f"Using user target size: {base_size:.2f} (surface diagonal: {diagonal:.2f})")
     
@@ -2560,6 +2570,12 @@ def run_constrained_triangulation_py(
         min_angle=min_angle,
         base_size=base_size
     )
+
+    # CRITICAL FIX: Enable C++ MeshIt compatible Triangle switches
+    # This uses "pzYYu" switches like C++ MeshIt instead of "pzq" switches
+    # This should produce denser, higher quality meshes that work better with TetGen
+    triangulator.set_cpp_compatible_mode(True)
+    logger.info("✓ Enabled C++ MeshIt compatible Triangle switches for conforming mesh generation")
 
     # Run triangulation using DirectTriangleWrapper (FAST PERFORMANCE OPTIMIZATIONS)
     triangulation_result = triangulator.triangulate(

@@ -9733,6 +9733,10 @@ segmentation, triangulation, and visualization.
         plotter.render()
     
 
+    # In meshit_workflow_gui.py
+
+    # In meshit_workflow_gui.py
+
     def _generate_tetrahedral_mesh_action(self) -> None:
         """
         Slot connected to the “Generate Tetrahedral Mesh” button.
