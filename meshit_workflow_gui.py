@@ -713,7 +713,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
         # Buttons for loading files
         load_btn = QPushButton("Load Single File...")
-        load_btn.setToolTip("Load points from a single file (.txt, .csv, .pts)")
+        load_btn.setToolTip("Load points from a single file (.txt, .csv, .dat, .vtu)")
         load_btn.clicked.connect(self.load_file)
         file_layout.addWidget(load_btn)
         
@@ -3655,7 +3655,7 @@ class MeshItWorkflowGUI(QMainWindow):
             self,
             "Select a point data file",
             "",
-            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;All files (*.*)"
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
         )
         
         if not file_path:
@@ -3699,6 +3699,34 @@ class MeshItWorkflowGUI(QMainWindow):
         """Read points from a file, handling various delimiters and formats."""
         points = []
         try:
+            # Check file extension to determine reading method
+            ext = os.path.splitext(file_path)[1].lower()
+            
+            # Handle VTU files using PyVista (if available)
+            if ext == '.vtu':
+                if not HAVE_PYVISTA:
+                    raise ValueError("PyVista is required to read VTU files. Please install PyVista.")
+                
+                logger.info(f"Reading VTU file using PyVista: {file_path}")
+                mesh = pv.read(file_path)
+                
+                # Extract points from the mesh
+                if hasattr(mesh, 'points') and mesh.points is not None:
+                    points = mesh.points
+                    logger.info(f"Successfully extracted {len(points)} points from VTU mesh")
+                    
+                    # Ensure 3D format
+                    if points.shape[1] < 3:
+                        points_3d = np.zeros((len(points), 3))
+                        points_3d[:, :points.shape[1]] = points
+                        return points_3d
+                    
+                    return points[:, :3]  # Return first 3 columns (x, y, z)
+                else:
+                    raise ValueError("No point data found in VTU file")
+            
+            # Handle text-based files (.txt, .csv, .dat) with existing logic
+            # Handle text-based files (.txt, .csv, .dat) with existing logic
             # --- Primary Method: Line-by-line parsing for robustness --- 
             with open(file_path, 'r') as f:
                 for line_num, line in enumerate(f):
@@ -3747,7 +3775,7 @@ class MeshItWorkflowGUI(QMainWindow):
             else:
                  logger.info("Line-by-line parsing yielded no points, trying np.loadtxt.")
 
-            # --- Fallback Method: np.loadtxt --- 
+            # --- Fallback Method: np.loadtxt for text files --- 
             points = None # Reset points if primary method failed
             ext = os.path.splitext(file_path)[1].lower()
             delimiters_to_try = [None, '\t', ',', ' '] # None tries whitespace
@@ -5964,7 +5992,7 @@ segmentation, triangulation, and visualization.
             self,
             "Select a point data file",
             "",
-            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;All files (*.*)"
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
         )
         
         if not file_path:
@@ -6019,7 +6047,7 @@ segmentation, triangulation, and visualization.
             self,
             "Select point data files",
             "",
-            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;All files (*.*)"
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
         )
         
         if not file_paths:
@@ -7284,6 +7312,9 @@ segmentation, triangulation, and visualization.
             # Set background color
             self.current_plotter.set_background("#383F51")
             
+            # OPTIMIZATION: Disable auto-rendering during batch operations for better performance
+            self.current_plotter.disable()
+            
             # Process datasets based on visualization type
             plotter_has_geometry = False
             for i, dataset in enumerate(datasets):
@@ -7311,9 +7342,19 @@ segmentation, triangulation, and visualization.
                     logger.warning(f"Dataset '{name}' has unexpected point dimensions: {points.shape[1]}. Skipping.")
                     continue
 
+                # OPTIMIZATION: Subsample large point clouds for better performance
+                max_points_for_viz = 5000  # Limit points for smooth visualization
+                if len(points_3d) > max_points_for_viz:
+                    # Use uniform sampling to maintain distribution
+                    step = len(points_3d) // max_points_for_viz
+                    points_3d_viz = points_3d[::step]
+                    logger.info(f"Subsampled {len(points_3d)} points to {len(points_3d_viz)} for visualization of '{name}'")
+                else:
+                    points_3d_viz = points_3d
+
                 # Add visualization based on type
                 if view_type == "points":
-                    point_cloud = pv.PolyData(points_3d)
+                    point_cloud = pv.PolyData(points_3d_viz)
                     self.current_plotter.add_mesh(point_cloud, color=color, render_points_as_spheres=True, 
                                         point_size=8, label=name)
                     plotter_has_geometry = True
@@ -7339,37 +7380,65 @@ segmentation, triangulation, and visualization.
                                 # Take only first 3 coordinates if more than 3D
                                 hull_3d = hull_3d[:, :3]
                             
-                            # Create lines for the hull with proper validation
-                            for j in range(len(hull_3d)-1):
+                            # OPTIMIZED: Batch create all hull lines at once
+                            num_hull_points = len(hull_3d)
+                            # Create all line points and connectivity in batches
+                            line_points = np.zeros((num_hull_points * 2, 3))  # 2 points per line
+                            line_connectivity = np.zeros(num_hull_points * 3, dtype=int)  # [2, p1_idx, p2_idx] per line
+                            
+                            valid_lines = 0
+                            for j in range(num_hull_points):
                                 try:
-                                    # Convert to proper 3D coordinate lists
-                                    point_a = hull_3d[j].tolist() if hasattr(hull_3d[j], 'tolist') else list(hull_3d[j])
-                                    point_b = hull_3d[j+1].tolist() if hasattr(hull_3d[j+1], 'tolist') else list(hull_3d[j+1])
+                                    # Get current and next point (wrap around for last point)
+                                    point_a = hull_3d[j]
+                                    point_b = hull_3d[(j + 1) % num_hull_points]  # Wrap around to close the hull
                                     
-                                    # Ensure exactly 3 coordinates and valid floats
+                                    # Validate coordinates
                                     if (len(point_a) >= 3 and len(point_b) >= 3 and
-                                        all(isinstance(x, (int, float)) for x in point_a[:3]) and
-                                        all(isinstance(x, (int, float)) for x in point_b[:3])):
+                                        np.all(np.isfinite(point_a[:3])) and np.all(np.isfinite(point_b[:3]))):
                                         
-                                        hull_line = pv.Line([float(point_a[0]), float(point_a[1]), float(point_a[2])],
-                                                        [float(point_b[0]), float(point_b[1]), float(point_b[2])])
-                                        self.current_plotter.add_mesh(hull_line, color=color, line_width=3)
+                                        # Add to batch arrays
+                                        point_idx = valid_lines * 2
+                                        line_points[point_idx] = point_a[:3]
+                                        line_points[point_idx + 1] = point_b[:3]
+                                        
+                                        # Line connectivity: [2, point1_index, point2_index]
+                                        conn_idx = valid_lines * 3
+                                        line_connectivity[conn_idx] = 2
+                                        line_connectivity[conn_idx + 1] = point_idx
+                                        line_connectivity[conn_idx + 2] = point_idx + 1
+                                        
+                                        valid_lines += 1
                                     else:
                                         logger.warning(f"Skipping invalid hull line {j} for {name}")
+                                        
                                 except Exception as e:
                                     logger.warning(f"Error creating hull line {j} for {name}: {e}")
                                     continue
+                            
+                            # Create single mesh for all hull lines if we have valid lines
+                            if valid_lines > 0:
+                                # Trim arrays to actual size
+                                line_points = line_points[:valid_lines * 2]
+                                line_connectivity = line_connectivity[:valid_lines * 3]
+                                
+                                # Create PolyData with all hull edges at once
+                                hull_mesh = pv.PolyData(line_points, lines=line_connectivity)
+                                self.current_plotter.add_mesh(hull_mesh, color=color, line_width=3.0, 
+                                                            opacity=1.0, label=f"{name} Hull")
+                                
+                                logger.info(f"Successfully visualized hull with {valid_lines} edges for dataset '{name}'")
                                     
-                            # Add the original points with reduced opacity for context
-                            point_cloud = pv.PolyData(points_3d)
+                            # Add the original points with reduced opacity for context (use subsampled points)
+                            point_cloud = pv.PolyData(points_3d_viz)
                             self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.3, 
                                             render_points_as_spheres=True, point_size=5)
                             plotter_has_geometry = True
                             
                         except Exception as e:
                             logger.error(f"Error processing hull points for {name}: {e}")
-                            # Fallback to just showing points
-                            point_cloud = pv.PolyData(points_3d)
+                            # Fallback to just showing points (use subsampled points)
+                            point_cloud = pv.PolyData(points_3d_viz)
                             self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.7, 
                                             render_points_as_spheres=True, point_size=5)
                             plotter_has_geometry = True
@@ -7379,8 +7448,8 @@ segmentation, triangulation, and visualization.
                     if segments is not None and len(segments) > 0:
                         logger.info(f"Visualizing {len(segments)} segments for dataset '{name}'")
                         
-                        # Add original points for context (smaller and more transparent)
-                        point_cloud = pv.PolyData(points_3d)
+                        # Add original points for context (smaller and more transparent, use subsampled)
+                        point_cloud = pv.PolyData(points_3d_viz)
                         self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.2, render_points_as_spheres=True,
                                         point_size=3, label=f"{name} Original Points")
 
@@ -7471,13 +7540,21 @@ segmentation, triangulation, and visualization.
                                 vertices_3d = np.zeros((len(vertices), 3))
                                 vertices_3d[:, 0:2] = vertices
                                 
-                                # Try to map Z values from original points
-                                for j in range(len(vertices)):
-                                    vertex_2d = vertices[j]
-                                    # Find closest point in original dataset for Z value
-                                    distances = np.sum((points_3d[:, 0:2] - vertex_2d)**2, axis=1)
-                                    closest_idx = np.argmin(distances)
-                                    vertices_3d[j, 2] = points_3d[closest_idx, 2]
+                                # OPTIMIZED: Vectorized Z mapping from original points
+                                if len(points_3d) > 0:
+                                    # Use KDTree for fast nearest neighbor search for large point sets
+                                    if len(points_3d) > 1000:
+                                        from scipy.spatial import cKDTree
+                                        tree = cKDTree(points_3d[:, 0:2])
+                                        _, closest_indices = tree.query(vertices[:, 0:2])
+                                        vertices_3d[:, 2] = points_3d[closest_indices, 2]
+                                    else:
+                                        # Simple vectorized approach for smaller datasets
+                                        for j in range(len(vertices)):
+                                            vertex_2d = vertices[j]
+                                            distances = np.sum((points_3d[:, 0:2] - vertex_2d)**2, axis=1)
+                                            closest_idx = np.argmin(distances)
+                                            vertices_3d[j, 2] = points_3d[closest_idx, 2]
                             else:
                                 # Use Z values if they're already present
                                 vertices_3d = vertices.copy()[:, 0:3]
@@ -7495,6 +7572,9 @@ segmentation, triangulation, and visualization.
                 self.current_plotter.add_axes()
                 self.current_plotter.reset_camera()
                 
+                # OPTIMIZATION: Re-enable rendering after all geometry is added
+                self.current_plotter.enable()
+                
                 # Force a render to ensure the visualization is updated
                 try:
                     self.current_plotter.render()
@@ -7502,6 +7582,8 @@ segmentation, triangulation, and visualization.
                 except Exception as e:
                     logger.warning(f"Error forcing render: {e}")
             else:
+                # Re-enable even if no geometry was added
+                self.current_plotter.enable()
                 logger.warning("No geometry added to the plotter for the current view.")
             
             # Add controls for adjustment
