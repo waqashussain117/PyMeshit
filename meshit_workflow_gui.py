@@ -1289,11 +1289,28 @@ class MeshItWorkflowGUI(QMainWindow):
         
         # Hierarchical constraint tree (Surface → Constraint Type → Segments)
         self.refine_constraint_tree = QTreeWidget()
-        self.refine_constraint_tree.setHeaderLabels(["Constraint", "Type", "Segments", "Status"])
+        self.refine_constraint_tree.setHeaderLabels(["Constraint", "Type", "Segments", "Status", "Hole"])
         self.refine_constraint_tree.itemChanged.connect(self._on_refine_constraint_tree_item_changed)
         self.refine_constraint_tree.setMaximumHeight(300)
         constraint_layout.addWidget(QLabel("Surface → Constraint Type → Segments:"))
         constraint_layout.addWidget(self.refine_constraint_tree)
+        
+        # Add info label about holes
+        hole_info_label = QLabel("• Use 'Hole' column to mark segments as holes for triangulation\n• Hole segments (red) define interior regions to be excluded\n• Regular constraints (green) define boundaries\n• Parent-child synchronization: checking a group marks all its segments\n• Cross-surface synchronization: intersection holes sync across all surfaces")
+        hole_info_label.setStyleSheet("QLabel { color: #666; font-size: 10px; }")
+        hole_info_label.setWordWrap(True)
+        constraint_layout.addWidget(hole_info_label)
+        
+        # Add hole control buttons
+        hole_controls_layout = QHBoxLayout()
+        mark_holes_btn = QPushButton("Mark Selected as Holes")
+        unmark_holes_btn = QPushButton("Unmark Selected as Holes")
+        mark_holes_btn.clicked.connect(self._mark_selected_as_holes)
+        unmark_holes_btn.clicked.connect(self._unmark_selected_as_holes)
+        hole_controls_layout.addWidget(mark_holes_btn)
+        hole_controls_layout.addWidget(unmark_holes_btn)
+        hole_controls_layout.addStretch()
+        constraint_layout.addLayout(hole_controls_layout)
         
         control_layout.addWidget(constraint_group)
         # --- view-mode toggles ------------------------------------------------
@@ -3021,8 +3038,15 @@ class MeshItWorkflowGUI(QMainWindow):
                 pts2d = (np.array([[p.x, p.y, p.z] for p in pts3d]) - centroid) @ basis.T
                 pts2d = pts2d[:, :2]
 
+                # Convert hole points to 2D coordinates
+                holes_2d = []
+                if holes:
+                    holes_3d = np.array([[h.x, h.y, h.z] for h in holes])
+                    holes_2d = (holes_3d - centroid) @ basis.T
+                    holes_2d = holes_2d[:, :2]
+
                 v3d, tris, _ = run_constrained_triangulation_py(
-                    pts2d, seg_arr, holes, proj,
+                    pts2d, seg_arr, holes_2d, proj,
                     np.array([[p.x, p.y, p.z] for p in pts3d]), cfg
                 )
 
@@ -3032,10 +3056,12 @@ class MeshItWorkflowGUI(QMainWindow):
                 ds["conforming_mesh"] = {
                     "vertices": v3d,
                     "triangles": tris,
+                    "holes": holes,  # Include hole information
                     "statistics": {
                         "num_vertices": len(v3d),
                         "num_triangles": len(tris),
                         "num_constraints": len(seg_arr),
+                        "num_holes": len(holes) if holes else 0,
                         "target_size": tgt,
                         "surface_size": surf_data.get("size", "unknown"),
                         "effective_mesh_density": f"{len(tris) / max(1, len(v3d)):.2f} triangles/vertex",
@@ -6953,15 +6979,28 @@ segmentation, triangulation, and visualization.
     def _segment_vis_props(self, surf_idx: int, seg_uid: int):
         """
         Return a tuple   (rgb-tuple , line-width , stipple-pattern)
-        • If the segment is selected  →  thick solid green
-        • If not selected            →  thin  dotted grey
+        • If the segment is selected and is a hole  →  thick solid red
+        • If the segment is selected               →  thick solid green
+        • If not selected                         →  thin  dotted grey
         """
         checked = self._segment_checked(surf_idx, seg_uid)
+        is_hole = self._segment_is_hole(surf_idx, seg_uid)
+        
         if checked:
-            return ((0.00, 1.00, 0.00), 4, 0xFFFF)      # solid green
+            if is_hole:
+                return ((1.00, 0.00, 0.00), 4, 0xFFFF)      # solid red for holes
+            else:
+                return ((0.00, 1.00, 0.00), 4, 0xFFFF)      # solid green for normal constraints
         else:
             # 0xAAAA = dot-dot pattern; renders solid on old VTK builds
             return ((0.53, 0.53, 0.53), 2, 0xAAAA)
+        
+    def _segment_is_hole(self, surf_idx: int, seg_uid: int) -> bool:
+        """Check if a segment is marked as a hole."""
+        seg_data = self._refine_segment_map.get((surf_idx, seg_uid))
+        if seg_data:
+            return seg_data.get("is_hole", False)
+        return False
         # ======================================================================
     #  SEGMENT-TREE → 3-D SYNC
     # ======================================================================
@@ -7005,7 +7044,14 @@ segmentation, triangulation, and visualization.
                 if data and data.get("type") == "constraint":
                     s_idx = data["surface_idx"]
                     uid   = data["seg_uid"]
-                    self._apply_segment_state(s_idx, uid, item.checkState(0) == Qt.Checked)
+                    is_checked = (item.checkState(0) == Qt.Checked)
+                    is_hole = (item.checkState(4) == Qt.Checked)
+                    
+                    # Update segment map with current hole state
+                    if (s_idx, uid) in self._refine_segment_map:
+                        self._refine_segment_map[(s_idx, uid)]["is_hole"] = is_hole
+                        
+                    self._apply_segment_state(s_idx, uid, is_checked)
                 for i in range(item.childCount()):
                     walk(item.child(i))
 
@@ -7022,12 +7068,105 @@ segmentation, triangulation, and visualization.
         1) Propagate parent->children or child->parent states.
         2) Update visibility/colour of the corresponding 3-D actor(s).
         3) Synchronize intersection line selections across surfaces.
+        4) Handle hole checkbox changes (column 4).
         """
-        if self._refine_updating_constraint_tree or column != 0:
+        if self._refine_updating_constraint_tree:
             return
 
         self._refine_updating_constraint_tree = True
         try:
+            # Handle hole checkbox changes (column 4)
+            if column == 4:
+                data = item.data(0, Qt.UserRole)
+                if data and data.get("type") == "constraint":
+                    surface_idx = data["surface_idx"]
+                    seg_uid = data["seg_uid"]
+                    is_hole = (item.checkState(4) == Qt.Checked)
+                    # Update the segment map
+                    if (surface_idx, seg_uid) in self._refine_segment_map:
+                        self._refine_segment_map[(surface_idx, seg_uid)]["is_hole"] = is_hole
+                        logger.info(f"Updated segment {seg_uid} hole status: {is_hole}")
+                        
+                    # Synchronize hole marking across surfaces for shared intersection lines
+                    self._sync_hole_selection_across_surfaces(item)
+                        
+                    # Update visualization to show hole segments differently
+                    self._update_all_segment_actors()
+                
+                # Handle hole checkbox changes for group items (intersection_group or hull_group)
+                elif data and data.get("type") in ["intersection_group", "hull_group"]:
+                    is_hole = (item.checkState(4) == Qt.Checked)
+                    group_type = data.get("type")
+                    surface_idx = data.get("surface_idx")
+                    
+                    logger.info(f"Group {group_type} hole state changed to {is_hole} for surface {surface_idx}")
+                    
+                    # Propagate hole state to all children segments
+                    def set_all_children_hole_state(parent, state):
+                        for i in range(parent.childCount()):
+                            child = parent.child(i)
+                            child_data = child.data(0, Qt.UserRole)
+                            if child_data and child_data.get("type") == "constraint":
+                                child.setCheckState(4, state)
+                                # Update segment map
+                                child_surface_idx = child_data["surface_idx"]
+                                child_seg_uid = child_data["seg_uid"]
+                                if (child_surface_idx, child_seg_uid) in self._refine_segment_map:
+                                    self._refine_segment_map[(child_surface_idx, child_seg_uid)]["is_hole"] = (state == Qt.Checked)
+                                    logger.debug(f"Updated segment {child_seg_uid} hole status: {state == Qt.Checked}")
+                            set_all_children_hole_state(child, state)
+                    
+                    set_all_children_hole_state(item, Qt.Checked if is_hole else Qt.Unchecked)
+                    
+                    # Synchronize across surfaces if it's an intersection group
+                    if data.get("type") == "intersection_group":
+                        logger.info(f"Synchronizing intersection group hole state across surfaces...")
+                        self._sync_hole_selection_across_surfaces(item)
+                    
+                    # Update visualization
+                    self._update_all_segment_actors()
+                
+                # Handle parent state updates when children change
+                def update_parent_hole_state(child):
+                    parent = child.parent()
+                    if not parent:
+                        return
+                    
+                    parent_data = parent.data(0, Qt.UserRole)
+                    if parent_data and parent_data.get("type") in ["intersection_group", "hull_group"]:
+                        # Check if all children have the same hole state
+                        all_hole = True
+                        any_hole = False
+                        for i in range(parent.childCount()):
+                            child_item = parent.child(i)
+                            child_item_data = child_item.data(0, Qt.UserRole)
+                            if child_item_data and child_item_data.get("type") == "constraint":
+                                child_is_hole = (child_item.checkState(4) == Qt.Checked)
+                                if child_is_hole:
+                                    any_hole = True
+                                else:
+                                    all_hole = False
+                        
+                        # Set parent state: checked if all children are holes, unchecked if none, partially checked if mixed
+                        if all_hole and any_hole:
+                            parent.setCheckState(4, Qt.Checked)
+                        elif any_hole:
+                            parent.setCheckState(4, Qt.PartiallyChecked)
+                        else:
+                            parent.setCheckState(4, Qt.Unchecked)
+                        
+                        update_parent_hole_state(parent)
+                
+                # Update parent state if this was a constraint item
+                if data and data.get("type") == "constraint":
+                    update_parent_hole_state(item)
+                
+                return
+
+            # Handle selection checkbox changes (column 0)
+            if column != 0:
+                return
+
             # -------- propagate state downwards (parent → children) ----------
             def set_all_children_state(parent, state):
                 for i in range(parent.childCount()):
@@ -9840,6 +9979,9 @@ segmentation, triangulation, and visualization.
              QMessageBox.critical(self, "Data Error", "No conforming mesh data is loaded in the Tetra Mesh tab.")
              return
         
+        # Collect hole information from constraint tree
+        holes = self._collect_holes_from_constraint_tree()
+        
         self.tetra_mesh_generator = TetrahedralMeshGenerator(
             datasets=self.datasets,
             selected_surfaces=self.tetra_selected_surfaces,
@@ -9847,7 +9989,8 @@ segmentation, triangulation, and visualization.
             unit_surface_indices=unit_indices,
             fault_surface_indices=fault_indices,
             materials=self.tetra_materials,
-            surface_data=self.tetra_surface_data  # <-- PASS THE CORRECT DATA
+            surface_data=self.tetra_surface_data,  # <-- PASS THE CORRECT DATA
+            holes=holes  # <-- PASS HOLE INFORMATION
         )
 
         self.statusBar().showMessage("Generating 3D tetrahedral mesh... This may take a while.")
@@ -9893,6 +10036,123 @@ segmentation, triangulation, and visualization.
             QMessageBox.critical(self, "TetGen Failure", "Failed to generate tetrahedral mesh. Check the logs and the exported debug_plc.vtm file for details.")
 
         self.statusBar().showMessage("Tetrahedral meshing complete.")
+
+    def _collect_holes_from_constraint_tree(self):
+        """
+        Collect hole points from the constraint tree where users have marked intersections as holes.
+        Returns a list of (x, y, z) hole center points.
+        """
+        holes = []
+        processed_intersections = set()  # Avoid duplicate holes from same intersection
+        
+        # Try to get the constraint tree from Refine & Mesh tab
+        constraint_tree = None
+        if hasattr(self, 'refine_constraint_tree') and self.refine_constraint_tree:
+            constraint_tree = self.refine_constraint_tree
+            logger.info("Using constraint tree from Refine & Mesh tab for hole collection")
+        else:
+            logger.info("No constraint tree available for hole collection")
+            return holes
+            
+        tree = constraint_tree
+        
+        # Iterate through all surfaces in the constraint tree
+        for i in range(tree.topLevelItemCount()):
+            surface_item = tree.topLevelItem(i)
+            surface_data = surface_item.data(0, Qt.UserRole)
+            
+            if not surface_data or surface_data.get('type') != 'surface':
+                continue
+                
+            surface_idx = surface_data.get('surface_idx')
+            if surface_idx is None:
+                continue
+                
+            # Iterate through intersection groups in this surface
+            for j in range(surface_item.childCount()):
+                group_item = surface_item.child(j)
+                group_data = group_item.data(0, Qt.UserRole)
+                
+                if not group_data or group_data.get('type') != 'intersection_group':
+                    continue
+                
+                # Check if this intersection group is marked as a hole (column 4)
+                if group_item.checkState(4) == Qt.Checked:
+                    # Extract intersection index from text (e.g., "Intersection 2")
+                    item_text = group_item.text(0)
+                    try:
+                        intersection_idx = int(item_text.split(" ")[-1])
+                    except (ValueError, IndexError):
+                        continue
+                        
+                    # Get intersection data
+                    if (hasattr(self, 'refined_intersections_for_visualization') and 
+                        surface_idx in self.refined_intersections_for_visualization and 
+                        intersection_idx < len(self.refined_intersections_for_visualization[surface_idx])):
+                        
+                        intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+                        dataset_id1 = intersection_data.get('dataset_id1')
+                        dataset_id2 = intersection_data.get('dataset_id2')
+                        
+                        # Create unique key for this intersection to avoid duplicates
+                        intersection_key = tuple(sorted([dataset_id1, dataset_id2]))
+                        if intersection_key in processed_intersections:
+                            continue
+                            
+                        processed_intersections.add(intersection_key)
+                        
+                        # Calculate hole center from intersection segments
+                        hole_center = self._calculate_intersection_hole_center(surface_idx, intersection_idx)
+                        if hole_center:
+                            holes.append(hole_center)
+                            surface_name = self.datasets[surface_idx].get("name", f"Surface_{surface_idx}")
+                            logger.info(f"Collected hole from constraint tree: '{surface_name}' intersection {intersection_idx} at ({hole_center[0]:.3f}, {hole_center[1]:.3f}, {hole_center[2]:.3f})")
+        
+        if holes:
+            logger.info(f"✓ Collected {len(holes)} holes from constraint tree")
+        else:
+            logger.info("No holes marked in constraint tree")
+            
+        return holes
+    
+    def _calculate_intersection_hole_center(self, surface_idx, intersection_idx):
+        """
+        Calculate the center point of a hole from intersection segments.
+        """
+        try:
+            if (not hasattr(self, 'refined_intersections_for_visualization') or
+                surface_idx not in self.refined_intersections_for_visualization or 
+                intersection_idx >= len(self.refined_intersections_for_visualization[surface_idx])):
+                return None
+                
+            intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+            segments = intersection_data.get('segments', [])
+            
+            if not segments:
+                return None
+            
+            # Collect all points from all segments
+            all_points = []
+            for segment in segments:
+                points = segment.get('points', [])
+                for point in points:
+                    if hasattr(point, 'x'):  # Vector3D-like object
+                        all_points.append([point.x, point.y, point.z])
+                    elif isinstance(point, (list, tuple)) and len(point) >= 3:
+                        all_points.append([point[0], point[1], point[2]])
+            
+            if not all_points:
+                return None
+                
+            # Calculate centroid
+            import numpy as np
+            coords_array = np.array(all_points)
+            center = np.mean(coords_array, axis=0)
+            return [float(center[0]), float(center[1]), float(center[2])]
+            
+        except Exception as e:
+            logger.warning(f"Failed to calculate intersection hole center: {e}")
+            return None
 
     def _get_surface_indices_from_list(self, list_widget):
         """Extract surface indices from a list widget containing classified surfaces"""
@@ -13111,6 +13371,8 @@ segmentation, triangulation, and visualization.
                 hull_item.setText(0, "Hull segments")
                 hull_item.setFlags(hull_item.flags() | Qt.ItemIsUserCheckable)
                 hull_item.setCheckState(0, Qt.Checked)
+                # Add hole checkbox for hull group
+                hull_item.setCheckState(4, Qt.Unchecked)
                 hull_item.setData(0, Qt.UserRole,
                                 {"type": "hull_group", "surface_idx": s_idx})
 
@@ -13118,8 +13380,12 @@ segmentation, triangulation, and visualization.
                     p1, p2 = hull[i], hull[(i + 1) % len(hull)]
                     seg_item = QTreeWidgetItem(hull_item)
                     seg_item.setText(0, f"Seg {i}")
+                    seg_item.setText(1, "HULL")  # Set type column
                     seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
                     seg_item.setCheckState(0, Qt.Checked)
+                    # Add hole checkbox in column 4
+                    seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
+                    seg_item.setCheckState(4, Qt.Unchecked)  # Default: not a hole
                     seg_item.setData(0, Qt.UserRole,
                                     {"type": "constraint",
                                     "surface_idx": s_idx,
@@ -13127,6 +13393,7 @@ segmentation, triangulation, and visualization.
                     self._refine_segment_map[(s_idx, seg_uid)] = {
                         "points": [p1, p2],
                         "ctype": "HULL",
+                        "is_hole": False,  # Default: not a hole
                     }
                     seg_uid += 1
             # ------------------ intersection lines ------------------------------
@@ -13150,6 +13417,8 @@ segmentation, triangulation, and visualization.
                 line_item.setText(0, f"Intersection {line_id}")
                 line_item.setFlags(line_item.flags() | Qt.ItemIsUserCheckable)
                 line_item.setCheckState(0, Qt.Checked)
+                # Add hole checkbox for intersection group
+                line_item.setCheckState(4, Qt.Unchecked)
                 line_item.setData(0, Qt.UserRole,
                                   {"type": "intersection_group", "surface_idx": s_idx})
 
@@ -13159,8 +13428,12 @@ segmentation, triangulation, and visualization.
 
                         seg_item = QTreeWidgetItem(line_item)
                         seg_item.setText(0, f"Seg {k}.{e}")
+                        seg_item.setText(1, "INT")  # Set type column
                         seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
                         seg_item.setCheckState(0, Qt.Checked)
+                        # Add hole checkbox in column 4
+                        seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
+                        seg_item.setCheckState(4, Qt.Unchecked)  # Default: not a hole
                         seg_item.setData(0, Qt.UserRole,
                                          {"type": "constraint",
                                           "surface_idx": s_idx,
@@ -13169,6 +13442,7 @@ segmentation, triangulation, and visualization.
                         self._refine_segment_map[(s_idx, seg_uid)] = {
                             "points": [p1, p2],
                             "ctype": "INT",
+                            "is_hole": False,  # Default: not a hole
                         }
                         seg_uid += 1
         tree.expandAll()
@@ -13196,6 +13470,347 @@ segmentation, triangulation, and visualization.
             walk(self.refine_constraint_tree.topLevelItem(i))
 
         return selected
+    
+    def _collect_selected_hole_segments(self, surface_idx: int) -> List[List]:
+        """Return list of point-pairs [p1, p2] for all segments marked as holes."""
+        if not hasattr(self, "refine_constraint_tree"):
+            return []
+
+        hole_segments = []
+
+        def walk(item: QTreeWidgetItem):
+            data = item.data(0, Qt.UserRole)
+            if data and data.get("type") == "constraint":
+                # Only check if it's marked as hole and for the correct surface
+                # Don't require it to be selected for meshing (column 0) 
+                # because holes are exclusion regions
+                if (item.checkState(4) == Qt.Checked  # Hole checkbox is checked
+                        and data["surface_idx"] == surface_idx):
+                    seg_uid = data["seg_uid"]
+                    if (surface_idx, seg_uid) in self._refine_segment_map:
+                        hole_segments.append(self._refine_segment_map[(surface_idx, seg_uid)]["points"])
+                        logger.debug(f"Collected hole segment {seg_uid} for surface {surface_idx}")
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(self.refine_constraint_tree.topLevelItemCount()):
+            walk(self.refine_constraint_tree.topLevelItem(i))
+
+        if hole_segments:
+            logger.info(f"Collected {len(hole_segments)} hole segments for surface {surface_idx}")
+        else:
+            logger.debug(f"No hole segments found for surface {surface_idx}")
+
+        return hole_segments
+    
+    def _sync_hole_selection_across_surfaces(self, item):
+        """Synchronize hole selection for intersection lines across all surfaces that share them."""
+        if self._refine_updating_constraint_tree:
+            return
+            
+        if not hasattr(self, "refined_intersections_for_visualization") or not hasattr(self, "refine_constraint_tree"):
+            return
+            
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+            
+        hole_state = item.checkState(4)
+        
+        # Handle intersection group synchronization
+        if data.get("type") == "intersection_group":
+            surface_idx = data.get('surface_idx')
+            
+            # Extract the intersection index from the text (e.g., "Intersection 2")
+            item_text = item.text(0)
+            try:
+                intersection_idx = int(item_text.split(" ")[-1])
+            except (ValueError, IndexError):
+                return
+                
+            # Get the intersection data for this surface and index
+            if surface_idx not in self.refined_intersections_for_visualization:
+                return
+                
+            if intersection_idx >= len(self.refined_intersections_for_visualization[surface_idx]):
+                return
+                
+            # Get the intersection data
+            intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+            
+            # Find all surfaces involved in this intersection
+            dataset_id1 = intersection_data.get('dataset_id1')
+            dataset_id2 = intersection_data.get('dataset_id2')
+            
+            logger.info(f"Synchronizing intersection hole state: surface {surface_idx}, intersection {intersection_idx}, datasets {dataset_id1}-{dataset_id2}, hole={hole_state == Qt.Checked}")
+            
+            # Update both surfaces (except the current one)
+            if dataset_id1 is not None and dataset_id1 != surface_idx:
+                self._update_matching_intersection_hole_state(dataset_id1, intersection_data, hole_state)
+                logger.info(f"Updated hole state for surface {dataset_id1}")
+                
+            if dataset_id2 is not None and dataset_id2 != surface_idx:
+                self._update_matching_intersection_hole_state(dataset_id2, intersection_data, hole_state)
+                logger.info(f"Updated hole state for surface {dataset_id2}")
+        
+        # Handle individual constraint synchronization  
+        elif data.get("type") == "constraint":
+            # Find the parent intersection group
+            parent = item.parent()
+            if parent:
+                parent_data = parent.data(0, Qt.UserRole)
+                if parent_data and parent_data.get("type") == "intersection_group":
+                    surface_idx = parent_data.get('surface_idx')
+                    
+                    # Extract the intersection index from the parent text
+                    item_text = parent.text(0)
+                    try:
+                        intersection_idx = int(item_text.split(" ")[-1])
+                    except (ValueError, IndexError):
+                        return
+                        
+                    # Get the intersection data
+                    if surface_idx not in self.refined_intersections_for_visualization:
+                        return
+                        
+                    if intersection_idx >= len(self.refined_intersections_for_visualization[surface_idx]):
+                        return
+                        
+                    intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+                    
+                    # Get the segment data
+                    segment_uid = data.get("seg_uid")
+                    segment_points = self._refine_segment_map.get((surface_idx, segment_uid), {}).get("points", [])
+                    
+                    # Find all surfaces involved in this intersection
+                    dataset_id1 = intersection_data.get('dataset_id1')
+                    dataset_id2 = intersection_data.get('dataset_id2')
+                    
+                    # Update both surfaces (except the current one)
+                    if dataset_id1 is not None and dataset_id1 != surface_idx:
+                        self._update_matching_segment_hole_state(dataset_id1, intersection_idx, segment_points, hole_state)
+                        
+                    if dataset_id2 is not None and dataset_id2 != surface_idx:
+                        self._update_matching_segment_hole_state(dataset_id2, intersection_idx, segment_points, hole_state)
+                        
+                    intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+                    
+                    # Get the segment data
+                    seg_uid = data.get('seg_uid')
+                    if (surface_idx, seg_uid) not in self._refine_segment_map:
+                        return
+                        
+                    segment_data = self._refine_segment_map[(surface_idx, seg_uid)]
+                    segment_points = segment_data.get('points', [])
+                    
+                    # Find all surfaces involved in this intersection
+                    dataset_id1 = intersection_data.get('dataset_id1')
+                    dataset_id2 = intersection_data.get('dataset_id2')
+                    
+                    # Update segments in all related surfaces (except the current one)
+                    if dataset_id1 is not None and dataset_id1 != surface_idx:
+                        for i in range(len(self.refined_intersections_for_visualization.get(dataset_id1, []))):
+                            self._update_matching_segment_hole_state(dataset_id1, i, segment_points, hole_state)
+                        
+                    if dataset_id2 is not None and dataset_id2 != surface_idx:
+                        for i in range(len(self.refined_intersections_for_visualization.get(dataset_id2, []))):
+                            self._update_matching_segment_hole_state(dataset_id2, i, segment_points, hole_state)
+    
+    def _update_matching_intersection_hole_state(self, target_surface_idx, intersection_data, hole_state):
+        """Update hole state for matching intersection groups in target surface."""
+        # Find the matching intersection in the target surface
+        tree = self.refine_constraint_tree
+        
+        for i in range(tree.topLevelItemCount()):
+            surface_item = tree.topLevelItem(i)
+            surface_data = surface_item.data(0, Qt.UserRole)
+            if surface_data and surface_data.get("surface_idx") == target_surface_idx:
+                # Look through intersection groups
+                for j in range(surface_item.childCount()):
+                    group_item = surface_item.child(j)
+                    group_data = group_item.data(0, Qt.UserRole)
+                    if group_data and group_data.get("type") == "intersection_group":
+                        # Extract intersection index from text
+                        item_text = group_item.text(0)
+                        try:
+                            intersection_idx = int(item_text.split(" ")[-1])
+                        except (ValueError, IndexError):
+                            continue
+                            
+                        # Check if this intersection matches by comparing dataset IDs
+                        if (target_surface_idx in self.refined_intersections_for_visualization and 
+                            intersection_idx < len(self.refined_intersections_for_visualization[target_surface_idx])):
+                            
+                            other_intersection = self.refined_intersections_for_visualization[target_surface_idx][intersection_idx]
+                            
+                            # Check if this is the same intersection (by comparing the two surfaces involved)
+                            if ((other_intersection.get('dataset_id1') == intersection_data.get('dataset_id1') and 
+                                 other_intersection.get('dataset_id2') == intersection_data.get('dataset_id2')) or
+                                (other_intersection.get('dataset_id1') == intersection_data.get('dataset_id2') and 
+                                 other_intersection.get('dataset_id2') == intersection_data.get('dataset_id1'))):
+                                
+                                # This is the matching intersection, update its hole state (column 4)
+                                if group_item.checkState(4) != hole_state:
+                                    group_item.setCheckState(4, hole_state)
+                                    
+                                    # Also update all child segments
+                                    for k in range(group_item.childCount()):
+                                        child_item = group_item.child(k)
+                                        child_data = child_item.data(0, Qt.UserRole)
+                                        if child_data and child_data.get("type") == "constraint":
+                                            child_item.setCheckState(4, hole_state)
+                                            # Update segment map
+                                            child_surface_idx = child_data["surface_idx"]
+                                            child_seg_uid = child_data["seg_uid"]
+                                            if (child_surface_idx, child_seg_uid) in self._refine_segment_map:
+                                                self._refine_segment_map[(child_surface_idx, child_seg_uid)]["is_hole"] = (hole_state == Qt.Checked)
+                                    
+                                    logger.info(f"Synchronized intersection hole state across surface {target_surface_idx}")
+                                    break
+                break
+    
+    def _update_matching_segment_hole_state(self, target_surface_idx, intersection_idx, segment_points, hole_state):
+        """Update hole state for matching segments in target surface."""
+        tree = self.refine_constraint_tree
+        
+        for i in range(tree.topLevelItemCount()):
+            surface_item = tree.topLevelItem(i)
+            surface_data = surface_item.data(0, Qt.UserRole)
+            if surface_data and surface_data.get("surface_idx") == target_surface_idx:
+                # Look through intersection groups
+                for j in range(surface_item.childCount()):
+                    group_item = surface_item.child(j)
+                    group_data = group_item.data(0, Qt.UserRole)
+                    if group_data and group_data.get("type") == "intersection_group":
+                        # Check if this is the right intersection
+                        group_text = group_item.text(0)
+                        try:
+                            group_intersection_idx = int(group_text.split(" ")[-1])
+                            if group_intersection_idx == intersection_idx:
+                                # Look through segments in this group
+                                for k in range(group_item.childCount()):
+                                    child_item = group_item.child(k)
+                                    child_data = child_item.data(0, Qt.UserRole)
+                                    if child_data and child_data.get("type") == "constraint":
+                                        # Check if segment points match
+                                        child_seg_uid = child_data["seg_uid"]
+                                        if (target_surface_idx, child_seg_uid) in self._refine_segment_map:
+                                            child_segment_data = self._refine_segment_map[(target_surface_idx, child_seg_uid)]
+                                            child_points = child_segment_data.get('points', [])
+                                            if self._segments_match(segment_points, child_points):
+                                                child_item.setCheckState(4, hole_state)
+                                                child_segment_data["is_hole"] = (hole_state == Qt.Checked)
+                        except (ValueError, IndexError):
+                            continue
+                break
+    
+    def _intersections_match(self, surface_idx, intersection_idx, target_intersection_data):
+        """Check if intersections match based on their data."""
+        if surface_idx not in self.refined_intersections_for_visualization:
+            return False
+        if intersection_idx >= len(self.refined_intersections_for_visualization[surface_idx]):
+            return False
+            
+        intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+        
+        # Compare dataset IDs
+        return (intersection_data.get('dataset_id1') == target_intersection_data.get('dataset_id1') and
+                intersection_data.get('dataset_id2') == target_intersection_data.get('dataset_id2')) or \
+               (intersection_data.get('dataset_id1') == target_intersection_data.get('dataset_id2') and
+                intersection_data.get('dataset_id2') == target_intersection_data.get('dataset_id1'))
+    
+    def _segments_match(self, points1, points2, tolerance=1e-6):
+        """Check if two segments match (same points)."""
+        if len(points1) != len(points2):
+            return False
+            
+        # Check if points match in order or reverse order
+        def points_equal(p1, p2):
+            if hasattr(p1, 'x'):
+                return (abs(p1.x - (p2.x if hasattr(p2, 'x') else p2[0])) < tolerance and
+                        abs(p1.y - (p2.y if hasattr(p2, 'y') else p2[1])) < tolerance and
+                        abs(p1.z - (p2.z if hasattr(p2, 'z') else p2[2])) < tolerance)
+            else:
+                return (abs(p1[0] - (p2.x if hasattr(p2, 'x') else p2[0])) < tolerance and
+                        abs(p1[1] - (p2.y if hasattr(p2, 'y') else p2[1])) < tolerance and
+                        abs(p1[2] - (p2.z if hasattr(p2, 'z') else p2[2])) < tolerance)
+        
+        # Check forward direction
+        forward_match = all(points_equal(points1[i], points2[i]) for i in range(len(points1)))
+        
+        # Check reverse direction
+        reverse_match = all(points_equal(points1[i], points2[-(i+1)]) for i in range(len(points1)))
+        
+        return forward_match or reverse_match
+    
+    def _mark_selected_segments_as_holes(self, surface_idx: int, is_hole: bool = True):
+        """Mark all selected segments for a surface as holes or not holes."""
+        if not hasattr(self, "refine_constraint_tree"):
+            return
+            
+        self._refine_updating_constraint_tree = True
+        try:
+            def walk(item: QTreeWidgetItem):
+                data = item.data(0, Qt.UserRole)
+                if data and data.get("type") == "constraint":
+                    if (item.checkState(0) == Qt.Checked
+                            and data["surface_idx"] == surface_idx):
+                        seg_uid = data["seg_uid"]
+                        # Update UI
+                        item.setCheckState(4, Qt.Checked if is_hole else Qt.Unchecked)
+                        # Update segment map
+                        if (surface_idx, seg_uid) in self._refine_segment_map:
+                            self._refine_segment_map[(surface_idx, seg_uid)]["is_hole"] = is_hole
+                for i in range(item.childCount()):
+                    walk(item.child(i))
+
+            for i in range(self.refine_constraint_tree.topLevelItemCount()):
+                walk(self.refine_constraint_tree.topLevelItem(i))
+        finally:
+            self._refine_updating_constraint_tree = False
+            
+        logger.info(f"Marked selected segments for surface {surface_idx} as {'holes' if is_hole else 'constraints'}")
+    
+    def _mark_selected_as_holes(self):
+        """Mark all selected segments as holes for the currently selected surface."""
+        # Get the currently selected surface from the tree
+        selected_surface_idx = self._get_currently_selected_surface_from_tree()
+        if selected_surface_idx is not None:
+            self._mark_selected_segments_as_holes(selected_surface_idx, True)
+        else:
+            # If no specific surface selected, apply to all surfaces
+            for s_idx in range(len(self.datasets)):
+                if self.datasets[s_idx].get("type") != "polyline":
+                    self._mark_selected_segments_as_holes(s_idx, True)
+    
+    def _unmark_selected_as_holes(self):
+        """Unmark all selected segments as holes for the currently selected surface."""
+        # Get the currently selected surface from the tree
+        selected_surface_idx = self._get_currently_selected_surface_from_tree()
+        if selected_surface_idx is not None:
+            self._mark_selected_segments_as_holes(selected_surface_idx, False)
+        else:
+            # If no specific surface selected, apply to all surfaces
+            for s_idx in range(len(self.datasets)):
+                if self.datasets[s_idx].get("type") != "polyline":
+                    self._mark_selected_segments_as_holes(s_idx, False)
+    
+    def _get_currently_selected_surface_from_tree(self):
+        """Get the surface index of the currently selected item in the constraint tree."""
+        if not hasattr(self, "refine_constraint_tree"):
+            return None
+            
+        current_item = self.refine_constraint_tree.currentItem()
+        if current_item:
+            # Walk up the tree to find the surface item
+            item = current_item
+            while item:
+                data = item.data(0, Qt.UserRole)
+                if data and data.get("type") == "surface":
+                    return data.get("surface_idx")
+                item = item.parent()
+        return None
+    
     def _get_selected_refine_constraints(self, surface_idx_to_check):
         """
         Checks the refine_constraint_tree to see if hull and intersection
@@ -13232,12 +13847,14 @@ segmentation, triangulation, and visualization.
         from meshit.intersection_utils import Vector3D
         import numpy as np
         seg_lists = self._collect_selected_refine_segments(surface_idx)
+        hole_segments = self._collect_selected_hole_segments(surface_idx)
         if not seg_lists:
             return [], np.empty((0, 2), dtype=int), []
 
         uniq: Dict[Tuple[float, float, float], int] = {}
         pts: List[Vector3D] = []
         seg_idx: List[List[int]] = []
+        hole_points: List[Vector3D] = []
 
         def add(v):
             if isinstance(v, Vector3D):
@@ -13264,7 +13881,44 @@ segmentation, triangulation, and visualization.
                 if i1 != i2:
                     seg_idx.append([i1, i2])
 
-        return pts, np.asarray(seg_idx, dtype=int), []
+        # Process hole segments - combine segments into closed loops and calculate centroids
+        logger.debug(f"Processing {len(hole_segments)} hole segments for surface {surface_idx}")
+        
+        if hole_segments:
+            # Combine all hole segments into a single continuous point list
+            all_hole_points = []
+            for hole_idx, hole_seg_pts in enumerate(hole_segments):
+                logger.debug(f"Hole segment {hole_idx}: {len(hole_seg_pts)} points")
+                if len(hole_seg_pts) >= 2:  # Each segment should have at least 2 points
+                    # For the first segment, add all points
+                    if hole_idx == 0:
+                        all_hole_points.extend(hole_seg_pts)
+                    else:
+                        # For subsequent segments, skip the first point to avoid duplication
+                        # (assuming segments are connected end-to-end)
+                        all_hole_points.extend(hole_seg_pts[1:])
+                else:
+                    logger.warning(f"Skipping hole segment with only {len(hole_seg_pts)} points")
+            
+            # Now calculate hole center from the combined point list
+            if len(all_hole_points) >= 3:  # Need at least 3 points for a valid hole
+                # Calculate centroid of all hole points
+                x_sum = sum(p.x if hasattr(p, 'x') else p[0] for p in all_hole_points)
+                y_sum = sum(p.y if hasattr(p, 'y') else p[1] for p in all_hole_points)
+                z_sum = sum(p.z if hasattr(p, 'z') else p[2] for p in all_hole_points)
+                n = len(all_hole_points)
+                hole_center = Vector3D(x_sum/n, y_sum/n, z_sum/n)
+                hole_points.append(hole_center)
+                logger.info(f"Added hole center at ({hole_center.x:.3f}, {hole_center.y:.3f}, {hole_center.z:.3f}) from {len(all_hole_points)} combined points")
+            else:
+                logger.warning(f"Combined hole points ({len(all_hole_points)}) insufficient for hole center calculation")
+
+        if hole_points:
+            logger.info(f"Built PLC with {len(pts)} constraint points, {len(seg_idx)} segments, and {len(hole_points)} holes")
+        else:
+            logger.info(f"Built PLC with {len(pts)} constraint points and {len(seg_idx)} segments (no holes)")
+
+        return pts, np.asarray(seg_idx, dtype=int), hole_points
     def _refine_select_intersection_constraints_only(self):
         """Select only intersection constraints in Tab 6, deselect hull constraints"""
         if not hasattr(self, 'refine_constraint_tree'):

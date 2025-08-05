@@ -20,7 +20,7 @@ class TetrahedralMeshGenerator:
     def __init__(self, datasets: List[Dict], selected_surfaces: set, 
                  border_surface_indices: set, unit_surface_indices: set, 
                  fault_surface_indices: set, materials: List[Dict] = None,
-                 surface_data: Dict = None):
+                 surface_data: Dict = None, holes: List = None):
         """
         Initialize the tetrahedral mesh generator.
         
@@ -32,6 +32,7 @@ class TetrahedralMeshGenerator:
             fault_surface_indices: Set of fault surface indices.
             materials: List of material definitions with locations.
             surface_data: Dictionary of conforming mesh data {surface_idx: mesh_data}.
+            holes: List of hole points [(x, y, z), ...] to be passed to TetGen.
         """
         self.datasets = datasets
         self.selected_surfaces = selected_surfaces
@@ -40,6 +41,7 @@ class TetrahedralMeshGenerator:
         self.fault_surface_indices = fault_surface_indices
         self.materials = materials or []
         self.surface_data = surface_data or {}
+        self.external_holes = holes or []  # Holes passed from GUI
         self.tetrahedral_mesh = None
         
         # PLC data containers
@@ -49,6 +51,7 @@ class TetrahedralMeshGenerator:
         self.plc_regions = None
         self.plc_edge_constraints = None
         self.plc_edge_markers = None
+        self.plc_holes = None  # Store hole points
 
     def generate_tetrahedral_mesh(self, tetgen_switches: str = "pq1.414aAY") -> Optional[pv.UnstructuredGrid]:
         """
@@ -71,6 +74,14 @@ class TetrahedralMeshGenerator:
             # Step 2: Create a TetGen object.
             tet = tetgen.TetGen(self.plc_vertices, self.plc_facets, self.plc_facet_markers)
             
+            # Step 2.5: Add holes to TetGen if any exist
+            if hasattr(self, 'plc_holes') and self.plc_holes is not None and len(self.plc_holes) > 0:
+                for hole_point in self.plc_holes:
+                    hole_coords = (float(hole_point[0]), float(hole_point[1]), float(hole_point[2]))
+                    tet.add_hole(hole_coords)
+                    logger.info(f"Added hole to TetGen at ({hole_coords[0]:.3f}, {hole_coords[1]:.3f}, {hole_coords[2]:.3f})")
+                logger.info(f"✓ Added {len(self.plc_holes)} holes to TetGen mesh")
+            
             # Step 3: Add edge constraints.
             if self.plc_edge_constraints is not None and len(self.plc_edge_constraints) > 0:
                 tet.edge_list = self.plc_edge_constraints.tolist()
@@ -84,15 +95,40 @@ class TetrahedralMeshGenerator:
                 
                 if volumetric_regions:
                     # Only add VOLUMETRIC materials (units/formations) as 3D regions
+                    # Check for holes and avoid placing material points in hole regions
+                    hole_distance_threshold = 5.0  # Minimum distance from hole centers
+                    
                     for i, region in enumerate(volumetric_regions):
                         region_id = int(region[3])  # material attribute
                         point = (float(region[0]), float(region[1]), float(region[2]))
                         max_vol = float(region[4]) if region[4] > 0 else 0.0  # TetGen expects 0.0 for no constraint
                         
+                        # Check if this material point is too close to any hole
+                        too_close_to_hole = False
+                        if hasattr(self, 'plc_holes') and self.plc_holes is not None and len(self.plc_holes) > 0:
+                            for hole in self.plc_holes:
+                                distance = np.linalg.norm(np.array(point) - np.array(hole))
+                                if distance < hole_distance_threshold:
+                                    logger.warning(f"Material point {point} is {distance:.2f} units from hole at {hole}. Adjusting position.")
+                                    # Move the material point away from the hole
+                                    direction = np.array(point) - np.array(hole)
+                                    if np.linalg.norm(direction) > 1e-10:
+                                        direction = direction / np.linalg.norm(direction)
+                                        adjusted_point = np.array(hole) + direction * hole_distance_threshold * 1.5
+                                        point = tuple(adjusted_point)
+                                        logger.info(f"Adjusted material point to {point}")
+                                    break
+                        
                         tet.add_region(region_id, point, max_vol)
                         logger.info(f"Added 3D region {region_id}: point={point}, max_vol={max_vol}")
                     
-                    logger.info(f"✓ C++ Style: Added {len(volumetric_regions)} 3D regions (units/formations) to TetGen")
+                    # Log hole information for debugging
+                    if hasattr(self, 'plc_holes') and self.plc_holes is not None and len(self.plc_holes) > 0:
+                        logger.info(f"✓ C++ Style: Added {len(volumetric_regions)} 3D regions (units/formations) to TetGen, avoiding {len(self.plc_holes)} holes")
+                        for hole in self.plc_holes:
+                            logger.debug(f"Hole at ({hole[0]:.3f}, {hole[1]:.3f}, {hole[2]:.3f})")
+                    else:
+                        logger.info(f"✓ C++ Style: Added {len(volumetric_regions)} 3D regions (units/formations) to TetGen")
                     
                 if surface_materials:
                     logger.info(f"✓ C++ Style: {len(surface_materials)} 2D materials (faults) handled as surface constraints")
@@ -202,6 +238,7 @@ class TetrahedralMeshGenerator:
         global_facets = []
         global_facet_markers = []
         edge_constraints = set()
+        global_holes = []  # Collect holes from all surfaces
 
         # CRITICAL: Separate surface types for proper handling
         boundary_surfaces = (self.border_surface_indices | self.unit_surface_indices) & self.selected_surfaces
@@ -214,6 +251,16 @@ class TetrahedralMeshGenerator:
         # ======================================================================
         surfaces_with_precomputed = set()
         
+        # CRITICAL FIX: Collect holes from datasets directly since conforming mesh data doesn't include them
+        logger.info("Collecting holes from stored constraints...")
+        self._collect_holes_from_datasets(global_holes)
+        
+        # Also add any external holes passed from GUI
+        if self.external_holes:
+            for hole in self.external_holes:
+                global_holes.append(hole)
+            logger.info(f"Added {len(self.external_holes)} external holes from GUI")
+        
         for s_idx in boundary_surfaces | fault_surfaces:
             if s_idx not in self.surface_data:
                 continue
@@ -221,9 +268,22 @@ class TetrahedralMeshGenerator:
             conforming_mesh = self.surface_data[s_idx]
             local_vertices = conforming_mesh.get('vertices')
             local_triangles = conforming_mesh.get('triangles')
+            local_holes = conforming_mesh.get('holes', [])  # Get holes from conforming mesh
 
             if local_vertices is None or local_triangles is None or len(local_vertices) == 0:
                 continue
+
+            # Process holes from this surface
+            if local_holes:
+                surface_name = self.datasets[s_idx].get("name", f"Surface_{s_idx}")
+                logger.info(f"Processing {len(local_holes)} holes from surface '{surface_name}'")
+                for hole in local_holes:
+                    hole_point = _xyz(hole)
+                    global_holes.append(hole_point)
+                    logger.debug(f"Added hole at ({hole_point[0]:.3f}, {hole_point[1]:.3f}, {hole_point[2]:.3f})")
+            else:
+                surface_name = self.datasets[s_idx].get("name", f"Surface_{s_idx}")
+                logger.debug(f"No holes found in conforming mesh for surface '{surface_name}'")
 
             # Add vertices to global pool
             local_to_global_map = {}
@@ -504,12 +564,88 @@ class TetrahedralMeshGenerator:
         self.plc_facet_markers = np.asarray(final_facet_markers, dtype=np.int32)
         self.plc_edge_constraints = np.asarray(list(validated_edge_constraints), dtype=np.int32) if validated_edge_constraints else np.empty((0, 2), dtype=np.int32)
         self.plc_edge_markers = np.arange(1, len(self.plc_edge_constraints) + 1, dtype=np.int32)
+        self.plc_holes = np.asarray(global_holes, dtype=np.float64) if global_holes else np.empty((0, 3), dtype=np.float64)
 
         precomputed_count = len(surfaces_with_precomputed)
         fallback_count = len(missing_surfaces) - len([s for s in missing_surfaces if s not in surfaces_with_precomputed])
         
-        logger.info(f"Final PLC built: {len(self.plc_vertices)} vertices, {len(self.plc_facets)} facets, {len(self.plc_edge_constraints)} edge constraints")
+        if len(global_holes) > 0:
+            logger.info(f"Final PLC built: {len(self.plc_vertices)} vertices, {len(self.plc_facets)} facets, {len(self.plc_edge_constraints)} edge constraints, {len(global_holes)} holes")
+            for i, hole in enumerate(global_holes):
+                logger.info(f"  Hole {i+1}: ({hole[0]:.3f}, {hole[1]:.3f}, {hole[2]:.3f})")
+        else:
+            logger.info(f"Final PLC built: {len(self.plc_vertices)} vertices, {len(self.plc_facets)} facets, {len(self.plc_edge_constraints)} edge constraints")
         logger.info(f"✓ Surface processing: {precomputed_count} from conforming meshes, {fallback_count} from constraint triangulation")
+    
+    def _collect_holes_from_datasets(self, global_holes):
+        """
+        Collect hole centers from stored constraints in datasets.
+        This is needed because conforming mesh data doesn't include hole information.
+        """
+        hole_count = 0
+        processed_holes = set()  # Avoid duplicates
+        
+        for s_idx in self.selected_surfaces:
+            if s_idx >= len(self.datasets):
+                continue
+                
+            dataset = self.datasets[s_idx]
+            surface_name = dataset.get("name", f"Surface_{s_idx}")
+            
+            # Look for intersection line constraints that might be marked as holes
+            for constraint in dataset.get("stored_constraints", []):
+                constraint_type = constraint.get("type")
+                is_hole = constraint.get("is_hole", False)
+                
+                if constraint_type == "intersection_line" and is_hole:
+                    # Get hole center from constraint points
+                    points = constraint.get("points", [])
+                    if points:
+                        # Calculate centroid of intersection line points
+                        hole_center = self._calculate_hole_center(points)
+                        if hole_center:
+                            # Create a unique key for this hole to avoid duplicates
+                            hole_key = (round(hole_center[0], 3), round(hole_center[1], 3), round(hole_center[2], 3))
+                            if hole_key not in processed_holes:
+                                global_holes.append(hole_center)
+                                processed_holes.add(hole_key)
+                                hole_count += 1
+                                logger.info(f"Collected hole from '{surface_name}' intersection at ({hole_center[0]:.3f}, {hole_center[1]:.3f}, {hole_center[2]:.3f})")
+        
+        if hole_count > 0:
+            logger.info(f"✓ Collected {hole_count} holes from stored constraints")
+        else:
+            logger.info("No holes found in stored constraints - will check for GUI hole data")
+    
+    def _calculate_hole_center(self, points):
+        """Calculate the center point of a hole from its boundary points."""
+        if not points:
+            return None
+        
+        # Convert points to numpy array for easier calculation
+        import numpy as np
+        
+        try:
+            # Handle different point formats
+            coords = []
+            for pt in points:
+                if hasattr(pt, 'x'):  # Vector3D-like object
+                    coords.append([pt.x, pt.y, pt.z])
+                elif isinstance(pt, (list, tuple)) and len(pt) >= 3:
+                    coords.append([pt[0], pt[1], pt[2]])
+                else:
+                    continue
+            
+            if not coords:
+                return None
+                
+            coords_array = np.array(coords)
+            center = np.mean(coords_array, axis=0)
+            return [float(center[0]), float(center[1]), float(center[2])]
+            
+        except Exception as e:
+            logger.warning(f"Failed to calculate hole center: {e}")
+            return None
 
     def _edge_intersects_triangles(self, edge_tuple, triangles, vertices):
         """
@@ -701,6 +837,7 @@ class TetrahedralMeshGenerator:
         self.plc_facet_markers = np.asarray(global_facet_markers, dtype=np.int32)
         self.plc_edge_constraints = np.asarray(list(edge_constraints), dtype=np.int32) if edge_constraints else np.empty((0, 2), dtype=np.int32)
         self.plc_edge_markers = np.arange(1, len(self.plc_edge_constraints) + 1, dtype=np.int32)
+        self.plc_holes = np.empty((0, 3), dtype=np.float64)  # No holes in fallback method
 
         logger.info(f"Final PLC built: {len(self.plc_vertices)} vertices, {len(self.plc_facets)} facets, {len(self.plc_edge_constraints)} edge constraints")
 
