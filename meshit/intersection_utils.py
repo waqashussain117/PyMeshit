@@ -997,62 +997,132 @@ def connect_intersection_segments(segments, tolerance=1e-10):
 # ##################################################################
 
 
-def calculate_skew_line_transversal(p1: Vector3D, p2: Vector3D, p3: Vector3D, p4: Vector3D) -> Optional[Vector3D]:
+def calculate_skew_line_transversal_c_style(p1: Vector3D, p2: Vector3D, p3: Vector3D, p4: Vector3D) -> Optional[List[Vector3D]]:
     """
     Calculate the skew line transversal between two 3D line segments.
     
-    This is a port of C_Line::calculateSkewLineTransversal from C++.
-    It calculates the point of closest approach between two non-coplanar segments.
+    This is an exact port of C_Line::calculateSkewLineTransversal from C++.
+    Returns a list of two points (like C++ connector.Ns) if intersection occurs within both segments.
     
     Args:
         p1: First point of first segment
-        p2: Second point of first segment
+        p2: Second point of first segment  
         p3: First point of second segment
         p4: Second point of second segment
         
     Returns:
-        Vector3D representing the point of closest approach, or None if the lines are parallel
+        List containing two Vector3D points representing the shortest connector endpoints,
+        or None if lines are parallel or don't intersect within their bounds
     """
-    # Direction vectors for the two lines
-    d1 = p2 - p1
-    d2 = p4 - p3
+    # Direction vectors (P21 and Q21 in C++)
+    p21 = p2 - p1
+    q21 = p4 - p3
     
-    # Check if the lines are parallel
-    cross_d1d2 = d1.cross(d2)
-    len_cross = cross_d1d2.length()
-    if len_cross < 1e-10:
+    # Common normal vector (R21 in C++)
+    r21 = p21.cross(q21)
+    pq1 = p1 - p3
+    
+    # Check if lines are parallel (length of cross product is zero)
+    if r21.length() == 0:
         return None  # Lines are parallel, no unique transversal
     
-    # Calculate parameters for the closest point
-    n = cross_d1d2.normalized()
+    # Calculate determinant D using the 3x3 determinant formula from C++
+    d = (p21.x * q21.y * r21.z + q21.x * r21.y * p21.z + r21.x * p21.y * q21.z -
+         r21.x * q21.y * p21.z - q21.x * p21.y * r21.z - p21.x * r21.y * q21.z)
     
-    # Calculate distance between the lines
-    p_diff = p3 - p1
+    if abs(d) < 1e-12:  # Avoid division by zero
+        return None
     
-    # Calculate t values for closest points on the two lines
-    # Compute determinants for the linear system
-    det1 = p_diff.dot(d2.cross(n))
-    det2 = p_diff.dot(d1.cross(n))
+    # Calculate Ds (determinant for parameter s)
+    ds = (r21.x * q21.y * pq1.z + q21.x * pq1.y * r21.z + pq1.x * r21.y * q21.z -
+          pq1.x * q21.y * r21.z - q21.x * r21.y * pq1.z - r21.x * pq1.y * q21.z)
     
-    # Denominator is the square of the sin of the angle between d1 and d2
-    denom = len_cross * len_cross
+    # Calculate Dt (determinant for parameter t)  
+    dt = (p21.x * pq1.y * r21.z + pq1.x * r21.y * p21.z + r21.x * p21.y * pq1.z -
+          r21.x * pq1.y * p21.z - pq1.x * p21.y * r21.z - p21.x * r21.y * pq1.z)
     
-    # Parameters along the two lines for the closest points
-    t1 = det1 / denom
-    t2 = det2 / denom
+    # Calculate parameters s and t
+    s = ds / d
+    t = dt / d
     
-    # Check if the closest points are within the segments
-    if 0 <= t1 <= 1 and 0 <= t2 <= 1:
-        # Calculate the two closest points
-        c1 = p1 + d1 * t1
-        c2 = p3 + d2 * t2
+    # C++ condition: if (0 <= s && s<1) if (0 <= t && t<1)
+    # Only accept if both parameters are within the segment bounds
+    if 0 <= s < 1 and 0 <= t < 1:
+        # Calculate the two points on the segments (like C++ connector.Ns)
+        point1 = p1 + p21 * s
+        point2 = p3 + q21 * t
         
-        # Check if the points are close enough to be considered an intersection
-        if (c1 - c2).length() < 1e-5:
-            # Return midpoint
-            return (c1 + c2) * 0.5
+        # Return list of two points (matching C++ connector.Ns structure)
+        return [point1, point2]
     
-    return None
+    return None  # Intersection not within both segments
+
+
+def calculate_skew_line_transversal(p1: Vector3D, p2: Vector3D, p3: Vector3D, p4: Vector3D) -> Optional[Vector3D]:
+    """
+    Calculate the skew line transversal between two 3D line segments.
+    
+    This is a direct port of C_Line::calculateSkewLineTransversal from C++.
+    It only returns a valid point if the intersection occurs within both segments.
+    
+    Args:
+        p1: First point of first segment
+        p2: Second point of first segment  
+        p3: First point of second segment
+        p4: Second point of second segment
+        
+    Returns:
+        Vector3D representing the midpoint of the shortest connector, or None if lines 
+        are parallel or don't intersect within their bounds
+    """
+    # Direction vectors (P21 and Q21 in C++)
+    p21 = p2 - p1
+    q21 = p4 - p3
+    
+    # Common normal vector (R21 in C++)
+    r21 = p21.cross(q21)
+    pq1 = p1 - p3
+    
+    # Check if lines are parallel (length of cross product is zero)
+    if r21.length() == 0:
+        return None  # Lines are parallel, no unique transversal
+    
+    # Calculate determinant D using the 3x3 determinant formula from C++
+    # D = P21.x*Q21.y*R21.z + Q21.x*R21.y*P21.z + R21.x*P21.y*Q21.z 
+    #     - R21.x*Q21.y*P21.z - Q21.x*P21.y*R21.z - P21.x*R21.y*Q21.z
+    d = (p21.x * q21.y * r21.z + q21.x * r21.y * p21.z + r21.x * p21.y * q21.z -
+         r21.x * q21.y * p21.z - q21.x * p21.y * r21.z - p21.x * r21.y * q21.z)
+    
+    if abs(d) < 1e-12:  # Avoid division by zero
+        return None
+    
+    # Calculate Ds (determinant for parameter s)
+    # Ds = R21.x*Q21.y*PQ1.z + Q21.x*PQ1.y*R21.z + PQ1.x*R21.y*Q21.z
+    #      - PQ1.x*Q21.y*R21.z - Q21.x*R21.y*PQ1.z - R21.x*PQ1.y*Q21.z
+    ds = (r21.x * q21.y * pq1.z + q21.x * pq1.y * r21.z + pq1.x * r21.y * q21.z -
+          pq1.x * q21.y * r21.z - q21.x * r21.y * pq1.z - r21.x * pq1.y * q21.z)
+    
+    # Calculate Dt (determinant for parameter t)  
+    # Dt = P21.x*PQ1.y*R21.z + PQ1.x*R21.y*P21.z + R21.x*P21.y*PQ1.z
+    #      - R21.x*PQ1.y*P21.z - PQ1.x*P21.y*R21.z - P21.x*R21.y*PQ1.z
+    dt = (p21.x * pq1.y * r21.z + pq1.x * r21.y * p21.z + r21.x * p21.y * pq1.z -
+          r21.x * pq1.y * p21.z - pq1.x * p21.y * r21.z - p21.x * r21.y * pq1.z)
+    
+    # Calculate parameters s and t
+    s = ds / d
+    t = dt / d
+    
+    # C++ condition: if (0 <= s && s<1) if (0 <= t && t<1)
+    # Only accept if both parameters are within the segment bounds
+    if 0 <= s < 1 and 0 <= t < 1:
+        # Calculate the two points on the segments
+        point1 = p1 + p21 * s
+        point2 = p3 + q21 * t
+        
+        # Return the midpoint of the shortest connector
+        return (point1 + point2) * 0.5
+    
+    return None  # Intersection not within both segments
 
 
 def sort_intersection_points(points: List[Vector3D]) -> List[Vector3D]:
@@ -1492,14 +1562,16 @@ def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, mode
             for seg2_idx, seg2 in enumerate(box.N2s):
                 p2a, p2b = seg2[0], seg2[1]
 
-                # Calculate distance and closest points between segments FIRST
-                dist, closest1, closest2 = segment_segment_distance(p1a, p1b, p2a, p2b)
-
-                # Check if distance is within tolerance
-                if dist < tolerance:
-                    # Calculate triple point as the midpoint
-                    tp_point = (closest1 + closest2) * 0.5
-                    # Just append the raw point coordinate to the list passed by reference
+                # Use exact C++ logic: calculate skew line transversal
+                connector_points = calculate_skew_line_transversal_c_style(p1a, p1b, p2a, p2b)
+                
+                # C++ condition: connector.Ns.length() == 2 && lengthSquared(connector.Ns[0] - connector.Ns[1])<1e-24
+                if (connector_points is not None and 
+                    len(connector_points) == 2 and 
+                    (connector_points[0] - connector_points[1]).length_squared() < 1e-24):
+                    
+                    # Calculate triple point as the midpoint (matching C++ logic exactly)
+                    tp_point = (connector_points[0] + connector_points[1]) * 0.5
                     found_triple_points.append(tp_point)
 
                     # --- REMOVED duplicate check and TriplePoint object creation ---
@@ -1537,11 +1609,16 @@ def insert_triple_points(model, tolerance=1e-5):
         tp.intersection_ids  (fast path)
     2)  completeness pass – walk over every remaining poly-line and insert the
         point wherever the orthogonal distance to any segment < tolerance.
+        
+    This version uses more conservative tolerance for the completeness pass.
     """
     from meshit.intersection_utils import closest_point_on_segment
 
     if not getattr(model, "triple_points", None):
         return                                           # nothing to do
+
+    # Use more conservative tolerance for the completeness pass to prevent false insertions
+    conservative_tolerance = min(tolerance, 1e-7)  # Much stricter for the second pass
 
     # ------------------------------------------------------------------ PASS 1
     #         original ID-based insertion (kept as-is)
@@ -1553,7 +1630,7 @@ def insert_triple_points(model, tolerance=1e-5):
                                             tp.point, tolerance)
 
     # ------------------------------------------------------------------ PASS 2
-    #         completeness – make sure *every* line owns the TP
+    #         completeness – make sure *every* line owns the TP (with stricter tolerance)
     # ------------------------------------------------------------------
     for tp in model.triple_points:
         p_tp = tp.point
@@ -1561,25 +1638,25 @@ def insert_triple_points(model, tolerance=1e-5):
             if i in tp.intersection_ids:
                 continue                                 # already done
 
-            # quick BB check ---------------------------------------------------
+            # quick BB check with conservative margin ------------------------
             xs = [v.x for v in inter.points]
             ys = [v.y for v in inter.points]
             zs = [v.z for v in inter.points]
-            if not (min(xs) - tolerance <= p_tp.x <= max(xs) + tolerance and
-                    min(ys) - tolerance <= p_tp.y <= max(ys) + tolerance and
-                    min(zs) - tolerance <= p_tp.z <= max(zs) + tolerance):
+            if not (min(xs) - conservative_tolerance <= p_tp.x <= max(xs) + conservative_tolerance and
+                    min(ys) - conservative_tolerance <= p_tp.y <= max(ys) + conservative_tolerance and
+                    min(zs) - conservative_tolerance <= p_tp.z <= max(zs) + conservative_tolerance):
                 continue
 
-            # precise distance to each segment --------------------------------
+            # precise distance to each segment with conservative tolerance ----
             on_line = False
             for a, b in zip(inter.points[:-1], inter.points[1:]):
                 dist = (closest_point_on_segment(p_tp, a, b) - p_tp).length()
-                if dist < tolerance:
+                if dist < conservative_tolerance:
                     on_line = True
                     break
 
             if on_line:
-                _insert_point_into_polyline(inter.points, p_tp, tolerance)
+                _insert_point_into_polyline(inter.points, p_tp, conservative_tolerance)
                 tp.add_intersection(i)                  # keep bookkeeping
 
 # --------------------------------------------------------------------------
@@ -1589,27 +1666,50 @@ def _insert_point_into_polyline(pts, p_new, tol):
     """
     Insert p_new between the two vertices of *pts* whose segment is closest
     to the point (unless a vertex at the same XYZ already exists).
+    
+    This version uses stricter validation to prevent false insertions.
     """
     import math
+    
     # duplicate check ------------------------------------------------------
     for v in pts:
-        if ( (v - p_new).length() < tol ):
+        if (v - p_new).length() < tol:
             # Same coordinate already there → keep the *special* flag
             if getattr(p_new, "type", "DEFAULT") == "TRIPLE_POINT":
                 v.type = "TRIPLE_POINT"
             return
 
-    # find best host segment ----------------------------------------------
+    # find best host segment with stricter validation ----------------------
     best_k = None
     best_d = math.inf
+    best_closest_point = None
+    
     for k in range(len(pts) - 1):
-        d = (closest_point_on_segment(p_new, pts[k], pts[k+1]) - p_new).length()
+        closest_point = closest_point_on_segment(p_new, pts[k], pts[k+1])
+        d = (closest_point - p_new).length()
+        
         if d < best_d:
-            best_d, best_k = d, k
+            best_d, best_k, best_closest_point = d, k, closest_point
 
-    if best_k is not None:
-        p_new.type = "TRIPLE_POINT"
-        pts.insert(best_k + 1, p_new)
+    # Only insert if the point is truly on the segment (not just close to endpoints)
+    if best_k is not None and best_d < tol:
+        # Additional validation: make sure the closest point is actually between the endpoints
+        # and not just very close to one of them
+        seg_start = pts[best_k]
+        seg_end = pts[best_k + 1]
+        
+        # Check if closest point is reasonably far from both endpoints
+        dist_to_start = (best_closest_point - seg_start).length()
+        dist_to_end = (best_closest_point - seg_end).length()
+        seg_length = (seg_end - seg_start).length()
+        
+        # Only insert if closest point is not too close to either endpoint
+        # This prevents insertion of triple points very close to existing vertices
+        if (seg_length > tol * 2 and 
+            dist_to_start > tol and 
+            dist_to_end > tol):
+            p_new.type = "TRIPLE_POINT"
+            pts.insert(best_k + 1, p_new)
 
 
 def clean_identical_points(points_list: List[Vector3D], tolerance=1e-10) -> List[Vector3D]:
