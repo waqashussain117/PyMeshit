@@ -1206,7 +1206,7 @@ class MeshItWorkflowGUI(QMainWindow):
         if not hasattr(self, 'triple_points'):
             self.triple_points = []
     def _setup_refine_mesh_tab(self):
-        """Sets up the Refine & Mesh Settings tab."""
+        """Sets up the Refine & Mesh Settings tab with three sub-tabs for better organization."""
         tab_layout = QHBoxLayout(self.refine_mesh_tab)
 
         # --- Control panel (left side) ---
@@ -1313,20 +1313,8 @@ class MeshItWorkflowGUI(QMainWindow):
         constraint_layout.addLayout(hole_controls_layout)
         
         control_layout.addWidget(constraint_group)
-        # --- view-mode toggles ------------------------------------------------
-        view_layout = QHBoxLayout()
-        self.view_btn_grp = QButtonGroup(self)
-        for idx, txt in enumerate(("Intersections", "Meshes", "Segments")):
-            b = QToolButton()
-            b.setText(txt)
-            b.setCheckable(True)
-            b.setToolButtonStyle(Qt.ToolButtonTextOnly)
-            self.view_btn_grp.addButton(b, idx)
-            view_layout.addWidget(b)
-        self.view_btn_grp.button(0).setChecked(True)
-        self.current_refine_view = 0
-        self.view_btn_grp.idClicked.connect(self._handle_view_toggle)
-        control_layout.addLayout(view_layout)
+
+        # --- Global Mesh Settings ---
         mesh_settings_group = QGroupBox("Global Mesh Settings")
         mesh_settings_layout = QFormLayout(mesh_settings_group) # Use QFormLayout for label-input pairs
 
@@ -1417,10 +1405,6 @@ class MeshItWorkflowGUI(QMainWindow):
         mesh_settings_layout.addRow("", self.constraint_indicator)
 
         control_layout.addWidget(mesh_settings_group)
-        # Placeholder for future "Generate Mesh" button
-        # generate_mesh_btn = QPushButton("Generate Final Mesh (Placeholder)")
-        # generate_mesh_btn.setEnabled(False) # Disabled for now
-        # control_layout.addWidget(generate_mesh_btn)
 
         # Navigation buttons
         nav_layout = QHBoxLayout()
@@ -1432,7 +1416,7 @@ class MeshItWorkflowGUI(QMainWindow):
         control_layout.addStretch()
         tab_layout.addWidget(control_panel)
 
-        # --- Visualization Area (right side) ---
+        # --- Visualization Area with Sub-tabs (right side) ---
         viz_group = QGroupBox("Refined Intersections & Mesh Preview")
         viz_layout = QVBoxLayout(viz_group)
 
@@ -1566,38 +1550,54 @@ class MeshItWorkflowGUI(QMainWindow):
         
         viz_layout.addWidget(surface_control_group)
 
-        self.refine_mesh_viz_frame = QFrame() # Use the class attribute
-        self.refine_mesh_viz_frame.setFrameShape(QFrame.StyledPanel)
-        self.refine_mesh_viz_frame.setMinimumSize(400, 300)
-        self.refine_mesh_plot_layout = QVBoxLayout(self.refine_mesh_viz_frame)
-        self.refine_mesh_plot_layout.setContentsMargins(0, 0, 0, 0)
-
-        if HAVE_PYVISTA:
-            try:
-                from pyvistaqt import QtInteractor
-                plotter = QtInteractor(self.refine_mesh_viz_frame)
-                self.refine_mesh_plot_layout.addWidget(plotter.interactor)
-                plotter.set_background([0.318, 0.341, 0.431])
-                plotter.add_text("Refine intersections to visualize or load data.", position='upper_edge', color='white')
-                # Store in both attribute and dictionary
-                self.refine_mesh_plotter = plotter
-                self.plotters['refine_mesh'] = plotter
-                logger.info("Successfully created refine_mesh_plotter")
-            except Exception as e:
-                logger.error(f"Error initializing Refine/Mesh plotter: {e}", exc_info=True)
-                placeholder = QLabel(f"Error initializing PyVista plotter: {e}")
-                placeholder.setAlignment(Qt.AlignCenter)
-                placeholder.setWordWrap(True)
-                self.refine_mesh_plot_layout.addWidget(placeholder)
-                self.refine_mesh_plotter = None
-        else:
-            placeholder = QLabel("PyVista is required for 3D visualization.")
-            placeholder.setAlignment(Qt.AlignCenter)
-            self.refine_mesh_plot_layout.addWidget(placeholder)
-            self.refine_mesh_plotter = None
-
-        viz_layout.addWidget(self.refine_mesh_viz_frame, 1)
+        # === CREATE SUB-TABS INSTEAD OF TOGGLE BUTTONS ===
+        self.refine_view_tabs = QTabWidget()
+        self.refine_view_tabs.currentChanged.connect(self._on_refine_view_tab_changed)
         
+        # --- Tab 1: Intersections ---
+        self.intersections_tab = QWidget()
+        self.intersections_viz_frame = QFrame()
+        self.intersections_viz_frame.setFrameShape(QFrame.StyledPanel)
+        self.intersections_viz_frame.setMinimumSize(400, 300)
+        self.intersections_plot_layout = QVBoxLayout(self.intersections_viz_frame)
+        self.intersections_plot_layout.setContentsMargins(0, 0, 0, 0)
+        
+        intersections_layout = QVBoxLayout(self.intersections_tab)
+        intersections_layout.addWidget(self.intersections_viz_frame)
+        self.refine_view_tabs.addTab(self.intersections_tab, "🔗 Intersections")
+        
+        # --- Tab 2: Meshes ---
+        self.meshes_tab = QWidget()
+        self.meshes_viz_frame = QFrame()
+        self.meshes_viz_frame.setFrameShape(QFrame.StyledPanel)
+        self.meshes_viz_frame.setMinimumSize(400, 300)
+        self.meshes_plot_layout = QVBoxLayout(self.meshes_viz_frame)
+        self.meshes_plot_layout.setContentsMargins(0, 0, 0, 0)
+        
+        meshes_layout = QVBoxLayout(self.meshes_tab)
+        meshes_layout.addWidget(self.meshes_viz_frame)
+        self.refine_view_tabs.addTab(self.meshes_tab, "🌐 Meshes")
+        
+        # --- Tab 3: Segments ---
+        self.segments_tab = QWidget()
+        self.segments_viz_frame = QFrame()
+        self.segments_viz_frame.setFrameShape(QFrame.StyledPanel)
+        self.segments_viz_frame.setMinimumSize(400, 300)
+        self.segments_plot_layout = QVBoxLayout(self.segments_viz_frame)
+        self.segments_plot_layout.setContentsMargins(0, 0, 0, 0)
+        
+        segments_layout = QVBoxLayout(self.segments_tab)
+        segments_layout.addWidget(self.segments_viz_frame)
+        self.refine_view_tabs.addTab(self.segments_tab, "📏 Segments")
+        
+        # Initialize plotters for each tab
+        self._setup_refine_tab_plotters()
+        
+        # Set default view to intersections (index 0)
+        self.current_refine_view = 0
+        self.refine_view_tabs.setCurrentIndex(0)
+        
+        viz_layout.addWidget(self.refine_view_tabs, 1)
         # Add summary labels for refinement and conforming mesh results
         self.refinement_summary_label = QLabel("Run refinement to see summary")
         self.refinement_summary_label.setWordWrap(True)
@@ -1611,6 +1611,139 @@ class MeshItWorkflowGUI(QMainWindow):
         viz_layout.addWidget(self.conforming_mesh_summary_label)
         
         tab_layout.addWidget(viz_group, 1)
+
+    def _setup_refine_tab_plotters(self):
+        """Initialize PyVista plotters for each sub-tab"""
+        if not HAVE_PYVISTA:
+            # Add placeholder labels for each tab if PyVista is not available
+            for viz_frame, tab_name in [
+                (self.intersections_viz_frame, "Intersections"),
+                (self.meshes_viz_frame, "Meshes"), 
+                (self.segments_viz_frame, "Segments")
+            ]:
+                placeholder = QLabel(f"PyVista is required for 3D {tab_name.lower()} visualization.")
+                placeholder.setAlignment(Qt.AlignCenter)
+                if tab_name == "Intersections":
+                    self.intersections_plot_layout.addWidget(placeholder)
+                elif tab_name == "Meshes":
+                    self.meshes_plot_layout.addWidget(placeholder)
+                else:  # Segments
+                    self.segments_plot_layout.addWidget(placeholder)
+            return
+
+        try:
+            from pyvistaqt import QtInteractor
+            
+            # Initialize plotters for each tab
+            self.plotters = getattr(self, 'plotters', {})
+            
+            # Intersections plotter
+            self.intersections_plotter = QtInteractor(self.intersections_viz_frame)
+            self.intersections_plot_layout.addWidget(self.intersections_plotter.interactor)
+            self.intersections_plotter.set_background([0.318, 0.341, 0.431])
+            self.intersections_plotter.add_text("Refine intersections to visualize refined intersection lines.", 
+                                               position='upper_edge', color='white')
+            self.plotters['intersections'] = self.intersections_plotter
+            
+            # Meshes plotter
+            self.meshes_plotter = QtInteractor(self.meshes_viz_frame)
+            self.meshes_plot_layout.addWidget(self.meshes_plotter.interactor)
+            self.meshes_plotter.set_background([0.318, 0.341, 0.431])
+            self.meshes_plotter.add_text("Generate conforming meshes to visualize surface meshes.", 
+                                       position='upper_edge', color='white')
+            self.plotters['meshes'] = self.meshes_plotter
+            
+            # Segments plotter
+            self.segments_plotter = QtInteractor(self.segments_viz_frame)
+            self.segments_plot_layout.addWidget(self.segments_plotter.interactor)
+            self.segments_plotter.set_background([0.318, 0.341, 0.431])
+            self.segments_plotter.add_text("Click on constraint segments to select/deselect them.", 
+                                         position='upper_edge', color='white')
+            self.plotters['segments'] = self.segments_plotter
+            
+            # Set the default main plotter reference for backward compatibility
+            self.refine_mesh_plotter = self.intersections_plotter
+            self.plotters['refine_mesh'] = self.intersections_plotter
+            
+            logger.info("Successfully created all refine mesh tab plotters")
+            
+        except Exception as e:
+            logger.error(f"Error initializing Refine/Mesh plotters: {e}", exc_info=True)
+            # Add error placeholders for each tab
+            for viz_frame, layout, tab_name in [
+                (self.intersections_viz_frame, self.intersections_plot_layout, "Intersections"),
+                (self.meshes_viz_frame, self.meshes_plot_layout, "Meshes"), 
+                (self.segments_viz_frame, self.segments_plot_layout, "Segments")
+            ]:
+                placeholder = QLabel(f"Error initializing {tab_name} PyVista plotter: {e}")
+                placeholder.setAlignment(Qt.AlignCenter)
+                placeholder.setWordWrap(True)
+                layout.addWidget(placeholder)
+            
+            # Set None references
+            self.intersections_plotter = None
+            self.meshes_plotter = None
+            self.segments_plotter = None
+            self.refine_mesh_plotter = None
+
+    def _on_refine_view_tab_changed(self, index):
+        """Handle switching between refine view sub-tabs"""
+        old_view = getattr(self, 'current_refine_view', 0)
+        self.current_refine_view = index
+        
+        logger.info(f"Refine view tab changed from {old_view} to {index}")
+        
+        # Update the main plotter reference for backward compatibility
+        if hasattr(self, 'plotters') and self.plotters:
+            if index == 0:  # Intersections
+                self.refine_mesh_plotter = getattr(self, 'intersections_plotter', None)
+            elif index == 1:  # Meshes
+                self.refine_mesh_plotter = getattr(self, 'meshes_plotter', None)
+            elif index == 2:  # Segments
+                self.refine_mesh_plotter = getattr(self, 'segments_plotter', None)
+        
+        # Only update visualization if view actually changed
+        if old_view != index:
+            # Clear actors cache to force rebuild for the new view
+            if hasattr(self, '_constraint_actors_built'):
+                self._constraint_actors_built = False
+            
+            # Disable mouse selection when leaving segments view
+            if old_view == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
+                if self.mouse_selection_enabled_btn.isChecked():
+                    self.mouse_selection_enabled_btn.setChecked(False)
+                    
+            # Update visualization for the new tab
+            self._update_refined_visualization()
+            
+            # Re-enable mouse selection if returning to segments view and it was previously enabled
+            if index == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
+                # Enable the button but don't auto-check it - let user decide
+                self.mouse_selection_enabled_btn.setEnabled(True)
+            elif hasattr(self, 'mouse_selection_enabled_btn'):
+                # Disable mouse selection button for non-segments views
+                self.mouse_selection_enabled_btn.setEnabled(index == 2)
+
+    def _clear_refine_tab_plotters(self):
+        """Clear all refine tab plotters"""
+        for plotter_name in ['intersections_plotter', 'meshes_plotter', 'segments_plotter']:
+            plotter = getattr(self, plotter_name, None)
+            if plotter and hasattr(plotter, 'clear'):
+                try:
+                    plotter.clear()
+                except Exception as e:
+                    logger.warning(f"Error clearing {plotter_name}: {e}")
+
+    def _get_current_refine_plotter(self):
+        """Get the currently active refine tab plotter"""
+        current_index = getattr(self, 'current_refine_view', 0)
+        if current_index == 0:
+            return getattr(self, 'intersections_plotter', None)
+        elif current_index == 1:
+            return getattr(self, 'meshes_plotter', None)
+        elif current_index == 2:
+            return getattr(self, 'segments_plotter', None)
+        return None
     # Event handlers - placeholder implementations
     # ─── Visibility helpers for the view selector ─────────────────────────
     def _show_intersection_actors(self, visible: bool):
@@ -1621,7 +1754,11 @@ class MeshItWorkflowGUI(QMainWindow):
                 a.SetVisibility(visible)
             except Exception:
                 pass
-        if self.refine_mesh_plotter:
+        # Render on the current active plotter
+        current_plotter = self._get_current_refine_plotter()
+        if current_plotter:
+            current_plotter.render()
+        elif self.refine_mesh_plotter:  # Fallback
             self.refine_mesh_plotter.render()
 
     def _show_conforming_mesh_actors(self, visible: bool):
@@ -1632,7 +1769,11 @@ class MeshItWorkflowGUI(QMainWindow):
                 a.SetVisibility(visible)
             except Exception:
                 pass
-        if self.refine_mesh_plotter:
+        # Render on the current active plotter
+        current_plotter = self._get_current_refine_plotter()
+        if current_plotter:
+            current_plotter.render()
+        elif self.refine_mesh_plotter:  # Fallback
             self.refine_mesh_plotter.render()
 
     def _show_constraint_segment_actors(self, visible: bool):
@@ -1643,33 +1784,44 @@ class MeshItWorkflowGUI(QMainWindow):
                 a.SetVisibility(visible)
             except Exception:
                 pass
-        if self.refine_mesh_plotter:
+        # Render on the current active plotter
+        current_plotter = self._get_current_refine_plotter()
+        if current_plotter:
+            current_plotter.render()
+        elif self.refine_mesh_plotter:  # Fallback
             self.refine_mesh_plotter.render()
     def _handle_view_toggle(self, idx: int):
-        """Handle view mode toggle with optimized switching"""
-        old_view = getattr(self, 'current_refine_view', 0)
-        self.current_refine_view = idx
+        """Legacy method - now redirects to tab-based view switching"""
+        logger.info(f"Legacy _handle_view_toggle called with index {idx}, redirecting to tab system")
         
-        # Only update visualization if view actually changed
-        if old_view != idx:
-            # Clear actors cache to force rebuild for the new view
-            if hasattr(self, '_constraint_actors_built'):
-                self._constraint_actors_built = False
+        # Update the tab widget to match the requested index
+        if hasattr(self, 'refine_view_tabs'):
+            self.refine_view_tabs.setCurrentIndex(idx)
+        else:
+            # Fallback to old behavior if tabs are not set up yet
+            old_view = getattr(self, 'current_refine_view', 0)
+            self.current_refine_view = idx
             
-            # Disable mouse selection when leaving segments view
-            if old_view == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
-                if self.mouse_selection_enabled_btn.isChecked():
-                    self.mouse_selection_enabled_btn.setChecked(False)
-                    
-            self._update_refined_visualization()
-            
-            # Re-enable mouse selection if returning to segments view and it was previously enabled
-            if idx == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
-                # Enable the button but don't auto-check it - let user decide
-                self.mouse_selection_enabled_btn.setEnabled(True)
-            elif hasattr(self, 'mouse_selection_enabled_btn'):
-                # Disable mouse selection button for non-segments views
-                self.mouse_selection_enabled_btn.setEnabled(idx == 2)
+            # Only update visualization if view actually changed
+            if old_view != idx:
+                # Clear actors cache to force rebuild for the new view
+                if hasattr(self, '_constraint_actors_built'):
+                    self._constraint_actors_built = False
+                
+                # Disable mouse selection when leaving segments view
+                if old_view == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
+                    if self.mouse_selection_enabled_btn.isChecked():
+                        self.mouse_selection_enabled_btn.setChecked(False)
+                        
+                self._update_refined_visualization()
+                
+                # Re-enable mouse selection if returning to segments view and it was previously enabled
+                if idx == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
+                    # Enable the button but don't auto-check it - let user decide
+                    self.mouse_selection_enabled_btn.setEnabled(True)
+                elif hasattr(self, 'mouse_selection_enabled_btn'):
+                    # Disable mouse selection button for non-segments views
+                    self.mouse_selection_enabled_btn.setEnabled(idx == 2)
     
     def _on_refine_surface_selection_changed(self, surface_name):
         """
@@ -1699,10 +1851,14 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.warning("No constraint_segment_actor_refs available for visibility update")
             return
             
-        plotter = self.plotters.get("refine_mesh")
+        # Get the current active plotter
+        plotter = self._get_current_refine_plotter()
         if not plotter:
-            logger.warning("No refine_mesh plotter available for visibility update")
-            return
+            # Fallback to old method
+            plotter = self.plotters.get("refine_mesh")
+            if not plotter:
+                logger.warning("No refine_mesh plotter available for visibility update")
+                return
 
         logger.info(f"Updating visibility for surface filter: '{selected_surface}'")
         logger.info(f"Total constraint actors available: {len(self.constraint_segment_actor_refs)}")
@@ -1919,10 +2075,14 @@ class MeshItWorkflowGUI(QMainWindow):
             self.highlight_timer.timeout.connect(self._clear_selection_highlight)
             self.highlight_timer.setInterval(500)  # 500ms highlight duration (faster feedback)
         
-        plotter = self.plotters.get("refine_mesh")
+        # Get the current active plotter
+        plotter = self._get_current_refine_plotter()
         if not plotter:
-            logger.warning("No refine_mesh plotter available for mouse selection")
-            return
+            # Fallback to old method
+            plotter = self.plotters.get("refine_mesh")
+            if not plotter:
+                logger.warning("No refine_mesh plotter available for mouse selection")
+                return
             
         # Check if we're in the right view for mouse selection
         current_view = getattr(self, 'current_refine_view', 0)
@@ -1933,8 +2093,13 @@ class MeshItWorkflowGUI(QMainWindow):
             # Auto-switch to segments view for mouse selection
             if enabled:
                 logger.info("Auto-switching to Segments view for mouse selection")
-                self.view_btn_grp.button(2).setChecked(True)
-                self._handle_view_toggle(2)
+                if hasattr(self, 'refine_view_tabs'):
+                    self.refine_view_tabs.setCurrentIndex(2)
+                else:
+                    # Fallback for legacy button system
+                    if hasattr(self, 'view_btn_grp'):
+                        self.view_btn_grp.button(2).setChecked(True)
+                    self._handle_view_toggle(2)
             
         if enabled:
             # Ensure we have constraint actors built
@@ -2037,7 +2202,11 @@ class MeshItWorkflowGUI(QMainWindow):
         This allows users to see the actual selection state of constraints.
         """
         try:
-            plotter = self.plotters.get("refine_mesh")
+            # Get the current active plotter
+            plotter = self._get_current_refine_plotter()
+            if not plotter:
+                # Fallback to old method
+                plotter = self.plotters.get("refine_mesh")
             if plotter:
                 # Try multiple methods to clear PyVista highlighting
                 try:
@@ -2074,7 +2243,11 @@ class MeshItWorkflowGUI(QMainWindow):
         Green = selected, Gray = unselected (following the original constraint visualization system).
         """
         try:
-            plotter = self.plotters.get("refine_mesh")
+            # Get the current active plotter
+            plotter = self._get_current_refine_plotter()
+            if not plotter:
+                # Fallback to old method
+                plotter = self.plotters.get("refine_mesh")
             if not plotter or not hasattr(self, 'constraint_segment_actor_refs'):
                 return
                 
@@ -8840,11 +9013,16 @@ segmentation, triangulation, and visualization.
             plotter.add_text("No valid data to display in refined view.", position='upper_edge', color='white')
             plotter.reset_camera()
     def _clear_refine_mesh_plot(self):
-            """Clear the embedded Refine & Mesh PyVista plotter."""
+        """Clear all refine mesh tab plotters"""
+        try:
+            # Clear all individual tab plotters
+            self._clear_refine_tab_plotters()
+            
+            # Legacy compatibility: Clear the main plotter if it exists
             plotter = None
             if hasattr(self, 'refine_mesh_plotter') and self.refine_mesh_plotter:
                 plotter = self.refine_mesh_plotter
-            elif 'refine_mesh' in self.plotters and self.plotters['refine_mesh']:
+            elif 'refine_mesh' in getattr(self, 'plotters', {}) and self.plotters['refine_mesh']:
                 plotter = self.plotters['refine_mesh']
                 self.refine_mesh_plotter = plotter
             
@@ -8852,18 +9030,10 @@ segmentation, triangulation, and visualization.
                 plotter.clear()
                 plotter.add_text("Refine intersections to visualize or load data.", position='upper_edge', color='white')
                 plotter.reset_camera()
-            elif hasattr(self, 'refine_mesh_plot_layout'): # Fallback if plotter is None but layout exists
-                for i in reversed(range(self.refine_mesh_plot_layout.count())):
-                    widget = self.refine_mesh_plot_layout.itemAt(i).widget()
-                    if widget:
-                        if hasattr(self, 'refine_mesh_plotter') and self.refine_mesh_plotter and widget == self.refine_mesh_plotter.interactor:
-                            continue
-                        widget.setParent(None)
-                        widget.deleteLater()
-                if not hasattr(self, 'refine_mesh_plotter') or not self.refine_mesh_plotter:
-                    placeholder = QLabel("PyVista required or plot cleared.")
-                    placeholder.setAlignment(Qt.AlignCenter)
-                    self.refine_mesh_plot_layout.addWidget(placeholder)
+                
+            logger.info("Cleared all refine mesh visualizations")
+        except Exception as e:
+            logger.warning(f"Error in _clear_refine_mesh_plot: {e}")
     
     # ======================================================================
         # ======================================================================
@@ -8903,9 +9073,13 @@ segmentation, triangulation, and visualization.
             return None
         # ───────────────────────────────────────────────────────────────────
 
-        plotter = self.plotters.get("refine_mesh")
-        if not plotter:              # first call arrives before plotter exists
-            return
+        # Get the current active plotter based on the tab
+        plotter = self._get_current_refine_plotter()
+        if not plotter:
+            # Fallback to the old method for backward compatibility
+            plotter = self.plotters.get("refine_mesh")
+            if not plotter:              # first call arrives before plotter exists
+                return
 
         # fresh canvas + actor caches
         plotter.clear()
@@ -9227,9 +9401,12 @@ segmentation, triangulation, and visualization.
         actor.SetVisibility(True)      # always draw – style encodes selection
         
         # Immediate render for instant feedback (only if in segments view)
-        if (getattr(self, "current_refine_view", 0) == 2 and 
-            self.plotters.get("refine_mesh")):
-            self.plotters["refine_mesh"].render()
+        if (getattr(self, "current_refine_view", 0) == 2):
+            current_plotter = self._get_current_refine_plotter()
+            if current_plotter:
+                current_plotter.render()
+            elif self.plotters.get("refine_mesh"):
+                self.plotters["refine_mesh"].render()
 
     def _update_all_segment_actors(self):
         """
@@ -9278,8 +9455,12 @@ segmentation, triangulation, and visualization.
                     pass
 
         # Only render ONCE at the end if something actually changed
-        if needs_render and self.plotters.get("refine_mesh"):
-            self.plotters["refine_mesh"].render()
+        if needs_render:
+            current_plotter = self._get_current_refine_plotter()
+            if current_plotter:
+                current_plotter.render()
+            elif self.plotters.get("refine_mesh"):
+                self.plotters["refine_mesh"].render()
 
     # ----------------------------------------------------------------------
     def _on_refine_constraint_tree_item_changed(self, item, column):
