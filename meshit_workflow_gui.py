@@ -1227,10 +1227,6 @@ class MeshItWorkflowGUI(QMainWindow):
         
         # Add the new "Generate Conforming Surface Meshes" button
         self.generate_conforming_meshes_btn = QPushButton("Generate Conforming Surface Meshes")
-        self.generate_conforming_meshes_btn.setToolTip(
-            "Generate conforming 2D meshes for each surface using refined convex hulls and intersection lines as constraints.\n"
-            "This follows the C++ core.cpp workflow and prepares surfaces for tetrahedral meshing."
-        )
         self.generate_conforming_meshes_btn.clicked.connect(self._generate_conforming_meshes_action)
         self.generate_conforming_meshes_btn.setEnabled(False)  # Enabled after refinement
         self.generate_conforming_meshes_btn.setStyleSheet("""
@@ -1276,12 +1272,10 @@ class MeshItWorkflowGUI(QMainWindow):
         constraint_buttons_layout = QHBoxLayout()
         
         self.refine_select_intersection_constraints_only_btn = QPushButton("Select Intersection Constraints Only")
-        self.refine_select_intersection_constraints_only_btn.setToolTip("Select only intersection line constraints (deselect hull constraints)")
         self.refine_select_intersection_constraints_only_btn.clicked.connect(self._refine_select_intersection_constraints_only)
         constraint_buttons_layout.addWidget(self.refine_select_intersection_constraints_only_btn)
         
         self.refine_select_hull_constraints_only_btn = QPushButton("Select Hull Constraints Only")
-        self.refine_select_hull_constraints_only_btn.setToolTip("Select only hull constraints (deselect intersection constraints)")
         self.refine_select_hull_constraints_only_btn.clicked.connect(self._refine_select_hull_constraints_only)
         constraint_buttons_layout.addWidget(self.refine_select_hull_constraints_only_btn)
         
@@ -1295,11 +1289,6 @@ class MeshItWorkflowGUI(QMainWindow):
         constraint_layout.addWidget(QLabel("Surface → Constraint Type → Segments:"))
         constraint_layout.addWidget(self.refine_constraint_tree)
         
-        # Add info label about holes
-        hole_info_label = QLabel("• Use 'Hole' column to mark segments as holes for triangulation\n• Hole segments (red) define interior regions to be excluded\n• Regular constraints (green) define boundaries\n• Parent-child synchronization: checking a group marks all its segments\n• Cross-surface synchronization: intersection holes sync across all surfaces")
-        hole_info_label.setStyleSheet("QLabel { color: #666; font-size: 10px; }")
-        hole_info_label.setWordWrap(True)
-        constraint_layout.addWidget(hole_info_label)
         
         # Add hole control buttons
         hole_controls_layout = QHBoxLayout()
@@ -1324,17 +1313,6 @@ class MeshItWorkflowGUI(QMainWindow):
         self.mesh_target_feature_size_input.setValue(15.0) # Default
         self.mesh_target_feature_size_input.setSingleStep(0.5)
         self.mesh_target_feature_size_input.setDecimals(1)
-        self.mesh_target_feature_size_input.setToolTip(
-            "🎯 UNIFIED MESH DENSITY CONTROL 🎯\n"
-            "Controls density for BOTH:\n"
-            "• 'Refine Intersection Lines' operation\n"
-            "• 'Compute Conforming Mesh' operation\n\n"
-            "Settings:\n"
-            "• Lower values (1-5) = Very fine/dense mesh\n"
-            "• Medium values (10-20) = Balanced mesh  \n"
-            "• Higher values (30+) = Coarse/sparse mesh\n\n"
-            "✅ Now properly synchronized across all operations!"
-        )
         self.mesh_target_feature_size_input.setStyleSheet("""
             QDoubleSpinBox {
                 font-weight: bold;
@@ -1431,21 +1409,13 @@ class MeshItWorkflowGUI(QMainWindow):
         surface_selector_layout.addWidget(QLabel("Surface:"))
         self.refine_surface_selector = QComboBox()
         self.refine_surface_selector.addItem("All Surfaces")  # Default option to show all
-        self.refine_surface_selector.setToolTip("Select which surface's constraints to visualize")
         self.refine_surface_selector.currentTextChanged.connect(self._on_refine_surface_selection_changed)
         surface_selector_layout.addWidget(self.refine_surface_selector)
         
         # Mouse selection toggle button
-        self.mouse_selection_enabled_btn = QPushButton("🖱️ Mouse Selection")
+        self.mouse_selection_enabled_btn = QPushButton("Mouse Selection")
         self.mouse_selection_enabled_btn.setCheckable(True)
         self.mouse_selection_enabled_btn.setChecked(False)
-        self.mouse_selection_enabled_btn.setToolTip(
-            "Enable mouse-based constraint selection:\n"
-            "• Click on constraint lines to select/deselect them\n"
-            "• Selection syncs with the constraint tree\n"
-            "• Works with current surface filter\n"
-            "• Rectangle selection without pressing 'R' key"
-        )
         self.mouse_selection_enabled_btn.toggled.connect(self._on_mouse_selection_toggled)
         self.mouse_selection_enabled_btn.setStyleSheet("""
             QPushButton {
@@ -1470,23 +1440,11 @@ class MeshItWorkflowGUI(QMainWindow):
         self.selection_mode_btn = QPushButton("✅ Select Mode")
         self.selection_mode_btn.setCheckable(True)
         self.selection_mode_btn.setChecked(True)  # Default to select mode
-        self.selection_mode_btn.setToolTip(
-            "Select Mode (Active):\n"
-            "• Rectangle drag will SELECT constraints\n"
-            "• Changes unselected constraints to selected\n"
-            "• Click to switch to this mode"
-        )
         self.selection_mode_btn.setVisible(False)  # Hidden initially
         
         self.deselection_mode_btn = QPushButton("❌ Deselect Mode")
         self.deselection_mode_btn.setCheckable(True)
         self.deselection_mode_btn.setChecked(False)
-        self.deselection_mode_btn.setToolTip(
-            "Deselect Mode:\n"
-            "• Rectangle drag will DESELECT constraints\n"
-            "• Changes selected constraints to unselected\n"
-            "• Click to switch to this mode"
-        )
         self.deselection_mode_btn.setVisible(False)  # Hidden initially
         
         # Make selection mode buttons mutually exclusive
@@ -1541,7 +1499,6 @@ class MeshItWorkflowGUI(QMainWindow):
         
         self.show_selected_only_checkbox = QCheckBox("Selected Only")
         self.show_selected_only_checkbox.setChecked(False)
-        self.show_selected_only_checkbox.setToolTip("Show only constraints that are selected in the constraint tree")
         self.show_selected_only_checkbox.toggled.connect(self._on_constraint_filter_changed)
         constraint_visibility_layout.addWidget(self.show_selected_only_checkbox)
         
@@ -1564,9 +1521,9 @@ class MeshItWorkflowGUI(QMainWindow):
         
         intersections_layout = QVBoxLayout(self.intersections_tab)
         intersections_layout.addWidget(self.intersections_viz_frame)
-        self.refine_view_tabs.addTab(self.intersections_tab, "🔗 Intersections")
+        self.refine_view_tabs.addTab(self.intersections_tab, "Intersections")
         
-        # --- Tab 2: Meshes ---
+         # --- Tab 2: Meshes ---
         self.meshes_tab = QWidget()
         self.meshes_viz_frame = QFrame()
         self.meshes_viz_frame.setFrameShape(QFrame.StyledPanel)
@@ -1576,7 +1533,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
         meshes_layout = QVBoxLayout(self.meshes_tab)
         meshes_layout.addWidget(self.meshes_viz_frame)
-        self.refine_view_tabs.addTab(self.meshes_tab, "🌐 Meshes")
+        self.refine_view_tabs.addTab(self.meshes_tab, "Meshes")
         
         # --- Tab 3: Segments ---
         self.segments_tab = QWidget()
@@ -1588,7 +1545,9 @@ class MeshItWorkflowGUI(QMainWindow):
         
         segments_layout = QVBoxLayout(self.segments_tab)
         segments_layout.addWidget(self.segments_viz_frame)
-        self.refine_view_tabs.addTab(self.segments_tab, "📏 Segments")
+        self.refine_view_tabs.addTab(self.segments_tab, "Segments")
+
+       
         
         # Initialize plotters for each tab
         self._setup_refine_tab_plotters()
@@ -1665,7 +1624,13 @@ class MeshItWorkflowGUI(QMainWindow):
             self.refine_mesh_plotter = self.intersections_plotter
             self.plotters['refine_mesh'] = self.intersections_plotter
             
-            logger.info("Successfully created all refine mesh tab plotters")
+            # Initialize constraint actor persistence system
+            self.constraint_segment_actor_refs = {}
+            self._constraint_actors_built = False
+            self._last_segment_count = 0
+            self._constraint_actors_persistent = True
+            
+            logger.info("Successfully created all refine mesh tab plotters and initialized constraint actor system")
             
         except Exception as e:
             logger.error(f"Error initializing Refine/Mesh plotters: {e}", exc_info=True)
@@ -1704,9 +1669,12 @@ class MeshItWorkflowGUI(QMainWindow):
         
         # Only update visualization if view actually changed
         if old_view != index:
-            # Clear actors cache to force rebuild for the new view
-            if hasattr(self, '_constraint_actors_built'):
-                self._constraint_actors_built = False
+            # Ensure constraint actors persist across tab switches (performance optimization)
+            self._ensure_constraint_actors_persistence()
+            
+            # Don't clear actors cache unnecessarily - let them persist
+            # if hasattr(self, '_constraint_actors_built'):
+            #     self._constraint_actors_built = False  # Removed to prevent rebuilding
             
             # Disable mouse selection when leaving segments view
             if old_view == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
@@ -1744,6 +1712,26 @@ class MeshItWorkflowGUI(QMainWindow):
         elif current_index == 2:
             return getattr(self, 'segments_plotter', None)
         return None
+    
+    def _ensure_constraint_actors_persistence(self):
+        """
+        Ensure constraint actors persist across tab switches and surface filter changes.
+        This prevents unnecessary rebuilding and improves performance.
+        """
+        if not hasattr(self, 'constraint_segment_actor_refs'):
+            self.constraint_segment_actor_refs = {}
+            
+        if not hasattr(self, '_constraint_actors_built'):
+            self._constraint_actors_built = False
+            
+        # Mark constraint actors as persistent to avoid clearing during tab switches
+        if hasattr(self, 'constraint_segment_actor_refs') and self.constraint_segment_actor_refs:
+            setattr(self, '_constraint_actors_persistent', True)
+            
+        # Initialize segment count tracking for change detection
+        if not hasattr(self, '_last_segment_count'):
+            self._last_segment_count = 0
+    
     # Event handlers - placeholder implementations
     # ─── Visibility helpers for the view selector ─────────────────────────
     def _show_intersection_actors(self, visible: bool):
@@ -1831,13 +1819,30 @@ class MeshItWorkflowGUI(QMainWindow):
         """
         logger.info(f"Surface selection changed to: {surface_name}")
         
-        # FORCE visibility update regardless of view or state
-        # The visualization filtering MUST work when surface selection changes
-        if hasattr(self, 'constraint_segment_actor_refs') and self.constraint_segment_actor_refs:
-            logger.info(f"FORCING visibility update for surface filter (view={getattr(self, 'current_refine_view', 'unknown')})")
-            self._update_segment_visibility_for_surface_selection(surface_name)
+        current_view = getattr(self, 'current_refine_view', 0)
+        
+        # Only update constraint visibility if we're in the Segments view (view 2)
+        # For other views, the surface selection may be used differently
+        if current_view == 2:
+            # FORCE visibility update for Segments view
+            if hasattr(self, 'constraint_segment_actor_refs') and self.constraint_segment_actor_refs:
+                logger.info(f"Updating constraint visibility for surface filter in Segments view (view={current_view})")
+                self._update_segment_visibility_for_surface_selection(surface_name)
+            else:
+                logger.warning("No constraint actors available for visibility update")
         else:
-            logger.warning("No constraint actors available for visibility update")
+            # For Intersections (view 0) and Meshes (view 1), surface selection might be used for different filtering
+            # but we don't force constraint visibility updates since those views don't have constraint actors
+            logger.info(f"Surface selection noted for view {current_view} (constraint visibility not applicable)")
+            
+            # If we're in Intersections view, we might want to refresh the visualization
+            # to respect the new surface filter
+            if current_view == 0:
+                logger.info(f"Refreshing intersections visualization for surface filter: {surface_name}")
+                self._visualize_refined_intersections()  # Direct call to avoid full visualization update
+            elif current_view == 1:
+                logger.info(f"Refreshing meshes visualization for surface filter: {surface_name}")
+                self._update_refined_visualization()  # Only meshes view needs full update
         
         # Optionally highlight the corresponding surface in the constraint tree
         self._highlight_surface_in_constraint_tree(surface_name)
@@ -8741,32 +8746,19 @@ segmentation, triangulation, and visualization.
     
     def _visualize_refined_intersections(self):
         """Visualize refined intersections with enhanced special point visualization."""
-        # Get plotter
-        plotter = None
-        if hasattr(self, 'refine_mesh_plotter') and self.refine_mesh_plotter:
-            plotter = self.refine_mesh_plotter
-        elif hasattr(self, 'plotters') and 'refine_mesh' in self.plotters and self.plotters['refine_mesh']:
-            plotter = self.plotters['refine_mesh']
-            self.refine_mesh_plotter = plotter
+        # Get the current active plotter from the tab system
+        plotter = self._get_current_refine_plotter()
+        if not plotter:
+            # Fallback to old method for backward compatibility
+            if hasattr(self, 'refine_mesh_plotter') and self.refine_mesh_plotter:
+                plotter = self.refine_mesh_plotter
+            elif hasattr(self, 'plotters') and 'refine_mesh' in self.plotters and self.plotters['refine_mesh']:
+                plotter = self.plotters['refine_mesh']
+                self.refine_mesh_plotter = plotter
         
         if not plotter:
             logger.warning("Refine/Mesh plotter not available for visualization.")
-            if HAVE_PYVISTA and hasattr(self, 'refine_mesh_viz_frame') and self.refine_mesh_viz_frame:
-                try:
-                    from pyvistaqt import QtInteractor
-                    new_plotter = QtInteractor(self.refine_mesh_viz_frame)
-                    self.refine_mesh_plot_layout.addWidget(new_plotter.interactor)
-                    new_plotter.set_background([0.318, 0.341, 0.431])
-                    plotter = new_plotter
-                    self.refine_mesh_plotter = plotter
-                    if hasattr(self, 'plotters'):
-                        self.plotters['refine_mesh'] = plotter
-                    logger.info("Successfully recreated refine_mesh_plotter")
-                except Exception as e:
-                    logger.error(f"Error recreating Refine/Mesh plotter: {e}")
-                    return
-            else:
-                return
+            return
 
         plotter.clear()
         plotter.set_background([0.2, 0.2, 0.25])
@@ -8777,6 +8769,20 @@ segmentation, triangulation, and visualization.
             return
 
         logger.info("Visualizing refined intersections...")
+
+        # Get selected surface from dropdown for filtering
+        selected_surface = "All Surfaces"
+        if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
+            selected_surface = self.refine_surface_selector.currentText()
+
+        # Helper function to check if a surface should be shown
+        def should_show_surface(dataset_idx):
+            if selected_surface == "All Surfaces":
+                return True
+            if dataset_idx < len(self.datasets):
+                dataset_name = self.datasets[dataset_idx].get("name", f"Surface_{dataset_idx}")
+                return dataset_name == selected_surface
+            return False
 
         # Initialize constraint points collection (consolidated)
         constraint_points = []  # All constraint points for triangulation
@@ -8818,6 +8824,13 @@ segmentation, triangulation, and visualization.
                     # Track involved datasets
                     dataset_id1 = intersection_data.get('dataset_id1', -1)
                     dataset_id2 = intersection_data.get('dataset_id2', -1)
+                    
+                    # Apply surface filter - only show intersections involving the selected surface
+                    if selected_surface != "All Surfaces":
+                        surface_involved = (should_show_surface(dataset_id1) or should_show_surface(dataset_id2))
+                        if not surface_involved:
+                            continue  # Skip this intersection if neither dataset matches the filter
+                    
                     involved_dataset_indices.add(dataset_id1)
                     involved_dataset_indices.add(dataset_id2)
                     
@@ -8961,8 +8974,6 @@ segmentation, triangulation, and visualization.
                 points_np = np.array(unique_constraints)
                 plotter.add_mesh(points_np, color='red', point_size=10,
                             render_points_as_spheres=True, name="Constraint_Points")
-                plotter.add_point_labels(points_np, [f"C{i}" for i in range(len(points_np))],
-                                    point_size=5, text_color='black')
                 plotter_has_content = True
                 logger.info(f"Added {len(unique_constraints)} constraint points (consolidated)")
             except Exception as e:
@@ -8971,8 +8982,6 @@ segmentation, triangulation, and visualization.
         # Add comprehensive legend and statistics
         if plotter_has_content:
             # Statistics text
-           # Clean statistics text
-            # Clean statistics text
             stats_text = "MeshIt Constraint Points (All Types):\n"
             if constraint_points:
                 unique_constraints = []
@@ -8990,18 +8999,21 @@ segmentation, triangulation, and visualization.
 
             stats_text += f"\nIntersection Lines: {len(refined_intersection_lines)}"
             stats_text += f"\nDatasets Involved: {len(involved_dataset_indices)}"
+            
+            # Add surface filter information
+            if selected_surface != "All Surfaces":
+                stats_text += f"\nSurface Filter: {selected_surface}"
 
             # Simple legend
             legend_text = "Constraint Points for Triangulation:\n"
             legend_text += "C = Constraint Point (all special types)\n"
             legend_text += "Red = Ready for triangulation\n"
             
-            stats_text += f"\nIntersection Lines: {len(refined_intersection_lines)}"
-            stats_text += f"\nDatasets Involved: {len(involved_dataset_indices)}"
+            # Add filter info to legend if active
+            if selected_surface != "All Surfaces":
+                legend_text += f"\nFiltered for: {selected_surface}"
             
             plotter.add_text(stats_text, position='lower_left', font_size=10, color='white')
-            
-          
             plotter.add_text(legend_text, position='upper_right', font_size=9, color='white')
             
             plotter.add_axes()
@@ -9081,25 +9093,60 @@ segmentation, triangulation, and visualization.
             if not plotter:              # first call arrives before plotter exists
                 return
 
-        # fresh canvas + actor caches
-        plotter.clear()
-        self.intersection_actor_refs       = []
-        self.conforming_mesh_actor_refs    = []
-        self.constraint_segment_actor_refs = {}
-        
-        # Clear actor ID mapping for mouse picking
-        if hasattr(self, '_actor_id_to_segment_map'):
-            self._actor_id_to_segment_map = {}
-        
-        # Clear mesh geometry mapping for accurate picking
-        if hasattr(self, '_mesh_geometry_map'):
-            self._mesh_geometry_map = {}
-        
-        # Reset constraint actors cache only when switching views (not surface selection)
-        if hasattr(self, '_constraint_actors_built'):
-            self._constraint_actors_built = False
-
         view = getattr(self, "current_refine_view", 0)
+
+        # Smart clearing - preserve constraint actors when switching to segments view
+        if view == 0:
+            # For intersections view, skip clearing here as the enhanced method handles it
+            self.intersection_actor_refs       = []
+            self.conforming_mesh_actor_refs    = []
+            if not hasattr(self, 'constraint_segment_actor_refs'):
+                self.constraint_segment_actor_refs = {}
+        elif view == 1:
+            # For meshes view, clear but preserve constraint actors
+            plotter.clear()
+            self.intersection_actor_refs       = []
+            self.conforming_mesh_actor_refs    = []
+            # Don't clear constraint_segment_actor_refs to preserve actors
+            
+            # Clear actor ID mapping for mouse picking for non-constraint actors
+            if hasattr(self, '_actor_id_to_segment_map'):
+                # Keep constraint mappings but could clear others if needed
+                pass
+        elif view == 2:
+            # For segments view, preserve ALL existing constraint actors
+            # DO NOT remove any actors - just ensure they exist
+            if not hasattr(self, 'constraint_segment_actor_refs'):
+                self.constraint_segment_actor_refs = {}
+            
+            # Remove only intersection and mesh actors, keep constraint actors untouched
+            if hasattr(self, 'intersection_actor_refs'):
+                for actor in self.intersection_actor_refs:
+                    try:
+                        plotter.remove_actor(actor)
+                    except:
+                        pass
+            if hasattr(self, 'conforming_mesh_actor_refs'):
+                for actor in self.conforming_mesh_actor_refs:
+                    try:
+                        plotter.remove_actor(actor)
+                    except:
+                        pass
+            
+            self.intersection_actor_refs       = []
+            self.conforming_mesh_actor_refs    = []
+            # DO NOT clear constraint_segment_actor_refs - preserve ALL constraint actors
+            
+        # Clear mesh geometry mapping for accurate picking (for non-constraint actors)
+        if view != 2 and hasattr(self, '_mesh_geometry_map'):
+            # Only clear if not in segments view to preserve constraint geometry mappings
+            # But don't clear constraint-related mappings
+            pass  # Keep all mappings to preserve constraint functionality
+        
+        # NEVER reset constraint actors cache flag - keep them persistent across ALL operations
+        # if view != 2 and hasattr(self, '_constraint_actors_built'):
+        #     # Only reset if switching away from segments view
+        #     self._constraint_actors_built = False
 
         # Get selected surface from dropdown
         selected_surface = "All Surfaces"
@@ -9125,22 +9172,10 @@ segmentation, triangulation, and visualization.
             return False
 
         # ------------------------------------------------ 0 : intersections
-        if view == 0 and hasattr(self, "refined_intersections_for_visualization"):
-            for surf_idx, inters in self.refined_intersections_for_visualization.items():
-                if not should_show_surface(surf_idx):
-                    continue
-                    
-                for inter_d in inters:
-                    coords = [_to_xyz(p) for p in inter_d.get("points", [])]
-                    coords = [c for c in coords if c is not None]
-                    if len(coords) < 2:
-                        continue
-                    self.intersection_actor_refs.append(
-                        plotter.add_mesh(
-                            pv.lines_from_points(np.asarray(coords, float)),
-                            color="red", line_width=4,
-                        )
-                    )
+        if view == 0:
+            # Use the enhanced intersection visualization instead of simple red lines
+            self._visualize_refined_intersections()
+            # The enhanced method handles its own plotter clearing and setup
 
         # ------------------------------------------------ 1 : conforming mesh
         elif view == 1:
@@ -9170,17 +9205,44 @@ segmentation, triangulation, and visualization.
 
         # ------------------------------------------------ 2 : constraint segments (filtered by surface and type)
         else:   # view == 2
-            # Build actors only once, then use visibility for surface switching
+            # GLOBAL PERSISTENT ACTORS: Build actors only ONCE per application session
+            # These actors will persist across ALL tab switches and surface filter changes
             need_rebuild = (not hasattr(self, '_constraint_actors_built') or 
                           not self._constraint_actors_built or
                           not hasattr(self, 'constraint_segment_actor_refs') or
                           len(self.constraint_segment_actor_refs) == 0)
             
+            # Additional check: Only rebuild if the underlying segment data actually changed
+            current_segment_count = len(getattr(self, '_refine_segment_map', {}))
+            last_known_count = getattr(self, '_last_segment_count', 0)
+            
+            if current_segment_count != last_known_count and current_segment_count > 0:
+                logger.info(f"Segment data changed: {last_known_count} -> {current_segment_count}, enabling rebuild")
+                need_rebuild = True
+                self._last_segment_count = current_segment_count
+                # Reset the built flag to allow rebuild with new data
+                self._constraint_actors_built = False
+            elif current_segment_count == last_known_count and self._constraint_actors_built:
+                # Data hasn't changed and actors exist - absolutely no rebuild needed
+                need_rebuild = False
+                logger.debug(f"Constraint actors already exist and data unchanged - using existing actors")
+            
+            # Only rebuild if actors don't exist OR if the underlying data has actually changed
             if need_rebuild:
-                # Clear existing actors and mappings
+                logger.info(f"Building constraint actors for all surfaces (GLOBAL one-time setup)...")
+                # Use the segments plotter specifically for building actors
+                segments_plotter = self._get_current_refine_plotter()
+                if not segments_plotter:
+                    segments_plotter = plotter
+                
+                # Clear existing actors and mappings only if rebuilding
+                # SAFETY CHECK: Only clear if we're absolutely sure we need to rebuild
+                if len(self.constraint_segment_actor_refs) > 0:
+                    logger.warning(f"Clearing {len(self.constraint_segment_actor_refs)} existing constraint actors for rebuild")
+                
                 for actor in getattr(self, 'constraint_segment_actor_refs', {}).values():
                     try:
-                        plotter.remove_actor(actor)
+                        segments_plotter.remove_actor(actor)
                     except:
                         pass
                 self.constraint_segment_actor_refs = {}
@@ -9194,7 +9256,6 @@ segmentation, triangulation, and visualization.
                     self._actor_id_to_segment_map.clear()
                 
                 # Build all segment actors for ALL surfaces (not just selected one)
-                logger.info(f"Building constraint actors for all surfaces...")
                 actors_built = 0
                 
                 for (surf_idx, seg_uid), seg_info in getattr(self, "_refine_segment_map", {}).items():
@@ -9212,8 +9273,8 @@ segmentation, triangulation, and visualization.
                     # Create the mesh object
                     line_mesh = pv.lines_from_points(np.array([p1, p2], float))
                     
-                    # Add mesh to plotter and get actor
-                    actor = plotter.add_mesh(
+                    # Add mesh to segments plotter and get actor
+                    actor = segments_plotter.add_mesh(
                         line_mesh,
                         color=rgb, 
                         line_width=lw,
@@ -9258,11 +9319,34 @@ segmentation, triangulation, and visualization.
                     
                     actors_built += 1
                 
-                logger.info(f"Built {actors_built} constraint actors")
+                logger.info(f"Built {actors_built} constraint actors (GLOBAL - persistent across ALL operations)")
                 self._constraint_actors_built = True
+                
+                # Mark the exact segment count to detect future data changes
+                self._last_segment_count = len(getattr(self, '_refine_segment_map', {}))
+            else:
+                # Actors already exist - NO REBUILDING NEEDED!
+                logger.info(f"Using existing {len(self.constraint_segment_actor_refs)} constraint actors (no rebuild needed)")
+                
+                # Just ensure all constraint actors are visible in the current segments plotter
+                current_segments_plotter = self._get_current_refine_plotter()
+                if current_segments_plotter:
+                    # Move actors to current plotter if needed (without rebuilding)
+                    actors_moved = 0
+                    for (surf_idx, seg_uid), actor in self.constraint_segment_actor_refs.items():
+                        # Check if actor is in current plotter's renderer
+                        try:
+                            if actor not in current_segments_plotter.renderer.actors:
+                                current_segments_plotter.renderer.AddActor(actor)
+                                actors_moved += 1
+                        except:
+                            pass
+                    if actors_moved > 0:
+                        logger.info(f"Moved {actors_moved} existing constraint actors to current segments plotter")
             
-            # Update visibility of ALL actors based on current filters (FAST - no rebuilding)
+            # INSTANT visibility update - no rebuilding, just toggle visibility
             visible_count = 0
+            hidden_count = 0
             for (surf_idx, seg_uid), actor in getattr(self, 'constraint_segment_actor_refs', {}).items():
                 # Check surface filter
                 should_show = should_show_surface(surf_idx)
@@ -9283,36 +9367,44 @@ segmentation, triangulation, and visualization.
                         if not is_selected:
                             should_show = False
 
-                # Apply visibility (INSTANT)
+                # Apply visibility (INSTANT - no rendering needed)
                 actor.SetVisibility(should_show)
                 if should_show:
                     visible_count += 1
+                else:
+                    hidden_count += 1
             
-            logger.info(f"Surface filter applied instantly: {visible_count} segments visible")
-
-        # Add status text showing current filter settings and mouse selection state
-        status_parts = []
-        if selected_surface != "All Surfaces":
-            status_parts.append(f"Surface: {selected_surface}")
-        if view == 2:  # Only show constraint filters in constraint view
-            if not show_hull_constraints:
-                status_parts.append("Hull: Hidden")
-            if not show_intersection_constraints:
-                status_parts.append("Intersections: Hidden")
-            if show_selected_only_mode:
-                status_parts.append("Mode: Selected Only")
+            # Only render once at the end for efficiency
+            plotter.render()
             
-            # Add mouse selection status
-            mouse_enabled = getattr(self, 'mouse_selection_enabled_btn', None)
-            if mouse_enabled and mouse_enabled.isChecked():
-                status_parts.append("🖱️ Mouse: ON")
-        
-        if status_parts:
-            filter_text = "Filters: " + " | ".join(status_parts)
-            plotter.add_text(filter_text, position='upper_left', font_size=10, color='yellow')
+            logger.info(f"INSTANT surface filter applied: {visible_count} segments visible, {hidden_count} hidden (no rebuild)")
 
-        plotter.reset_camera()
-        plotter.render()
+        # Add status text and render for non-intersection views
+        # (intersection view handles its own text and rendering)
+        if view != 0:
+            # Add status text showing current filter settings and mouse selection state
+            status_parts = []
+            if selected_surface != "All Surfaces":
+                status_parts.append(f"Surface: {selected_surface}")
+            if view == 2:  # Only show constraint filters in constraint view
+                if not show_hull_constraints:
+                    status_parts.append("Hull: Hidden")
+                if not show_intersection_constraints:
+                    status_parts.append("Intersections: Hidden")
+                if show_selected_only_mode:
+                    status_parts.append("Mode: Selected Only")
+                
+                # Add mouse selection status
+                mouse_enabled = getattr(self, 'mouse_selection_enabled_btn', None)
+                if mouse_enabled and mouse_enabled.isChecked():
+                    status_parts.append("🖱️ Mouse: ON")
+            
+            if status_parts:
+                filter_text = "Filters: " + " | ".join(status_parts)
+                plotter.add_text(filter_text, position='upper_left', font_size=10, color='yellow')
+
+            plotter.reset_camera()
+            plotter.render()
     # =====================================
 
     # ======================================================================
