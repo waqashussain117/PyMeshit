@@ -1814,7 +1814,6 @@ def make_corners_special(convex_hull: List[Vector3D], angle_threshold_deg: float
     logger.info(f"Identified {special_count} corner points on convex hull")
     return convex_hull
 
-
 def align_intersections_to_convex_hull(surface_idx: int, model):
     """
     Align intersection points to the convex hull of a surface.

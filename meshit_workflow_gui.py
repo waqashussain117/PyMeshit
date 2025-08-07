@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import QAbstractItemView
 from meshit.intersection_utils import align_intersections_to_convex_hull, Vector3D, Intersection, refine_intersection_line_by_length, insert_triple_points
 from meshit.intersection_utils import prepare_plc_for_surface_triangulation, run_constrained_triangulation_py, calculate_triple_points, TriplePoint
 # Import PyQt5
+from meshit.intersection_utils import make_corners_special, Vector3D
 # import QMessageBox
 from meshit.pre_tetra_constraint_manager import PreTetraConstraintManager
 from PyQt5.QtWidgets import QMenu, QTreeWidgetItemIterator
@@ -4617,9 +4618,9 @@ class MeshItWorkflowGUI(QMainWindow):
 
         # --- Get UI Parameters ---
         try:
-            target_feature_size = float(self.mesh_target_feature_size_input.value())  # Fixed: use .value() not .text()
-            gradient = float(self.mesh_gradient_input.value())  # Also fixed gradient
-            min_angle_deg = float(self.mesh_min_angle_input.value())  # Also fixed min_angle
+            target_feature_size = float(self.mesh_target_feature_size_input.value())
+            gradient = float(self.mesh_gradient_input.value())
+            min_angle_deg = float(self.mesh_min_angle_input.value())
             uniform_meshing = self.mesh_uniform_checkbox.isChecked()
         except ValueError:
             QMessageBox.warning(self, "Input Error", "Invalid numeric input for refinement parameters.")
@@ -4629,17 +4630,14 @@ class MeshItWorkflowGUI(QMainWindow):
         # --- Temporary Model Setup ---
         class TempModelWrapper:
             def __init__(self):
-                self.surfaces = [] # List of TempDataWrapper for surfaces only (no triangulation needed)
-                self.polylines = [] # List of TempDataWrapper for polylines
-                self.intersections = [] # List of Intersection objects
-                self.triple_points = [] # List to store the triple points explicitly
-                
-                # Mappings
+                self.surfaces = []
+                self.polylines = []
+                self.intersections = []
+                self.triple_points = []
                 self.original_indices_map = {} 
                 self.is_polyline = {}
                 self.surface_original_to_temp_idx_map = {}
                 self.polyline_original_to_temp_idx_map = {}
-
 
         temp_model = TempModelWrapper()
 
@@ -4649,7 +4647,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 involved_original_indices.add(intersection_data['dataset_id1'])
                 involved_original_indices.add(intersection_data['dataset_id2'])
 
-        temp_data_idx_counter = 0 # This will be the key for original_indices_map and is_polyline
+        temp_data_idx_counter = 0
 
         for original_idx, dataset_content in enumerate(self.datasets):
             if original_idx not in involved_original_indices:
@@ -4657,51 +4655,46 @@ class MeshItWorkflowGUI(QMainWindow):
 
             class TempDataWrapper:
                 def __init__(self):
-                    self.convex_hull = [] # List of Vector3D
-                    self.size = 0.1 # Default size
+                    self.convex_hull = []
+                    self.size = 0.1
                     self.name = f"Dataset_{original_idx}"
-                    # self.vertices = [] # Could add if needed by some refinement step
 
             data_wrapper = TempDataWrapper()
             data_wrapper.name = dataset_content.get('name', f"Dataset_{original_idx}")
             
-            current_geom_points = [] # For calculating size if hull_points is missing
-            hull_points_np = dataset_content.get('hull_points')
-            if hull_points_np is not None and len(hull_points_np) > 0:
-                data_wrapper.convex_hull = []
-                for hp in hull_points_np:
+            current_geom_points_obj_array = None
+            hull_points_obj_array = dataset_content.get('hull_points')
+            
+            if hull_points_obj_array is not None and len(hull_points_obj_array) > 0:
+                for hp in hull_points_obj_array:
                     point_type = hp[3] if len(hp) > 3 and isinstance(hp[3], str) else "DEFAULT"
-                    data_wrapper.convex_hull.append(Vector3D(hp[0], hp[1], hp[2] if len(hp) > 2 else 0.0, point_type=point_type))
-                current_geom_points = hull_points_np
-            else: # Fallback: use 'points' if 'hull_points' is missing
+                    data_wrapper.convex_hull.append(Vector3D(hp[0], hp[1], hp[2], point_type=point_type))
+                current_geom_points_obj_array = hull_points_obj_array
+            else:
                 points_np = dataset_content.get('points')
                 if points_np is not None and len(points_np) > 0:
-                    data_wrapper.convex_hull = [Vector3D(p[0], p[1], p[2] if len(p) > 2 else 0.0) for p in points_np]
-                    current_geom_points = points_np
+                    data_wrapper.convex_hull = [Vector3D(p[0], p[1], p[2]) for p in points_np]
+                    current_geom_points_obj_array = points_np
                 else:
                     logger.warning(f"Dataset {original_idx} ({data_wrapper.name}) has no hull_points or points. Skipping for temp_model.")
                     continue
             
-            if len(current_geom_points) > 1:
-                min_pt, max_pt = np.min(current_geom_points, axis=0), np.max(current_geom_points, axis=0)
-                diag_length = np.linalg.norm(max_pt - min_pt)
-                data_wrapper.size = diag_length / 10.0 if diag_length > 0 else 0.1
-            
-            # Determine if it's a polyline (heuristic, improve if type is stored in dataset_content)
-            if original_idx == 0:  # Force first dataset to be a surface
-                is_p = False
-                logger.info(f"Dataset {original_idx} ({data_wrapper.name}) FORCED as surface for testing")
-            else:
-                # Original logic with triangulation check
-                is_p = (dataset_content.get('type') == 'polyline' or
-                        ('segments' in dataset_content and 'triangles' not in dataset_content and 'hull_points' not in dataset_content))
-                logger.info(f"Dataset {original_idx} ({data_wrapper.name}) classified as {'polyline' if is_p else 'surface'}")
-            if not is_p: # Check intersection involvement if not clearly a polyline
-                for _, intersection_list_check in self.datasets_intersections.items():
-                    for intersection_d_check in intersection_list_check:
-                        if intersection_d_check['is_polyline_mesh'] and intersection_d_check['dataset_id1'] == original_idx:
-                            is_p = True; break
-                    if is_p: break
+            # *** FIX START: Convert object array to numeric array for calculations ***
+            if current_geom_points_obj_array is not None and len(current_geom_points_obj_array) > 1:
+                try:
+                    # Extract only the first 3 columns (x,y,z) and convert to float
+                    numeric_points = np.array(current_geom_points_obj_array[:, :3], dtype=np.float64)
+                    
+                    min_pt, max_pt = np.min(numeric_points, axis=0), np.max(numeric_points, axis=0)
+                    diag_length = np.linalg.norm(max_pt - min_pt)
+                    data_wrapper.size = diag_length / 10.0 if diag_length > 0 else 0.1
+                except Exception as e:
+                    logger.error(f"Error calculating size for dataset {original_idx}: {e}")
+                    data_wrapper.size = 0.1 # Fallback size
+            # *** FIX END ***
+
+            is_p = (dataset_content.get('type') == 'polyline' or
+                    ('segments' in dataset_content and 'triangles' not in dataset_content and 'hull_points' not in dataset_content))
             
             temp_model.original_indices_map[temp_data_idx_counter] = original_idx
             temp_model.is_polyline[temp_data_idx_counter] = is_p
@@ -4720,7 +4713,8 @@ class MeshItWorkflowGUI(QMainWindow):
             self.statusBar().showMessage("Refinement failed: No valid datasets.", 5000)
             return
         logger.info(f"Temp model created: {len(temp_model.surfaces)} surfaces, {len(temp_model.polylines)} polylines.")
-
+        
+        # ... (The rest of the function remains the same as your latest working version) ...
         # Map original self.datasets_intersections to temp_model.intersections using temp_data_idx_counter keys
         original_to_temp_combined_idx_map = {v: k for k, v in temp_model.original_indices_map.items()}
 
@@ -4746,32 +4740,19 @@ class MeshItWorkflowGUI(QMainWindow):
 
         # --- Step 1: Identify Triple Points ---
         try:
-            # Triple points are crucial for refinement - these are points where 3 or more surfaces intersect
-            # First find the triple points where multiple intersections meet
             for i in range(len(temp_model.intersections) - 1):
                 for j in range(i + 1, len(temp_model.intersections)):
-                    # Calculate triple points between pairs of intersections
                     triple_points = calculate_triple_points(i, j, temp_model, tolerance=1e-5)
                     for tp in triple_points:
-                        # Create a TriplePoint object
                         triple_point_obj = TriplePoint(tp)
                         triple_point_obj.add_intersection(i)
                         triple_point_obj.add_intersection(j)
-                        # Set point type explicitly to TRIPLE_POINT
                         tp.point_type = "TRIPLE_POINT"
                         temp_model.triple_points.append(triple_point_obj)
             
-            # Insert the triple points into the intersections
             insert_triple_points(temp_model)
             
-            # Store triple points for constraint references in the pre-tetrameshtab
-            self.triple_points = []
-            for tp in temp_model.triple_points:
-                self.triple_points.append({
-                    'point': tp.point,
-                    'intersections': tp.intersection_ids
-                })
-                
+            self.triple_points = [{'point': tp.point, 'intersections': tp.intersection_ids} for tp in temp_model.triple_points]
             logger.info(f"Found and inserted {len(temp_model.triple_points)} triple points.")
         except Exception as e:
             logger.error(f"Error during triple points calculation: {e}", exc_info=True)
@@ -4781,26 +4762,11 @@ class MeshItWorkflowGUI(QMainWindow):
         # --- Step 2: Identify corner points on convex hulls (C++ MakeCornersSpecial) ---
         try:
             from meshit.intersection_utils import make_corners_special
-            
-            # Process each surface's convex hull to identify corner points first
-            # This mirrors the C++ workflow: calculate_convex_hull -> MakeCornersSpecial -> alignIntersectionsToConvexHull
             corner_points_count = 0
             for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
-                if not hasattr(temp_surface, 'convex_hull') or len(temp_surface.convex_hull) < 3:
-                    continue
-                
-                original_dataset_idx = temp_model.original_indices_map.get(temp_surface_idx)
-                logger.info(f"Identifying corner points on convex hull for surface {temp_surface_idx} (original dataset {original_dataset_idx})")
-                
-                # Apply corner detection using the same angle threshold as C++ MeshIt (135°)
-                temp_surface.convex_hull = make_corners_special(temp_surface.convex_hull, angle_threshold_deg=135.0)
-                
-                # Count corner points
-                for pt in temp_surface.convex_hull:
-                    pt_type = getattr(pt, 'point_type', getattr(pt, 'type', "DEFAULT"))
-                    if pt_type == "CORNER":
-                        corner_points_count += 1
-            
+                if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
+                    temp_surface.convex_hull = make_corners_special(temp_surface.convex_hull, angle_threshold_deg=135.0)
+                    corner_points_count += sum(1 for pt in temp_surface.convex_hull if getattr(pt, 'point_type', "DEFAULT") == "CORNER")
             logger.info(f"Identified {corner_points_count} corner points across all convex hulls")
         except Exception as e:
             logger.error(f"Error during corner point identification: {e}", exc_info=True)
@@ -4809,8 +4775,6 @@ class MeshItWorkflowGUI(QMainWindow):
         
         # --- Step 3: Align intersections to convex hulls (C++ alignIntersectionsToConvexHull) ---
         try:
-            # This step aligns intersection points with the convex hulls of surfaces
-            # Creates new special junction points where intersection lines meet convex hull boundaries
             for temp_surface_list_idx in range(len(temp_model.surfaces)):
                 align_intersections_to_convex_hull(temp_surface_list_idx, temp_model)
             logger.info("Intersection alignment to convex hulls complete.")
@@ -4820,118 +4784,68 @@ class MeshItWorkflowGUI(QMainWindow):
             return
         
         # --- Step 4: Refine intersection lines by length ---
-            
-                # --- Step 4: Refine intersection lines by length ---
         try:
-            # Custom angle thresholds for point classification in refine_intersection_line_by_length
-            # HC_ANGLE_THRESHOLD = 135.0  # Only keep special points with angles > 135 degrees
-            
             for intersection in temp_model.intersections:
-                # Determine effective target length based on involved objects
-                id1 = intersection.id1
-                id2 = intersection.id2
+                id1, id2 = intersection.id1, intersection.id2
                 is_poly1 = temp_model.is_polyline.get(id1, False)
                 is_poly2 = temp_model.is_polyline.get(id2, False)
-                
-                # Get the data wrappers for the objects
-                obj1_data = None
+
+                obj1, obj2 = None, None
                 if is_poly1:
                     if temp_model.original_indices_map[id1] in temp_model.polyline_original_to_temp_idx_map:
-                        obj1_data = temp_model.polylines[temp_model.polyline_original_to_temp_idx_map[temp_model.original_indices_map[id1]]]
+                        obj1 = temp_model.polylines[temp_model.polyline_original_to_temp_idx_map[temp_model.original_indices_map[id1]]]
                 else:
                     if temp_model.original_indices_map[id1] in temp_model.surface_original_to_temp_idx_map:
-                        obj1_data = temp_model.surfaces[temp_model.surface_original_to_temp_idx_map[temp_model.original_indices_map[id1]]]
-                
-                obj2_data = None
+                        obj1 = temp_model.surfaces[temp_model.surface_original_to_temp_idx_map[temp_model.original_indices_map[id1]]]
                 if is_poly2:
                     if temp_model.original_indices_map[id2] in temp_model.polyline_original_to_temp_idx_map:
-                        obj2_data = temp_model.polylines[temp_model.polyline_original_to_temp_idx_map[temp_model.original_indices_map[id2]]]
+                        obj2 = temp_model.polylines[temp_model.polyline_original_to_temp_idx_map[temp_model.original_indices_map[id2]]]
                 else:
                     if temp_model.original_indices_map[id2] in temp_model.surface_original_to_temp_idx_map:
-                        obj2_data = temp_model.surfaces[temp_model.surface_original_to_temp_idx_map[temp_model.original_indices_map[id2]]]
+                        obj2 = temp_model.surfaces[temp_model.surface_original_to_temp_idx_map[temp_model.original_indices_map[id2]]]
+
+                obj1_size = obj1.size if obj1 else 0.1
+                obj2_size = obj2.size if obj2 else 0.1
                 
-                # Get sizes
-                obj1_size = obj1_data.size if obj1_data and hasattr(obj1_data, 'size') else 0.1
-                obj2_size = obj2_data.size if obj2_data and hasattr(obj2_data, 'size') else 0.1
-                
-                # Determine effective target length
                 eff_target_length = target_feature_size
                 if not uniform_meshing:
                     valid_sizes = [s for s in [obj1_size, obj2_size] if s > 1e-6]
-                    if valid_sizes:
-                        eff_target_length = min(valid_sizes)
+                    if valid_sizes: eff_target_length = min(valid_sizes)
                     if target_feature_size > 1e-6 and target_feature_size < eff_target_length:
                         eff_target_length = target_feature_size
                 
-                if eff_target_length <= 1e-6:
-                    eff_target_length = 0.1
+                if eff_target_length <= 1e-6: eff_target_length = 0.1
                 
-                # Refine the intersection line
-                refined_points = refine_intersection_line_by_length(
-                    intersection, 
-                    target_length=eff_target_length,
-                    min_angle_deg=min_angle_deg,
-                    uniform_meshing=uniform_meshing
+                intersection.points = refine_intersection_line_by_length(
+                    intersection, target_length=eff_target_length,
+                    min_angle_deg=min_angle_deg, uniform_meshing=uniform_meshing
                 )
-                
-                # Update the intersection with refined points
-                intersection.points = refined_points
-                
             logger.info("Length-based refinement complete.")
         except Exception as e:
             logger.error(f"Error during length-based refinement: {e}", exc_info=True)
             QMessageBox.warning(self, "Refinement Error", f"Error during length-based refinement: {str(e)}")
             return
-                # --- STEP: Store intersection lines as constraints (C++ approach) ---
+            
+        # --- Store intersection lines as constraints (C++ approach) ---
         logger.info("Storing intersection lines as constraints for each surface...")
-        
-            # ------------------------------------------------------------------
-        # STEP: Store intersection lines as constraints (C++ approach)
-        # ------------------------------------------------------------------
-        logger.info("Storing intersection lines as constraints for each surface…")
-
-        # 1.  Clear any previous constraints
-        for ds in self.datasets:
-            ds["stored_constraints"] = []
-
-        # 2.  One loop over all refined intersections
+        for ds in self.datasets: ds["stored_constraints"] = []
         for inter in temp_model.intersections:
-            sid1 = temp_model.original_indices_map.get(inter.id1)   # first surface
-            sid2 = temp_model.original_indices_map.get(inter.id2)   # second surface
-            if sid1 is None or sid2 is None:
-                continue
-
-            # ---- build the polyline ONCE ---------------------------------
-            pts_with_type = [
-                [pt.x, pt.y, pt.z,
-                getattr(pt, "point_type", getattr(pt, "type", "DEFAULT"))]
-                for pt in inter.points
-            ]
-            if len(pts_with_type) < 2:          # not a valid line
-                continue
-
-            # shared dictionary template (points list is the SAME object)
-            base_entry = {
-                "type": "intersection_line",
-                "points": pts_with_type          # <-- shared reference
-            }
-
-            # ---- append to both surfaces ---------------------------------
+            sid1 = temp_model.original_indices_map.get(inter.id1)
+            sid2 = temp_model.original_indices_map.get(inter.id2)
+            if sid1 is None or sid2 is None: continue
+            
+            pts_with_type = [[pt.x, pt.y, pt.z, getattr(pt, "point_type", "DEFAULT")] for pt in inter.points]
+            if len(pts_with_type) < 2: continue
+            
+            base_entry = {"type": "intersection_line", "points": pts_with_type}
             for ds_idx, other_idx in ((sid1, sid2), (sid2, sid1)):
-                if ds_idx is None or ds_idx >= len(self.datasets):
-                    continue
-                entry = dict(base_entry)         # shallow copy of dict
+                if ds_idx is None or ds_idx >= len(self.datasets): continue
+                entry = dict(base_entry)
                 entry["other_surface_id"] = other_idx
                 self.datasets[ds_idx]["stored_constraints"].append(entry)
                 self.datasets[ds_idx]["needs_constraint_update"] = True
-                logger.info(
-                    f"Stored intersection constraint for surface {ds_idx}: "
-                    f"{len(pts_with_type)} points (other surface {other_idx})"
-                )
+        logger.info("Constraint storage complete.")
 
-        logger.info("Constraint storage complete.")
-        
-        logger.info("Constraint storage complete.")
         # --- Update main data structures and visualization ---
         self.datasets_intersections.clear() 
         self.refined_intersections_for_visualization = {}
@@ -6254,26 +6168,23 @@ class MeshItWorkflowGUI(QMainWindow):
     # ------------------------------------------------------------------------
 
 
+    # Replace the entire _compute_hull_for_dataset method with this:
     def _compute_hull_for_dataset(self, dataset_index: int) -> bool:
         """
         Compute (and store) the boundary poly-line for the selected dataset.
-        For 2D data, this is the convex hull.
-        For 3D sheet-like data, this finds the ordered "rim" or "outline" by:
-            1. Projecting all points to a 2D plane.
-            2. Performing a Delaunay triangulation on the 2D points.
-            3. Identifying the boundary edges (edges belonging to only one triangle).
-            4. Stitching these edges into a continuous, ordered polyline.
+        - For 2D data, this computes the convex hull.
+        - For 3D sheet-like data, this finds the ordered "rim" or "outline"
+        (which can be concave) by finding the boundary of a Delaunay triangulation.
+        
+        This version also identifies and marks geometric corners as "special points"
+        immediately after calculation, preparing it for robust segmentation.
 
-        Returns
-        -------
-        bool
-            True  -> hull stored in dataset['hull_points']
-            False -> error (logged)
+        Returns:
+            bool: True if a boundary was computed and stored in dataset['hull_points'].
         """
         from scipy.spatial import ConvexHull, Delaunay
         import traceback
 
-        # ------------ Basic checks ------------------------------------------------
         if not (0 <= dataset_index < len(self.datasets)):
             logger.error("Invalid dataset index %s for hull computation", dataset_index)
             return False
@@ -6281,60 +6192,48 @@ class MeshItWorkflowGUI(QMainWindow):
         ds = self.datasets[dataset_index]
         pts = ds.get("points")
         if pts is None or len(pts) < 3:
-            logger.warning("Dataset %s needs ≥3 points for hull", dataset_index)
+            logger.warning("Dataset '%s' has < 3 points, skipping hull computation.", ds.get('name'))
             return False
 
-        dim = pts.shape[1]
         try:
-            # ======================================================================
-            # 2-D CASE: Convex hull is correct and efficient here.
-            # ======================================================================
-            if dim == 2:
-                hull_on_plane = ConvexHull(pts)
-                hull_pts = pts[hull_on_plane.vertices]
+            dim = pts.shape[1]
+            hull_pts_np = None
 
-            # ======================================================================
-            # 3-D CASE: Use Delaunay triangulation to find the true boundary.
-            # ======================================================================
+            # --- BRANCH 1: Strict 2D data ---
+            # For pure 2D data, the convex hull is the correct and efficient approach.
+            if dim == 2:
+                logger.info(f"Computing 2D convex hull for '{ds.get('name')}'...")
+                hull = ConvexHull(pts)
+                hull_pts_2d = pts[hull.vertices]
+                # Convert to 3D for consistency, setting Z=0
+                hull_pts_np = np.hstack([hull_pts_2d, np.zeros((len(hull_pts_2d), 1))])
+
+            # --- BRANCH 2: 3D Data (Handles Convex and Concave Boundaries) ---
             else: # dim >= 3
-                # 1. Project all 3D points onto their best-fit 2D plane.
+                logger.info(f"Computing 3D data boundary for '{ds.get('name')}' using Delaunay triangulation...")
+                # 1. Project all 3D points onto their best-fit 2D plane using PCA.
                 _centroid, projected_pts_2d = self._pca_project(pts)
 
                 # 2. Perform Delaunay triangulation on the 2D projected points.
                 tri = Delaunay(projected_pts_2d)
 
-                # 3. Find the boundary edges. These are edges that appear only once.
+                # 3. Find the boundary edges (edges that appear in only one triangle).
                 edges = set()
-                # A map from vertex index to the list of edges it is part of.
-                edge_map = {}
-
-                for i, simplex in enumerate(tri.simplices):
+                for simplex in tri.simplices:
                     for j in range(3):
-                        p1_idx = simplex[j]
-                        p2_idx = simplex[(j + 1) % 3]
-                        
-                        # Canonical edge representation (sorted indices)
+                        p1_idx, p2_idx = simplex[j], simplex[(j + 1) % 3]
                         edge = tuple(sorted((p1_idx, p2_idx)))
-                        
-                        if p1_idx not in edge_map: edge_map[p1_idx] = []
-                        if p2_idx not in edge_map: edge_map[p2_idx] = []
-                        edge_map[p1_idx].append(edge)
-                        edge_map[p2_idx].append(edge)
-                        
                         if edge in edges:
-                            # This edge is shared, so it's not a boundary edge.
-                            edges.remove(edge)
+                            edges.remove(edge) # Internal edge, remove it.
                         else:
-                            # First time we see this edge.
-                            edges.add(edge)
+                            edges.add(edge) # Potential boundary edge.
                 
-                # 4. Stitch the unordered boundary edges into a continuous path.
                 if not edges:
-                    logger.warning("Delaunay method found no boundary edges. Falling back to convex hull.")
-                    hull_on_plane = ConvexHull(projected_pts_2d)
-                    hull_pts = pts[hull_on_plane.vertices]
+                    logger.warning("Delaunay method found no boundary edges. Falling back to convex hull on projected points.")
+                    hull = ConvexHull(projected_pts_2d)
+                    hull_pts_np = pts[hull.vertices]
                 else:
-                    # Start the walk.
+                    # 4. Stitch the unordered boundary edges into a continuous path.
                     ordered_indices = []
                     current_edge = edges.pop()
                     ordered_indices.extend(list(current_edge))
@@ -6342,8 +6241,7 @@ class MeshItWorkflowGUI(QMainWindow):
                     while edges:
                         last_point_idx = ordered_indices[-1]
                         found_next = False
-                        # Find the next edge connected to the last point.
-                        for edge in edges:
+                        for edge in list(edges): # Iterate over a copy
                             if last_point_idx in edge:
                                 next_point_idx = edge[1] if edge[0] == last_point_idx else edge[0]
                                 ordered_indices.append(next_point_idx)
@@ -6354,18 +6252,34 @@ class MeshItWorkflowGUI(QMainWindow):
                             logger.warning("Boundary walk broken. The result might be incomplete or have multiple loops.")
                             break
                     
-                    # 5. Create the final ordered polyline from the original 3D points.
-                    hull_pts = pts[ordered_indices]
+                    # 5. Get the final ordered polyline from the original 3D points.
+                    hull_pts_np = pts[ordered_indices]
 
-            # ------------ Close the poly-line for visualization -----------------
-            if len(hull_pts) > 0 and not np.array_equal(hull_pts[0], hull_pts[-1]):
-                hull_pts = np.vstack([hull_pts, hull_pts[0:1]])
+            # --- Post-processing for BOTH cases ---
 
-            # ------------ Store result and cleanup ------------------------------
-            ds["hull_points"] = hull_pts
+            # Ensure the polyline is closed for processing
+            if len(hull_pts_np) > 0 and not np.array_equal(hull_pts_np[0], hull_pts_np[-1]):
+                hull_pts_np = np.vstack([hull_pts_np, hull_pts_np[0:1]])
+            
+            # Convert numpy array to list of Vector3D objects, initializing type
+            hull_vector3d = [Vector3D(p[0], p[1], p[2], point_type="DEFAULT") for p in hull_pts_np]
+                
+            # Identify and mark special corner points using our utility function
+            hull_vector3d = make_corners_special(hull_vector3d)
+
+            # Store the final hull as a NumPy array of [x, y, z, type_string]
+            # This is the crucial format for passing feature info to the next steps.
+            hull_with_types = []
+            for p in hull_vector3d:
+                ptype = getattr(p, 'point_type', "DEFAULT")
+                hull_with_types.append([p.x, p.y, p.z, ptype])
+                
+            ds["hull_points"] = np.array(hull_with_types, dtype=object)
+
+            # Clear downstream results as they are now invalid
             ds.pop("segments", None)
             ds.pop("triangulation_result", None)
-            logger.info(f"Successfully computed boundary for '{ds.get('name')}' with {len(hull_pts)-1} vertices.")
+            logger.info(f"Successfully computed and analyzed boundary for '{ds.get('name')}' with {len(hull_pts_np)-1} vertices.")
             return True
 
         except Exception as exc:
@@ -6717,8 +6631,14 @@ segmentation, triangulation, and visualization.
             return hull_boundary[0] if len(hull_boundary) > 0 else np.array([0, 0])
 
     def _compute_segments_for_dataset(self, dataset_index):
-        """Compute the segmentation for a specific dataset index. Returns True on success, False on error."""
-        # Check index validity
+        """
+        Compute segmentation using the robust RefineByLength approach. This method
+        takes the pre-processed hull (with corner points marked) and refines it
+        based on the target feature size, preserving geometric features.
+
+        Returns:
+            bool: True on success, False on error.
+        """
         if not (0 <= dataset_index < len(self.datasets)):
             logger.error(f"Invalid dataset index {dataset_index} for segmentation.")
             return False
@@ -6726,135 +6646,59 @@ segmentation, triangulation, and visualization.
         dataset = self.datasets[dataset_index]
         dataset_name = dataset.get('name', f"Dataset {dataset_index}")
         
-        if dataset.get('hull_points') is None or len(dataset['hull_points']) < 4:  # 3 vertices + 1 closing point
-            self.statusBar().showMessage(f"Skipping segments for {dataset_name}: Compute convex hull first")
-            logger.warning(f"Skipping segments for {dataset_name}: hull not computed.")
-            return False # Indicate error or skip
-
-        # --- START EDIT: Get target size from new control ---
-        # Get the segmentation parameter from the UI
-        try:
-            effective_segment_length = float(self.target_feature_size_input.value())
-            if effective_segment_length <= 1e-6: # Use a small threshold instead of zero
-                logger.warning("Target Feature Size is too small, using default value (1.0).")
-                effective_segment_length = 1.0
-        except ValueError:
-            logger.warning("Invalid Target Feature Size, using default value (1.0).")
-            effective_segment_length = 1.0
-        # --- END EDIT ---
+        hull_points_with_types = dataset.get('hull_points')
+        if hull_points_with_types is None or len(hull_points_with_types) < 4:
+            logger.warning(f"Skipping segments for {dataset_name}: hull not computed or too small.")
+            return False
 
         try:
-            # Extract the hull boundary (excluding the closing point)
-            hull_boundary = dataset['hull_points'][:-1]
-            hull_size = len(hull_boundary)
+            target_length = float(self.target_feature_size_input.value())
+            if target_length <= 1e-6:
+                logger.warning("Target Feature Size is too small, using default (1.0).")
+                target_length = 1.0
+                
+            # Create a temporary object that mimics the Intersection class structure
+            # required by the refinement function.
+            class TempHullLine:
+                def __init__(self, points_with_types):
+                    self.points = []
+                    for p in points_with_types:
+                        # Input `p` is expected to be [x, y, z, type_str]
+                        self.points.append(Vector3D(p[0], p[1], p[2], point_type=p[3]))
+
+            hull_line = TempHullLine(hull_points_with_types)
+
+            # >>> USE THE ROBUST REFINEMENT FUNCTION <<<
+            # This function preserves special points (like corners) and subdivides
+            # segments between them to meet the target length.
+            refined_hull_points_vec = refine_intersection_line_by_length(hull_line, target_length)
             
-            logger.info(f"Processing hull with {hull_size} vertices for segmentation of '{dataset_name}'")
-            
-            # Performance optimization: Limit the number of segments per edge to prevent excessive calculations
-            MAX_SEGMENTS_PER_EDGE = 20
-            
-            # Calculate total perimeter along the complex hull boundary
-            total_perimeter = 0
-            for i in range(hull_size):
-                p1 = hull_boundary[i]
-                p2 = hull_boundary[(i + 1) % hull_size]
-                total_perimeter += np.linalg.norm(p2 - p1)
-            
-            # For complex hulls, we need to be more adaptive with segment sizing
-            if hull_size > 20:  # Complex hull detected
-                # Use a more conservative approach for complex hulls
-                avg_edge_length = total_perimeter / hull_size
-                min_segment_length = avg_edge_length * 0.5  # Allow smaller segments for complex shapes
-            else:
-                # Simple hull - use original logic
-                avg_edge_length = total_perimeter / hull_size
-                min_segment_length = avg_edge_length / MAX_SEGMENTS_PER_EDGE
-            
-            # Use the larger of calculated min_segment_length and effective_segment_length
-            effective_segment_length = max(effective_segment_length, min_segment_length)
-            
-            # Pre-allocate segments list with reasonable capacity
-            estimated_segments = int(total_perimeter / effective_segment_length) + hull_size
+            # Convert the refined list of Vector3D objects back into [start, end]
+            # numpy array segments for storage and visualization.
             segments = []
-            
-            # Generate segments along the hull boundary with uniform distribution
-            # For complex hulls, we process the entire boundary as a continuous path
-            # instead of segmenting each individual edge
-            
-            if hull_size > 20:  # Complex hull - use continuous path approach
-                logger.info(f"Using continuous path segmentation for complex hull with {hull_size} vertices")
+            if len(refined_hull_points_vec) >= 2:
+                num_points_for_segments = len(refined_hull_points_vec)
                 
-                # Calculate cumulative distances along the hull boundary
-                cumulative_distances = [0.0]
-                for i in range(hull_size):
-                    p1 = hull_boundary[i]
-                    p2 = hull_boundary[(i + 1) % hull_size]
-                    dist = np.linalg.norm(p2 - p1)
-                    cumulative_distances.append(cumulative_distances[-1] + dist)
+                # For a closed loop, the refinement function may return a duplicated endpoint.
+                # We handle this by not creating a segment from the last point back to the first
+                # if they are identical.
+                if (refined_hull_points_vec[0] - refined_hull_points_vec[-1]).length_squared() < 1e-24:
+                    num_points_for_segments -= 1
                 
-                # Create uniform segments along the entire perimeter
-                num_total_segments = max(4, int(np.ceil(total_perimeter / effective_segment_length)))
-                segment_spacing = total_perimeter / num_total_segments
-                
-                # Optimized segment creation - pre-allocate and compute in batch
-                segments = []
-                for seg_idx in range(num_total_segments):
-                    # Calculate start and end positions along the perimeter
-                    start_dist = seg_idx * segment_spacing
-                    end_dist = ((seg_idx + 1) * segment_spacing) % total_perimeter
-                    
-                    # Find start and end points (optimized version)
-                    start_point = self._find_point_at_distance_fast(hull_boundary, cumulative_distances, start_dist)
-                    end_point = self._find_point_at_distance_fast(hull_boundary, cumulative_distances, end_dist)
-                    
-                    if start_point is not None and end_point is not None:
-                        segments.append([start_point, end_point])
-                
-            else:  # Simple hull - use original edge-by-edge approach
-                logger.info(f"Using edge-by-edge segmentation for simple hull with {hull_size} vertices")
-                
-                for i in range(hull_size):
-                    p1 = hull_boundary[i]
-                    p2 = hull_boundary[(i + 1) % hull_size]
-                    
-                    # Compute edge length
-                    dist = np.linalg.norm(p2 - p1)
-                    
-                    # Skip very short edges to avoid over-segmentation
-                    if dist < effective_segment_length * 0.1:
-                        continue
-                    
-                    # Limit number of segments per edge
-                    num_segments = min(max(1, int(np.ceil(dist / effective_segment_length))), MAX_SEGMENTS_PER_EDGE)
-                    
-                    # Create segments for this edge
-                    if num_segments == 1:
-                        # Single segment for this edge
-                        segments.append([p1, p2])
-                    else:
-                        # Multiple segments for this edge
-                        t_values = np.linspace(0, 1, num_segments + 1)
-                        for j in range(num_segments):
-                            t1, t2 = t_values[j], t_values[j+1]
-                            segment_start = p1 + t1 * (p2 - p1)
-                            segment_end = p1 + t2 * (p2 - p1)
-                            segments.append([segment_start, segment_end])
-            
-            # Store the segments in the dataset - using a normal list for better performance
-            dataset['segments'] = segments
-            
-            # Log success information (reduced logging for performance)
-            logger.info(f"Successfully created {len(segments)} segments for dataset '{dataset_name}'")
-            
-            # Clear any previous results from later steps for this dataset
-            dataset.pop('triangulation_result', None)
+                for i in range(num_points_for_segments):
+                    p1 = refined_hull_points_vec[i]
+                    # Wrap around for the last segment of a closed loop
+                    p2 = refined_hull_points_vec[(i + 1) % len(refined_hull_points_vec)]
+                    segments.append([p1.to_numpy(), p2.to_numpy()])
 
-            return True # Indicate success
+            dataset['segments'] = segments
+            dataset.pop('triangulation_result', None)
+            logger.info(f"Successfully created {len(segments)} segments for '{dataset_name}' using RefineByLength logic.")
+            return True
 
         except Exception as e:
-            logger.error(f"Error computing segments for {dataset_name}: {str(e)}")
-            return False # Indicate error
-
+            logger.error(f"Error computing segments for '{dataset_name}': {e}", exc_info=True)
+            return False
     def compute_segments(self):
         """Compute the segmentation of the convex hull for the *active* dataset (primarily for context menu)"""
         # Check if we have an active dataset
@@ -9862,439 +9706,174 @@ segmentation, triangulation, and visualization.
                 if widget:
                     widget.deleteLater()
 
-            # Ensure parent_frame has a layout
             if parent_frame.layout() is None:
                 parent_frame.setLayout(QVBoxLayout())
 
-            # Create a message if PyVista is not available
-            msg_widget = QWidget()
-            msg_layout = QVBoxLayout(msg_widget)
             msg = QLabel("PyVista not installed.\nPlease install PyVista for 3D visualization.")
             msg.setAlignment(Qt.AlignCenter)
-            msg_layout.addWidget(msg)
-            parent_frame.layout().addWidget(msg_widget)
-            return msg_widget
+            parent_frame.layout().addWidget(msg)
+            return
 
-        # Close previous plotter if it exists
-        if hasattr(self, 'current_plotter') and self.current_plotter is not None:
-            try:
-                self.current_plotter.close()
-            except Exception as e:
-                logger.warning(f"Error closing previous plotter: {e}")
-            self.current_plotter = None
-
-        # Clear previous content from parent frame layout first
+        # Close and clean up any previous plotter in this frame
+        if hasattr(self, f'{view_type}_plotter'):
+            old_plotter = getattr(self, f'{view_type}_plotter')
+            if old_plotter:
+                try:
+                    old_plotter.close()
+                except Exception as e:
+                    logger.warning(f"Error closing old plotter for {view_type}: {e}")
+        
         parent_layout = parent_frame.layout()
         if parent_layout is None:
             parent_layout = QVBoxLayout(parent_frame)
-            parent_layout.setContentsMargins(0,0,0,0)
+            parent_layout.setContentsMargins(0, 0, 0, 0)
 
         while parent_layout.count():
             item = parent_layout.takeAt(0)
             widget = item.widget()
             if widget:
-                if isinstance(widget, QFrame) and hasattr(widget, 'interactor'):
-                    try:
-                        widget.interactor.close()
-                    except Exception as e:
-                        logger.debug(f"Minor issue closing interactor: {e}")
                 widget.deleteLater()
 
-        # Create a container widget for the entire visualization area
-        vis_container_widget = QWidget()
-        vis_container_layout = QVBoxLayout(vis_container_widget)
-        vis_container_layout.setContentsMargins(0, 0, 0, 0)
+        from pyvistaqt import QtInteractor
+        import pyvista as pv
+        import numpy as np
+                
+        plotter = QtInteractor(parent=parent_frame)
+        setattr(self, f'{view_type}_plotter', plotter) # Store reference to the new plotter
+        parent_layout.addWidget(plotter.interactor)
+        
+        plotter.set_background("#383F51")
+        plotter.disable() # Disable rendering for performance during setup
 
-        # Add visualization info header based on view_type
-        if view_type == "points":
-            info_title = "Point Cloud Visualization"
-        elif view_type == "hulls":
-            info_title = "Convex Hull Visualization"
-        elif view_type == "segments":
-            info_title = "Segmentation Visualization"
-        elif view_type == "triangulation":
-            info_title = "Triangulation Visualization"
-        else:
-            info_title = title
-
-        info_label = QLabel(info_title)
-        info_label.setAlignment(Qt.AlignCenter)
-        vis_container_layout.addWidget(info_label)
-
-        # Create legend with colored boxes for each dataset
-        legend_widget = QWidget()
-        legend_layout = QHBoxLayout(legend_widget)
-        legend_layout.setContentsMargins(5, 2, 5, 2)
-
-        visible_datasets_in_list = [d for d in datasets if d.get('visible', True)]
-        for dataset in visible_datasets_in_list:
+        plotter_has_geometry = False
+        for i, dataset in enumerate(datasets):
+            if not dataset.get('visible', True):
+                continue
+                
+            points = dataset.get('points')
             color = dataset.get('color', '#000000')
             name = dataset.get('name', 'Unnamed')
             
-            legend_item = QWidget()
-            legend_item_layout = QHBoxLayout(legend_item)
-            legend_item_layout.setContentsMargins(0, 0, 5, 0)
-            
-            # Color box
-            color_box = QLabel("■")
-            color_box.setStyleSheet(f"color: {color}; font-size: 16px;")
-            legend_item_layout.addWidget(color_box)
-            
-            # Dataset name
-            name_label = QLabel(name)
-            legend_item_layout.addWidget(name_label)
-            
-            legend_layout.addWidget(legend_item)
+            if points is None or len(points) == 0:
+                continue
 
-        legend_layout.addStretch()
-        vis_container_layout.addWidget(legend_widget)
+            if points.shape[1] >= 3:
+                points_3d = points[:, 0:3].copy()
+            else:
+                points_3d = np.zeros((len(points), 3))
+                points_3d[:, :points.shape[1]] = points
 
-        try:
-            # Create PyVista plotter widget using QtInteractor
-            from pyvistaqt import QtInteractor
-            import pyvista as pv
-            import numpy as np
-            
-            self.current_plotter = QtInteractor(parent=vis_container_widget)
-            vis_container_layout.addWidget(self.current_plotter)
-            
-            # Set background color
-            self.current_plotter.set_background("#383F51")
-            
-            # OPTIMIZATION: Disable auto-rendering during batch operations for better performance
-            self.current_plotter.disable()
-            
-            # Process datasets based on visualization type
-            plotter_has_geometry = False
-            for i, dataset in enumerate(datasets):
-                if not dataset.get('visible', True):
-                    continue
-                    
-                # Get dataset properties
-                points = dataset.get('points')
-                color = dataset.get('color', '#000000')
-                name = dataset.get('name', 'Unnamed')
-                
-                if points is None or len(points) == 0:
-                    continue
-                
-                # Convert 2D points to 3D with height variation
-                if points.shape[1] == 2:
-                    points_3d = np.zeros((len(points), 3))
-                    points_3d[:, 0] = points[:, 0]
-                    points_3d[:, 1] = points[:, 1]
-                    # Z coordinate is left as 0 for 2D points
-                elif points.shape[1] >= 3:
-                    # Use actual Z coordinates from the data
-                    points_3d = points.copy()[:, 0:3]
-                else:
-                    logger.warning(f"Dataset '{name}' has unexpected point dimensions: {points.shape[1]}. Skipping.")
-                    continue
+            max_points_for_viz = 5000
+            if len(points_3d) > max_points_for_viz:
+                step = len(points_3d) // max_points_for_viz
+                points_3d_viz = points_3d[::step]
+            else:
+                points_3d_viz = points_3d
 
-                # OPTIMIZATION: Subsample large point clouds for better performance
-                max_points_for_viz = 5000  # Limit points for smooth visualization
-                if len(points_3d) > max_points_for_viz:
-                    # Use uniform sampling to maintain distribution
-                    step = len(points_3d) // max_points_for_viz
-                    points_3d_viz = points_3d[::step]
-                    logger.info(f"Subsampled {len(points_3d)} points to {len(points_3d_viz)} for visualization of '{name}'")
-                else:
-                    points_3d_viz = points_3d
-
-                # Add visualization based on type
-                if view_type == "points":
-                    point_cloud = pv.PolyData(points_3d_viz)
-                    self.current_plotter.add_mesh(point_cloud, color=color, render_points_as_spheres=True, 
-                                        point_size=8, label=name)
-                    plotter_has_geometry = True
-                
-                elif view_type == "hulls":
-                    hull_points = dataset.get('hull_points')
-                    if hull_points is not None and len(hull_points) > 3:
-                        try:
-                            # Ensure hull points are properly formatted as 3D coordinates
-                            hull_3d = np.array(hull_points)
-                            
-                            # Validate dimensions
-                            if len(hull_3d.shape) < 2:
-                                logger.warning(f"Invalid hull shape for {name}: {hull_3d.shape}")
-                                continue
-                                
-                            # Ensure each point has exactly 3 coordinates
-                            if hull_3d.shape[1] < 3:
-                                # Pad with zeros if less than 3D
-                                padding = np.zeros((hull_3d.shape[0], 3 - hull_3d.shape[1]))
-                                hull_3d = np.hstack([hull_3d, padding])
-                            elif hull_3d.shape[1] > 3:
-                                # Take only first 3 coordinates if more than 3D
-                                hull_3d = hull_3d[:, :3]
-                            
-                            # OPTIMIZED: Batch create all hull lines at once
-                            num_hull_points = len(hull_3d)
-                            # Create all line points and connectivity in batches
-                            line_points = np.zeros((num_hull_points * 2, 3))  # 2 points per line
-                            line_connectivity = np.zeros(num_hull_points * 3, dtype=int)  # [2, p1_idx, p2_idx] per line
-                            
-                            valid_lines = 0
-                            for j in range(num_hull_points):
+            if view_type == "points":
+                point_cloud = pv.PolyData(points_3d_viz)
+                plotter.add_mesh(point_cloud, color=color, render_points_as_spheres=True, point_size=8, label=name)
+                plotter_has_geometry = True
+            
+            elif view_type == "hulls":
+                hull_points = dataset.get('hull_points')
+                if hull_points is not None and len(hull_points) > 3:
+                    try:
+                        # *** FIX START ***
+                        # The hull_points array has dtype=object because of the type string.
+                        # We must explicitly extract the numeric coordinates into a new, purely numeric array.
+                        hull_vertices_numeric = []
+                        for p in hull_points:
+                            if len(p) >= 3:
                                 try:
-                                    # Get current and next point (wrap around for last point)
-                                    point_a = hull_3d[j]
-                                    point_b = hull_3d[(j + 1) % num_hull_points]  # Wrap around to close the hull
-                                    
-                                    # Validate coordinates
-                                    if (len(point_a) >= 3 and len(point_b) >= 3 and
-                                        np.all(np.isfinite(point_a[:3])) and np.all(np.isfinite(point_b[:3]))):
-                                        
-                                        # Add to batch arrays
-                                        point_idx = valid_lines * 2
-                                        line_points[point_idx] = point_a[:3]
-                                        line_points[point_idx + 1] = point_b[:3]
-                                        
-                                        # Line connectivity: [2, point1_index, point2_index]
-                                        conn_idx = valid_lines * 3
-                                        line_connectivity[conn_idx] = 2
-                                        line_connectivity[conn_idx + 1] = point_idx
-                                        line_connectivity[conn_idx + 2] = point_idx + 1
-                                        
-                                        valid_lines += 1
-                                    else:
-                                        logger.warning(f"Skipping invalid hull line {j} for {name}")
-                                        
-                                except Exception as e:
-                                    logger.warning(f"Error creating hull line {j} for {name}: {e}")
-                                    continue
-                            
-                            # Create single mesh for all hull lines if we have valid lines
-                            if valid_lines > 0:
-                                # Trim arrays to actual size
-                                line_points = line_points[:valid_lines * 2]
-                                line_connectivity = line_connectivity[:valid_lines * 3]
-                                
-                                # Create PolyData with all hull edges at once
-                                hull_mesh = pv.PolyData(line_points, lines=line_connectivity)
-                                self.current_plotter.add_mesh(hull_mesh, color=color, line_width=3.0, 
-                                                            opacity=1.0, label=f"{name} Hull")
-                                
-                                logger.info(f"Successfully visualized hull with {valid_lines} edges for dataset '{name}'")
-                                    
-                            # Add the original points with reduced opacity for context (use subsampled points)
-                            point_cloud = pv.PolyData(points_3d_viz)
-                            self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.3, 
-                                            render_points_as_spheres=True, point_size=5)
-                            plotter_has_geometry = True
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing hull points for {name}: {e}")
-                            # Fallback to just showing points (use subsampled points)
-                            point_cloud = pv.PolyData(points_3d_viz)
-                            self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.7, 
-                                            render_points_as_spheres=True, point_size=5)
-                            plotter_has_geometry = True
-
-                elif view_type == "segments":
-                    segments = dataset.get('segments')
-                    if segments is not None and len(segments) > 0:
-                        logger.info(f"Visualizing {len(segments)} segments for dataset '{name}'")
+                                    # Extract and convert the first 3 elements (x,y,z)
+                                    xyz = [float(p[0]), float(p[1]), float(p[2])]
+                                    hull_vertices_numeric.append(xyz)
+                                except (ValueError, TypeError):
+                                    continue # Skip if conversion fails
                         
-                        # Add original points for context (smaller and more transparent, use subsampled)
+                        if not hull_vertices_numeric:
+                            continue # Skip if no valid points were extracted
+
+                        hull_3d = np.array(hull_vertices_numeric, dtype=np.float64)
+                        # *** FIX END ***
+
+                        # This logic now works correctly with the clean `hull_3d` array
+                        num_hull_points = len(hull_3d)
+                        if num_hull_points >= 2:
+                            # Create a single PolyData object for the entire hull outline
+                            line_segments = np.array([[2, i, (i + 1) % num_hull_points] for i in range(num_hull_points)], dtype=np.int32).ravel()
+                            hull_mesh = pv.PolyData(hull_3d)
+                            hull_mesh.lines = line_segments
+
+                            plotter.add_mesh(hull_mesh, color=color, line_width=3.0, label=f"{name} Hull")
+                            
+                            point_cloud = pv.PolyData(points_3d_viz)
+                            plotter.add_mesh(point_cloud, color=color, opacity=0.3, render_points_as_spheres=True, point_size=5)
+                            plotter_has_geometry = True
+                                
+                    except Exception as e:
+                        logger.error(f"Error processing hull points for {name}: {e}")
                         point_cloud = pv.PolyData(points_3d_viz)
-                        self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.2, render_points_as_spheres=True,
-                                        point_size=3, label=f"{name} Original Points")
-
-                        # OPTIMIZED: Batch process all segments into single line mesh
-                        if segments:
-                            # Pre-allocate arrays for all line points and connectivity
-                            total_lines = len(segments)
-                            line_points = np.zeros((total_lines * 2, 3))  # 2 points per line
-                            line_connectivity = np.zeros(total_lines * 3, dtype=int)  # [2, p1_idx, p2_idx] per line
-                            
-                            valid_lines = 0
-                            segment_endpoints_set = set()  # Use set for fast deduplication
-                            
-                            for i, segment in enumerate(segments):
-                                try:
-                                    # Ensure segment points are 3D NumPy arrays
-                                    p1 = np.array(segment[0], dtype=float)
-                                    p2 = np.array(segment[1], dtype=float)
-                                    
-                                    # Pad with zeros if dimension is less than 3
-                                    if len(p1) == 2: 
-                                        p1 = np.append(p1, 0.0)
-                                    if len(p2) == 2: 
-                                        p2 = np.append(p2, 0.0)
-
-                                    # Validate coordinates
-                                    if (len(p1) >= 3 and len(p2) >= 3 and
-                                        np.all(np.isfinite(p1[:3])) and np.all(np.isfinite(p2[:3]))):
-                                        
-                                        # Add to batch arrays
-                                        point_idx = valid_lines * 2
-                                        line_points[point_idx] = p1[:3]
-                                        line_points[point_idx + 1] = p2[:3]
-                                        
-                                        # Line connectivity: [2, point1_index, point2_index]
-                                        conn_idx = valid_lines * 3
-                                        line_connectivity[conn_idx] = 2
-                                        line_connectivity[conn_idx + 1] = point_idx
-                                        line_connectivity[conn_idx + 2] = point_idx + 1
-                                        
-                                        # Collect endpoints for markers (use tuples for set)
-                                        segment_endpoints_set.add(tuple(p1[:3]))
-                                        segment_endpoints_set.add(tuple(p2[:3]))
-                                        
-                                        valid_lines += 1
-                                        
-                                except Exception as e:
-                                    logger.warning(f"Error processing segment {i} for {name}: {e}")
-                                    continue
-
-                            # Create single mesh for all segments if we have valid lines
-                            if valid_lines > 0:
-                                # Trim arrays to actual size
-                                line_points = line_points[:valid_lines * 2]
-                                line_connectivity = line_connectivity[:valid_lines * 3]
-                                
-                                # Create PolyData with all segments at once
-                                segments_mesh = pv.PolyData(line_points, lines=line_connectivity)
-                                self.current_plotter.add_mesh(segments_mesh, color=color, line_width=3.0, 
-                                                            opacity=0.9, label=f"{name} Segments")
-                                
-                                # Add segment endpoints as visible points (batch processed)
-                                if segment_endpoints_set:
-                                    unique_endpoints = np.array(list(segment_endpoints_set))
-                                    segment_points = pv.PolyData(unique_endpoints)
-                                    
-                                    # Make segment points more visible
-                                    segment_point_color = '#FF0000' if color != '#FF0000' else '#00FF00'
-                                    self.current_plotter.add_mesh(segment_points, color=segment_point_color, 
-                                                                render_points_as_spheres=True, point_size=8, 
-                                                                opacity=1.0, label=f"{name} Segment Points")
-                                    
-                                    logger.info(f"Added {len(unique_endpoints)} segment endpoint markers for dataset '{name}'")
-
-                                logger.info(f"Successfully visualized {valid_lines}/{len(segments)} segments for dataset '{name}'")
-                        
+                        plotter.add_mesh(point_cloud, color=color, opacity=0.7, render_points_as_spheres=True, point_size=5)
                         plotter_has_geometry = True
 
-                elif view_type == "triangulation":
-                    triangulation_result = dataset.get('triangulation_result')
-                    if triangulation_result is not None:
-                        vertices = triangulation_result.get('vertices')
-                        triangles = triangulation_result.get('triangles')
+            elif view_type == "segments":
+                segments = dataset.get('segments')
+                if segments is not None and len(segments) > 0:
+                    point_cloud = pv.PolyData(points_3d_viz)
+                    plotter.add_mesh(point_cloud, color=color, opacity=0.2, render_points_as_spheres=True, point_size=3)
+
+                    segment_points_list = []
+                    for seg in segments:
+                        segment_points_list.append(seg[0])
+                        segment_points_list.append(seg[1])
+                    
+                    if segment_points_list:
+                        all_line_points = np.array(segment_points_list)
+                        # Create line connectivity array
+                        lines = np.arange(len(all_line_points)).reshape(-1, 2)
+                        lines = np.hstack((np.full((len(lines), 1), 2), lines))
                         
-                        if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
-                            # Convert vertices to 3D, respecting Z coordinates 
-                            if vertices.shape[1] == 2:
-                                vertices_3d = np.zeros((len(vertices), 3))
-                                vertices_3d[:, 0:2] = vertices
-                                
-                                # OPTIMIZED: Vectorized Z mapping from original points
-                                if len(points_3d) > 0:
-                                    # Use KDTree for fast nearest neighbor search for large point sets
-                                    if len(points_3d) > 1000:
-                                        from scipy.spatial import cKDTree
-                                        tree = cKDTree(points_3d[:, 0:2])
-                                        _, closest_indices = tree.query(vertices[:, 0:2])
-                                        vertices_3d[:, 2] = points_3d[closest_indices, 2]
-                                    else:
-                                        # Simple vectorized approach for smaller datasets
-                                        for j in range(len(vertices)):
-                                            vertex_2d = vertices[j]
-                                            distances = np.sum((points_3d[:, 0:2] - vertex_2d)**2, axis=1)
-                                            closest_idx = np.argmin(distances)
-                                            vertices_3d[j, 2] = points_3d[closest_idx, 2]
-                            else:
-                                # Use Z values if they're already present
-                                vertices_3d = vertices.copy()[:, 0:3]
-                            
-                            cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
-                            mesh = pv.PolyData(vertices_3d, cells)
-                            
-                            self.current_plotter.add_mesh(mesh, color=color, opacity=0.7, 
-                                                    show_edges=True, edge_color=color, 
-                                                    line_width=1, specular=0.5, label=name)
-                            plotter_has_geometry = True
+                        segments_mesh = pv.PolyData(all_line_points, lines=lines.ravel())
+                        plotter.add_mesh(segments_mesh, color=color, line_width=3.0, label=f"{name} Segments")
+                        
+                        # Add endpoint markers
+                        unique_endpoints = np.unique(all_line_points, axis=0)
+                        plotter.add_points(unique_endpoints, color='red', point_size=8, render_points_as_spheres=True)
+                        plotter_has_geometry = True
 
-            # Add axes and reset camera only if something was plotted
-            if plotter_has_geometry:
-                self.current_plotter.add_axes()
-                self.current_plotter.reset_camera()
-                
-                # OPTIMIZATION: Re-enable rendering after all geometry is added
-                self.current_plotter.enable()
-                
-                # Force a render to ensure the visualization is updated
-                try:
-                    self.current_plotter.render()
-                    logger.info("3D visualization rendered successfully")
-                except Exception as e:
-                    logger.warning(f"Error forcing render: {e}")
-            else:
-                # Re-enable even if no geometry was added
-                self.current_plotter.enable()
-                logger.warning("No geometry added to the plotter for the current view.")
-            
-            # Add controls for adjustment
-            controls_widget = QWidget()
-            controls_layout = QHBoxLayout(controls_widget)
-            controls_layout.setContentsMargins(5, 2, 5, 2)
-            
-            # Add segment controls for segment view
-            if view_type == "segments":
-                # Toggle for showing segment distances
-                show_distances_cb = QCheckBox("Show Distances")
-                show_distances_cb.setChecked(False)
-                show_distances_cb.stateChanged.connect(lambda state: self._toggle_segment_distance_labels(state == 2))
-                controls_layout.addWidget(show_distances_cb)
-                controls_layout.addWidget(QLabel("|"))
-            
-            # Height adjustment slider - for Z axis exaggeration
-            controls_layout.addWidget(QLabel("Z Exaggeration:"))
-            height_slider = QSlider(Qt.Horizontal)
-            height_slider.setMinimum(1)
-            height_slider.setMaximum(100)
-            height_slider.setValue(int(self.height_factor * 20))
-            height_slider.valueChanged.connect(lambda v: self._set_height_factor_and_update(v / 20.0))
-            controls_layout.addWidget(height_slider)
-            
-            # Add zoom controls
-            controls_layout.addStretch(1)
-            controls_layout.addWidget(QLabel("Zoom:"))
-            zoom_in_btn = QPushButton("+")
-            zoom_in_btn.setMaximumWidth(30)
-            zoom_in_btn.clicked.connect(lambda: self.current_plotter.camera.zoom(1.2))
-            controls_layout.addWidget(zoom_in_btn)
-            
-            zoom_out_btn = QPushButton("-")
-            zoom_out_btn.setMaximumWidth(30)
-            zoom_out_btn.clicked.connect(lambda: self.current_plotter.camera.zoom(1/1.2))
-            controls_layout.addWidget(zoom_out_btn)
-            
-            # Reset view button
-            reset_btn = QPushButton("Reset View")
-            reset_btn.clicked.connect(lambda: self.current_plotter.reset_camera())
-            controls_layout.addWidget(reset_btn)
-            
-            vis_container_layout.addWidget(controls_widget)
+            elif view_type == "triangulation":
+                tri_result = dataset.get('triangulation_result')
+                if tri_result:
+                    vertices = tri_result.get('vertices')
+                    triangles = tri_result.get('triangles')
+                    
+                    if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
+                        vertices_3d = np.zeros((len(vertices), 3))
+                        if vertices.shape[1] >= 3:
+                            vertices_3d = vertices[:, :3].copy()
+                        else:
+                            vertices_3d[:, :vertices.shape[1]] = vertices
+                        
+                        # Apply height factor for visualization
+                        vertices_3d[:, 2] *= self.height_factor
 
-        except ImportError:
-            logger.error("PyVistaQt import failed unexpectedly.")
-            error_msg = QLabel("Error: Failed to load PyVistaQt.")
-            error_msg.setAlignment(Qt.AlignCenter)
-            vis_container_layout.addWidget(error_msg)
-        except Exception as e:
-            error_msg_text = f"Error creating 3D view: {str(e)}\nCheck logs for details."
-            error_msg = QLabel(error_msg_text)
-            error_msg.setAlignment(Qt.AlignCenter)
-            error_msg.setWordWrap(True)
-            vis_container_layout.addWidget(error_msg)
-            logger.exception(f"Error creating multi-dataset 3D view:")
+                        cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
+                        mesh = pv.PolyData(vertices_3d, cells)
+                        
+                        plotter.add_mesh(mesh, color=color, opacity=0.8, show_edges=True, edge_color='black', line_width=0.5, label=name)
+                        plotter_has_geometry = True
 
-        # Add the visualization container widget to the parent frame provided
-        parent_layout.addWidget(vis_container_widget)
-
-        return vis_container_widget
+        if plotter_has_geometry:
+            plotter.add_axes()
+            plotter.add_legend()
+            plotter.reset_camera()
+        else:
+            plotter.add_text(f"No valid data to display for '{view_type}' view.", position='upper_edge', color='white')
+            
+        plotter.enable()
+        plotter.render()
 
     def _set_height_factor_and_update(self, height_factor):
         """Sets the height factor and triggers a visualization update."""
