@@ -127,16 +127,14 @@ class ComputationWorker(QObject):
 
         for i in range(total_datasets):
             if not self._is_running:
-                logger.info(f"Worker: Hull computation loop canceled at index {i}.")
                 break
-            dataset_name = self.gui.datasets[i].get('name', f"Dataset {i}")
-            logger.debug(f"Worker: Computing hull for '{dataset_name}' (index {i}).")
-            # Moved the check inside the loop iteration, just before the potentially long call
-            if not self._is_running:
-                 logger.info(f"Worker: Hull computation canceled just before processing index {i}.")
-                 break
-            success = self.gui._compute_hull_for_dataset(i) # Call GUI's compute method
-            logger.debug(f"Worker: Hull computation for index {i} finished (Success: {success}).")
+            dataset = self.gui.datasets[i]
+            dataset_name = dataset.get('name', f"Dataset {i}")
+            # Skip wells
+            if dataset.get('type') == 'WELL':
+                self.dataset_finished.emit(i, dataset_name, True)
+                continue
+            success = self.gui._compute_hull_for_dataset(i)
             self.dataset_finished.emit(i, dataset_name, success)
             if success:
                 success_count += 1
@@ -144,31 +142,29 @@ class ComputationWorker(QObject):
         elapsed = time.time() - start_time
         logger.info(f"Worker: Hull batch finished. Success: {success_count}/{total_datasets}. Elapsed: {elapsed:.2f}s.")
         self.batch_finished.emit(success_count, total_datasets, elapsed)
+
         # self._is_running = False # Resetting here might be redundant if worker is deleted
 
     def compute_segments_batch(self):
         """Worker method to compute segments for all eligible datasets."""
         logger.info("Worker: Starting segment computation batch.")
-        datasets_with_hulls_indices = [i for i, d in enumerate(self.gui.datasets) if d.get('hull_points') is not None]
-
-        if not datasets_with_hulls_indices:
+        eligible = [i for i, d in enumerate(self.gui.datasets)
+                    if d.get('type') != 'WELL' and d.get('hull_points') is not None]
+        if not eligible:
             self.error_occurred.emit("No datasets have computed hulls.")
             self.batch_finished.emit(0, 0, 0)
             logger.info("Worker: Segment batch finished (no eligible datasets).")
             return
 
         success_count = 0
-        total_eligible = len(datasets_with_hulls_indices)
+        total_eligible = len(eligible)
         start_time = time.time()
 
-        for i in datasets_with_hulls_indices:
+        for i in eligible:
             if not self._is_running:
-                 break
+                break
             dataset_name = self.gui.datasets[i].get('name', f"Dataset {i}")
-             # Moved the check inside the loop iteration
-            if not self._is_running:
-                 break
-            success = self.gui._compute_segments_for_dataset(i) # Call GUI's compute method
+            success = self.gui._compute_segments_for_dataset(i)
             self.dataset_finished.emit(i, dataset_name, success)
             if success:
                 success_count += 1
@@ -176,35 +172,28 @@ class ComputationWorker(QObject):
         elapsed = time.time() - start_time
         logger.info(f"Worker: Segment batch finished. Success: {success_count}/{total_eligible}. Elapsed: {elapsed:.2f}s.")
         self.batch_finished.emit(success_count, total_eligible, elapsed)
-        # self._is_running = False
+
 
     def compute_triangulations_batch(self):
         """Worker method to compute triangulations for all eligible datasets."""
         logger.info("Worker: Starting triangulation computation batch.")
-        datasets_with_segments_indices = [i for i, d in enumerate(self.gui.datasets) if d.get('segments') is not None]
-
-        if not datasets_with_segments_indices:
+        eligible = [i for i, d in enumerate(self.gui.datasets)
+                    if d.get('type') != 'WELL' and d.get('segments') is not None]
+        if not eligible:
             self.error_occurred.emit("No datasets have computed segments.")
             self.batch_finished.emit(0, 0, 0)
             logger.info("Worker: Triangulation batch finished (no eligible datasets).")
             return
 
         success_count = 0
-        total_eligible = len(datasets_with_segments_indices)
+        total_eligible = len(eligible)
         start_time = time.time()
 
-        for i in datasets_with_segments_indices:
+        for i in eligible:
             if not self._is_running:
-                 logger.info(f"Worker: Triangulation computation loop canceled at index {i}.")
-                 break
+                break
             dataset_name = self.gui.datasets[i].get('name', f"Dataset {i}")
-            logger.debug(f"Worker: Computing triangulation for '{dataset_name}' (index {i}).")
-             # Moved the check inside the loop iteration
-            if not self._is_running:
-                 logger.info(f"Worker: Triangulation computation canceled just before processing index {i}.")
-                 break
-            success = self.gui._run_triangulation_for_dataset(i) # Call GUI's compute method
-            logger.debug(f"Worker: Triangulation computation for index {i} finished (Success: {success}).")
+            success = self.gui._run_triangulation_for_dataset(i)
             self.dataset_finished.emit(i, dataset_name, success)
             if success:
                 success_count += 1
@@ -212,7 +201,7 @@ class ComputationWorker(QObject):
         elapsed = time.time() - start_time
         logger.info(f"Worker: Triangulation batch finished. Success: {success_count}/{total_eligible}. Elapsed: {elapsed:.2f}s.")
         self.batch_finished.emit(success_count, total_eligible, elapsed)
-        # self._is_running = False
+            # self._is_running = False
 
     def compute_global_intersections_task(self):
         """Worker task to trigger global intersection computation on the GUI instance."""
@@ -635,6 +624,17 @@ class MeshItWorkflowGUI(QMainWindow):
         load_multiple_action.triggered.connect(self.load_multiple_files)
         file_menu.addAction(load_multiple_action)
 
+        # Add Well loaders
+        load_well_action = QAction("Load &Well File...", self)
+        load_well_action.setStatusTip("Load a single well (polyline) file")
+        load_well_action.triggered.connect(self.load_well_file)
+        file_menu.addAction(load_well_action)
+
+        load_multiple_wells_action = QAction("Load Multiple &Wells...", self)
+        load_multiple_wells_action.setStatusTip("Load multiple well (polyline) files")
+        load_multiple_wells_action.triggered.connect(self.load_multiple_well_files)
+        file_menu.addAction(load_multiple_wells_action)
+
         
         file_menu.addSeparator()
 
@@ -697,7 +697,87 @@ class MeshItWorkflowGUI(QMainWindow):
         about_action = help_menu.addAction("&About")
         about_action.setStatusTip("Show information about the application")
         about_action.triggered.connect(self._show_about)
-    
+    def load_well_file(self):
+        """Load a single well (polyline) file. Wells are 1D and not triangulated."""
+        self.statusBar().showMessage("Loading well file...")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select a well (polyline) file", "",
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
+        )
+        if not file_path:
+            self.statusBar().showMessage("Well file loading canceled")
+            return
+
+        try:
+            points = self._read_point_file(file_path)
+            if points is None or len(points) == 0:
+                QMessageBox.critical(self, "Error", "No valid points found in well file")
+                self.statusBar().showMessage("Error: No valid points found in well file")
+                return
+
+            filename = os.path.basename(file_path)
+            dataset = {
+                'name': filename,
+                'type': 'WELL',            # CRITICAL: mark as WELL
+                'points': points,          # 3D polyline points in order
+                'visible': True,
+                'color': self._get_next_color()
+            }
+            self.datasets.append(dataset)
+            self.current_dataset_index = len(self.datasets) - 1
+
+            # Update UI
+            self._update_dataset_list()
+            self._update_statistics()
+            self._update_visualization()
+
+            self.statusBar().showMessage(f"Successfully loaded well with {len(points)} points from {filename}")
+        except Exception as e:
+            self.statusBar().showMessage(f"Error loading well file: {str(e)}")
+            logger.error(f"Error loading well file: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error loading well file: {str(e)}")
+
+
+    def load_multiple_well_files(self):
+        """Load multiple well (polyline) files as separate WELL datasets."""
+        self.statusBar().showMessage("Loading multiple well files...")
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select well (polyline) files", "",
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
+        )
+        if not file_paths:
+            self.statusBar().showMessage("Well file loading canceled")
+            return
+
+        successful = 0
+        for file_path in file_paths:
+            try:
+                points = self._read_point_file(file_path)
+                if points is None or len(points) == 0:
+                    logger.warning(f"No valid points found in well file: {file_path}")
+                    continue
+                filename = os.path.basename(file_path)
+                dataset = {
+                    'name': filename,
+                    'type': 'WELL',
+                    'points': points,
+                    'visible': True,
+                    'color': self._get_next_color()
+                }
+                self.datasets.append(dataset)
+                self.current_dataset_index = len(self.datasets) - 1
+                successful += 1
+            except Exception as e:
+                logger.error(f"Error loading well file {file_path}: {str(e)}")
+
+        if successful > 0:
+            self._update_dataset_list()
+            self._update_statistics()
+            self._update_visualization()
+            self.statusBar().showMessage(f"Successfully loaded {successful} well(s)")
+        else:
+            self.statusBar().showMessage("No valid wells loaded")
+            QMessageBox.critical(self, "Error", "No valid wells loaded")
     def _setup_file_tab(self):
         """Sets up the file loading tab with controls and visualization area"""
         # Main layout for the tab
@@ -723,6 +803,7 @@ class MeshItWorkflowGUI(QMainWindow):
         load_multiple_btn.setToolTip("Load points from multiple files as separate datasets")
         load_multiple_btn.clicked.connect(self.load_multiple_files)
         file_layout.addWidget(load_multiple_btn)
+        
         
         
         control_layout.addWidget(file_group)
@@ -4650,13 +4731,49 @@ class MeshItWorkflowGUI(QMainWindow):
                 summary += f"• {original_total_points} → {refined_total_points} points<br>"
         
         return summary
+
+    def _add_wells_polyline_to_plotter(self, plotter, color_map=None):
+        """Render all WELL datasets as polylines on the given PyVista plotter."""
+        try:
+            import numpy as np
+            import pyvista as pv
+        except Exception:
+            return
+        if not hasattr(self, 'datasets') or not self.datasets or not plotter:
+            return
+
+        for idx, ds in enumerate(self.datasets):
+            if ds.get('type') != 'WELL':
+                continue
+            pts = ds.get('refined_well_points') or ds.get('points')
+            if pts is None or len(pts) < 2:
+                continue
+
+            pts = np.array(pts, dtype=float)
+            if pts.shape[1] < 3:
+                tmp = np.zeros((pts.shape[0], 3))
+                tmp[:, :pts.shape[1]] = pts
+                pts = tmp
+
+            n = len(pts)
+            # Polyline cell format: [n, 0, 1, 2, ... n-1]
+            lines = np.hstack(([n], np.arange(n, dtype=np.int32))).astype(np.int32)
+            poly = pv.PolyData(pts, lines=lines)
+            color = ds.get('color', self.DEFAULT_COLORS[idx % len(self.DEFAULT_COLORS)])
+            plotter.add_mesh(poly, color=color, line_width=3, opacity=0.9, label=f"{ds.get('name', 'Well')}")
+
+
+    def _add_wells_to_intersection_plotter(self):
+        """Convenience wrapper to add wells to the Intersection tab plotter."""
+        if hasattr(self, 'intersection_plotter') and self.intersection_plotter:
+            self._add_wells_polyline_to_plotter(self.intersection_plotter)
     def _refine_intersection_lines_action(self):
         """
         Action to refine intersection lines by:
         1. Identifying triple points at intersection line crossings
         2. Identifying special points (angles > 135 degrees) on hulls and intersections 
         3. Refining lines by dividing into segments of target length
-        
+
         Focus on keeping only convex hull and intersection lines without triangulated surfaces.
         """
         logger.info("Starting refinement of intersection lines...")
@@ -4667,11 +4784,9 @@ class MeshItWorkflowGUI(QMainWindow):
             self.statusBar().showMessage("Refinement skipped: No intersections found.", 5000)
             return
 
-        # --- Store original for summary ---
         import copy
         self.original_intersections_backup = copy.deepcopy(self.datasets_intersections)
 
-        # --- Get UI Parameters ---
         try:
             target_feature_size = float(self.mesh_target_feature_size_input.value())
             gradient = float(self.mesh_gradient_input.value())
@@ -4681,15 +4796,14 @@ class MeshItWorkflowGUI(QMainWindow):
             QMessageBox.warning(self, "Input Error", "Invalid numeric input for refinement parameters.")
             self.statusBar().showMessage("Refinement failed: Invalid input.", 5000)
             return
-        
-        # --- Temporary Model Setup ---
+
         class TempModelWrapper:
             def __init__(self):
                 self.surfaces = []
                 self.polylines = []
                 self.intersections = []
                 self.triple_points = []
-                self.original_indices_map = {} 
+                self.original_indices_map = {}
                 self.is_polyline = {}
                 self.surface_original_to_temp_idx_map = {}
                 self.polyline_original_to_temp_idx_map = {}
@@ -4716,10 +4830,10 @@ class MeshItWorkflowGUI(QMainWindow):
 
             data_wrapper = TempDataWrapper()
             data_wrapper.name = dataset_content.get('name', f"Dataset_{original_idx}")
-            
+
             current_geom_points_obj_array = None
             hull_points_obj_array = dataset_content.get('hull_points')
-            
+
             if hull_points_obj_array is not None and len(hull_points_obj_array) > 0:
                 for hp in hull_points_obj_array:
                     point_type = hp[3] if len(hp) > 3 and isinstance(hp[3], str) else "DEFAULT"
@@ -4733,8 +4847,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 else:
                     logger.warning(f"Dataset {original_idx} ({data_wrapper.name}) has no hull_points or points. Skipping for temp_model.")
                     continue
-            
-            # Convert object array to numeric array for calculations
+
             if current_geom_points_obj_array is not None and len(current_geom_points_obj_array) > 1:
                 try:
                     numeric_points = np.array(current_geom_points_obj_array[:, :3], dtype=np.float64)
@@ -4745,9 +4858,10 @@ class MeshItWorkflowGUI(QMainWindow):
                     logger.error(f"Error calculating size for dataset {original_idx}: {e}")
                     data_wrapper.size = 0.1
 
-            is_p = (dataset_content.get('type') == 'polyline' or
+            # CRITICAL: Treat wells as polylines
+            is_p = (dataset_content.get('type') in ('WELL', 'polyline') or
                     ('segments' in dataset_content and 'triangles' not in dataset_content and 'hull_points' not in dataset_content))
-            
+
             temp_model.original_indices_map[temp_data_idx_counter] = original_idx
             temp_model.is_polyline[temp_data_idx_counter] = is_p
 
@@ -4757,39 +4871,36 @@ class MeshItWorkflowGUI(QMainWindow):
             else:
                 temp_model.surface_original_to_temp_idx_map[original_idx] = len(temp_model.surfaces)
                 temp_model.surfaces.append(data_wrapper)
-            
+
             temp_data_idx_counter += 1
 
         if not temp_model.surfaces and not temp_model.polylines:
             QMessageBox.warning(self, "No Valid Datasets", "No datasets with geometry were prepared for refinement.")
             self.statusBar().showMessage("Refinement failed: No valid datasets.", 5000)
             return
-        logger.info(f"Temp model created: {len(temp_model.surfaces)} surfaces, {len(temp_model.polylines)} polylines.")
-        
-        # Map original self.datasets_intersections to temp_model.intersections
-        original_to_temp_combined_idx_map = {v: k for k, v in temp_model.original_indices_map.items()}
 
+        logger.info(f"Temp model created: {len(temp_model.surfaces)} surfaces, {len(temp_model.polylines)} polylines.")
+
+        # Map intersections into temp model
+        original_to_temp_combined_idx_map = {v: k for k, v in temp_model.original_indices_map.items()}
         for _, intersections_list in self.datasets_intersections.items():
             for intersection_data in intersections_list:
                 temp_combined_id1 = original_to_temp_combined_idx_map.get(intersection_data['dataset_id1'])
                 temp_combined_id2 = original_to_temp_combined_idx_map.get(intersection_data['dataset_id2'])
-
                 if temp_combined_id1 is None or temp_combined_id2 is None:
                     logger.warning(f"Skipping intersection: Original IDs {intersection_data['dataset_id1']}/{intersection_data['dataset_id2']} not in temp_model map.")
                     continue
-                
                 new_int = Intersection(temp_combined_id1, temp_combined_id2, intersection_data['is_polyline_mesh'])
                 for pt_coords in intersection_data['points']:
                     new_int.add_point(Vector3D(pt_coords[0], pt_coords[1], pt_coords[2] if len(pt_coords) > 2 else 0.0))
                 temp_model.intersections.append(new_int)
-        
+
         if not temp_model.intersections:
             QMessageBox.information(self, "No Intersections", "No intersections populated in temp_model.")
             self.statusBar().showMessage("Refinement skipped: No intersections in temp model.", 5000)
             return
-        logger.info(f"Temp model has {len(temp_model.intersections)} intersections to process.")
 
-        # --- Step 1: Identify Triple Points ---
+        # Step 1: Triple points
         try:
             for i in range(len(temp_model.intersections) - 1):
                 for j in range(i + 1, len(temp_model.intersections)):
@@ -4800,17 +4911,15 @@ class MeshItWorkflowGUI(QMainWindow):
                         triple_point_obj.add_intersection(j)
                         tp.point_type = "TRIPLE_POINT"
                         temp_model.triple_points.append(triple_point_obj)
-            
             insert_triple_points(temp_model)
-            
             self.triple_points = [{'point': tp.point, 'intersections': tp.intersection_ids} for tp in temp_model.triple_points]
             logger.info(f"Found and inserted {len(temp_model.triple_points)} triple points.")
         except Exception as e:
             logger.error(f"Error during triple points calculation: {e}", exc_info=True)
             QMessageBox.warning(self, "Refinement Error", f"Error during triple point identification: {str(e)}")
             return
-        
-        # --- Step 2: Identify corner points on convex hulls (C++ MakeCornersSpecial) ---
+
+        # Step 2: Corners on convex hulls
         try:
             from meshit.intersection_utils import make_corners_special
             corner_points_count = 0
@@ -4823,8 +4932,8 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.error(f"Error during corner point identification: {e}", exc_info=True)
             QMessageBox.warning(self, "Refinement Error", f"Error during corner point identification: {str(e)}")
             return
-        
-        # --- Step 3: Align intersections to convex hulls (C++ alignIntersectionsToConvexHull) ---
+
+        # Step 3: Align intersections to convex hulls
         try:
             for temp_surface_list_idx in range(len(temp_model.surfaces)):
                 align_intersections_to_convex_hull(temp_surface_list_idx, temp_model)
@@ -4833,8 +4942,8 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.error(f"Error during convex hull alignment: {e}", exc_info=True)
             QMessageBox.warning(self, "Refinement Error", f"Error during convex hull alignment: {str(e)}")
             return
-        
-        # --- Step 4: Refine intersection lines by length ---
+
+        # Step 4: Refine intersection lines by length
         try:
             for intersection in temp_model.intersections:
                 id1, id2 = intersection.id1, intersection.id2
@@ -4857,16 +4966,17 @@ class MeshItWorkflowGUI(QMainWindow):
 
                 obj1_size = obj1.size if obj1 else 0.1
                 obj2_size = obj2.size if obj2 else 0.1
-                
+
                 eff_target_length = target_feature_size
                 if not uniform_meshing:
                     valid_sizes = [s for s in [obj1_size, obj2_size] if s > 1e-6]
-                    if valid_sizes: eff_target_length = min(valid_sizes)
+                    if valid_sizes:
+                        eff_target_length = min(valid_sizes)
                     if target_feature_size > 1e-6 and target_feature_size < eff_target_length:
                         eff_target_length = target_feature_size
-                
-                if eff_target_length <= 1e-6: eff_target_length = 0.1
-                
+                if eff_target_length <= 1e-6:
+                    eff_target_length = 0.1
+
                 intersection.points = refine_intersection_line_by_length(
                     intersection, target_length=eff_target_length,
                     min_angle_deg=min_angle_deg, uniform_meshing=uniform_meshing
@@ -4877,9 +4987,7 @@ class MeshItWorkflowGUI(QMainWindow):
             QMessageBox.warning(self, "Refinement Error", f"Error during length-based refinement: {str(e)}")
             return
 
-        # --- NEW Step 3.5: Refine convex hulls by length (C++ ConvexHull.RefineByLength)
-        # Hull-specific refinement: preserve ALL existing vertices and their types.
-        # Only insert intermediate DEFAULT points between consecutive vertices.
+        # --- Refine convex hulls by length (unchanged from your version) ---
         try:
             import math
 
@@ -4895,8 +5003,6 @@ class MeshItWorkflowGUI(QMainWindow):
                 for i in range(n):
                     p0 = hull_pts[i]
                     p1 = hull_pts[(i + 1) % n]
-
-                    # Keep the original vertex (preserve its type and identity)
                     refined.append(p0)
 
                     seg_vec = p1 - p0
@@ -4910,17 +5016,14 @@ class MeshItWorkflowGUI(QMainWindow):
                     else:
                         num_insert = max(0, int(math.ceil(ratio)) - 1)
 
-                    # Insert intermediate points; new points are DEFAULT
                     for k in range(1, num_insert + 1):
                         t = k / (num_insert + 1)
                         interp = p0 + seg_vec * t
                         refined.append(Vector3D(interp.x, interp.y, interp.z, point_type="DEFAULT"))
 
-                # Remove duplicate closing vertex if present
                 if len(refined) >= 2 and (refined[0] - refined[-1]).length_squared() < 1e-24:
                     refined.pop()
 
-                # Compact consecutive duplicates (numerical safety), keep order
                 compact: list[Vector3D] = []
                 prev = None
                 for q in refined:
@@ -4950,39 +5053,37 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.error(f"Error during convex hull length refinement: {e}", exc_info=True)
             QMessageBox.warning(self, "Refinement Error", f"Error during convex hull length refinement: {str(e)}")
             return
-        
-        # --- Store intersection lines as constraints (C++ approach) ---
+
+        # Store intersection lines as constraints (unchanged)
         logger.info("Storing intersection lines as constraints for each surface...")
         for ds in self.datasets: ds["stored_constraints"] = []
         for inter in temp_model.intersections:
             sid1 = temp_model.original_indices_map.get(inter.id1)
             sid2 = temp_model.original_indices_map.get(inter.id2)
-            if sid1 is None or sid2 is None: continue
-            
+            if sid1 is None or sid2 is None:
+                continue
             pts_with_type = [[pt.x, pt.y, pt.z, getattr(pt, "point_type", "DEFAULT")] for pt in inter.points]
-            if len(pts_with_type) < 2: continue
-            
+            if len(pts_with_type) < 2:
+                continue
             base_entry = {"type": "intersection_line", "points": pts_with_type}
             for ds_idx, other_idx in ((sid1, sid2), (sid2, sid1)):
-                if ds_idx is None or ds_idx >= len(self.datasets): continue
+                if ds_idx is None or ds_idx >= len(self.datasets): 
+                    continue
                 entry = dict(base_entry)
                 entry["other_surface_id"] = other_idx
                 self.datasets[ds_idx]["stored_constraints"].append(entry)
                 self.datasets[ds_idx]["needs_constraint_update"] = True
         logger.info("Constraint storage complete.")
 
-        # --- Update main data structures and visualization ---
-        self.datasets_intersections.clear() 
+        # Repopulate datasets_intersections for visualization (unchanged)
+        self.datasets_intersections.clear()
         self.refined_intersections_for_visualization = {}
-        
         for temp_s_list_idx, temp_surface_data in enumerate(temp_model.surfaces):
-            # Find the original dataset index for this temp surface
             original_dataset_idx = None
             for orig_idx, temp_idx in temp_model.surface_original_to_temp_idx_map.items():
                 if temp_idx == temp_s_list_idx:
                     original_dataset_idx = orig_idx
                     break
-            
             if original_dataset_idx is not None:
                 if hasattr(temp_surface_data, 'convex_hull') and temp_surface_data.convex_hull:
                     hull_points_with_type = []
@@ -4996,19 +5097,16 @@ class MeshItWorkflowGUI(QMainWindow):
 
                     self.datasets[original_dataset_idx]['hull_points'] = np.array(hull_points_with_type, dtype=object)
                     logger.info(f"Updated convex hull for dataset {original_dataset_idx} with {len(hull_points_with_type)} points.")
-                else:
-                    logger.warning(f"No convex hull data in temp_surface_data for original_dataset_idx {original_dataset_idx} to copy back.")
             else:
                 logger.warning(f"Could not map temp_model.surfaces index {temp_s_list_idx} to an original dataset index for hull update.")
 
         for intersection in temp_model.intersections:
             original_id1 = temp_model.original_indices_map.get(intersection.id1)
             original_id2 = temp_model.original_indices_map.get(intersection.id2)
-
             if original_id1 is None or original_id2 is None:
                 logger.warning(f"Post-refinement: Skipping intersection due to missing original ID map for temp IDs {intersection.id1}/{intersection.id2}.")
                 continue
-            
+
             points_for_entry = []
             for p_obj in intersection.points:
                 p_type_str = "DEFAULT"
@@ -5022,11 +5120,11 @@ class MeshItWorkflowGUI(QMainWindow):
                 'is_polyline_mesh': intersection.is_polyline_mesh,
                 'points': points_for_entry,
             }
-            
+
             primary_key_ds = min(original_id1, original_id2)
             if primary_key_ds not in self.datasets_intersections:
                 self.datasets_intersections[primary_key_ds] = []
-            
+
             def _same_intersection(e1, e2, tol=1e-8):
                 if {e1['dataset_id1'], e1['dataset_id2']} != {e2['dataset_id1'], e2['dataset_id2']}:
                     return False
@@ -5036,11 +5134,8 @@ class MeshItWorkflowGUI(QMainWindow):
                 if len(pts1) != len(pts2):
                     return False
                 def _close(p, q):
-                    return (abs(p[0] - q[0]) < tol and
-                            abs(p[1] - q[1]) < tol and
-                            abs(p[2] - q[2]) < tol)
-                ends_match = (_close(pts1[0], pts2[0]) and _close(pts1[-1], pts2[-1])) or \
-                            (_close(pts1[0], pts2[-1]) and _close(pts1[-1], pts2[0]))
+                    return (abs(p[0] - q[0]) < tol and abs(p[1] - q[1]) < tol and abs(p[2] - q[2]) < tol)
+                ends_match = (_close(pts1[0], pts2[0]) and _close(pts1[-1], pts2[-1])) or (_close(pts1[0], pts2[-1]) and _close(pts1[-1], pts2[0]))
                 if not ends_match:
                     return False
                 import numpy as np
@@ -5048,11 +5143,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 c2 = np.mean(np.asarray(pts2)[:, :3], axis=0)
                 return np.linalg.norm(c1 - c2) < tol
 
-            already_added = any(
-                _same_intersection(existing, intersection_entry)
-                for existing in self.datasets_intersections[primary_key_ds]
-            )
-
+            already_added = any(_same_intersection(existing, intersection_entry) for existing in self.datasets_intersections[primary_key_ds])
             if not already_added:
                 self.datasets_intersections[primary_key_ds].append(intersection_entry)
 
@@ -5064,9 +5155,7 @@ class MeshItWorkflowGUI(QMainWindow):
                     if len(a_pts) != len(b_pts):
                         return False
                     def _close(p, q):
-                        return (abs(p[0] - q[0]) < tol and
-                                abs(p[1] - q[1]) < tol and
-                                abs(p[2] - q[2]) < tol)
+                        return (abs(p[0] - q[0]) < tol and abs(p[1] - q[1]) < tol and abs(p[2] - q[2]) < tol)
                     if all(_close(pa, pb) for pa, pb in zip(a_pts, b_pts)):
                         return True
                     if all(_close(pa, pb) for pa, pb in zip(a_pts, reversed(b_pts))):
@@ -5078,14 +5167,10 @@ class MeshItWorkflowGUI(QMainWindow):
                     ie['is_polyline_mesh'] == intersection_entry['is_polyline_mesh']
                     for ie in self.refined_intersections_for_visualization[vis_key_id]
                 )
-
                 if not vis_already_added:
-                    self.refined_intersections_for_visualization[vis_key_id].append(
-                        intersection_entry.copy()
-                    )
+                    self.refined_intersections_for_visualization[vis_key_id].append(intersection_entry.copy())
 
-        # --- Populate summaries and UI ---
-        summary = self._analyze_refinement_results() 
+        summary = self._analyze_refinement_results()
         self.refinement_summary_label.setText(summary)
 
         self.statusBar().showMessage("Intersection lines refined successfully.", 5000)
@@ -5095,11 +5180,9 @@ class MeshItWorkflowGUI(QMainWindow):
         self.consolidate_points_for_triangulation()
         logger.info("Consolidation complete!")
 
-        # Enable the "Generate Conforming Surface Meshes" button after successful refinement
         self.generate_conforming_meshes_btn.setEnabled(True)
         logger.info("Enabled conforming mesh generation button after successful refinement.")
-        
-        # Populate Tab 6 constraint tree and selector with updated hulls
+
         try:
             self._populate_refine_constraint_tree()
             logger.info("Refinement complete. Populated constraint tree in 'Refine & Mesh' tab.")
@@ -5127,8 +5210,10 @@ class MeshItWorkflowGUI(QMainWindow):
         ok, total, fails = 0, 0, []
 
         for s_idx, ds in enumerate(self.datasets):
-            if ds.get("type") == "polyline":
+            # CRITICAL: Skip wells (polylines) entirely for triangulation
+            if ds.get("type") in ("WELL", "polyline"):
                 continue
+
             seg_lists = self._collect_selected_refine_segments(s_idx)
             if not seg_lists:
                 continue
@@ -5150,7 +5235,6 @@ class MeshItWorkflowGUI(QMainWindow):
                 pts2d = (np.array([[p.x, p.y, p.z] for p in pts3d]) - centroid) @ basis.T
                 pts2d = pts2d[:, :2]
 
-                # Convert hole points to 2D coordinates
                 holes_2d = []
                 if holes:
                     holes_3d = np.array([[h.x, h.y, h.z] for h in holes])
@@ -5165,41 +5249,22 @@ class MeshItWorkflowGUI(QMainWindow):
                 if v3d is None or len(v3d) == 0 or tris is None or len(tris) == 0:
                     raise RuntimeError("triangulation returned empty result")
 
-                ds["conforming_mesh"] = {
-                    "vertices": v3d,
-                    "triangles": tris,
-                    "holes": holes,  # Include hole information
-                    "statistics": {
-                        "num_vertices": len(v3d),
-                        "num_triangles": len(tris),
-                        "num_constraints": len(seg_arr),
-                        "num_holes": len(holes) if holes else 0,
-                        "target_size": tgt,
-                        "surface_size": surf_data.get("size", "unknown"),
-                        "effective_mesh_density": f"{len(tris) / max(1, len(v3d)):.2f} triangles/vertex",
-                    },
-                }
+                # Save conforming mesh to dataset
+                ds.setdefault("conforming_mesh", {})
+                ds["conforming_mesh"]["vertices"] = v3d
+                ds["conforming_mesh"]["triangles"] = tris
+                ds["conforming_mesh"]["holes"] = [[h.x, h.y, h.z] for h in holes] if holes else []
+
                 ok += 1
-                density_ratio = len(tris) / max(1, len(v3d))
-                logger.info(f"✓ {name}: {len(v3d)} verts, {len(tris)} tris (density: {density_ratio:.2f} tri/vert, target: {tgt})")
+                logger.info(f"✓ Conforming mesh generated for '{name}': {len(v3d)} vertices, {len(tris)} triangles")
             except Exception as e:
-                logger.error(f"✗ {name}: {e}", exc_info=True)
-                fails.append((s_idx, name, str(e)))
+                fails.append((name, str(e)))
+                logger.error(f"Conforming mesh generation FAILED for '{name}': {e}")
 
-        msg = f"Conforming mesh generation finished: {ok}/{total} surfaces succeeded."
         if fails:
-            msg += "\n\nFailures:\n" + "\n".join(f"• {n}: {err}" for _, n, err in fails)
-            QMessageBox.warning(self, "Conforming Mesh Generation", msg)
-        else:
-            QMessageBox.information(self, "Conforming Mesh Generation", msg)
-
-        self.statusBar().showMessage(msg, 8000)
-        self._update_conforming_mesh_summary(ok, total, fails)
-        
-        # Update surface selector after conforming mesh generation
-        self._populate_surface_selector()
-        
-        self._update_conforming_mesh_visualization()
+            logger.warning(f"Conforming mesh generation failures: {len(fails)}")
+        self._update_refined_visualization()
+        self.statusBar().showMessage(f"Conforming surface mesh generation finished: {ok}/{total} succeeded.", 6000)
 
 
     def _prepare_surface_data_for_triangulation(self, dataset_idx, dataset, config):
@@ -5789,53 +5854,42 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.error(f"Error adding intersection lines to visualization: {e}")
 
     def load_file(self):
-        """Load data from a file"""
+        """Load a single data file"""
         self.statusBar().showMessage("Loading file...")
-        
-        # Open file dialog
         file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select a point data file",
-            "",
+            self, "Select a point data file", "",
             "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
         )
-        
         if not file_path:
             self.statusBar().showMessage("File loading canceled")
             return
-            
-        # Update status with file path
-        self.statusBar().showMessage(f"Loading file: {os.path.basename(file_path)}...")
-        
+
         try:
-            # Try to read the file
             points = self._read_point_file(file_path)
-            
             if points is not None and len(points) > 0:
-                self.points = points
-                
-                # Visualize the loaded points
-                self._plot_points(points)
-                
-                self.statusBar().showMessage(f"Successfully loaded {len(points)} points")
-                
-                # Clear any previous results from later steps
-                self.hull_points = None
-                self.segments = None
-                self.triangulation_result = None
-                
-                # Update other views
-                self._clear_hull_plot()
-                self._clear_segment_plot()
-                self._clear_triangulation_plot()
+                filename = os.path.basename(file_path)
+                dataset = {
+                    'name': filename,
+                    'type': 'SURFACE',   # mark as SURFACE
+                    'points': points,
+                    'visible': True,
+                    'color': self._get_next_color()
+                }
+                self.datasets.append(dataset)
+                self.current_dataset_index = len(self.datasets) - 1
+                self._clear_segmentation_visualization_flag()
+                self._update_dataset_list()
+                self._update_statistics()
+                self._visualize_all_points()
+                self.statusBar().showMessage(f"Successfully loaded {len(points)} points from {filename}")
             else:
                 self.statusBar().showMessage("Error: No valid points found in file")
                 QMessageBox.critical(self, "Error", "No valid points found in file")
-        
         except Exception as e:
             self.statusBar().showMessage(f"Error loading file: {str(e)}")
             logger.error(f"Error loading file: {str(e)}")
             QMessageBox.critical(self, "Error", f"Error loading file: {str(e)}")
+
     
     def _read_point_file(self, file_path):
         """Read points from a file, handling various delimiters and formats."""
@@ -8005,40 +8059,27 @@ segmentation, triangulation, and visualization.
     def load_multiple_files(self):
         """Load multiple data files"""
         self.statusBar().showMessage("Loading multiple files...")
-        
-        # Open file dialog
         file_paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Select point data files",
-            "",
+            self, "Select point data files", "",
             "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
         )
-        
         if not file_paths:
             self.statusBar().showMessage("File loading canceled")
             return
-        
+
         successful_loads = 0
-        
         for file_path in file_paths:
+            filename = os.path.basename(file_path)
             try:
-                # Update status with file path
-                filename = os.path.basename(file_path)
-                self.statusBar().showMessage(f"Loading file: {filename}...")
-                
-                # Try to read the file
                 points = self._read_point_file(file_path)
-                
                 if points is not None and len(points) > 0:
-                    # Create a new dataset
                     dataset = {
                         'name': filename,
+                        'type': 'SURFACE',   # mark as SURFACE
                         'points': points,
                         'visible': True,
                         'color': self._get_next_color()
                     }
-                    
-                    # Add to datasets
                     self.datasets.append(dataset)
                     self.current_dataset_index = len(self.datasets) - 1
                     successful_loads += 1
@@ -8046,13 +8087,11 @@ segmentation, triangulation, and visualization.
                     logger.warning(f"No valid points found in file: {filename}")
             except Exception as e:
                 logger.error(f"Error loading file {filename}: {str(e)}")
-        
+
         if successful_loads > 0:
-            # Update UI
             self._update_dataset_list()
             self._update_statistics()
             self._visualize_all_points()
-            
             self.statusBar().showMessage(f"Successfully loaded {successful_loads} out of {len(file_paths)} files")
         else:
             self.statusBar().showMessage("Error: No valid points found in any file")
@@ -8089,73 +8128,61 @@ segmentation, triangulation, and visualization.
 
     def _visualize_all_points(self):
         """Visualize all visible datasets' points"""
-        # Get visible datasets
         visible_datasets = [d for d in self.datasets if d.get('visible', True)]
-        
         if not visible_datasets:
             self._clear_hull_plot()
             return
-        
-        # Clear existing visualization
+
         while self.file_viz_layout.count():
             item = self.file_viz_layout.takeAt(0)
             widget = item.widget()
             if widget:
                 widget.deleteLater()
-        
-        # Calculate global bounds for all visible datasets
-        all_points = np.vstack([d['points'] for d in visible_datasets if d['points'] is not None])
+
+        all_points = np.vstack([d['points'] for d in visible_datasets if d.get('points') is not None])
         if len(all_points) == 0:
             return
-            
-        # Calculate bounds, correctly handling 3D coordinates
+
         min_coords = np.min(all_points, axis=0)
         max_coords = np.max(all_points, axis=0)
         min_x, min_y = min_coords[0], min_coords[1]
         max_x, max_y = max_coords[0], max_coords[1]
-        
-        # Use 3D visualization if enabled
+
         if self.view_3d_enabled:
-            # Create 3D visualization
+            # Keep existing 3D path (no change here)
             self._create_multi_dataset_3d_visualization(
-                self.file_viz_frame,
-                visible_datasets,
-                "Points Visualization",
-                view_type="points"
+                self.file_viz_frame, visible_datasets, "Points Visualization", view_type="points"
             )
         else:
-            # Fall back to matplotlib if PyVista is not available
             fig = Figure(figsize=(6, 4), dpi=100)
             ax = fig.add_subplot(111)
-            
-            # Plot each dataset with its color
             for dataset in visible_datasets:
-                points = dataset['points']
-                if points is not None and len(points) > 0:
-                    color = dataset.get('color', 'blue')
-                    name = dataset.get('name', 'Unnamed')
+                points = dataset.get('points')
+                if points is None or len(points) == 0:
+                    continue
+                color = dataset.get('color', 'blue')
+                name = dataset.get('name', 'Unnamed')
+                if dataset.get('type') == 'WELL' and len(points) >= 2:
+                    # Draw well polyline as connected line
+                    ax.plot(points[:, 0], points[:, 1], '-', c=color, alpha=0.9, lw=1.5, label=f"{name} (well)")
+                    # Also scatter endpoints lightly
+                    ax.scatter([points[0, 0], points[-1, 0]], [points[0, 1], points[-1, 1]],
+                            s=12, c=color, alpha=0.9, zorder=3)
+                else:
                     ax.scatter(points[:, 0], points[:, 1], s=5, c=color, alpha=0.7, label=name)
-            
+
             ax.set_aspect('equal')
-            ax.set_title("Point Clouds")
+            ax.set_title("Point Clouds (Wells drawn as polylines)")
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
             ax.legend()
-            
-            # Add grid and set limits with some padding
             ax.grid(True, linestyle='--', alpha=0.6)
             padding = max((max_x - min_x), (max_y - min_y)) * 0.05
             ax.set_xlim(min_x - padding, max_x + padding)
             ax.set_ylim(min_y - padding, max_y + padding)
-            
-            # Create canvas
+
             canvas = FigureCanvas(fig)
             self.file_viz_layout.addWidget(canvas)
-            
-            # Add toolbar
-            toolbar = NavigationToolbar(canvas, self.file_viz_frame)
-            self.file_viz_layout.addWidget(toolbar)
-    
     def _visualize_all_hulls(self):
         """Visualize all visible hulls"""
         # Get datasets with hulls
@@ -9035,6 +9062,7 @@ segmentation, triangulation, and visualization.
             if not hasattr(self, 'constraint_segment_actor_refs'):
                 self.constraint_segment_actor_refs = {}
             self._visualize_refined_intersections()
+            self._add_wells_to_intersection_plotter()
             return
 
         # --- 1: Meshes ---
@@ -10345,162 +10373,162 @@ segmentation, triangulation, and visualization.
         """
         Compute intersections globally for all datasets with triangulation data.
         This method is called by the worker thread.
-        
+
         Returns:
             bool: True if successful, False otherwise
         """
         logger.info("Starting global intersection computation...")
         try:
             from meshit.intersection_utils import (
-                Vector3D, Triangle, Intersection, TriplePoint, 
+                Vector3D, Triangle, Intersection, TriplePoint,
                 run_intersection_workflow
             )
         except ImportError as e:
             logger.error(f"Failed to import intersection utilities: {e}")
             QMessageBox.critical(self, "Import Error", f"Failed to import intersection utilities: {e}\nPlease ensure meshit.intersection_utils is available.")
             return False
-        
-        # Check if there are any datasets with triangulation
-        eligible_dataset_indices = [i for i, d in enumerate(self.datasets) if d.get('triangulation_result') is not None]
-        
-        if len(eligible_dataset_indices) < 2:
-            logger.warning("Need at least two triangulated datasets to compute intersections.")
-            QMessageBox.warning(self, "Not Enough Data", "Need at least two triangulated datasets to compute intersections.")
-            return False
-        
-        logger.info(f"Found {len(eligible_dataset_indices)} eligible datasets for intersection.")
 
-        # Create a structure similar to MeshItModel to store all eligible datasets
+        # Eligible surfaces require triangulations
+        eligible_surface_indices = [i for i, d in enumerate(self.datasets) if d.get('type') != 'WELL' and d.get('triangulation_result') is not None]
+        if len(eligible_surface_indices) < 1:
+            logger.warning("Need at least one triangulated surface to compute intersections.")
+            QMessageBox.warning(self, "Not Enough Data", "Need at least one triangulated surface to compute intersections.")
+            return False
+
+        # Collect wells (polylines) regardless of triangulation
+        well_indices = [i for i, d in enumerate(self.datasets) if d.get('type') == 'WELL' and d.get('points') is not None and len(d.get('points')) >= 2]
+        logger.info(f"Found {len(eligible_surface_indices)} triangulated surfaces and {len(well_indices)} wells for intersection.")
+
+        if len(eligible_surface_indices) + len(well_indices) < 2:
+            logger.warning("Need at least two objects (surfaces and/or wells) to compute intersections.")
+            QMessageBox.warning(self, "Not Enough Data", "Need at least two objects (surfaces and/or wells) to compute intersections.")
+            return False
+
+        # Model wrapper compatible with intersection_utils
         class ModelWrapper:
             def __init__(self):
                 self.surfaces = []
-                self.model_polylines = [] # Future extension: Add polylines if needed
+                self.model_polylines = []
                 self.intersections = []
                 self.triple_points = []
-                self.original_indices = {} # Map model surface index back to original dataset index
-                self.is_polyline = {} # Map surface index to whether it's a polyline (False for all surfaces)
-        
+                # Maps: model indices -> original dataset indices
+                self.original_surface_indices = {}
+                self.original_polyline_indices = {}
+
         model = ModelWrapper()
-        
-        # Populate model with surfaces from eligible datasets
-        for original_index in eligible_dataset_indices:
+
+        # Populate surfaces
+        for original_index in eligible_surface_indices:
             dataset = self.datasets[original_index]
-            
-            # Create a surface object for this dataset
+
             class SurfaceWrapper:
                 def __init__(self, dataset, index):
                     self.name = dataset.get('name', f"Dataset {index+1}")
-                    self.vertices = [] # Vertices corresponding to the triangulation
-                    self.triangles = [] # Triangle indices referencing self.vertices
+                    self.vertices = []
+                    self.triangles = []
                     self.convex_hull = []
                     self.bounds = [Vector3D(), Vector3D()]
                     self.type = "Surface"
-                    
+
                     tri_result = dataset.get('triangulation_result')
                     if not tri_result or 'vertices' not in tri_result or 'triangles' not in tri_result:
-                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: Missing valid triangulation result (vertices or triangles).")
-                        return # Skip if no valid triangulation result
-                        
-                    # --- CORRECTED: Use vertices from triangulation result --- 
+                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: Missing triangulation result.")
+                        return
+
                     tri_vertices = tri_result['vertices']
                     self.triangles = tri_result['triangles']
-                    
                     if tri_vertices is None or len(tri_vertices) == 0 or self.triangles is None:
-                         logger.warning(f"Skipping SurfaceWrapper for dataset {index}: Empty vertices or triangles in triangulation result.")
-                         return
-                         
-                    # Convert triangulation vertices to Vector3D
+                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: Empty vertices or triangles.")
+                        return
+
                     for point in tri_vertices:
-                         # Ensure points are 3D
-                         if len(point) >= 3:
-                             self.vertices.append(Vector3D(point[0], point[1], point[2]))
-                         elif len(point) == 2:
-                             self.vertices.append(Vector3D(point[0], point[1], 0.0)) # Assume Z=0 for 2D
-                         else:
-                             logger.warning(f"Skipping invalid vertex in triangulation result for dataset {index}: {point}")
-                    
+                        if len(point) >= 3:
+                            self.vertices.append(Vector3D(point[0], point[1], point[2]))
+                        elif len(point) == 2:
+                            self.vertices.append(Vector3D(point[0], point[1], 0.0))
+                        else:
+                            logger.warning(f"Skipping invalid vertex in triangulation result for dataset {index}: {point}")
+
                     if not self.vertices:
-                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: No valid Vector3D vertices created from triangulation result.")
-                        return # Skip if no valid vertices could be created
-                        
-                    # Ensure triangle indices are valid for the created vertices list
+                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: No valid vertices.")
+                        return
+
                     max_vertex_index = len(self.vertices) - 1
                     valid_triangles = []
                     for tri in self.triangles:
                         if all(0 <= idx <= max_vertex_index for idx in tri):
                             valid_triangles.append(tri)
-                        else:
-                            logger.warning(f"Skipping invalid triangle in dataset {index} (indices out of bounds): {tri}")
                     self.triangles = valid_triangles
-                    
                     if not self.triangles:
-                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: No valid triangles remain after index check.")
+                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: No valid triangles remain.")
                         return
-                    # --- END CORRECTION --- 
-                    
-                    # Add convex hull if available (optional for intersection but good practice)
+
                     hull_points_data = dataset.get('hull_points')
                     if hull_points_data is not None and len(hull_points_data) > 0:
                         self.convex_hull = [Vector3D(p[0], p[1], p[2]) for p in hull_points_data if len(p) >= 3]
-                    
-                    # Calculate bounds for early rejection test using the triangulation vertices
+
                     if self.vertices:
-                        min_x = min(v.x for v in self.vertices)
-                        min_y = min(v.y for v in self.vertices)
-                        min_z = min(v.z for v in self.vertices)
-                        max_x = max(v.x for v in self.vertices)
-                        max_y = max(v.y for v in self.vertices)
-                        max_z = max(v.z for v in self.vertices)
-                        
+                        min_x = min(v.x for v in self.vertices); min_y = min(v.y for v in self.vertices); min_z = min(v.z for v in self.vertices)
+                        max_x = max(v.x for v in self.vertices); max_y = max(v.y for v in self.vertices); max_z = max(v.z for v in self.vertices)
                         self.bounds[0] = Vector3D(min_x, min_y, min_z)
                         self.bounds[1] = Vector3D(max_x, max_y, max_z)
-            
-            # Add surface to model if valid
+
             surface = SurfaceWrapper(dataset, original_index)
-            # --- START CORRECTED BLOCK ---
-            # Check the validity of the surface before adding
-            # Use explicit length checks for lists/arrays to avoid ValueError
             vertices_valid = hasattr(surface, 'vertices') and surface.vertices is not None and len(surface.vertices) > 0
             triangles_valid = hasattr(surface, 'triangles') and surface.triangles is not None and len(surface.triangles) > 0
-
             if vertices_valid and triangles_valid:
-                # If checks pass, add the surface
-                model_surface_index = len(model.surfaces)
+                model_index = len(model.surfaces)
                 model.surfaces.append(surface)
-                model.original_indices[model_surface_index] = original_index # Store mapping
-                model.is_polyline[model_surface_index] = False # All surfaces are not polylines
-                logger.debug(f"Added dataset {original_index} as model surface {model_surface_index}")
+                model.original_surface_indices[model_index] = original_index
             else:
-                # Log if checks fail
-                logger.warning(f"Dataset {original_index} ('{dataset.get('name')}') could not be added to intersection model (missing valid vertices or triangles). Vertices valid: {vertices_valid}, Triangles valid: {triangles_valid}")
-            # --- END CORRECTED BLOCK ---
+                logger.warning(f"Dataset {original_index} ('{dataset.get('name')}') skipped as surface (missing valid vertices or triangles).")
 
-        # Check if we have enough valid surfaces in the model
-        if len(model.surfaces) < 2:
-            logger.warning("Need at least two valid surfaces in the model to compute intersections.")
-            QMessageBox.warning(self, "Not Enough Valid Data", "Need at least two valid triangulated datasets for intersection computation.")
+        if len(model.surfaces) < 1 and len(well_indices) < 2:
+            logger.warning("Insufficient surfaces and wells to compute intersections.")
+            QMessageBox.warning(self, "Not Enough Valid Data", "Insufficient triangulated surfaces and wells for intersections.")
             return False
 
-        logger.info(f"Prepared intersection model with {len(model.surfaces)} surfaces.")
+        # Populate polylines (wells)
+        for original_index in well_indices:
+            dataset = self.datasets[original_index]
+            points = dataset.get('points')
+            if points is None or len(points) < 2:
+                continue
 
-        # Initialize progress reporting function for intersection_utils
+            class PolylineWrapper:
+                def __init__(self, dataset, pts, index):
+                    self.name = dataset.get('name', f"Well_{index}")
+                    self.vertices = [Vector3D(float(p[0]), float(p[1]), float(p[2]) if len(p) > 2 else 0.0) for p in pts]
+                    # Consecutive segment pairs referencing self.vertices indices
+                    self.segments = [(i, i + 1) for i in range(len(self.vertices) - 1)]
+                    # Bounds
+                    xs = [v.x for v in self.vertices]; ys = [v.y for v in self.vertices]; zs = [v.z for v in self.vertices]
+                    self.bounds = [Vector3D(min(xs), min(ys), min(zs)), Vector3D(max(xs), max(ys), max(zs))]
+                    self.type = "Polyline"
+
+            polyline = PolylineWrapper(dataset, points, original_index)
+            if hasattr(polyline, 'vertices') and len(polyline.vertices) >= 2 and hasattr(polyline, 'segments') and len(polyline.segments) >= 1:
+                model_idx = len(model.model_polylines)
+                model.model_polylines.append(polyline)
+                model.original_polyline_indices[model_idx] = original_index
+
+        logger.info(f"Prepared intersection model with {len(model.surfaces)} surfaces and {len(model.model_polylines)} wells.")
+
+        # Run workflow
         def progress_callback(message):
-            # We can log this, but the main progress dialog is handled by batch_finished
             logger.debug(f"Intersection util progress: {message.strip()}")
-            QApplication.processEvents() # Keep UI responsive during internal steps
-        
-        # --- Run the intersection workflow --- 
+            QApplication.processEvents()
+
         try:
             logger.info("Calling run_intersection_workflow...")
-            # Configure constraint processing for intersection workflow with enhanced curved surface detection
             intersection_config = {
                 'use_constraint_processing': True,
                 'type_based_sizing': True,
                 'hierarchical_constraints': True,
                 'gradient': 2.0,
-                'use_enhanced_curved_detection': True,  # Enable enhanced curved surface detection
-                'adaptive_sampling': True,               # Enable adaptive sampling for curved surfaces
-                'max_subdivisions': 3                    # Maximum subdivision levels for adaptive sampling
+                'use_enhanced_curved_detection': True,
+                'adaptive_sampling': True,
+                'max_subdivisions': 3
             }
             model = run_intersection_workflow(model, progress_callback, config=intersection_config)
             logger.info("run_intersection_workflow finished.")
@@ -10509,71 +10537,63 @@ segmentation, triangulation, and visualization.
             logger.error(error_msg, exc_info=True)
             QMessageBox.critical(self, "Intersection Computation Error", error_msg)
             return False
-        
-        # --- Store the results --- 
-        # Clear previous results
-        self.datasets_intersections = {} # Store intersections per *original* dataset index
-        self.triple_points = [] # Store triple points globally
-        
+
+        # Store results
+        self.datasets_intersections = {}
+        self.triple_points = []
+
         logger.info(f"Processing {len(model.intersections)} raw intersections and {len(model.triple_points)} triple points from workflow.")
 
-        # Process intersections
         found_intersections_count = 0
         for intersection in model.intersections:
-            # Map model surface indices back to original dataset indices
-            original_id1 = model.original_indices.get(intersection.id1, -1)
-            original_id2 = model.original_indices.get(intersection.id2, -1)
-            
+            # Map back to original dataset indices
+            if getattr(intersection, 'is_polyline_mesh', False):
+                original_poly = model.original_polyline_indices.get(intersection.id1, -1)
+                original_surf = model.original_surface_indices.get(intersection.id2, -1)
+                original_id1, original_id2 = original_poly, original_surf
+            else:
+                original_id1 = model.original_surface_indices.get(intersection.id1, -1)
+                original_id2 = model.original_surface_indices.get(intersection.id2, -1)
+
             if original_id1 == -1 or original_id2 == -1:
-                logger.warning(f"Skipping intersection with invalid original index mapping (IDs: {intersection.id1}, {intersection.id2})")
-                continue # Skip invalid mappings
-            
-            # Convert points to regular lists for storage
+                logger.warning(f"Skipping intersection with invalid mapping (IDs: {intersection.id1}, {intersection.id2}, is_polyline={getattr(intersection, 'is_polyline_mesh', False)})")
+                continue
+
+            # Points to plain lists
             points = []
             for point in intersection.points:
                 points.append([point.x, point.y, point.z])
-            
-            # Create intersection info
+
             intersection_info = {
                 'dataset_id1': original_id1,
                 'dataset_id2': original_id2,
-                'is_polyline_mesh': intersection.is_polyline_mesh,
+                'is_polyline_mesh': getattr(intersection, 'is_polyline_mesh', False),
                 'points': points
             }
             found_intersections_count += 1
 
-            # Store only with the dataset having the lower ID
-            if original_id1 <= original_id2:
-                if original_id1 not in self.datasets_intersections:
-                    self.datasets_intersections[original_id1] = []
-                self.datasets_intersections[original_id1].append(intersection_info)
-            else:
-                if original_id2 not in self.datasets_intersections:
-                    self.datasets_intersections[original_id2] = []
-                self.datasets_intersections[original_id2].append(intersection_info)
-  
-        # Process triple points
+            # Store keyed by the lower dataset id (as before)
+            primary_key = min(original_id1, original_id2)
+            if primary_key not in self.datasets_intersections:
+                self.datasets_intersections[primary_key] = []
+            self.datasets_intersections[primary_key].append(intersection_info)
+
+        # Triple points
         for tp in model.triple_points:
             point = [tp.point.x, tp.point.y, tp.point.z]
-            # Note: intersection_ids in TriplePoint refer to the indices within model.intersections
-            # We might need to map these if we store intersections differently, but for now, store raw indices.
-            intersection_ids = tp.intersection_ids 
             self.triple_points.append({
                 'point': point,
-                'intersection_ids': intersection_ids
+                'intersection_ids': tp.intersection_ids
             })
-        
+
         logger.info(f"Stored {found_intersections_count} intersections across datasets and {len(self.triple_points)} triple points.")
 
-        # --- Update UI --- 
-        # Use QTimer.singleShot to ensure UI updates happen on the main thread
-        # after the worker thread finishes processing this method.
         QTimer.singleShot(0, self._update_statistics)
         QTimer.singleShot(0, self._update_intersection_list)
-        QTimer.singleShot(0, self._visualize_intersections) # Or visualize selected if preferred
-        
+        QTimer.singleShot(0, self._visualize_intersections)
+
         logger.info("Global intersection computation successful.")
-        return True # Indicate success
+        return True
     def _clear_intersection_results(self):
         """Clear all intersection results"""
         # Clear intersection data
@@ -11028,6 +11048,9 @@ segmentation, triangulation, and visualization.
                         logger.warning(f"Invalid triple points array shape or content: {points_array.shape}")
             except Exception as e:
                 logger.error(f"Error adding triple points in embedded view: {e}")
+
+        # Add Well datasets as polylines
+        self._add_wells_polyline_to_plotter(plotter)
 
         if plotter_has_content:
             # Use white text for legend on dark background
