@@ -617,35 +617,53 @@ def isect2(v0, v1, v2, vv0, vv1, vv2, d0, d1, d2, isect, isectpoint):
 def triangle_triangle_intersection(tri1: Triangle, tri2: Triangle) -> List[Vector3D]:
     """
     Calculate intersection between two triangles using robust Möller's algorithm.
-    This directly calls the C++ ported tri_tri_intersect_with_isectline function.
-    
-    Args:
-        tri1: First triangle
-        tri2: Second triangle
-        
-    Returns:
-        List of intersection points (empty if no intersection)
+    Adds a pre-check to reject intersections between near-parallel but separated planes.
     """
-    # Use the robust triangle-triangle intersection algorithm
+    # Pre-check: near-parallel planes with non-zero separation => no intersection
+    n1 = tri1.normal(); n2 = tri2.normal()
+    n1_len = n1.length(); n2_len = n2.length()
+    if n1_len < 1e-14 or n2_len < 1e-14:
+        return []
+    n1u = n1 * (1.0 / n1_len); n2u = n2 * (1.0 / n2_len)
+    align = abs(n1u.dot(n2u))  # 1.0 == parallel
+    if align > 0.999:  # ~< 2.5°
+        # Characteristic size for scale-aware tolerance
+        e = [
+            (tri1.v2 - tri1.v1).length(),
+            (tri1.v3 - tri1.v1).length(),
+            (tri1.v3 - tri1.v2).length(),
+            (tri2.v2 - tri2.v1).length(),
+            (tri2.v3 - tri2.v1).length(),
+            (tri2.v3 - tri2.v2).length(),
+        ]
+        L = max(e) if e else 1.0
+        dist_tol = 1e-6 * L + 1e-12
+        # Distance of tri2 centroid to tri1 plane
+        c2 = tri2.centroid()
+        plane_sep = abs(n1u.dot(c2 - tri1.v1))
+        if plane_sep > dist_tol:
+            return []  # parallel and separated: ignore
+        
     pt1, pt2 = tri_tri_intersect_with_isectline(tri1, tri2)
-    
     if pt1 is not None and pt2 is not None:
-        # Check if we have a valid line segment with meaningful length
-        segment_length = (pt1 - pt2).length()
-        if segment_length > 1e-6:  # More reasonable tolerance for actual intersections
-            # Additional validation: ensure intersection points are actually within both triangles
+        # Scale-aware minimum length to drop tiny slivers
+        e = [
+            (tri1.v2 - tri1.v1).length(),
+            (tri1.v3 - tri1.v1).length(),
+            (tri1.v3 - tri1.v2).length(),
+            (tri2.v2 - tri2.v1).length(),
+            (tri2.v3 - tri2.v1).length(),
+            (tri2.v3 - tri2.v2).length(),
+        ]
+        L = max(e) if e else 1.0
+        min_len = 1e-6 * L
+        if (pt1 - pt2).length() > min_len:
             if (tri1.contains_point(pt1) and tri1.contains_point(pt2)) or \
                (tri2.contains_point(pt1) and tri2.contains_point(pt2)) or \
                (tri1.contains_point(pt1) and tri2.contains_point(pt2)) or \
                (tri1.contains_point(pt2) and tri2.contains_point(pt1)):
                 return [pt1, pt2]
-            else:
-                # This is likely a false positive intersection
-                return []
-        else:
-            # Degenerate case - single point intersection or very small segment
-            return []
-    
+        return []
     return []
 
 
@@ -866,29 +884,21 @@ def connect_intersection_segments(segments, tolerance=1e-10):
     
     logger.info(f"Starting segment connection with {len(segments)} input segments")
     
-    # First, validate and filter segments using C++ appendNonExistingSegment logic
-    # Convert to flat list of points (like C++ input->Ns)
     validated_points = []
     for i, segment in enumerate(segments):
         if len(segment) >= 2:
             p1, p2 = segment[0], segment[1]
-            
-            # C++ check: points are identical --> not a segment
             if (p1 - p2).length_squared() < 1e-24:
                 logger.info(f"Segment {i} rejected: identical points")
                 continue
-                
-            # C++ check: prevent duplicate segments
             is_duplicate = False
             for j in range(0, len(validated_points), 2):
                 if j + 1 < len(validated_points):
                     ep1, ep2 = validated_points[j], validated_points[j + 1]
-                    # Check both orientations
                     if ((p1 - ep1).length_squared() < 1e-24 and (p2 - ep2).length_squared() < 1e-24) or \
                        ((p2 - ep1).length_squared() < 1e-24 and (p1 - ep2).length_squared() < 1e-24):
                         is_duplicate = True
                         break
-            
             if not is_duplicate:
                 validated_points.extend([p1, p2])
                 logger.info(f"Segment {i} accepted: ({p1.x:.3f},{p1.y:.3f},{p1.z:.3f}) -> ({p2.x:.3f},{p2.y:.3f},{p2.z:.3f})")
@@ -901,29 +911,28 @@ def connect_intersection_segments(segments, tolerance=1e-10):
     
     logger.info(f"After filtering: {len(validated_points)//2} valid segments")
     
-    # Process segments iteratively like C++ GenerateFirstSplineOfSegments
+    # Much stricter compatibility: avoid jumping to nearby but different lines
+    def is_direction_compatible(tangent: Vector3D, candidate_vec: Vector3D, min_dot: float = 0.95) -> bool:
+        t_len = tangent.length()
+        c_len = candidate_vec.length()
+        if t_len < 1e-14 or c_len < 1e-14:
+            return False
+        t = tangent * (1.0 / t_len)
+        c = candidate_vec * (1.0 / c_len)
+        return t.dot(c) > min_dot
+
     curves = []
     curve_count = 0
-    
-    # Use C++ MeshIt's exact tolerance: 1e-12 for squared distance comparison
     connect_tolerance_squared = 1e-12
     
-    # Continue while there are segments to process (like C++ while loop)
     while len(validated_points) >= 2:
         curve_count += 1
         logger.info(f"Starting curve {curve_count} with {len(validated_points)//2} segments remaining")
-        
-        # Start a new curve with the first available segment
         curve = [validated_points[0], validated_points[1]]
         logger.info(f"Curve {curve_count} initial segment: ({curve[0].x:.3f},{curve[0].y:.3f},{curve[0].z:.3f}) -> ({curve[1].x:.3f},{curve[1].y:.3f},{curve[1].z:.3f})")
-        
-        # Remove the used segment (like C++ removeAt)
         validated_points.pop(1)
         validated_points.pop(0)
         
-
-        
-        # Try to extend the curve at the beginning (like C++ first reloop)
         extended_count = 0
         extended = True
         while extended:
@@ -932,25 +941,26 @@ def connect_intersection_segments(segments, tolerance=1e-10):
             while n < len(validated_points):
                 dist_squared = (validated_points[n] - curve[0]).length_squared()
                 if dist_squared < connect_tolerance_squared:
-                    if n % 2 == 0:  # Even index - this is the first point of a segment
-                        curve.insert(0, validated_points[n + 1])
-                        validated_points.pop(n + 1)
-                        validated_points.pop(n)
-                        extended = True
-                        extended_count += 1
-                        logger.info(f"Curve {curve_count} extended at beginning (extension #{extended_count})")
-                        break
-                    else:  # Odd index - this is the second point of a segment
-                        curve.insert(0, validated_points[n - 1])
-                        validated_points.pop(n)
-                        validated_points.pop(n - 1)
-                        extended = True
-                        extended_count += 1
-                        logger.info(f"Curve {curve_count} extended at beginning (extension #{extended_count})")
+                    tangent = curve[0] - curve[1]
+                    if n % 2 == 0:
+                        meeting = validated_points[n]
+                        other = validated_points[n + 1]
+                    else:
+                        meeting = validated_points[n]
+                        other = validated_points[n - 1]
+                    candidate_vec = other - meeting
+                    if is_direction_compatible(tangent, candidate_vec):
+                        if n % 2 == 0:
+                            curve.insert(0, other)
+                            validated_points.pop(n + 1); validated_points.pop(n)
+                        else:
+                            curve.insert(0, other)
+                            validated_points.pop(n); validated_points.pop(n - 1)
+                        extended = True; extended_count += 1
+                        logger.info(f"Curve {curve_count} extended at beginning (#{extended_count})")
                         break
                 n += 1
         
-        # Try to extend the curve at the end (like C++ second reloop)
         extended = True
         while extended:
             extended = False
@@ -958,25 +968,26 @@ def connect_intersection_segments(segments, tolerance=1e-10):
             while n < len(validated_points):
                 dist_squared = (validated_points[n] - curve[-1]).length_squared()
                 if dist_squared < connect_tolerance_squared:
-                    if n % 2 == 0:  # Even index - this is the first point of a segment
-                        curve.append(validated_points[n + 1])
-                        validated_points.pop(n + 1)
-                        validated_points.pop(n)
-                        extended = True
-                        extended_count += 1
-                        logger.info(f"Curve {curve_count} extended at end (extension #{extended_count})")
-                        break
-                    else:  # Odd index - this is the second point of a segment
-                        curve.append(validated_points[n - 1])
-                        validated_points.pop(n)
-                        validated_points.pop(n - 1)
-                        extended = True
-                        extended_count += 1
-                        logger.info(f"Curve {curve_count} extended at end (extension #{extended_count})")
+                    tangent = curve[-1] - curve[-2]
+                    if n % 2 == 0:
+                        meeting = validated_points[n]
+                        other = validated_points[n + 1]
+                    else:
+                        meeting = validated_points[n]
+                        other = validated_points[n - 1]
+                    candidate_vec = other - meeting
+                    if is_direction_compatible(tangent, candidate_vec):
+                        if n % 2 == 0:
+                            curve.append(other)
+                            validated_points.pop(n + 1); validated_points.pop(n)
+                        else:
+                            curve.append(other)
+                            validated_points.pop(n); validated_points.pop(n - 1)
+                        extended = True; extended_count += 1
+                        logger.info(f"Curve {curve_count} extended at end (#{extended_count})")
                         break
                 n += 1
         
-        # Clean up the curve by removing duplicate consecutive points
         cleaned_curve = [curve[0]]
         for point in curve[1:]:
             if (point - cleaned_curve[-1]).length_squared() > tolerance * tolerance:
@@ -1410,18 +1421,14 @@ def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, mode
     intersection1 = model.intersections[intersection1_idx]
     intersection2 = model.intersections[intersection2_idx]
 
-    # Check if the intersections share a common surface/polyline ID
-    # This is a basic check, more robust checks might involve surface indices
+    # Both lines must share one common parent (typical: A∩B with A∩C → common A)
     ids1 = {intersection1.id1, intersection1.id2}
     ids2 = {intersection2.id1, intersection2.id2}
     if not ids1.intersection(ids2):
         return []  # No common parent object, cannot form a triple point
     
-    # Create a spatial subdivision box for more efficient computation
+    # Spatial box on the overlap of their bounds
     box = Box()
-    
-    # Set box bounds to the intersection of the bounds of both polylines
-    # First, compute the bounds of intersection1
     if len(intersection1.points) > 0:
         min1 = Vector3D(
             min(p.x for p in intersection1.points),
@@ -1433,8 +1440,6 @@ def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, mode
             max(p.y for p in intersection1.points),
             max(p.z for p in intersection1.points)
         )
-        
-        # Compute the bounds of intersection2
         min2 = Vector3D(
             min(p.x for p in intersection2.points),
             min(p.y for p in intersection2.points),
@@ -1445,85 +1450,61 @@ def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, mode
             max(p.y for p in intersection2.points),
             max(p.z for p in intersection2.points)
         )
-        
-        # Set the box bounds to the intersection of the two bounds
         box.min.x = max(min1.x, min2.x)
         box.min.y = max(min1.y, min2.y)
         box.min.z = max(min1.z, min2.z)
         box.max.x = min(max1.x, max2.x)
         box.max.y = min(max1.y, max2.y)
         box.max.z = min(max1.z, max2.z)
-        
-        # Check if there's no overlap in the bounding boxes
         if (box.min.x > box.max.x or 
             box.min.y > box.max.y or 
             box.min.z > box.max.z):
-            return []  # No overlap, cannot have triple points
+            return []
     else:
-        return []  # No points in one of the intersections
+        return []
     
-    # Gather segments in the overlap box
+    # Populate candidate segments
     for i in range(len(intersection1.points) - 1):
         p1 = intersection1.points[i]
         p2 = intersection1.points[i + 1]
         if box.seg_in_box(p1, p2):
             box.N1s.append((p1, p2))
-    
     for i in range(len(intersection2.points) - 1):
         p1 = intersection2.points[i]
         p2 = intersection2.points[i + 1]
         if box.seg_in_box(p1, p2):
             box.N2s.append((p1, p2))
-    
-    # No segments in the overlap box
     if not box.N1s or not box.N2s:
         return []
     
-    # List to store found triple points
     found_triple_points = []
-    
-    # Use recursive spatial subdivision to find triple points
+
+    # Reject near-parallel segments to prevent false positives along close, parallel lines
+    # e.g., require at least ~10 degrees between directions (|dot| <= 0.985 ≈ cos(10°))
+    parallel_dot_threshold = 0.985
+
     if box.too_much_seg():
         box.split_seg(found_triple_points, intersection1_idx, intersection2_idx)
     else:
-        # Direct testing for small number of segments
         for seg1_idx, seg1 in enumerate(box.N1s):
             p1a, p1b = seg1[0], seg1[1]
+            d1 = (p1b - p1a).normalized()
             for seg2_idx, seg2 in enumerate(box.N2s):
                 p2a, p2b = seg2[0], seg2[1]
+                d2 = (p2b - p2a).normalized()
 
-                # Calculate distance and closest points between segments FIRST
+                # Skip if near parallel; they should not form triple points when merely close
+                if abs(d1.dot(d2)) > parallel_dot_threshold:
+                    continue
+
+                # Calculate shortest distance between segments and their closest points
                 dist, closest1, closest2 = segment_segment_distance(p1a, p1b, p2a, p2b)
 
-                # Check if distance is within tolerance
                 if dist < tolerance:
-                    # Calculate triple point as the midpoint
+                    # Use midpoint as triple point candidate
                     tp_point = (closest1 + closest2) * 0.5
-                    # Just append the raw point coordinate to the list passed by reference
                     found_triple_points.append(tp_point)
 
-                    # --- REMOVED duplicate check and TriplePoint object creation ---
-                    # # Check for duplicates within the accumulating list
-                    # is_duplicate = False
-                    # for existing_tp in found_triple_points:
-                    #     # This check is problematic here, should be done after collecting all points
-                    #     # if (existing_tp.point - tp_point).length() < tolerance:
-                    #     #     # Merge intersection IDs into the existing TP
-                    #     #     existing_tp.add_intersection(i1)
-                    #     #     existing_tp.add_intersection(i2)
-                    #     #     is_duplicate = True
-                    #     #     break
-                    #
-                    # if not is_duplicate:
-                    #     # Create a new TriplePoint object
-                    #     # This creation should happen after merging
-                    #     # triple_point_obj = TriplePoint(tp_point)
-                    #     # triple_point_obj.add_intersection(i1)
-                    #     # triple_point_obj.add_intersection(i2)
-                    #     # found_triple_points.append(triple_point_obj)
-                    # --- END REMOVAL ---
-
-    # Return list of potential coordinate points (Vector3D)
     return found_triple_points
 
 
