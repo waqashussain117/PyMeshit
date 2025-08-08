@@ -8821,7 +8821,31 @@ segmentation, triangulation, and visualization.
     # ======================================================================
         # ======================================================================
     #  REFINED-MESH TAB : 3-D view updater  (Intersections / Mesh / Segments)
+    def _refresh_segment_map_from_tree(self):
+        """
+        Mirror refine_constraint_tree states into _refine_segment_map for drawing.
+        Keeps 'selected' and 'is_hole' in sync with the table (source of truth).
+        """
+        seg_map = getattr(self, "_refine_segment_map", {}) or {}
+        tree = getattr(self, "refine_constraint_tree", None)
+        if not tree or not seg_map:
+            return
 
+        def walk(item):
+            data = item.data(0, Qt.UserRole)
+            if data and data.get("type") == "constraint":
+                surf_idx = data.get("surface_idx")
+                seg_uid = data.get("seg_uid")
+                key = (surf_idx, seg_uid)
+                if key in seg_map:
+                    seg_map[key]["selected"] = (item.checkState(0) == Qt.Checked)
+                    # Column 4 is the holes checkbox
+                    seg_map[key]["is_hole"] = (item.checkState(4) == Qt.Checked)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(tree.topLevelItemCount()):
+            walk(tree.topLevelItem(i))
     def _draw_segments_batched_fast(
         self,
         plotter,
@@ -8841,6 +8865,12 @@ segmentation, triangulation, and visualization.
         """
         import numpy as np
         import pyvista as pv
+
+        # NEW: ensure the map mirrors the table before drawing (synchronization respected)
+        try:
+            self._refresh_segment_map_from_tree()
+        except Exception:
+            pass
 
         seg_map = getattr(self, "_refine_segment_map", {}) or {}
 
