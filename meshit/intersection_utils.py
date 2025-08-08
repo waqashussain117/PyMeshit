@@ -997,132 +997,62 @@ def connect_intersection_segments(segments, tolerance=1e-10):
 # ##################################################################
 
 
-def calculate_skew_line_transversal_c_style(p1: Vector3D, p2: Vector3D, p3: Vector3D, p4: Vector3D) -> Optional[List[Vector3D]]:
-    """
-    Calculate the skew line transversal between two 3D line segments.
-    
-    This is an exact port of C_Line::calculateSkewLineTransversal from C++.
-    Returns a list of two points (like C++ connector.Ns) if intersection occurs within both segments.
-    
-    Args:
-        p1: First point of first segment
-        p2: Second point of first segment  
-        p3: First point of second segment
-        p4: Second point of second segment
-        
-    Returns:
-        List containing two Vector3D points representing the shortest connector endpoints,
-        or None if lines are parallel or don't intersect within their bounds
-    """
-    # Direction vectors (P21 and Q21 in C++)
-    p21 = p2 - p1
-    q21 = p4 - p3
-    
-    # Common normal vector (R21 in C++)
-    r21 = p21.cross(q21)
-    pq1 = p1 - p3
-    
-    # Check if lines are parallel (length of cross product is zero)
-    if r21.length() == 0:
-        return None  # Lines are parallel, no unique transversal
-    
-    # Calculate determinant D using the 3x3 determinant formula from C++
-    d = (p21.x * q21.y * r21.z + q21.x * r21.y * p21.z + r21.x * p21.y * q21.z -
-         r21.x * q21.y * p21.z - q21.x * p21.y * r21.z - p21.x * r21.y * q21.z)
-    
-    if abs(d) < 1e-12:  # Avoid division by zero
-        return None
-    
-    # Calculate Ds (determinant for parameter s)
-    ds = (r21.x * q21.y * pq1.z + q21.x * pq1.y * r21.z + pq1.x * r21.y * q21.z -
-          pq1.x * q21.y * r21.z - q21.x * r21.y * pq1.z - r21.x * pq1.y * q21.z)
-    
-    # Calculate Dt (determinant for parameter t)  
-    dt = (p21.x * pq1.y * r21.z + pq1.x * r21.y * p21.z + r21.x * p21.y * pq1.z -
-          r21.x * pq1.y * p21.z - pq1.x * p21.y * r21.z - p21.x * r21.y * pq1.z)
-    
-    # Calculate parameters s and t
-    s = ds / d
-    t = dt / d
-    
-    # C++ condition: if (0 <= s && s<1) if (0 <= t && t<1)
-    # Only accept if both parameters are within the segment bounds
-    if 0 <= s < 1 and 0 <= t < 1:
-        # Calculate the two points on the segments (like C++ connector.Ns)
-        point1 = p1 + p21 * s
-        point2 = p3 + q21 * t
-        
-        # Return list of two points (matching C++ connector.Ns structure)
-        return [point1, point2]
-    
-    return None  # Intersection not within both segments
-
-
 def calculate_skew_line_transversal(p1: Vector3D, p2: Vector3D, p3: Vector3D, p4: Vector3D) -> Optional[Vector3D]:
     """
     Calculate the skew line transversal between two 3D line segments.
     
-    This is a direct port of C_Line::calculateSkewLineTransversal from C++.
-    It only returns a valid point if the intersection occurs within both segments.
+    This is a port of C_Line::calculateSkewLineTransversal from C++.
+    It calculates the point of closest approach between two non-coplanar segments.
     
     Args:
         p1: First point of first segment
-        p2: Second point of first segment  
+        p2: Second point of first segment
         p3: First point of second segment
         p4: Second point of second segment
         
     Returns:
-        Vector3D representing the midpoint of the shortest connector, or None if lines 
-        are parallel or don't intersect within their bounds
+        Vector3D representing the point of closest approach, or None if the lines are parallel
     """
-    # Direction vectors (P21 and Q21 in C++)
-    p21 = p2 - p1
-    q21 = p4 - p3
+    # Direction vectors for the two lines
+    d1 = p2 - p1
+    d2 = p4 - p3
     
-    # Common normal vector (R21 in C++)
-    r21 = p21.cross(q21)
-    pq1 = p1 - p3
-    
-    # Check if lines are parallel (length of cross product is zero)
-    if r21.length() == 0:
+    # Check if the lines are parallel
+    cross_d1d2 = d1.cross(d2)
+    len_cross = cross_d1d2.length()
+    if len_cross < 1e-10:
         return None  # Lines are parallel, no unique transversal
     
-    # Calculate determinant D using the 3x3 determinant formula from C++
-    # D = P21.x*Q21.y*R21.z + Q21.x*R21.y*P21.z + R21.x*P21.y*Q21.z 
-    #     - R21.x*Q21.y*P21.z - Q21.x*P21.y*R21.z - P21.x*R21.y*Q21.z
-    d = (p21.x * q21.y * r21.z + q21.x * r21.y * p21.z + r21.x * p21.y * q21.z -
-         r21.x * q21.y * p21.z - q21.x * p21.y * r21.z - p21.x * r21.y * q21.z)
+    # Calculate parameters for the closest point
+    n = cross_d1d2.normalized()
     
-    if abs(d) < 1e-12:  # Avoid division by zero
-        return None
+    # Calculate distance between the lines
+    p_diff = p3 - p1
     
-    # Calculate Ds (determinant for parameter s)
-    # Ds = R21.x*Q21.y*PQ1.z + Q21.x*PQ1.y*R21.z + PQ1.x*R21.y*Q21.z
-    #      - PQ1.x*Q21.y*R21.z - Q21.x*R21.y*PQ1.z - R21.x*PQ1.y*Q21.z
-    ds = (r21.x * q21.y * pq1.z + q21.x * pq1.y * r21.z + pq1.x * r21.y * q21.z -
-          pq1.x * q21.y * r21.z - q21.x * r21.y * pq1.z - r21.x * pq1.y * q21.z)
+    # Calculate t values for closest points on the two lines
+    # Compute determinants for the linear system
+    det1 = p_diff.dot(d2.cross(n))
+    det2 = p_diff.dot(d1.cross(n))
     
-    # Calculate Dt (determinant for parameter t)  
-    # Dt = P21.x*PQ1.y*R21.z + PQ1.x*R21.y*P21.z + R21.x*P21.y*PQ1.z
-    #      - R21.x*PQ1.y*P21.z - PQ1.x*P21.y*R21.z - P21.x*R21.y*PQ1.z
-    dt = (p21.x * pq1.y * r21.z + pq1.x * r21.y * p21.z + r21.x * p21.y * pq1.z -
-          r21.x * pq1.y * p21.z - pq1.x * p21.y * r21.z - p21.x * r21.y * pq1.z)
+    # Denominator is the square of the sin of the angle between d1 and d2
+    denom = len_cross * len_cross
     
-    # Calculate parameters s and t
-    s = ds / d
-    t = dt / d
+    # Parameters along the two lines for the closest points
+    t1 = det1 / denom
+    t2 = det2 / denom
     
-    # C++ condition: if (0 <= s && s<1) if (0 <= t && t<1)
-    # Only accept if both parameters are within the segment bounds
-    if 0 <= s < 1 and 0 <= t < 1:
-        # Calculate the two points on the segments
-        point1 = p1 + p21 * s
-        point2 = p3 + q21 * t
+    # Check if the closest points are within the segments
+    if 0 <= t1 <= 1 and 0 <= t2 <= 1:
+        # Calculate the two closest points
+        c1 = p1 + d1 * t1
+        c2 = p3 + d2 * t2
         
-        # Return the midpoint of the shortest connector
-        return (point1 + point2) * 0.5
+        # Check if the points are close enough to be considered an intersection
+        if (c1 - c2).length() < 1e-5:
+            # Return midpoint
+            return (c1 + c2) * 0.5
     
-    return None  # Intersection not within both segments
+    return None
 
 
 def sort_intersection_points(points: List[Vector3D]) -> List[Vector3D]:
@@ -1562,16 +1492,14 @@ def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, mode
             for seg2_idx, seg2 in enumerate(box.N2s):
                 p2a, p2b = seg2[0], seg2[1]
 
-                # Use exact C++ logic: calculate skew line transversal
-                connector_points = calculate_skew_line_transversal_c_style(p1a, p1b, p2a, p2b)
-                
-                # C++ condition: connector.Ns.length() == 2 && lengthSquared(connector.Ns[0] - connector.Ns[1])<1e-24
-                if (connector_points is not None and 
-                    len(connector_points) == 2 and 
-                    (connector_points[0] - connector_points[1]).length_squared() < 1e-24):
-                    
-                    # Calculate triple point as the midpoint (matching C++ logic exactly)
-                    tp_point = (connector_points[0] + connector_points[1]) * 0.5
+                # Calculate distance and closest points between segments FIRST
+                dist, closest1, closest2 = segment_segment_distance(p1a, p1b, p2a, p2b)
+
+                # Check if distance is within tolerance
+                if dist < tolerance:
+                    # Calculate triple point as the midpoint
+                    tp_point = (closest1 + closest2) * 0.5
+                    # Just append the raw point coordinate to the list passed by reference
                     found_triple_points.append(tp_point)
 
                     # --- REMOVED duplicate check and TriplePoint object creation ---
@@ -1609,16 +1537,11 @@ def insert_triple_points(model, tolerance=1e-5):
         tp.intersection_ids  (fast path)
     2)  completeness pass – walk over every remaining poly-line and insert the
         point wherever the orthogonal distance to any segment < tolerance.
-        
-    This version uses more conservative tolerance for the completeness pass.
     """
     from meshit.intersection_utils import closest_point_on_segment
 
     if not getattr(model, "triple_points", None):
         return                                           # nothing to do
-
-    # Use more conservative tolerance for the completeness pass to prevent false insertions
-    conservative_tolerance = min(tolerance, 1e-7)  # Much stricter for the second pass
 
     # ------------------------------------------------------------------ PASS 1
     #         original ID-based insertion (kept as-is)
@@ -1630,7 +1553,7 @@ def insert_triple_points(model, tolerance=1e-5):
                                             tp.point, tolerance)
 
     # ------------------------------------------------------------------ PASS 2
-    #         completeness – make sure *every* line owns the TP (with stricter tolerance)
+    #         completeness – make sure *every* line owns the TP
     # ------------------------------------------------------------------
     for tp in model.triple_points:
         p_tp = tp.point
@@ -1638,25 +1561,25 @@ def insert_triple_points(model, tolerance=1e-5):
             if i in tp.intersection_ids:
                 continue                                 # already done
 
-            # quick BB check with conservative margin ------------------------
+            # quick BB check ---------------------------------------------------
             xs = [v.x for v in inter.points]
             ys = [v.y for v in inter.points]
             zs = [v.z for v in inter.points]
-            if not (min(xs) - conservative_tolerance <= p_tp.x <= max(xs) + conservative_tolerance and
-                    min(ys) - conservative_tolerance <= p_tp.y <= max(ys) + conservative_tolerance and
-                    min(zs) - conservative_tolerance <= p_tp.z <= max(zs) + conservative_tolerance):
+            if not (min(xs) - tolerance <= p_tp.x <= max(xs) + tolerance and
+                    min(ys) - tolerance <= p_tp.y <= max(ys) + tolerance and
+                    min(zs) - tolerance <= p_tp.z <= max(zs) + tolerance):
                 continue
 
-            # precise distance to each segment with conservative tolerance ----
+            # precise distance to each segment --------------------------------
             on_line = False
             for a, b in zip(inter.points[:-1], inter.points[1:]):
                 dist = (closest_point_on_segment(p_tp, a, b) - p_tp).length()
-                if dist < conservative_tolerance:
+                if dist < tolerance:
                     on_line = True
                     break
 
             if on_line:
-                _insert_point_into_polyline(inter.points, p_tp, conservative_tolerance)
+                _insert_point_into_polyline(inter.points, p_tp, tolerance)
                 tp.add_intersection(i)                  # keep bookkeeping
 
 # --------------------------------------------------------------------------
@@ -1666,50 +1589,27 @@ def _insert_point_into_polyline(pts, p_new, tol):
     """
     Insert p_new between the two vertices of *pts* whose segment is closest
     to the point (unless a vertex at the same XYZ already exists).
-    
-    This version uses stricter validation to prevent false insertions.
     """
     import math
-    
     # duplicate check ------------------------------------------------------
     for v in pts:
-        if (v - p_new).length() < tol:
+        if ( (v - p_new).length() < tol ):
             # Same coordinate already there → keep the *special* flag
             if getattr(p_new, "type", "DEFAULT") == "TRIPLE_POINT":
                 v.type = "TRIPLE_POINT"
             return
 
-    # find best host segment with stricter validation ----------------------
+    # find best host segment ----------------------------------------------
     best_k = None
     best_d = math.inf
-    best_closest_point = None
-    
     for k in range(len(pts) - 1):
-        closest_point = closest_point_on_segment(p_new, pts[k], pts[k+1])
-        d = (closest_point - p_new).length()
-        
+        d = (closest_point_on_segment(p_new, pts[k], pts[k+1]) - p_new).length()
         if d < best_d:
-            best_d, best_k, best_closest_point = d, k, closest_point
+            best_d, best_k = d, k
 
-    # Only insert if the point is truly on the segment (not just close to endpoints)
-    if best_k is not None and best_d < tol:
-        # Additional validation: make sure the closest point is actually between the endpoints
-        # and not just very close to one of them
-        seg_start = pts[best_k]
-        seg_end = pts[best_k + 1]
-        
-        # Check if closest point is reasonably far from both endpoints
-        dist_to_start = (best_closest_point - seg_start).length()
-        dist_to_end = (best_closest_point - seg_end).length()
-        seg_length = (seg_end - seg_start).length()
-        
-        # Only insert if closest point is not too close to either endpoint
-        # This prevents insertion of triple points very close to existing vertices
-        if (seg_length > tol * 2 and 
-            dist_to_start > tol and 
-            dist_to_end > tol):
-            p_new.type = "TRIPLE_POINT"
-            pts.insert(best_k + 1, p_new)
+    if best_k is not None:
+        p_new.type = "TRIPLE_POINT"
+        pts.insert(best_k + 1, p_new)
 
 
 def clean_identical_points(points_list: List[Vector3D], tolerance=1e-10) -> List[Vector3D]:
@@ -1813,6 +1713,7 @@ def make_corners_special(convex_hull: List[Vector3D], angle_threshold_deg: float
     
     logger.info(f"Identified {special_count} corner points on convex hull")
     return convex_hull
+
 
 def align_intersections_to_convex_hull(surface_idx: int, model):
     """
@@ -2505,104 +2406,143 @@ def refine_intersection_line_by_length(intersection,
     intersection.points = refined
     return refined
 
-def prepare_plc_for_surface_triangulation(surface_data, intersections_on_surface_data, config):
+def prepare_plc_for_surface_triangulation(surface_data,
+                                          intersections_on_surface_data,
+                                          config):
     """
-    Prepares Points and Segments for constrained 2D triangulation of a surface.
-    FIXED: Uses robust high-precision rounding approach following C++ MeshIt logic.
+    Build a PLC (Planar Straight–Line Complex) for one surface, ready to be
+    triangulated with Triangle / TetGen.
+
+    Differences from the earlier version
+    ------------------------------------
+    1.  Detects *closed* intersection polylines (first-point ≈ last-point).
+        These represent interior holes in C++ MeshIt and **must NOT** be treated
+        as ordinary intersection edge constraints.
+    2.  For every closed loop:
+        • the closing segment (last → first) is inserted so the loop is a proper
+          polygon;
+        • a point strictly inside the polygon is computed (simple centroid) and
+          stored in ``holes_2d``.  Triangle removes triangles containing that
+          point, and TetGen inherits the hole automatically – identical to the
+          C++ workflow.
+    3.  Open polylines are kept exactly as before.
+    4.  Function still returns 2-D points, segments, holes and the original
+        3-D points.
+
+    Parameters
+    ----------
+    surface_data : dict
+        Contains keys like ``'hull_points'`` and ``'projection_params'``.
+    intersections_on_surface_data : list[dict]
+        Each item has at least ``'points'`` (Vector3D list).
+    config : dict
+        Gui / workflow settings (only ``'target_size'`` is used here).
+
+    Returns
+    -------
+    points_2d : (N, 2) float64 ndarray
+    segments   : (M, 2) int32 ndarray
+    holes_2d   : (H, 2) float64 ndarray  – may be empty if no holes
+    points_3d  : (N, 3) float64 ndarray
     """
-    logger.info("Using FIXED robust PLC preparation following C++ MeshIt logic")
-    
-    # Get parameters from config
-    target_feature_size = config.get('target_size', 20.0)
-    
-    # ================================================================
-    # Direct PLC Generation Following C++ calculate_triangles Logic
-    # ================================================================
-    
-    # Initialize unique points map using high-precision rounding (round to 9 decimal places)
-    unique_points_map = {}  # key: (round_x, round_y, round_z) -> value: {'index': int, 'point': Vector3D}
-    final_points_list = []  # Final list of Vector3D points in index order
-    segment_indices_list = []  # Final list of [idx1, idx2] segment pairs
-    
-    def add_point_to_plc(point_obj: Vector3D) -> int:
-        """
-        Add a point to the PLC with high-precision deduplication.
-        Returns the index of the point in the final list.
-        """
-        key = (round(point_obj.x, 9), round(point_obj.y, 9), round(point_obj.z, 9))
-        
-        if key in unique_points_map:
-            # Point already exists, just return its index
-            return unique_points_map[key]['index']
-        else:
-            # New point - add to map and list
-            new_index = len(final_points_list)
-            unique_points_map[key] = {
-                'index': new_index,
-                'point': point_obj
-            }
-            final_points_list.append(point_obj)
-            return new_index
+    logger = logging.getLogger(__name__)
+    tgt_size = config.get("target_size", 20.0)
 
-    # ----------------------------------------------------------------
-    # Process hull constraints (closed loop)
-    # ----------------------------------------------------------------
-    hull_points = surface_data.get('hull_points', [])
-    if hull_points:
-        logger.info(f"Processing hull with {len(hull_points)} points")
-        hull_indices = [add_point_to_plc(p) for p in hull_points]
-        
-        # Create closed loop segments for hull
-        for i in range(len(hull_indices)):
-            idx1 = hull_indices[i]
-            idx2 = hull_indices[(i + 1) % len(hull_indices)]
-            if idx1 != idx2:  # Avoid zero-length segments
-                segment_indices_list.append([idx1, idx2])
+    # ------------------------------------------------------------------ helpers
+    def key_of(p: Vector3D):
+        return (round(p.x, 9), round(p.y, 9), round(p.z, 9))
 
-    # ----------------------------------------------------------------
-    # Process intersection constraints (open polylines)
-    # ----------------------------------------------------------------
-    for line_idx, intersection_data in enumerate(intersections_on_surface_data):
-        intersection_points = intersection_data.get('points', [])
-        if not intersection_points:
+    def add_point(pt: Vector3D) -> int:
+        """Insert unique 3-D point, return its global index."""
+        k = key_of(pt)
+        idx = point_map.get(k)
+        if idx is None:
+            idx = len(points_3d)
+            point_map[k] = idx
+            points_3d.append(pt)
+        return idx
+
+    # --------------------------- storage for global PLC -----------------------
+    point_map: Dict[Tuple[float, float, float], int] = {}
+    points_3d: List[Vector3D] = []
+    segments:   List[List[int]] = []
+    closed_loops_pts: List[List[Vector3D]] = []   # for hole centroids later
+
+    # --------------------------- 1. hull (outer boundary) ---------------------
+    hull_pts: List[Vector3D] = surface_data.get("hull_points",
+                           surface_data.get("convex_hull", []))
+    if hull_pts and len(hull_pts) > 1:
+        hull_idx = [add_point(p) for p in hull_pts]
+        for i in range(len(hull_idx)):
+            segments.append([hull_idx[i], hull_idx[(i + 1) % len(hull_idx)]])
+
+    # --------------------------- 2. intersection polylines --------------------
+    tol_sq = 1e-16  # squared tolerance for "same point" check
+    for inter in intersections_on_surface_data:
+        pts: List[Vector3D] = inter.get("points", [])
+        if len(pts) < 2:
             continue
-                
-        logger.info(f"Processing intersection line {line_idx} with {len(intersection_points)} points")
-        line_indices = [add_point_to_plc(p) for p in intersection_points]
-        
-        # Create segments for intersection polyline
-        for i in range(len(line_indices) - 1):
-            idx1 = line_indices[i]
-            idx2 = line_indices[i + 1]
-            if idx1 != idx2:  # Avoid zero-length segments
-                segment_indices_list.append([idx1, idx2])
 
-    logger.info(f"Robust PLC built: {len(final_points_list)} unique points, {len(segment_indices_list)} segments")
+        # Detect closed loop – first and last coincide within tolerance
+        is_closed = (pts[0] - pts[-1]).length_squared() < tol_sq
 
-    # ----------------------------------------------------------------
-    # Validate and Project to 2D
-    # ----------------------------------------------------------------
-    if len(final_points_list) < 3:
-        logger.error(f"Insufficient points ({len(final_points_list)}) for triangulation")
-        return None, None, np.empty((0, 2)), np.empty((0, 3))
-    
-    projection_params = surface_data.get('projection_params')
-    if not projection_params:
-        logger.error("Cannot create PLC: missing projection parameters.")
-        return None, None, np.empty((0, 2)), np.empty((0, 3))
-            
-    centroid = np.array(projection_params['centroid'])
-    basis = np.array(projection_params['basis'])
-    
-    points_3d_array = np.array([[p.x, p.y, p.z] for p in final_points_list])
-    centered_points = points_3d_array - centroid
-    points_2d = np.dot(centered_points, basis.T)[:,:2]
+        idx_list = [add_point(p) for p in pts]
 
-    segments_array = np.array(segment_indices_list, dtype=int) if segment_indices_list else np.empty((0, 2), dtype=int)
-    holes_2d = np.empty((0, 2))  # No holes for now
+        # Add polyline segments
+        for i in range(len(idx_list) - 1):
+            if idx_list[i] != idx_list[i + 1]:
+                segments.append([idx_list[i], idx_list[i + 1]])
 
-    logger.info(f"FIXED robust PLC preparation successful: {len(points_2d)} points, {len(segments_array)} segments")
-    return points_2d, segments_array, holes_2d, points_3d_array
+        # Close the loop if necessary and remember to create a hole
+        if is_closed and idx_list[0] != idx_list[-1]:
+            segments.append([idx_list[-1], idx_list[0]])
+            closed_loops_pts.append(pts)  # keep 3-D pts for centroid
+
+    logger.info(
+        f"PLC construction – raw counts: {len(points_3d)} pts, "
+        f"{len(segments)} segments, {len(closed_loops_pts)} holes detected"
+    )
+
+    # --------------------------- 3. project everything to 2-D -----------------
+    proj = surface_data.get("projection_params")
+    if not proj:
+        raise RuntimeError("Missing projection parameters for surface.")
+
+    centroid = np.asarray(proj["centroid"])
+    basis    = np.asarray(proj["basis"])        # (2×3) ortho basis stored row-wise
+
+    pts_3d_arr = np.array([[p.x, p.y, p.z] for p in points_3d])
+    pts_2d_arr = (pts_3d_arr - centroid) @ basis.T
+    pts_2d_arr = pts_2d_arr[:, :2]              # drop z in local coords
+
+    # --------------------------- 4. hole centroids ----------------------------
+    hole_pts_2d: List[np.ndarray] = []
+    for loop in closed_loops_pts:
+        # simple arithmetic centroid – sufficient for reasonably convex loops
+        cx = sum(p.x for p in loop) / len(loop)
+        cy = sum(p.y for p in loop) / len(loop)
+        cz = sum(p.z for p in loop) / len(loop)
+        p3d = np.array([cx, cy, cz])
+        p2d = (p3d - centroid) @ basis.T
+        hole_pts_2d.append(p2d[:2])
+
+    holes_2d_arr = (
+        np.vstack(hole_pts_2d).astype(float)
+        if hole_pts_2d else
+        np.empty((0, 2), dtype=float)
+    )
+
+    logger.info(
+        f"PLC ready: {pts_2d_arr.shape[0]} pts, {len(segments)} segments, "
+        f"{holes_2d_arr.shape[0]} holes"
+    )
+
+    return (
+        pts_2d_arr.astype(float),
+        np.asarray(segments, dtype=np.int32),
+        holes_2d_arr,
+        pts_3d_arr.astype(float),
+    )
 
 
 def run_constrained_triangulation_py(

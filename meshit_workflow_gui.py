@@ -1653,44 +1653,38 @@ class MeshItWorkflowGUI(QMainWindow):
             self.refine_mesh_plotter = None
 
     def _on_refine_view_tab_changed(self, index):
-        """Handle switching between refine view sub-tabs"""
+        """Handle switching between refine view sub-tabs."""
         old_view = getattr(self, 'current_refine_view', 0)
         self.current_refine_view = index
-        
-        logger.info(f"Refine view tab changed from {old_view} to {index}")
-        
-        # Update the main plotter reference for backward compatibility
-        if hasattr(self, 'plotters') and self.plotters:
-            if index == 0:  # Intersections
+
+        logger.info(f"[REFINE] Tab changed from {old_view} to {index}")
+
+        # Update main plotter reference; ensure Segments plotter exists on demand
+        if hasattr(self, 'plotters') and self.plotters is not None:
+            if index == 0:
                 self.refine_mesh_plotter = getattr(self, 'intersections_plotter', None)
-            elif index == 1:  # Meshes
+            elif index == 1:
                 self.refine_mesh_plotter = getattr(self, 'meshes_plotter', None)
-            elif index == 2:  # Segments
-                self.refine_mesh_plotter = getattr(self, 'segments_plotter', None)
-        
-        # Only update visualization if view actually changed
+            elif index == 2:
+                self.refine_mesh_plotter = self._ensure_segments_plotter()
+                # Inspect widget tree now that tab is active
+                self._debug_segments_widget_tree("tab-changed")
+            logger.info(f"[REFINE] refine_mesh_plotter set to tab {index} ({'OK' if self.refine_mesh_plotter else 'None'})")
+
         if old_view != index:
-            # Ensure constraint actors persist across tab switches (performance optimization)
             self._ensure_constraint_actors_persistence()
-            
-            # Don't clear actors cache unnecessarily - let them persist
-            # if hasattr(self, '_constraint_actors_built'):
-            #     self._constraint_actors_built = False  # Removed to prevent rebuilding
-            
+
             # Disable mouse selection when leaving segments view
             if old_view == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
                 if self.mouse_selection_enabled_btn.isChecked():
                     self.mouse_selection_enabled_btn.setChecked(False)
-                    
-            # Update visualization for the new tab
+
+            logger.info("[REFINE] Calling _update_refined_visualization after tab change")
             self._update_refined_visualization()
-            
-            # Re-enable mouse selection if returning to segments view and it was previously enabled
+
             if index == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
-                # Enable the button but don't auto-check it - let user decide
                 self.mouse_selection_enabled_btn.setEnabled(True)
             elif hasattr(self, 'mouse_selection_enabled_btn'):
-                # Disable mouse selection button for non-segments views
                 self.mouse_selection_enabled_btn.setEnabled(index == 2)
 
     def _clear_refine_tab_plotters(self):
@@ -1702,16 +1696,88 @@ class MeshItWorkflowGUI(QMainWindow):
                     plotter.clear()
                 except Exception as e:
                     logger.warning(f"Error clearing {plotter_name}: {e}")
+    def _ensure_segments_plotter(self):
+        """
+        Lazily create/attach the Segments QtInteractor if missing.
+        Returns the plotter or None if PyVistaQt is unavailable.
+        """
+        try:
+            have_pv = bool(HAVE_PYVISTA)
+        except NameError:
+            have_pv = False
+        logger.info(f"[SEGMENTS] ensure plotter: HAVE_PYVISTA={have_pv}")
 
+        if not have_pv:
+            logger.warning("[SEGMENTS] PyVista not available; cannot create Segments plotter")
+            return None
+
+        # Basic widget sanity
+        try:
+            logger.info(f"[SEGMENTS] segments_viz_frame exists: {hasattr(self, 'segments_viz_frame')} type={type(getattr(self, 'segments_viz_frame', None))}")
+        except Exception:
+            logger.warning("[SEGMENTS] unable to inspect segments_viz_frame")
+
+        # Import QtInteractor
+        try:
+            from pyvistaqt import QtInteractor
+            logger.info("[SEGMENTS] QtInteractor import OK")
+        except Exception as e:
+            logger.error(f"[SEGMENTS] QtInteractor import FAILED: {e}", exc_info=True)
+            return None
+
+        # Already present?
+        plotter = getattr(self, 'segments_plotter', None)
+        if plotter and hasattr(plotter, 'interactor'):
+            logger.info("[SEGMENTS] Reusing existing Segments plotter")
+            # Ensure it’s attached and visible
+            self._debug_segments_widget_tree("reuse")
+            return plotter
+
+        # Ensure layout exists
+        if not hasattr(self, 'segments_plot_layout') or self.segments_plot_layout is None:
+            try:
+                self.segments_plot_layout = QVBoxLayout(self.segments_viz_frame)
+                self.segments_plot_layout.setContentsMargins(0, 0, 0, 0)
+                logger.info("[SEGMENTS] Created segments_plot_layout and attached to frame")
+            except Exception as e:
+                logger.error(f"[SEGMENTS] Failed to create segments_plot_layout: {e}", exc_info=True)
+                return None
+        else:
+            logger.info("[SEGMENTS] segments_plot_layout already exists")
+
+        # Create and attach the interactor widget
+        try:
+            self.segments_plotter = QtInteractor(self.segments_viz_frame)
+            self.segments_plot_layout.addWidget(self.segments_plotter.interactor)
+            self.segments_plotter.set_background([0.318, 0.341, 0.431])
+            self.segments_plotter.add_text("Click on constraint segments to select/deselect them.",
+                                        position='upper_edge', color='white')
+            if not hasattr(self, 'plotters') or self.plotters is None:
+                self.plotters = {}
+            self.plotters['segments'] = self.segments_plotter
+            logger.info("[SEGMENTS] Segments plotter CREATED and interactor added to layout")
+            # Verify attachment
+            self._debug_segments_widget_tree("created")
+            return self.segments_plotter
+        except Exception as e:
+            logger.error(f"[SEGMENTS] Failed to create/attach Segments plotter: {e}", exc_info=True)
+            return None
     def _get_current_refine_plotter(self):
-        """Get the currently active refine tab plotter"""
+        """Get the currently active refine tab plotter (lazily ensures Segments plotter)."""
         current_index = getattr(self, 'current_refine_view', 0)
         if current_index == 0:
-            return getattr(self, 'intersections_plotter', None)
+            p = getattr(self, 'intersections_plotter', None)
+            logger.info(f"[REFINE] current plotter -> Intersections ({'OK' if p else 'None'})")
+            return p
         elif current_index == 1:
-            return getattr(self, 'meshes_plotter', None)
+            p = getattr(self, 'meshes_plotter', None)
+            logger.info(f"[REFINE] current plotter -> Meshes ({'OK' if p else 'None'})")
+            return p
         elif current_index == 2:
-            return getattr(self, 'segments_plotter', None)
+            p = self._ensure_segments_plotter()
+            logger.info(f"[REFINE] current plotter -> Segments ({'OK' if p else 'None'})")
+            return p
+        logger.warning(f"[REFINE] current plotter -> Unknown tab index {current_index}")
         return None
     
     def _ensure_constraint_actors_persistence(self):
@@ -1819,33 +1885,35 @@ class MeshItWorkflowGUI(QMainWindow):
         Similar to C++ setFShowGBox() function.
         """
         logger.info(f"Surface selection changed to: {surface_name}")
-        
+
         current_view = getattr(self, 'current_refine_view', 0)
-        
-        # Only update constraint visibility if we're in the Segments view (view 2)
-        # For other views, the surface selection may be used differently
-        if current_view == 2:
-            # FORCE visibility update for Segments view
+        if current_view != 2:
+            logger.info(f"Surface selection noted for view {current_view} (constraint visibility not applicable)")
+            if current_view == 0:
+                logger.info(f"Refreshing intersections visualization for surface filter: {surface_name}")
+                self._visualize_refined_intersections()
+            elif current_view == 1:
+                logger.info(f"Refreshing meshes visualization for surface filter: {surface_name}")
+                self._update_refined_visualization()
+            self._highlight_surface_in_constraint_tree(surface_name)
+            return
+
+        # Segments view
+        batched = bool(getattr(self, "_segments_batched_mode", False))
+        has_segment_actors = bool(getattr(self, 'constraint_segment_actor_refs', {}))
+
+        # In batched mode (mouse selection OFF) or when no actors exist → rebuild once (fast path)
+        if batched or not has_segment_actors:
+            logger.info("[SEGMENTS] Surface filter change: rebuilding batched view")
+            self._update_refined_visualization()
+        else:
+            # Per‑segment actors exist → fast toggle
             if hasattr(self, 'constraint_segment_actor_refs') and self.constraint_segment_actor_refs:
                 logger.info(f"Updating constraint visibility for surface filter in Segments view (view={current_view})")
                 self._update_segment_visibility_for_surface_selection(surface_name)
             else:
                 logger.warning("No constraint actors available for visibility update")
-        else:
-            # For Intersections (view 0) and Meshes (view 1), surface selection might be used for different filtering
-            # but we don't force constraint visibility updates since those views don't have constraint actors
-            logger.info(f"Surface selection noted for view {current_view} (constraint visibility not applicable)")
-            
-            # If we're in Intersections view, we might want to refresh the visualization
-            # to respect the new surface filter
-            if current_view == 0:
-                logger.info(f"Refreshing intersections visualization for surface filter: {surface_name}")
-                self._visualize_refined_intersections()  # Direct call to avoid full visualization update
-            elif current_view == 1:
-                logger.info(f"Refreshing meshes visualization for surface filter: {surface_name}")
-                self._update_refined_visualization()  # Only meshes view needs full update
-        
-        # Optionally highlight the corresponding surface in the constraint tree
+
         self._highlight_surface_in_constraint_tree(surface_name)
 
     def _update_segment_visibility_for_surface_selection(self, selected_surface):
@@ -2041,104 +2109,91 @@ class MeshItWorkflowGUI(QMainWindow):
     def _on_constraint_filter_changed(self):
         """
         Fast constraint filter update when checkboxes change.
-        Only updates visibility, no rebuilding.
+        If batched mode: rebuild once. If per‑segment mode: visibility toggle.
         """
-        if (getattr(self, "current_refine_view", 0) == 2 and 
-            hasattr(self, '_constraint_actors_built') and 
-            self._constraint_actors_built):
-            
-            # Get current surface selection and apply fast filter
-            selected_surface = "All Surfaces"
-            if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
-                selected_surface = self.refine_surface_selector.currentText()
-            
-            self._update_segment_visibility_for_surface_selection(selected_surface)
-        else:
-            # Full update for other views
+        if getattr(self, "current_refine_view", 0) != 2:
             self._update_refined_visualization()
+            return
+
+        batched = bool(getattr(self, "_segments_batched_mode", False))
+        if batched:
+            logger.info("[SEGMENTS] Constraint filter changed → rebuilding batched view")
+            self._update_refined_visualization()
+            return
+
+        # Per‑segment actors exist, toggle visibility without rebuild
+        selected_surface = "All Surfaces"
+        if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
+            selected_surface = self.refine_surface_selector.currentText()
+        self._update_segment_visibility_for_surface_selection(selected_surface)
 
     def _on_mouse_selection_toggled(self, enabled):
         """
         Toggle mouse-based constraint selection on/off.
-        When enabled, clicking on constraint lines will select/deselect them.
-        Also shows/hides the selection mode buttons.
+        When enabled we rebuild per-segment actors and enable picking.
+        When disabled we rebuild the fast batched view.
         """
         logger.info(f"Mouse selection {'enabled' if enabled else 'disabled'}")
-        
-        # Show/hide selection mode buttons based on mouse selection state
+
+        # Show/hide selection mode buttons
         if hasattr(self, 'selection_mode_btn') and hasattr(self, 'deselection_mode_btn'):
             self.selection_mode_btn.setVisible(enabled)
             self.deselection_mode_btn.setVisible(enabled)
-        
-        # Initialize selection mode if not set
+
         if not hasattr(self, 'current_selection_mode'):
-            self.current_selection_mode = "select"  # Default to select mode
-            
-        # Initialize highlight timer for temporary yellow highlighting
+            self.current_selection_mode = "select"
+
         if not hasattr(self, 'highlight_timer'):
             self.highlight_timer = QTimer()
-            self.highlight_timer.setSingleShot(True)  # One-time timer
+            self.highlight_timer.setSingleShot(True)
             self.highlight_timer.timeout.connect(self._clear_selection_highlight)
-            self.highlight_timer.setInterval(500)  # 500ms highlight duration (faster feedback)
-        
-        # Get the current active plotter
-        plotter = self._get_current_refine_plotter()
-        if not plotter:
-            # Fallback to old method
-            plotter = self.plotters.get("refine_mesh")
-            if not plotter:
-                logger.warning("No refine_mesh plotter available for mouse selection")
-                return
-            
-        # Check if we're in the right view for mouse selection
+            self.highlight_timer.setInterval(500)
+
+        # Ensure we are on Segments tab
         current_view = getattr(self, 'current_refine_view', 0)
-        logger.info(f"Current view: {current_view} (0=Intersections, 1=Meshes, 2=Segments)")
-        
-        if current_view != 2:
-            logger.warning("Mouse selection only works in Segments view (view 2)")
-            # Auto-switch to segments view for mouse selection
-            if enabled:
-                logger.info("Auto-switching to Segments view for mouse selection")
-                if hasattr(self, 'refine_view_tabs'):
-                    self.refine_view_tabs.setCurrentIndex(2)
-                else:
-                    # Fallback for legacy button system
-                    if hasattr(self, 'view_btn_grp'):
-                        self.view_btn_grp.button(2).setChecked(True)
-                    self._handle_view_toggle(2)
-            
+        if current_view != 2 and enabled:
+            if hasattr(self, 'refine_view_tabs'):
+                self.refine_view_tabs.setCurrentIndex(2)
+            else:
+                if hasattr(self, 'view_btn_grp'):
+                    self.view_btn_grp.button(2).setChecked(True)
+                self._handle_view_toggle(2)
+
+        plotter = self._get_current_refine_plotter() or self.plotters.get("refine_mesh")
+        if not plotter:
+            logger.warning("No refine_mesh plotter available for mouse selection")
+            return
+
+        # Rebuild visualization for the new mode
+        # - enabled: per-segment actors for picking
+        # - disabled: batched fast drawing
+        try:
+            self._update_refined_visualization()
+        except Exception as e:
+            logger.warning(f"Redraw after toggling mouse selection failed: {e}")
+
         if enabled:
-            # Ensure we have constraint actors built
-            if not (hasattr(self, 'constraint_segment_actor_refs') and 
-                    hasattr(self, '_constraint_actors_built') and 
-                    self._constraint_actors_built):
-                logger.warning("No constraint actors available for mouse selection")
+            # Require per-segment actors
+            if not hasattr(self, 'constraint_segment_actor_refs'):
+                self.constraint_segment_actor_refs = {}
+            if not getattr(self, '_constraint_actors_built', False) or not self.constraint_segment_actor_refs:
+                logger.warning("No constraint actors available for mouse selection after rebuild")
                 return
-                
-            logger.info(f"Available constraint actors: {len(getattr(self, 'constraint_segment_actor_refs', {}))}")
-            
-            # Start with the most reliable picking method for line elements
+
             try:
-                # Use cell picking with rectangle selection support - NO 'R' key needed
                 plotter.enable_cell_picking(
                     callback=self._on_constraint_cell_clicked,
-                    show_message=False,  # Disable message for cleaner UI
+                    show_message=False,
                     font_size=12,
                     color='yellow',
-                    through=True,  # Pick through the entire mesh
-                    start=True,  # Automatically start picking (no 'R' key needed)
-                    show=True  # Show selection feedback
+                    through=True,
+                    start=True,
+                    show=True
                 )
-                logger.info("Enabled CELL picking for constraint selection")
-                logger.info("🖱️ Single click: Select/deselect individual constraint lines")
-                logger.info("🔲 Drag rectangle: Select/deselect multiple constraints (no 'R' key needed)")
-                logger.info("💡 Surface filter applies: only constraints from selected surface will be affected")
-                logger.info("✅ Selection mode buttons now visible - choose Select or Deselect mode")
-                
+                self.mouse_selection_enabled_btn.setText("🖱️ Mouse ON")
+                logger.info("Constraint mouse selection enabled")
             except Exception as cell_error:
                 logger.warning(f"Cell picking failed: {cell_error}")
-                
-                # Fallback: try edge picking if available
                 try:
                     from pyvista.plotting.opts import ElementType
                     plotter.enable_element_picking(
@@ -2148,11 +2203,10 @@ class MeshItWorkflowGUI(QMainWindow):
                         font_size=10,
                         color='yellow'
                     )
-                    logger.info("Enabled EDGE element picking for constraint selection (fallback)")
-                    
+                    self.mouse_selection_enabled_btn.setText("🖱️ Mouse ON")
+                    logger.info("Constraint mouse selection enabled (edge picking fallback)")
                 except Exception as edge_error:
-                    logger.warning(f"Edge picking also failed: {edge_error}")
-                    # Final fallback to mesh picking
+                    logger.warning(f"Edge picking failed: {edge_error}")
                     try:
                         plotter.enable_mesh_picking(
                             callback=self._on_constraint_clicked_single,
@@ -2160,21 +2214,22 @@ class MeshItWorkflowGUI(QMainWindow):
                             font_size=10,
                             color='yellow'
                         )
-                        logger.info("Enabled mesh picking for constraint selection (final fallback)")
+                        self.mouse_selection_enabled_btn.setText("🖱️ Mouse ON")
+                        logger.info("Constraint mouse selection enabled (mesh picking fallback)")
                     except Exception as mesh_error:
-                        logger.error(f"All picking methods failed: cell={cell_error}, edge={edge_error}, mesh={mesh_error}")
+                        logger.error(f"All picking methods failed: {mesh_error}")
                         return
-                    
-            self.mouse_selection_enabled_btn.setText("🖱️ Mouse ON")
-            logger.info("Constraint mouse selection enabled - click on lines to select/deselect")
         else:
-            # Disable mouse picking
+            # Disable picking and rebuild fast view
             try:
                 plotter.disable_picking()
-                logger.info("Mouse picking disabled")
-            except Exception as e:
-                logger.warning(f"Error disabling picking: {e}")
+            except Exception:
+                pass
             self.mouse_selection_enabled_btn.setText("🖱️ Mouse Selection")
+            try:
+                self._update_refined_visualization()
+            except Exception:
+                pass
             logger.info("Constraint mouse selection disabled")
 
     def _on_selection_mode_changed(self, button, checked):
@@ -4679,19 +4734,16 @@ class MeshItWorkflowGUI(QMainWindow):
                     logger.warning(f"Dataset {original_idx} ({data_wrapper.name}) has no hull_points or points. Skipping for temp_model.")
                     continue
             
-            # *** FIX START: Convert object array to numeric array for calculations ***
+            # Convert object array to numeric array for calculations
             if current_geom_points_obj_array is not None and len(current_geom_points_obj_array) > 1:
                 try:
-                    # Extract only the first 3 columns (x,y,z) and convert to float
                     numeric_points = np.array(current_geom_points_obj_array[:, :3], dtype=np.float64)
-                    
                     min_pt, max_pt = np.min(numeric_points, axis=0), np.max(numeric_points, axis=0)
                     diag_length = np.linalg.norm(max_pt - min_pt)
                     data_wrapper.size = diag_length / 10.0 if diag_length > 0 else 0.1
                 except Exception as e:
                     logger.error(f"Error calculating size for dataset {original_idx}: {e}")
-                    data_wrapper.size = 0.1 # Fallback size
-            # *** FIX END ***
+                    data_wrapper.size = 0.1
 
             is_p = (dataset_content.get('type') == 'polyline' or
                     ('segments' in dataset_content and 'triangles' not in dataset_content and 'hull_points' not in dataset_content))
@@ -4714,8 +4766,7 @@ class MeshItWorkflowGUI(QMainWindow):
             return
         logger.info(f"Temp model created: {len(temp_model.surfaces)} surfaces, {len(temp_model.polylines)} polylines.")
         
-        # ... (The rest of the function remains the same as your latest working version) ...
-        # Map original self.datasets_intersections to temp_model.intersections using temp_data_idx_counter keys
+        # Map original self.datasets_intersections to temp_model.intersections
         original_to_temp_combined_idx_map = {v: k for k, v in temp_model.original_indices_map.items()}
 
         for _, intersections_list in self.datasets_intersections.items():
@@ -4820,12 +4871,86 @@ class MeshItWorkflowGUI(QMainWindow):
                     intersection, target_length=eff_target_length,
                     min_angle_deg=min_angle_deg, uniform_meshing=uniform_meshing
                 )
-            logger.info("Length-based refinement complete.")
+            logger.info("Length-based refinement of intersection lines complete.")
         except Exception as e:
             logger.error(f"Error during length-based refinement: {e}", exc_info=True)
             QMessageBox.warning(self, "Refinement Error", f"Error during length-based refinement: {str(e)}")
             return
-            
+
+        # --- NEW Step 3.5: Refine convex hulls by length (C++ ConvexHull.RefineByLength)
+        # Hull-specific refinement: preserve ALL existing vertices and their types.
+        # Only insert intermediate DEFAULT points between consecutive vertices.
+        try:
+            import math
+
+            def _refine_hull_preserve_vertices(hull_pts: list[Vector3D],
+                                            target_len: float,
+                                            uniform: bool) -> list[Vector3D]:
+                if not hull_pts or len(hull_pts) < 3:
+                    return hull_pts
+
+                refined: list[Vector3D] = []
+                n = len(hull_pts)
+
+                for i in range(n):
+                    p0 = hull_pts[i]
+                    p1 = hull_pts[(i + 1) % n]
+
+                    # Keep the original vertex (preserve its type and identity)
+                    refined.append(p0)
+
+                    seg_vec = p1 - p0
+                    seg_len = seg_vec.length()
+                    if seg_len <= max(target_len, 1e-12):
+                        continue
+
+                    ratio = seg_len / max(target_len, 1e-12)
+                    if uniform:
+                        num_insert = max(0, int(round(ratio)) - 1)
+                    else:
+                        num_insert = max(0, int(math.ceil(ratio)) - 1)
+
+                    # Insert intermediate points; new points are DEFAULT
+                    for k in range(1, num_insert + 1):
+                        t = k / (num_insert + 1)
+                        interp = p0 + seg_vec * t
+                        refined.append(Vector3D(interp.x, interp.y, interp.z, point_type="DEFAULT"))
+
+                # Remove duplicate closing vertex if present
+                if len(refined) >= 2 and (refined[0] - refined[-1]).length_squared() < 1e-24:
+                    refined.pop()
+
+                # Compact consecutive duplicates (numerical safety), keep order
+                compact: list[Vector3D] = []
+                prev = None
+                for q in refined:
+                    if prev is None or (q - prev).length_squared() > 1e-24:
+                        compact.append(q)
+                        prev = q
+                return compact
+
+            refined_hull_count = 0
+            for temp_surface in temp_model.surfaces:
+                if not hasattr(temp_surface, 'convex_hull') or len(temp_surface.convex_hull) < 3:
+                    continue
+
+                eff_target_length = target_feature_size
+                if not uniform_meshing and temp_surface.size > 1e-6:
+                    eff_target_length = min(temp_surface.size, target_feature_size) if target_feature_size > 1e-6 else temp_surface.size
+                if eff_target_length <= 1e-6:
+                    eff_target_length = 0.1
+
+                temp_surface.convex_hull = _refine_hull_preserve_vertices(
+                    temp_surface.convex_hull, eff_target_length, uniform_meshing
+                )
+                refined_hull_count += 1
+
+            logger.info(f"Refined {refined_hull_count} convex hull(s) by length, preserving original vertices and types.")
+        except Exception as e:
+            logger.error(f"Error during convex hull length refinement: {e}", exc_info=True)
+            QMessageBox.warning(self, "Refinement Error", f"Error during convex hull length refinement: {str(e)}")
+            return
+        
         # --- Store intersection lines as constraints (C++ approach) ---
         logger.info("Storing intersection lines as constraints for each surface...")
         for ds in self.datasets: ds["stored_constraints"] = []
@@ -4851,7 +4976,7 @@ class MeshItWorkflowGUI(QMainWindow):
         self.refined_intersections_for_visualization = {}
         
         for temp_s_list_idx, temp_surface_data in enumerate(temp_model.surfaces):
-    # Find the original dataset index for this temp surface
+            # Find the original dataset index for this temp surface
             original_dataset_idx = None
             for orig_idx, temp_idx in temp_model.surface_original_to_temp_idx_map.items():
                 if temp_idx == temp_s_list_idx:
@@ -4860,7 +4985,6 @@ class MeshItWorkflowGUI(QMainWindow):
             
             if original_dataset_idx is not None:
                 if hasattr(temp_surface_data, 'convex_hull') and temp_surface_data.convex_hull:
-                    # Create hull points array with type information
                     hull_points_with_type = []
                     for p in temp_surface_data.convex_hull:
                         point_type = "DEFAULT"
@@ -4868,18 +4992,15 @@ class MeshItWorkflowGUI(QMainWindow):
                             point_type = p.type
                         elif hasattr(p, 'point_type') and p.point_type:
                             point_type = p.point_type
-                        
-                        # Store points with type as 4th element [x, y, z, type]
                         hull_points_with_type.append([p.x, p.y, p.z, point_type])
-                        logger.info(f"Copying hull point: ({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) type={point_type}")
 
-                    # Store hull points with their types
                     self.datasets[original_dataset_idx]['hull_points'] = np.array(hull_points_with_type, dtype=object)
                     logger.info(f"Updated convex hull for dataset {original_dataset_idx} with {len(hull_points_with_type)} points.")
                 else:
                     logger.warning(f"No convex hull data in temp_surface_data for original_dataset_idx {original_dataset_idx} to copy back.")
             else:
                 logger.warning(f"Could not map temp_model.surfaces index {temp_s_list_idx} to an original dataset index for hull update.")
+
         for intersection in temp_model.intersections:
             original_id1 = temp_model.original_indices_map.get(intersection.id1)
             original_id2 = temp_model.original_indices_map.get(intersection.id2)
@@ -4888,58 +5009,40 @@ class MeshItWorkflowGUI(QMainWindow):
                 logger.warning(f"Post-refinement: Skipping intersection due to missing original ID map for temp IDs {intersection.id1}/{intersection.id2}.")
                 continue
             
-                      # Prepare points with embedded types for visualization compatibility
             points_for_entry = []
-            for p_obj in intersection.points: # Iterate over the point objects from refinement
-                p_type_str = "DEFAULT" # Default type if none found
+            for p_obj in intersection.points:
+                p_type_str = "DEFAULT"
                 if hasattr(p_obj, 'point_type') and p_obj.point_type:
                     p_type_str = p_obj.point_type
-                
                 points_for_entry.append([p_obj.x, p_obj.y, p_obj.z, p_type_str])
 
             intersection_entry = {
                 'dataset_id1': original_id1,
                 'dataset_id2': original_id2,
                 'is_polyline_mesh': intersection.is_polyline_mesh,
-                'points': points_for_entry, # Now contains [x,y,z,type_string]
-                # The separate 'point_types' list that was here before is no longer needed
-                # as the type is embedded directly with the coordinates for visualization.
+                'points': points_for_entry,
             }
             
-            # Store in self.datasets_intersections (main data)
-            # Key by the dataset that is involved (can be either id1 or id2)
-            # To avoid duplicates if an intersection is processed from "both sides", use a combined key or primary key
-            primary_key_ds = min(original_id1, original_id2) # Consistent keying
+            primary_key_ds = min(original_id1, original_id2)
             if primary_key_ds not in self.datasets_intersections:
-                 self.datasets_intersections[primary_key_ds] = []
+                self.datasets_intersections[primary_key_ds] = []
             
-                        # ---------------------------------------------------------
-            # Geometry-aware duplicate check
-            # ---------------------------------------------------------
             def _same_intersection(e1, e2, tol=1e-8):
-                # 1) same dataset pair (order-independent) and same polyline flag
-                if {e1['dataset_id1'], e1['dataset_id2']} != \
-                   {e2['dataset_id1'], e2['dataset_id2']}:
+                if {e1['dataset_id1'], e1['dataset_id2']} != {e2['dataset_id1'], e2['dataset_id2']}:
                     return False
                 if e1['is_polyline_mesh'] != e2['is_polyline_mesh']:
                     return False
-
                 pts1, pts2 = e1['points'], e2['points']
                 if len(pts1) != len(pts2):
                     return False
-
-                # 2) endpoints must match (allow reversed order)
                 def _close(p, q):
                     return (abs(p[0] - q[0]) < tol and
                             abs(p[1] - q[1]) < tol and
                             abs(p[2] - q[2]) < tol)
-
                 ends_match = (_close(pts1[0], pts2[0]) and _close(pts1[-1], pts2[-1])) or \
-                             (_close(pts1[0], pts2[-1]) and _close(pts1[-1], pts2[0]))
+                            (_close(pts1[0], pts2[-1]) and _close(pts1[-1], pts2[0]))
                 if not ends_match:
                     return False
-
-                # 3) cheap interior–shape test: centroid distance
                 import numpy as np
                 c1 = np.mean(np.asarray(pts1)[:, :3], axis=0)
                 c2 = np.mean(np.asarray(pts2)[:, :3], axis=0)
@@ -4953,38 +5056,22 @@ class MeshItWorkflowGUI(QMainWindow):
             if not already_added:
                 self.datasets_intersections[primary_key_ds].append(intersection_entry)
 
-                        # ---------------------------------------------------------
-            # Store in the VIS-layer dictionary
-            # ---------------------------------------------------------
             for vis_key_id in (original_id1, original_id2):
-
                 if vis_key_id not in self.refined_intersections_for_visualization:
                     self.refined_intersections_for_visualization[vis_key_id] = []
 
-                # geometry-aware duplicate test (order-agnostic)
                 def _same_line(a_pts, b_pts, tol=1e-8):
-                    """Return True iff the two polylines are identical
-                    (forward or reversed order) – every point must match."""
                     if len(a_pts) != len(b_pts):
                         return False
-
                     def _close(p, q):
                         return (abs(p[0] - q[0]) < tol and
                                 abs(p[1] - q[1]) < tol and
                                 abs(p[2] - q[2]) < tol)
-
-                    # forward
                     if all(_close(pa, pb) for pa, pb in zip(a_pts, b_pts)):
                         return True
-                    # reversed
                     if all(_close(pa, pb) for pa, pb in zip(a_pts, reversed(b_pts))):
                         return True
                     return False
-                    # centroid test
-                    import numpy as np
-                    c1 = np.mean(np.asarray(a_pts)[:, :3], axis=0)
-                    c2 = np.mean(np.asarray(b_pts)[:, :3], axis=0)
-                    return np.linalg.norm(c1 - c2) < tol
 
                 vis_already_added = any(
                     _same_line(intersection_entry['points'], ie['points']) and
@@ -4997,124 +5084,28 @@ class MeshItWorkflowGUI(QMainWindow):
                         intersection_entry.copy()
                     )
 
-        # --- NEW: Sync special convex hull points from intersections to hulls ---
-        for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
-            if not hasattr(temp_surface, 'convex_hull') or not temp_surface.convex_hull:
-                continue
-            # Find all intersection points for this surface that are special convex hull points
-            for intersection in temp_model.intersections:
-                # Only consider intersections involving this surface
-                if intersection.id1 != temp_surface_idx and intersection.id2 != temp_surface_idx:
-                    continue
-                for pt in intersection.points:
-                    # Only insert if it's a convex hull special point
-                    pt_type = getattr(pt, 'type', getattr(pt, 'point_type', None))
-                    if pt_type == "COMMON_INTERSECTION_CONVEXHULL_POINT":
-                        # Check if this point is already in the hull (within tolerance)
-                        already_in_hull = any(
-                            abs(pt.x - hp.x) < 1e-10 and abs(pt.y - hp.y) < 1e-10 and abs(pt.z - hp.z) < 1e-10
-                            for hp in temp_surface.convex_hull
-                        )
-                        if not already_in_hull:
-                            # Find the closest segment and insert
-                            min_dist = float('inf')
-                            insert_idx = 0
-                            for i in range(len(temp_surface.convex_hull) - 1):
-                                seg_start = temp_surface.convex_hull[i]
-                                seg_end = temp_surface.convex_hull[i+1]
-                                # Project pt onto segment
-                                seg_vec = Vector3D(seg_end.x - seg_start.x, seg_end.y - seg_start.y, seg_end.z - seg_start.z)
-                                seg_len2 = seg_vec.x**2 + seg_vec.y**2 + seg_vec.z**2
-                                if seg_len2 == 0:
-                                    continue
-                                t = ((pt.x - seg_start.x) * seg_vec.x + (pt.y - seg_start.y) * seg_vec.y + (pt.z - seg_start.z) * seg_vec.z) / seg_len2
-                                t = max(0, min(1, t))
-                                proj = Vector3D(
-                                    seg_start.x + (seg_end.x - seg_start.x) * t,
-                                    seg_start.y + (seg_end.y - seg_start.y) * t,
-                                    seg_start.z + (seg_end.z - seg_start.z) * t,
-                                    point_type=pt_type
-                                )
-                                dist = (Vector3D(pt.x, pt.y, pt.z) - proj).length()
-                                if dist < min_dist:
-                                    min_dist = dist
-                                    insert_idx = i + 1
-                            temp_surface.convex_hull.insert(insert_idx, pt)
-
-        for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
-            if hasattr(temp_surface, 'convex_hull') and temp_surface.convex_hull:
-                logger.info(f"After insertion, convex hull for surface {temp_surface_idx} has {len(temp_surface.convex_hull)} points.")
-                # Count special points by type
-                type_counts = {}
-                for hp in temp_surface.convex_hull:
-                    pt_type = getattr(hp, 'type', getattr(hp, 'point_type', 'NONE'))
-                    type_counts[pt_type] = type_counts.get(pt_type, 0) + 1
-                    if pt_type == "COMMON_INTERSECTION_CONVEXHULL_POINT":
-                        logger.info(f"  SPECIAL Hull pt: ({hp.x:.3f}, {hp.y:.3f}, {hp.z:.3f}) type={pt_type}")
-        
-                logger.info(f"  Hull point types: {type_counts}")
-        # Copy back modified convex hulls from temp_model.surfaces to self.datasets
-        for temp_s_list_idx, temp_surface_data in enumerate(temp_model.surfaces):
-            # Find the original_dataset_idx for temp_model.surfaces[temp_s_list_idx]
-            original_dataset_idx = -1
-            for orig_idx_key, temp_surf_map_idx_val in temp_model.surface_original_to_temp_idx_map.items():
-                if temp_surf_map_idx_val == temp_s_list_idx:
-                    original_dataset_idx = orig_idx_key
-                    break
-            
-            if original_dataset_idx != -1 and original_dataset_idx < len(self.datasets):
-                if hasattr(temp_surface_data, 'convex_hull') and temp_surface_data.convex_hull:
-                    # Create hull points array with type information
-                    hull_points_with_type = []
-                    for p in temp_surface_data.convex_hull:
-                        point_type = "DEFAULT"
-                        if hasattr(p, 'type') and p.type:
-                            point_type = p.type
-                        elif hasattr(p, 'point_type') and p.point_type:
-                            point_type = p.point_type
-                        
-                        # Store points with type as 4th element [x, y, z, type]
-                        hull_points_with_type.append([p.x, p.y, p.z, point_type])
-                        logger.info(f"Copying hull point: ({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) type={point_type}")
-
-                    # Store hull points with their types
-                    self.datasets[original_dataset_idx]['hull_points'] = np.array(hull_points_with_type, dtype=object)
-                    logger.info(f"Updated convex hull for dataset {original_dataset_idx} with {len(hull_points_with_type)} points.")
-                    logger.info(f"Updated convex hull for dataset {original_dataset_idx} ('{self.datasets[original_dataset_idx].get('name')}') with {len(hull_points_with_type)} points.")
-                else:
-                    logger.warning(f"No convex hull data in temp_surface_data for original_dataset_idx {original_dataset_idx} to copy back.")
-            else:
-                logger.warning(f"Could not map temp_model.surfaces index {temp_s_list_idx} to an original dataset index for hull update.")
-
+        # --- Populate summaries and UI ---
         summary = self._analyze_refinement_results() 
         self.refinement_summary_label.setText(summary)
 
         self.statusBar().showMessage("Intersection lines refined successfully.", 5000)
         logger.info("Intersection lines refined successfully.")
 
-        # At the very end of _refine_intersection_lines_action(), before the final success message:
         logger.info("Consolidating all refined points for triangulation...")
         self.consolidate_points_for_triangulation()
         logger.info("Consolidation complete!")
 
-        logger.info("Intersection lines refined successfully.")
-        
         # Enable the "Generate Conforming Surface Meshes" button after successful refinement
         self.generate_conforming_meshes_btn.setEnabled(True)
         logger.info("Enabled conforming mesh generation button after successful refinement.")
         
-        # --- NEW: Populate Tab 6 constraint tree after successful refinement ---
+        # Populate Tab 6 constraint tree and selector with updated hulls
         try:
-            # Populate the Tab 6 constraint tree with refinement results
             self._populate_refine_constraint_tree()
             logger.info("Refinement complete. Populated constraint tree in 'Refine & Mesh' tab.")
-            
         except Exception as e:
             logger.error(f"Error populating constraint tree for Tab 6: {e}", exc_info=True)
-        
-        # Populate surface selector dropdown with available surfaces
         self._populate_surface_selector()
-        
         self._update_refined_visualization()
 
     def _generate_conforming_meshes_action(self):
@@ -6780,7 +6771,6 @@ segmentation, triangulation, and visualization.
     
     def _run_triangulation_for_dataset(self, dataset_index):
         """Run triangulation for a specific dataset index. Returns True on success, False on error."""
-        # Check index validity
         if not (0 <= dataset_index < len(self.datasets)):
             logger.error(f"Invalid dataset index {dataset_index} for triangulation.")
             return False
@@ -6793,347 +6783,240 @@ segmentation, triangulation, and visualization.
             logger.warning(f"Skipping triangulation for {dataset_name}: segments not computed.")
             return False
 
-        # Get triangulation parameters from GUI
         gradient = self.gradient_input.value()
         min_angle = self.min_angle_input.value()
         uniform = self.uniform_checkbox.isChecked()
 
-        # --- START EDIT: Get base_size from the unified control ---
         try:
             base_size = float(self.target_feature_size_input.value())
             if base_size <= 1e-6:
-                logger.warning("Target Feature Size (used as base_size) is too small, using default (1.0).")
                 base_size = 1.0
         except ValueError:
-            logger.warning("Invalid Target Feature Size (used as base_size), using default (1.0).")
             base_size = 1.0
-        # Remove old target_edge_length reading
-        # target_edge_length = self.target_edge_length_input.value()
-        # base_size = max(1e-9, target_edge_length)
-        # --- END EDIT ---
 
         try:
+            import numpy as np
+            import time
+            from scipy.spatial import cKDTree, ConvexHull
+
             start_time = time.time()
 
-            # Extract unique points and segment indices from segments
-            segment_points = []
-            for segment in segments_data:
-                segment_points.append(segment[0])
-                segment_points.append(segment[1])
-
-            unique_points_list = []
-            point_to_index = {}
-            segment_indices = []
-
+            # 1) Unique boundary points and segment indices (as provided)
+            unique_points_list, point_to_index, segment_indices = [], {}, []
             current_index = 0
             for segment in segments_data:
-                start_pt, end_pt = segment[0], segment[1]
-                start_tuple = tuple(start_pt)
-                end_tuple = tuple(end_pt)
-
-                if start_tuple not in point_to_index:
-                    point_to_index[start_tuple] = current_index
-                    unique_points_list.append(start_pt)
-                    start_idx = current_index
-                    current_index += 1
+                p0, p1 = np.asarray(segment[0], float), np.asarray(segment[1], float)
+                t0, t1 = tuple(np.round(p0, 12)), tuple(np.round(p1, 12))
+                if t0 not in point_to_index:
+                    point_to_index[t0] = current_index
+                    unique_points_list.append(p0)
+                    i0 = current_index; current_index += 1
                 else:
-                    start_idx = point_to_index[start_tuple]
-
-                if end_tuple not in point_to_index:
-                    point_to_index[end_tuple] = current_index
-                    unique_points_list.append(end_pt)
-                    end_idx = current_index
-                    current_index += 1
+                    i0 = point_to_index[t0]
+                if t1 not in point_to_index:
+                    point_to_index[t1] = current_index
+                    unique_points_list.append(p1)
+                    i1 = current_index; current_index += 1
                 else:
-                    end_idx = point_to_index[end_tuple]
+                    i1 = point_to_index[t1]
+                segment_indices.append([i0, i1])
 
-                segment_indices.append([start_idx, end_idx])
+            boundary_xyz = np.asarray(unique_points_list, dtype=float)
+            boundary_segs = np.asarray(segment_indices, dtype=int)
 
-            all_boundary_points = np.array(unique_points_list)
-            boundary_segments_indices = np.array(segment_indices)
-            logger.info(f"Using {len(all_boundary_points)} unique points and {len(boundary_segments_indices)} segments from segmentation step for triangulation.")
+            # 2) Compute surface normal from SDs and build rotation like C++
+            all_pts = np.asarray(dataset['points'], dtype=float)
 
-            # Projection and reconstruction logic
-            all_dataset_points = np.array(dataset['points'])
-            plane_normal = None
-            projected_boundary_points = all_boundary_points.copy()
+            centred = all_pts - all_pts.mean(axis=0, keepdims=True)
+            _, _, vh = np.linalg.svd(centred, full_matrices=False)
+            normal = vh[-1]
+            if normal[2] < 0.0:
+                normal = -normal
 
-            if all_dataset_points.shape[1] > 2:
-                logger.info(f"Projecting ALL 3D points to best-fit plane for triangulation for {dataset_name}")
-                
-                # Find best-fitting plane using ALL points
-                centroid = np.mean(all_dataset_points, axis=0)
-                centered_all_points = all_dataset_points - centroid
-                u, s, vh = np.linalg.svd(centered_all_points, full_matrices=False)
-                projection_basis = vh[:2]
-                plane_normal = vh[2]
-                
-                # Project ALL points to 2D
-                all_points_2d = np.dot(centered_all_points, projection_basis.T)
-                
-                # Project boundary points using the same projection
-                centered_boundary = all_boundary_points - centroid
-                boundary_points_2d = np.dot(centered_boundary, projection_basis.T)
-                
-                # For complex hulls with many vertices, use intelligent subsampling
-                # instead of all original dataset points for interpolation efficiency
-                hull_size = len(dataset.get('hull_points', []))
-                if hull_size > 100:  # Complex hull detected
-                    # Use intelligent subsampling to maintain accuracy while improving performance
-                    max_interpolation_points = 500  # Balance between accuracy and performance
-                    if len(all_dataset_points) > max_interpolation_points:
-                        logger.info(f"Using intelligent subsampling ({max_interpolation_points}) from {len(all_dataset_points)} dataset points for efficient interpolation")
-                        
-                        # Subsample the dataset points intelligently
-                        # Always include boundary points + interior sampling
-                        step_size = max(1, len(all_dataset_points) // max_interpolation_points)
-                        subsampled_indices = list(range(0, len(all_dataset_points), step_size))
-                        
-                        # Ensure we don't exceed our limit
-                        if len(subsampled_indices) > max_interpolation_points:
-                            subsampled_indices = subsampled_indices[:max_interpolation_points]
-                        
-                        sampled_3d_points = all_dataset_points[subsampled_indices]
-                        sampled_2d_points = all_points_2d[subsampled_indices]
-                        
-                        dataset['original_points_3d'] = sampled_3d_points
-                        dataset['projected_points_2d'] = sampled_2d_points
-                        projection_reference_points = sampled_3d_points
-                        projection_reference_2d = sampled_2d_points
-                    else:
-                        logger.info(f"Using all dataset points ({len(all_dataset_points)}) for interpolation (within limit)")
-                        # Use all dataset points as they're within our limit
-                        dataset['original_points_3d'] = all_dataset_points.copy()
-                        dataset['projected_points_2d'] = all_points_2d
-                        projection_reference_points = all_dataset_points.copy()
-                        projection_reference_2d = all_points_2d
+            z_axis = np.array([0.0, 0.0, 1.0], dtype=float)
+
+            # C++-style rotation (Rodrigues) using axis = cross(normal, z)
+            def build_rot(n, onto_z=True):
+                if onto_z:
+                    axis = np.cross(n, z_axis)
+                    c = float(np.dot(z_axis, n))
                 else:
-                    # For simple hulls, use all dataset points as before
-                    dataset['original_points_3d'] = all_dataset_points.copy()
-                    dataset['projected_points_2d'] = all_points_2d
-                    projection_reference_points = all_dataset_points.copy()
-                    projection_reference_2d = all_points_2d
-                
-                projected_boundary_points = boundary_points_2d
-                
-                dataset['projection_params'] = {
-                    'centroid': centroid,
-                    'basis': projection_basis,
-                    'normal': plane_normal,
-                    'original_points': all_boundary_points.copy(),
-                    'all_original_points': projection_reference_points
-                }
+                    axis = np.cross(z_axis, n)
+                    c = float(np.dot(n, z_axis))
+                axis_norm = np.linalg.norm(axis)
+                if 1.0 - abs(c) < 1e-12 or axis_norm < 1e-15:
+                    return np.eye(3, dtype=float)
+                axis = axis / axis_norm
+                s = np.sqrt(1.0 - c * c)
+                C = 1.0 - c
+                r1 = np.array([axis[0]*axis[0]*C + c,        axis[0]*axis[1]*C - axis[2]*s, axis[0]*axis[2]*C + axis[1]*s])
+                r2 = np.array([axis[1]*axis[0]*C + axis[2]*s, axis[1]*axis[1]*C + c,        axis[1]*axis[2]*C - axis[0]*s])
+                r3 = np.array([axis[2]*axis[0]*C - axis[1]*s, axis[2]*axis[1]*C + axis[0]*s, axis[2]*axis[2]*C + c       ])
+                return np.vstack([r1, r2, r3])
+
+            R = build_rot(normal, onto_z=True)
+            R_inv = build_rot(normal, onto_z=False)  # exact inverse per C++ construction
+
+            # Rotate boundary and SDs
+            boundary_rot = (R @ boundary_xyz.T).T
+            all_pts_rot = (R @ all_pts.T).T
+
+            # Helper: order boundary ring from unordered segments (if present)
+            def order_ring(indices, pts):
+                adj = {}
+                for a, b in indices:
+                    adj.setdefault(a, []).append(b)
+                    adj.setdefault(b, []).append(a)
+                if not adj:
+                    return None
+                start = next((i for i, nbrs in adj.items() if len(nbrs) == 2), None)
+                if start is None:
+                    start = list(adj.keys())[0]
+                ring = [start]
+                prev = None
+                cur = start
+                for _ in range(len(adj) + 5):
+                    nxts = adj[cur]
+                    nxt = nxts[0] if nxts[0] != prev else (nxts[1] if len(nxts) > 1 else None)
+                    if nxt is None:
+                        break
+                    if nxt == ring[0]:
+                        ring.append(nxt)
+                        break
+                    ring.append(nxt)
+                    prev, cur = cur, nxt
+                return np.array(ring, dtype=int)
+
+            provided_order = order_ring(boundary_segs, boundary_rot)
+            provided_xy = boundary_rot[:, :2]
+            ring_xy = provided_xy[provided_order[:-1]] if provided_order is not None else None
+
+            # Compute convex hull of rotated SDs (C++ does hull in rotated plane)
+            ch = ConvexHull(all_pts_rot[:, :2])
+            hull_xy = all_pts_rot[ch.vertices, :2]
+
+            # Compare polygon areas to detect rectangular/global hulls
+            def poly_area(poly):
+                x = poly[:, 0]; y = poly[:, 1]
+                return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+            area_provided = poly_area(ring_xy) if ring_xy is not None and len(ring_xy) >= 3 else 0.0
+            area_hull = poly_area(hull_xy) if len(hull_xy) >= 3 else 0.0
+
+            # Decide boundary source:
+            # If provided boundary differs a lot from hull in rotated plane, rebuild from hull.
+            use_hull = (area_hull > 0 and (area_provided == 0 or abs(area_provided - area_hull) / area_hull > 0.25))
+
+            if use_hull:
+                # Refine hull by length, preserving vertices
+                ring = np.vstack([hull_xy, hull_xy[0]])
+                segs = []
+                refined_xy = []
+                total_idx = 0
+
+                def subdivide(p, q, L):
+                    d = np.linalg.norm(q - p)
+                    if d <= L * 1.001:
+                        return [p, q]
+                    n = max(1, int(np.ceil(d / L)))
+                    t = np.linspace(0.0, 1.0, n + 1)
+                    return [p * (1 - tt) + q * tt for tt in t]
+
+                for i in range(len(ring) - 1):
+                    pts_i = subdivide(ring[i], ring[i + 1], base_size)
+                    if i > 0:
+                        pts_i = pts_i[1:]  # avoid duplicate
+                    refined_xy.extend(pts_i)
+
+                refined_xy = np.asarray(refined_xy, dtype=float)
+                # Build segments for refined ring
+                idxs = np.arange(len(refined_xy), dtype=int)
+                segs = np.column_stack([idxs, np.roll(idxs, -1)])
+                segs[-1, 1] = 0  # close
+
+                boundary_xy = refined_xy
+                boundary_segs_for_tria = segs
+                # For boundary Z snapping, build a boundary map in rotated coords
+                # Reuse Z from nearest SDs on the boundary (exact keying done later)
+                boundary_rot_from_xy = np.zeros((len(boundary_xy), 3))
+                boundary_rot_from_xy[:, :2] = boundary_xy
+                # Interpolate provisional Z from SDs to have keys
+                tree_b = cKDTree(all_pts_rot[:, :2])
+                di_b, ii_b = tree_b.query(boundary_xy, k=1)
+                boundary_rot_from_xy[:, 2] = all_pts_rot[ii_b, 2]
+                boundary_rot_for_snap = boundary_rot_from_xy
             else:
-                projected_boundary_points = all_boundary_points
-                dataset['projection_params'] = None
+                # Use provided segments projected to rotated XY
+                boundary_xy = provided_xy
+                boundary_segs_for_tria = boundary_segs
+                boundary_rot_for_snap = boundary_rot
 
-            # Run triangulation
+            # 3) Triangulate in rotated XY
             if not HAVE_DIRECT_WRAPPER:
-                logger.error("DirectTriangleWrapper not available!")
-                raise ImportError("DirectTriangleWrapper failed to import.")
-
-            logger.info(f"Triangulating {dataset_name} with Target Edge Length = {base_size:.4f}")
-
-            # Initialize triangulator with mesh quality parameters
+                raise ImportError("DirectTriangleWrapper not available")
+            from meshit.triangle_direct import DirectTriangleWrapper
             triangulator = DirectTriangleWrapper(
                 gradient=gradient,
                 min_angle=min_angle,
                 base_size=base_size
             )
-
-            # Set up triangulation with enhanced transition feature points
-            triangulation_result = triangulator.triangulate(
-                points=projected_boundary_points,
-                segments=boundary_segments_indices,
+            tri_res = triangulator.triangulate(
+                points=boundary_xy,
+                segments=boundary_segs_for_tria,
                 uniform=uniform,
-                create_transition=True  # Enable enhanced transition point generation
+                create_transition=True
             )
-
-            if triangulation_result is None or 'vertices' not in triangulation_result or 'triangles' not in triangulation_result:
+            if tri_res is None or 'vertices' not in tri_res or 'triangles' not in tri_res:
                 raise ValueError("Triangulation failed to produce valid output.")
 
-            vertices_2d = triangulation_result['vertices']
-            triangles = triangulation_result['triangles']
+            vertices_xy = tri_res['vertices']
+            triangles = tri_res['triangles']
 
-            # Reconstruction logic
-            if dataset['projection_params'] is not None:
-                projection_params = dataset['projection_params']
-                centroid = projection_params['centroid']
-                basis = projection_params['basis']
-                normal = projection_params.get('normal')
-                original_boundary_points = projection_params['original_points']
-                all_original_points = projection_params.get('all_original_points')
-                all_projected_points = dataset.get('projected_points_2d')
+            # 4) Interpolate Z on rotated 2D domain (IDW 1/r^4) with boundary snap
+            sample_xy = all_pts_rot[:, :2]
+            sample_z = all_pts_rot[:, 2]
+            tree = cKDTree(sample_xy)
+            k = min(64, len(sample_xy))
+            dists, idxs = tree.query(vertices_xy, k=k)
+            if k == 1:
+                dists = dists[:, None]
+                idxs = idxs[:, None]
 
-                can_calculate_planar_z = normal is not None and abs(normal[2]) > 1e-9
-                final_vertices_3d = np.zeros((len(vertices_2d), 3))
-                
-                # Performance optimization for complex hulls
-                dataset_name = dataset.get('name', 'Unknown')
-                
-                # Use segments data to determine complexity, not original hull points
-                segments_data = dataset.get('segments', [])
-                segment_count = len(segments_data)
-                is_complex_dataset = segment_count > 100  # Based on number of segments, not hull vertices
-                
-                if is_complex_dataset:
-                    logger.info(f"Processing {len(vertices_2d)} vertices for complex dataset ({segment_count} segments)")
-                else:
-                    # For simple datasets, also check original hull size for logging consistency
-                    hull_size = len(dataset.get('hull_points', []))
-                    logger.info(f"FAST processing {len(vertices_2d)} vertices for simple dataset ({hull_size} hull vertices, {segment_count} segments)")
-                
-                # PERFORMANCE OPTIMIZATION: Build spatial indices for O(log N) lookups instead of O(N²)
-                # This provides ~100x speedup for the vertex processing step that was taking minutes
-                logger.info(f"Building spatial indices for {len(all_projected_points) if all_projected_points is not None else 0} projected points...")
-                
-                # Build KDTree for all projected points for fast nearest neighbor lookup
-                all_projected_kdtree = None
-                boundary_projected_kdtree = None
-                
-                if all_projected_points is not None and len(all_projected_points) > 0:
-                    from scipy.spatial import cKDTree
-                    all_projected_kdtree = cKDTree(all_projected_points)
-                    
-                if projected_boundary_points is not None and len(projected_boundary_points) > 0:
-                    from scipy.spatial import cKDTree  
-                    boundary_projected_kdtree = cKDTree(projected_boundary_points)
-                
-                # Process vertices using fast spatial lookup instead of nested loops
-                tolerance = 1e-10
-                for i, vertex_2d in enumerate(vertices_2d):
-                    # Progress logging for complex datasets only
-                    if is_complex_dataset and i > 0 and i % 100 == 0:
-                        logger.info(f"Processed {i}/{len(vertices_2d)} vertices for {dataset_name}")
-                        
-                    is_matched_point = False
-                    
-                    # FAST: Use KDTree for O(log N) lookup instead of O(N) linear search
-                    if all_projected_kdtree is not None:
-                        distances, indices = all_projected_kdtree.query(vertex_2d, k=1)
-                        if distances < tolerance and indices < len(all_original_points):
-                            final_vertices_3d[i] = all_original_points[indices]
-                            is_matched_point = True
-                    
-                    # Try boundary points if no match found (also with fast lookup)
-                    if not is_matched_point and boundary_projected_kdtree is not None:
-                        distances, indices = boundary_projected_kdtree.query(vertex_2d, k=1)
-                        if distances < tolerance and indices < len(original_boundary_points):
-                            final_vertices_3d[i] = original_boundary_points[indices]
-                            is_matched_point = True
-                
-                # PERFORMANCE OPTIMIZATION: Pre-compute interpolation setup for batch processing
-                original_3d = projection_params.get('all_original_points')
-                projected_2d = dataset.get('projected_points_2d')
-                has_interpolation_data = False
-                
-                if original_3d is not None and projected_2d is not None and len(original_3d) > 0:
-                    # Pre-compute interpolator for better performance
-                    original_z = original_3d[:, 2]
-                    has_interpolation_data = True
-                    
-                # Collect unmatched vertices for batch interpolation (much faster)
-                unmatched_indices = []
-                unmatched_vertices_2d = []
-                
-                # Process vertices using fast spatial lookup
-                tolerance = 1e-10
-                for i, vertex_2d in enumerate(vertices_2d):
-                    # Progress logging for complex datasets only
-                    if is_complex_dataset and i > 0 and i % 100 == 0:
-                        logger.info(f"Processed {i}/{len(vertices_2d)} vertices for {dataset_name}")
-                        
-                    is_matched_point = False
-                    
-                    # FAST: Use KDTree for O(log N) lookup instead of O(N) linear search
-                    if all_projected_kdtree is not None:
-                        distances, indices = all_projected_kdtree.query(vertex_2d, k=1)
-                        if distances < tolerance and indices < len(all_original_points):
-                            final_vertices_3d[i] = all_original_points[indices]
-                            is_matched_point = True
-                    
-                    # Try boundary points if no match found (also with fast lookup)
-                    if not is_matched_point and boundary_projected_kdtree is not None:
-                        distances, indices = boundary_projected_kdtree.query(vertex_2d, k=1)
-                        if distances < tolerance and indices < len(original_boundary_points):
-                            final_vertices_3d[i] = original_boundary_points[indices]
-                            is_matched_point = True
-                    
-                    # Collect unmatched vertices for batch interpolation
-                    if not is_matched_point:
-                        unmatched_indices.append(i)
-                        unmatched_vertices_2d.append(vertex_2d)
-                
-                # PERFORMANCE: Batch interpolation for all unmatched vertices
-                if unmatched_indices and has_interpolation_data:
-                    logger.info(f"Batch interpolating Z values for {len(unmatched_indices)} unmatched vertices")
-                    
-                    # Batch interpolation - much faster than individual calls
-                    unmatched_array = np.array(unmatched_vertices_2d)
-                    interpolated_z_values = griddata(projected_2d, original_z, unmatched_array, method='linear')
-                    
-                    # Handle NaN values with nearest neighbor fallback
-                    nan_mask = np.isnan(interpolated_z_values)
-                    if np.any(nan_mask):
-                        interpolated_z_values[nan_mask] = griddata(projected_2d, original_z, unmatched_array[nan_mask], method='nearest')
-                    
-                    # Apply interpolated Z values to final vertices
-                    for idx, vertex_idx in enumerate(unmatched_indices):
-                        vertex_2d = unmatched_vertices_2d[idx]
-                        interpolated_z = interpolated_z_values[idx]
-                        
-                        # Handle remaining NaN values
-                        if np.isnan(interpolated_z):
-                            interpolated_z = centroid[2]  # Fallback to centroid Z
-                            
-                        # Reconstruct 3D point
-                        vertex_3d_reconstructed = centroid.copy()
-                        vertex_3d_reconstructed += vertex_2d[0] * basis[0]
-                        vertex_3d_reconstructed += vertex_2d[1] * basis[1]
-                        vertex_3d_reconstructed[2] = float(interpolated_z)
-                        
-                        final_vertices_3d[vertex_idx] = vertex_3d_reconstructed
-                        
-                elif unmatched_indices:
-                    # Fallback for vertices without interpolation data
-                    logger.info(f"Using planar projection for {len(unmatched_indices)} unmatched vertices")
-                    for vertex_idx in unmatched_indices:
-                        vertex_2d = vertices_2d[vertex_idx]
-                        vertex_3d_on_plane = centroid.copy()
-                        vertex_3d_on_plane += vertex_2d[0] * basis[0]
-                        vertex_3d_on_plane += vertex_2d[1] * basis[1]
-                        if can_calculate_planar_z:
-                            z_planar = centroid[2] - (normal[0]*(vertex_3d_on_plane[0] - centroid[0]) + 
-                                                    normal[1]*(vertex_3d_on_plane[1] - centroid[1])) / normal[2]
-                            vertex_3d_on_plane[2] = z_planar
-                        else:
-                            vertex_3d_on_plane[2] = centroid[2]
-                        final_vertices_3d[vertex_idx] = vertex_3d_on_plane
-                
-                final_vertices = final_vertices_3d
-            else:
-                if vertices_2d.shape[1] == 2:
-                    final_vertices = np.zeros((len(vertices_2d), 3))
-                    final_vertices[:, :2] = vertices_2d
-                else:
-                    final_vertices = vertices_2d
+            def key_xy(xy):
+                return (round(float(xy[0]), 9), round(float(xy[1]), 9))
 
-            # Store results
+            boundary_map = {key_xy(xy[:2]): float(xy[2]) for xy in boundary_rot_for_snap}
+
+            final_vertices_rot3d = np.zeros((len(vertices_xy), 3), dtype=float)
+            final_vertices_rot3d[:, :2] = vertices_xy
+
+            for i in range(len(vertices_xy)):
+                kxy = key_xy(vertices_xy[i])
+                if kxy in boundary_map:
+                    final_vertices_rot3d[i, 2] = boundary_map[kxy]
+                    continue
+                di = dists[i]
+                ii = idxs[i]
+                r2 = np.maximum(di * di, 1e-24)
+                w = 1.0 / (r2 * r2)  # 1/(r^4)
+                wsum = float(np.sum(w))
+                final_vertices_rot3d[i, 2] = float(np.sum(w * sample_z[ii]) / wsum) if wsum > 0 else float(np.mean(sample_z))
+
+            # 5) Rotate back to original orientation
+            final_vertices_3d = (R_inv @ final_vertices_rot3d.T).T
+
             dataset['triangulation_result'] = {
-                'vertices': final_vertices,
+                'vertices': final_vertices_3d,
                 'triangles': triangles,
-                'uniform': uniform,
-                'gradient': gradient,
-                'min_angle': min_angle,
-                'target_edge_length': base_size,
             }
-            logger.info(f"Triangulation for {dataset_name} completed. Vertices: {len(final_vertices)}, Triangles: {len(triangles)}")
+
+            elapsed = time.time() - start_time
+            logger.info(f"Triangulation for {dataset_name} completed in {elapsed:.2f}s. "
+                        f"Vertices: {len(final_vertices_3d)}, Triangles: {len(triangles)}")
             return True
 
         except Exception as e:
-            logger.error(f"Error triangulating {dataset_name}: {str(e)}")
-            import traceback
-            logger.debug(f"Triangulation error traceback: {traceback.format_exc()}")
+            logger.error(f"Error during triangulation for '{dataset_name}': {e}", exc_info=True)
             return False
 
     def run_triangulation(self):
@@ -8890,13 +8773,203 @@ segmentation, triangulation, and visualization.
             logger.info("Cleared all refine mesh visualizations")
         except Exception as e:
             logger.warning(f"Error in _clear_refine_mesh_plot: {e}")
-    
+    def _debug_segments_widget_tree(self, where: str = ""):
+        try:
+            frame = getattr(self, 'segments_viz_frame', None)
+            layout = getattr(self, 'segments_plot_layout', None)
+            plotter = getattr(self, 'segments_plotter', None)
+            interactor = getattr(plotter, 'interactor', None) if plotter else None
+
+            logger.info(f"[SEGMENTS][DBG]{' ' + where if where else ''} "
+                        f"frame={type(frame).__name__ if frame else None} "
+                        f"layout={'OK' if layout else 'None'} "
+                        f"plotter={'OK' if plotter else 'None'} "
+                        f"interactor={'OK' if interactor else 'None'}")
+
+            if layout and interactor:
+                idx = layout.indexOf(interactor)
+                parent_ok = (interactor.parent() is frame)
+                vis = interactor.isVisible() if hasattr(interactor, 'isVisible') else None
+                size = interactor.size() if hasattr(interactor, 'size') else None
+                logger.info(f"[SEGMENTS][DBG]{' ' + where if where else ''} "
+                            f"layout_index={idx}, parent_ok={parent_ok}, visible={vis}, size={size}")
+
+                # Self-heal: if not in layout or wrong parent, reattach
+                if idx == -1 or not parent_ok:
+                    try:
+                        interactor.setParent(frame)
+                        layout.addWidget(interactor)
+                        interactor.show()
+                        logger.info(f"[SEGMENTS][DBG]{' ' + where if where else ''} reattached interactor to layout")
+                    except Exception as e:
+                        logger.error(f"[SEGMENTS][DBG] reattach failed: {e}", exc_info=True)
+            elif frame and not layout:
+                try:
+                    self.segments_plot_layout = QVBoxLayout(self.segments_viz_frame)
+                    self.segments_plot_layout.setContentsMargins(0, 0, 0, 0)
+                    logger.info(f"[SEGMENTS][DBG]{' ' + where if where else ''} created missing segments_plot_layout")
+                    if interactor:
+                        self.segments_plot_layout.addWidget(interactor)
+                        interactor.show()
+                except Exception as e:
+                    logger.error(f"[SEGMENTS][DBG] create layout failed: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"[SEGMENTS][DBG] exception: {e}", exc_info=True)
     # ======================================================================
         # ======================================================================
     #  REFINED-MESH TAB : 3-D view updater  (Intersections / Mesh / Segments)
     # ======================================================================
         # ======================================================================
     #  REFINED-MESH TAB : 3-D view updater  (Intersections / Mesh / Segments)
+
+    def _draw_segments_batched_fast(
+        self,
+        plotter,
+        surface_is_visible_fn,
+        show_hull_constraints: bool,
+        show_intersection_constraints: bool,
+        selected_only_mode: bool,
+    ):
+        """
+        Extremely fast Segments renderer: batches into at most 3 actors
+        - selected NORMAL constraints  (green, thick)
+        - selected HOLE constraints    (red,   thick)
+        - unselected constraints       (grey,  thin)
+
+        Includes fallback: if no HULL segments exist in _refine_segment_map
+        for a visible surface, draw its hull from dataset['hull_points'].
+        """
+        import numpy as np
+        import pyvista as pv
+
+        seg_map = getattr(self, "_refine_segment_map", {}) or {}
+
+        cats = {
+            "sel_norm": {"pts": [], "lines": [], "idx": 0},
+            "sel_hole": {"pts": [], "lines": [], "idx": 0},
+            "unsel":    {"pts": [], "lines": [], "idx": 0},
+        }
+
+        def add_segment(cat_key, p1, p2):
+            if p1 == p2:
+                return
+            cat = cats[cat_key]
+            i0 = cat["idx"]
+            cat["pts"].append(p1); cat["pts"].append(p2)
+            cat["lines"].extend([2, i0, i0 + 1])
+            cat["idx"] += 2
+
+        def to_xyz(p):
+            # Accept list/tuple, numpy rows (including dtype=object), or objects with x,y,z
+            try:
+                if isinstance(p, np.ndarray):
+                    if p.size >= 3:
+                        return float(p[0]), float(p[1]), float(p[2])
+                    return None
+                if isinstance(p, (list, tuple)) and len(p) >= 3:
+                    return float(p[0]), float(p[1]), float(p[2])
+                if hasattr(p, "x") and hasattr(p, "y") and hasattr(p, "z"):
+                    return float(p.x), float(p.y), float(p.z)
+            except Exception:
+                return None
+            return None
+
+        built = 0
+        saw_hull_for_surface = set()
+
+        # 1) Use map data when present
+        for (surf_idx, seg_uid), seg_info in seg_map.items():
+            if not surface_is_visible_fn(surf_idx):
+                continue
+
+            seg_type = str(seg_info.get("type", seg_info.get("ctype", ""))).lower()
+            if seg_type == "hull":
+                saw_hull_for_surface.add(surf_idx)
+                if not show_hull_constraints:
+                    continue
+            elif seg_type in ("int", "intersection"):
+                if not show_intersection_constraints:
+                    continue
+
+            is_selected = bool(seg_info.get("selected", True))
+            is_hole     = bool(seg_info.get("is_hole", False))
+            if selected_only_mode and not is_selected:
+                continue
+
+            pts = seg_info.get("points", [])
+            if not pts or len(pts) < 2:
+                continue
+
+            cat_key = "sel_hole" if (is_selected and is_hole) else ("sel_norm" if is_selected else "unsel")
+
+            if len(pts) == 2:
+                p1 = to_xyz(pts[0]); p2 = to_xyz(pts[1])
+                if p1 is not None and p2 is not None and p1 != p2:
+                    add_segment(cat_key, p1, p2)
+                    built += 1
+            else:
+                local_pairs = 0
+                for j in range(len(pts) - 1):
+                    p1 = to_xyz(pts[j]); p2 = to_xyz(pts[j + 1])
+                    if p1 is None or p2 is None or p1 == p2:
+                        continue
+                    add_segment(cat_key, p1, p2)
+                    local_pairs += 1
+                if local_pairs > 0:
+                    built += 1
+
+        # 2) Fallback for missing HULL segments: draw from dataset['hull_points']
+        if show_hull_constraints:
+            for s_idx, ds in enumerate(getattr(self, "datasets", [])):
+                if not surface_is_visible_fn(s_idx):
+                    continue
+                if s_idx in saw_hull_for_surface:
+                    continue  # already emitted from map
+                hull = ds.get("hull_points")
+                if hull is None or len(hull) < 2:
+                    continue
+
+                points = []
+                for hp in hull:
+                    xyz = to_xyz(hp)
+                    if xyz is not None:
+                        points.append(xyz)
+                if len(points) < 2:
+                    continue
+
+                n = len(points)
+                closed = (np.linalg.norm(np.array(points[0]) - np.array(points[-1])) < 1e-12)
+                last = n - 1  # wrap manually
+
+                local_pairs = 0
+                for i in range(last):
+                    p1 = points[i]
+                    p2 = points[(i + 1) % n] if closed or i + 1 < n else points[i + 1]
+                    if p1 != p2:
+                        add_segment("sel_norm", p1, p2)
+                        local_pairs += 1
+                if local_pairs > 0:
+                    built += 1
+
+        # build up to three actors
+        def emit(cat_key, color, lw):
+            cat = cats[cat_key]
+            if cat["idx"] == 0:
+                return
+            pts = np.asarray(cat["pts"], dtype=float)
+            lines = np.asarray(cat["lines"], dtype=np.int64)
+            poly = pv.PolyData(pts); poly.lines = lines
+            plotter.add_mesh(poly, color=color, line_width=lw,
+                            render_lines_as_tubes=True, pickable=False, smooth_shading=False)
+
+        # Clear per-segment refs in batched mode
+        self.constraint_segment_actor_refs = {}
+
+        emit("sel_norm", (0.0, 1.0, 0.0), 4)
+        emit("sel_hole", (1.0, 0.0, 0.0), 4)
+        emit("unsel",    (0.53, 0.53, 0.53), 2)
+
+        return built
     # ======================================================================
     def _update_refined_visualization(self):
         """
@@ -8906,350 +8979,237 @@ segmentation, triangulation, and visualization.
             view 1 – conforming surface meshes    (faces, 70 % opa)
             view 2 – constraint segments          (green ↔ dotted grey)
 
-        The routine is now robust against points that include an extra
-        string label in position 3 (e.g. “… CONVEXHULL_POINT_START_POINT”).
+        Restores reliable per-segment actors keyed by (surf_idx, seg_uid) and
+        guarantees the Segments plotter is cleared and repopulated each time.
         """
-        import pyvista as pv
         import numpy as np
+        import pyvista as pv
 
-        # ── helper ─────────────────────────────────────────────────────────
         def _to_xyz(pt):
-            """
-            Return [x, y, z] as floats or None if *pt* cannot be parsed.
-            Accepts plain lists / numpy rows / small objects that expose
-            .x . y . z attributes.
-            """
+            # Accept [x,y,z], numpy rows, or objects with x,y,z
             try:
                 if isinstance(pt, (list, tuple, np.ndarray)) and len(pt) >= 3:
-                    return [float(pt[0]), float(pt[1]), float(pt[2])]
+                    return float(pt[0]), float(pt[1]), float(pt[2])
                 if hasattr(pt, "x") and hasattr(pt, "y") and hasattr(pt, "z"):
-                    return [float(pt.x), float(pt.y), float(pt.z)]
+                    return float(pt.x), float(pt.y), float(pt.z)
             except Exception:
                 pass
             return None
-        # ───────────────────────────────────────────────────────────────────
-
-        # Get the current active plotter based on the tab
-        plotter = self._get_current_refine_plotter()
-        if not plotter:
-            # Fallback to the old method for backward compatibility
-            plotter = self.plotters.get("refine_mesh")
-            if not plotter:              # first call arrives before plotter exists
-                return
 
         view = getattr(self, "current_refine_view", 0)
 
-        # Smart clearing - preserve constraint actors when switching to segments view
+        # --- 0: Intersections ---
         if view == 0:
-            # For intersections view, skip clearing here as the enhanced method handles it
-            self.intersection_actor_refs       = []
-            self.conforming_mesh_actor_refs    = []
+            self.intersection_actor_refs = []
+            self.conforming_mesh_actor_refs = []
             if not hasattr(self, 'constraint_segment_actor_refs'):
                 self.constraint_segment_actor_refs = {}
-        elif view == 1:
-            # For meshes view, clear but preserve constraint actors
-            plotter.clear()
-            self.intersection_actor_refs       = []
-            self.conforming_mesh_actor_refs    = []
-            # Don't clear constraint_segment_actor_refs to preserve actors
-            
-            # Clear actor ID mapping for mouse picking for non-constraint actors
-            if hasattr(self, '_actor_id_to_segment_map'):
-                # Keep constraint mappings but could clear others if needed
-                pass
-        elif view == 2:
-            # For segments view, preserve ALL existing constraint actors
-            # DO NOT remove any actors - just ensure they exist
-            if not hasattr(self, 'constraint_segment_actor_refs'):
-                self.constraint_segment_actor_refs = {}
-            
-            # Remove only intersection and mesh actors, keep constraint actors untouched
-            if hasattr(self, 'intersection_actor_refs'):
-                for actor in self.intersection_actor_refs:
-                    try:
-                        plotter.remove_actor(actor)
-                    except:
-                        pass
-            if hasattr(self, 'conforming_mesh_actor_refs'):
-                for actor in self.conforming_mesh_actor_refs:
-                    try:
-                        plotter.remove_actor(actor)
-                    except:
-                        pass
-            
-            self.intersection_actor_refs       = []
-            self.conforming_mesh_actor_refs    = []
-            # DO NOT clear constraint_segment_actor_refs - preserve ALL constraint actors
-            
-        # Clear mesh geometry mapping for accurate picking (for non-constraint actors)
-        if view != 2 and hasattr(self, '_mesh_geometry_map'):
-            # Only clear if not in segments view to preserve constraint geometry mappings
-            # But don't clear constraint-related mappings
-            pass  # Keep all mappings to preserve constraint functionality
-        
-        # NEVER reset constraint actors cache flag - keep them persistent across ALL operations
-        # if view != 2 and hasattr(self, '_constraint_actors_built'):
-        #     # Only reset if switching away from segments view
-        #     self._constraint_actors_built = False
-
-        # Get selected surface from dropdown
-        selected_surface = "All Surfaces"
-        if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
-            selected_surface = self.refine_surface_selector.currentText()
-
-        # Get which constraint types to show
-        show_hull = getattr(self, 'show_hull_constraints_checkbox', None)
-        show_intersections = getattr(self, 'show_intersection_constraints_checkbox', None)
-        show_selected_only = getattr(self, 'show_selected_only_checkbox', None)
-        
-        show_hull_constraints = show_hull.isChecked() if show_hull else True
-        show_intersection_constraints = show_intersections.isChecked() if show_intersections else True
-        show_selected_only_mode = show_selected_only.isChecked() if show_selected_only else False
-
-        # Helper function to check if a surface should be shown
-        def should_show_surface(dataset_idx):
-            if selected_surface == "All Surfaces":
-                return True
-            if dataset_idx < len(self.datasets):
-                dataset_name = self.datasets[dataset_idx].get("name", f"Surface_{dataset_idx}")
-                return dataset_name == selected_surface
-            return False
-
-        # ------------------------------------------------ 0 : intersections
-        if view == 0:
-            # Use the enhanced intersection visualization instead of simple red lines
             self._visualize_refined_intersections()
-            # The enhanced method handles its own plotter clearing and setup
+            return
 
-        # ------------------------------------------------ 1 : conforming mesh
-        elif view == 1:
-            for dataset_idx, ds in enumerate(self.datasets):
-                if not should_show_surface(dataset_idx):
-                    continue
-                    
+        # --- 1: Meshes ---
+        if view == 1:
+            plotter = getattr(self, "meshes_plotter", None)
+            if not plotter:
+                return
+            plotter.clear()
+            self.intersection_actor_refs = []
+            self.conforming_mesh_actor_refs = []
+            if not hasattr(self, 'constraint_segment_actor_refs'):
+                self.constraint_segment_actor_refs = {}
+
+            for ds in self.datasets:
                 cm = ds.get("conforming_mesh")
                 if not cm:
                     continue
-                verts, faces = cm["vertices"], cm["triangles"]
+                verts, faces = cm.get("vertices"), cm.get("triangles")
                 if verts is None or faces is None or len(verts) == 0:
                     continue
                 mesh = pv.PolyData(
                     verts,
-                    np.hstack([np.full((len(faces), 1), 3), faces])
+                    np.hstack([np.full((len(faces), 1), 3, dtype=np.int64), faces])
                 )
-                self.conforming_mesh_actor_refs.append(
-                    plotter.add_mesh(
-                        mesh,
-                        color   = ds.get("color", "#CCCCCC"),
-                        opacity = 0.7,
-                        show_edges = True,
-                        edge_color = "black",
-                    )
+                actor = plotter.add_mesh(
+                    mesh,
+                    color=ds.get("color", "#CCCCCC"),
+                    opacity=0.7,
+                    show_edges=True,
+                    edge_color="black",
                 )
+                self.conforming_mesh_actor_refs.append(actor)
 
-        # ------------------------------------------------ 2 : constraint segments (filtered by surface and type)
-        else:   # view == 2
-            # GLOBAL PERSISTENT ACTORS: Build actors only ONCE per application session
-            # These actors will persist across ALL tab switches and surface filter changes
-            need_rebuild = (not hasattr(self, '_constraint_actors_built') or 
-                          not self._constraint_actors_built or
-                          not hasattr(self, 'constraint_segment_actor_refs') or
-                          len(self.constraint_segment_actor_refs) == 0)
-            
-            # Additional check: Only rebuild if the underlying segment data actually changed
-            current_segment_count = len(getattr(self, '_refine_segment_map', {}))
-            last_known_count = getattr(self, '_last_segment_count', 0)
-            
-            if current_segment_count != last_known_count and current_segment_count > 0:
-                logger.info(f"Segment data changed: {last_known_count} -> {current_segment_count}, enabling rebuild")
-                need_rebuild = True
-                self._last_segment_count = current_segment_count
-                # Reset the built flag to allow rebuild with new data
-                self._constraint_actors_built = False
-            elif current_segment_count == last_known_count and self._constraint_actors_built:
-                # Data hasn't changed and actors exist - absolutely no rebuild needed
-                need_rebuild = False
-                logger.debug(f"Constraint actors already exist and data unchanged - using existing actors")
-            
-            # Only rebuild if actors don't exist OR if the underlying data has actually changed
-            if need_rebuild:
-                logger.info(f"Building constraint actors for all surfaces (GLOBAL one-time setup)...")
-                # Use the segments plotter specifically for building actors
-                segments_plotter = self._get_current_refine_plotter()
-                if not segments_plotter:
-                    segments_plotter = plotter
-                
-                # Clear existing actors and mappings only if rebuilding
-                # SAFETY CHECK: Only clear if we're absolutely sure we need to rebuild
-                if len(self.constraint_segment_actor_refs) > 0:
-                    logger.warning(f"Clearing {len(self.constraint_segment_actor_refs)} existing constraint actors for rebuild")
-                
-                for actor in getattr(self, 'constraint_segment_actor_refs', {}).values():
+            plotter.add_axes()
+            plotter.reset_camera()
+            plotter.render()
+            return
+
+        # --- 2: Segments ---
+        plotter = getattr(self, "segments_plotter", None)
+        logger.info("[SEGMENTS] Enter segments view redraw")
+        self._debug_segments_widget_tree("redraw")
+        if not plotter:
+            return
+
+        # Fully reset the Segments viewport so it never stays white
+        plotter.clear()
+        plotter.set_background([0.318, 0.341, 0.431])
+
+        # UI filters
+        selected_surface_name = "All Surfaces"
+        if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
+            selected_surface_name = self.refine_surface_selector.currentText()
+
+        show_hull = getattr(self, 'show_hull_constraints_checkbox', None)
+        show_intersections = getattr(self, 'show_intersection_constraints_checkbox', None)
+        show_selected_only = getattr(self, 'show_selected_only_checkbox', None)
+
+        show_hull_constraints = show_hull.isChecked() if show_hull else True
+        show_intersection_constraints = show_intersections.isChecked() if show_intersections else True
+        selected_only_mode = show_selected_only.isChecked() if show_selected_only else False
+
+        def surface_name(idx):
+            if 0 <= idx < len(self.datasets):
+                return self.datasets[idx].get("name", f"Surface_{idx}")
+            return f"Surface_{idx}"
+
+        def surface_is_visible(idx):
+            if selected_surface_name == "All Surfaces":
+                return True
+            return surface_name(idx) == selected_surface_name
+
+        # Decide rendering mode: batched for speed when mouse selection is OFF
+        mouse_sel_on = bool(getattr(self, 'mouse_selection_enabled_btn', None) and self.mouse_selection_enabled_btn.isChecked())
+        self._segments_batched_mode = not mouse_sel_on
+
+        # Ensure the segment map is available
+        if not hasattr(self, "_refine_segment_map") or not self._refine_segment_map:
+            try:
+                self._populate_refine_constraint_tree()
+            except Exception:
+                pass
+
+        if self._segments_batched_mode:
+            # FAST path: draw everything in 1–3 actors
+            built = self._draw_segments_batched_fast(
+                plotter,
+                surface_is_visible_fn=surface_is_visible,
+                show_hull_constraints=show_hull_constraints,
+                show_intersection_constraints=show_intersection_constraints,
+                selected_only_mode=selected_only_mode,
+            )
+        else:
+            # PRECISE path (picking): one actor per segment (original behavior)
+            if not hasattr(self, 'constraint_segment_actor_refs'):
+                self.constraint_segment_actor_refs = {}
+            else:
+                for actor in list(self.constraint_segment_actor_refs.values()):
                     try:
-                        segments_plotter.remove_actor(actor)
-                    except:
+                        plotter.remove_actor(actor)
+                    except Exception:
                         pass
                 self.constraint_segment_actor_refs = {}
-                
-                # Clear geometry mappings for fresh start
-                if hasattr(self, '_mesh_geometry_map'):
-                    self._mesh_geometry_map.clear()
-                if hasattr(self, '_mesh_geometry_map_reduced'):
-                    self._mesh_geometry_map_reduced.clear()
-                if hasattr(self, '_actor_id_to_segment_map'):
-                    self._actor_id_to_segment_map.clear()
-                
-                # Build all segment actors for ALL surfaces (not just selected one)
-                actors_built = 0
-                
-                for (surf_idx, seg_uid), seg_info in getattr(self, "_refine_segment_map", {}).items():
-                    if len(seg_info.get("points", [])) < 2:
-                        continue
 
-                    p1 = _to_xyz(seg_info["points"][0])
-                    p2 = _to_xyz(seg_info["points"][-1])
-                    if p1 is None or p2 is None:
-                        continue
+            # initialize picking maps
+            self._actor_id_to_segment_map = {}
+            self._mesh_geometry_map = {}
+            self._mesh_geometry_map_reduced = {}
 
-                    # Create individual actor for each segment
-                    rgb, lw, pattern = self._segment_vis_props(surf_idx, seg_uid)
-                    
-                    # Create the mesh object
-                    line_mesh = pv.lines_from_points(np.array([p1, p2], float))
-                    
-                    # Add mesh to segments plotter and get actor
-                    actor = segments_plotter.add_mesh(
-                        line_mesh,
-                        color=rgb, 
-                        line_width=lw,
-                        pickable=True  # Enable picking for mouse selection
-                    )
-                    
-                    # dotted grey for un-selected segments (works on VTK ≥ 9.1)
+            seg_map = getattr(self, "_refine_segment_map", {}) or {}
+            built = 0
+
+            for (surf_idx, seg_uid), seg_info in seg_map.items():
+                if not surface_is_visible(surf_idx):
+                    continue
+
+                seg_type = str(seg_info.get("type", seg_info.get("ctype", ""))).lower()
+                if seg_type == "hull" and not show_hull_constraints:
+                    continue
+                if seg_type in ("int", "intersection") and not show_intersection_constraints:
+                    continue
+                if selected_only_mode and not seg_info.get("selected", True):
+                    continue
+
+                pts = seg_info.get("points", [])
+                if not pts or len(pts) < 2:
+                    continue
+
+                def to_xyz(p):
+                    if isinstance(p, (list, tuple)) and len(p) >= 3:
+                        return float(p[0]), float(p[1]), float(p[2])
+                    if hasattr(p, "x") and hasattr(p, "y") and hasattr(p, "z"):
+                        return float(p.x), float(p.y), float(p.z)
                     try:
-                        prop = actor.GetProperty()
+                        import numpy as np
+                        if isinstance(p, np.ndarray) and p.size >= 3:
+                            return float(p[0]), float(p[1]), float(p[2])
+                    except Exception:
+                        pass
+                    return None
+
+                p1 = to_xyz(pts[0]); p2 = to_xyz(pts[-1])
+                if p1 is None or p2 is None:
+                    continue
+
+                import numpy as np, pyvista as pv
+                poly = pv.PolyData(np.array([p1, p2], dtype=float))
+                poly.lines = np.array([2, 0, 1], dtype=np.int64)
+
+                rgb, lw, pattern = self._segment_vis_props(surf_idx, seg_uid)
+                actor = plotter.add_mesh(
+                    poly, color=rgb, line_width=lw, pickable=True,
+                    render_lines_as_tubes=True, smooth_shading=False,
+                )
+                try:
+                    prop = actor.GetProperty()
+                    try:
                         prop.SetLineStipplePattern(pattern)
                         prop.SetLineStippleRepeatFactor(1)
                     except Exception:
                         pass
+                except Exception:
+                    pass
 
-                    # Store actor reference with segment info for mouse picking
-                    self.constraint_segment_actor_refs[(surf_idx, seg_uid)] = actor
-                    
-                    # Store actor-to-segment mapping using actor memory address
-                    # This avoids both the unhashable PolyData issue and actor attribute restrictions
-                    if not hasattr(self, '_actor_id_to_segment_map'):
-                        self._actor_id_to_segment_map = {}
-                    
-                    # Use the actor's memory address as a unique identifier
-                    actor_id = id(actor)
-                    self._actor_id_to_segment_map[actor_id] = (surf_idx, seg_uid)
-                    
-                    # Store mesh geometry for accurate picking identification
-                    if not hasattr(self, '_mesh_geometry_map'):
-                        self._mesh_geometry_map = {}
-                    if not hasattr(self, '_mesh_geometry_map_reduced'):
-                        self._mesh_geometry_map_reduced = {}
-                    
-                    # Create a unique geometric signature for this mesh (high precision)
-                    mesh_signature = self._create_mesh_signature(line_mesh)
-                    if mesh_signature:
-                        self._mesh_geometry_map[mesh_signature] = (surf_idx, seg_uid)
-                    
-                    # Also create reduced precision signature for fallback matching
-                    reduced_signature = self._create_reduced_precision_signature(line_mesh)
-                    if reduced_signature:
-                        self._mesh_geometry_map_reduced[reduced_signature] = (surf_idx, seg_uid)
-                    
-                    actors_built += 1
-                
-                logger.info(f"Built {actors_built} constraint actors (GLOBAL - persistent across ALL operations)")
-                self._constraint_actors_built = True
-                
-                # Mark the exact segment count to detect future data changes
-                self._last_segment_count = len(getattr(self, '_refine_segment_map', {}))
-            else:
-                # Actors already exist - NO REBUILDING NEEDED!
-                logger.info(f"Using existing {len(self.constraint_segment_actor_refs)} constraint actors (no rebuild needed)")
-                
-                # Just ensure all constraint actors are visible in the current segments plotter
-                current_segments_plotter = self._get_current_refine_plotter()
-                if current_segments_plotter:
-                    # Move actors to current plotter if needed (without rebuilding)
-                    actors_moved = 0
-                    for (surf_idx, seg_uid), actor in self.constraint_segment_actor_refs.items():
-                        # Check if actor is in current plotter's renderer
-                        try:
-                            if actor not in current_segments_plotter.renderer.actors:
-                                current_segments_plotter.renderer.AddActor(actor)
-                                actors_moved += 1
-                        except:
-                            pass
-                    if actors_moved > 0:
-                        logger.info(f"Moved {actors_moved} existing constraint actors to current segments plotter")
-            
-            # INSTANT visibility update - no rebuilding, just toggle visibility
-            visible_count = 0
-            hidden_count = 0
-            for (surf_idx, seg_uid), actor in getattr(self, 'constraint_segment_actor_refs', {}).items():
-                # Check surface filter
-                should_show = should_show_surface(surf_idx)
-                
-                if should_show:
-                    seg_info = self._refine_segment_map.get((surf_idx, seg_uid), {})
-                    
-                    # Check constraint type filters
-                    seg_type = seg_info.get("type", "")
-                    if seg_type == "hull" and not show_hull_constraints:
-                        should_show = False
-                    elif seg_type == "intersection" and not show_intersection_constraints:
-                        should_show = False
+                # store refs and build picking maps
+                self.constraint_segment_actor_refs[(surf_idx, seg_uid)] = actor
+                actor_id = id(actor)
+                self._actor_id_to_segment_map[actor_id] = (surf_idx, seg_uid)
+                try:
+                    sig = self._create_mesh_signature(poly)
+                    if sig is not None:
+                        self._mesh_geometry_map[sig] = (surf_idx, seg_uid)
+                    rsig = self._create_reduced_precision_signature(poly)
+                    if rsig is not None:
+                        if not hasattr(self, '_mesh_geometry_map_reduced') or self._mesh_geometry_map_reduced is None:
+                            self._mesh_geometry_map_reduced = {}
+                        self._mesh_geometry_map_reduced[rsig] = (surf_idx, seg_uid)
+                except Exception:
+                    pass
 
-                    # Check if in selected-only mode
-                    if should_show and show_selected_only_mode:
-                        is_selected = seg_info.get("selected", False)
-                        if not is_selected:
-                            should_show = False
+                built += 1
 
-                # Apply visibility (INSTANT - no rendering needed)
-                actor.SetVisibility(should_show)
-                if should_show:
-                    visible_count += 1
-                else:
-                    hidden_count += 1
-            
-            # Only render once at the end for efficiency
-            plotter.render()
-            
-            logger.info(f"INSTANT surface filter applied: {visible_count} segments visible, {hidden_count} hidden (no rebuild)")
+            # flag for mouse toggler
+            self._constraint_actors_built = built > 0
 
-        # Add status text and render for non-intersection views
-        # (intersection view handles its own text and rendering)
-        if view != 0:
-            # Add status text showing current filter settings and mouse selection state
-            status_parts = []
-            if selected_surface != "All Surfaces":
-                status_parts.append(f"Surface: {selected_surface}")
-            if view == 2:  # Only show constraint filters in constraint view
-                if not show_hull_constraints:
-                    status_parts.append("Hull: Hidden")
-                if not show_intersection_constraints:
-                    status_parts.append("Intersections: Hidden")
-                if show_selected_only_mode:
-                    status_parts.append("Mode: Selected Only")
-                
-                # Add mouse selection status
-                mouse_enabled = getattr(self, 'mouse_selection_enabled_btn', None)
-                if mouse_enabled and mouse_enabled.isChecked():
-                    status_parts.append("🖱️ Mouse: ON")
-            
-            if status_parts:
-                filter_text = "Filters: " + " | ".join(status_parts)
-                plotter.add_text(filter_text, position='upper_left', font_size=10, color='yellow')
+        # Empty-state text if nothing passed the filters
+        if built == 0:
+            msg = "No segments to display."
+            details = []
+            if selected_surface_name != "All Surfaces":
+                details.append(f"Surface={selected_surface_name}")
+            if not show_hull_constraints:
+                details.append("Hull hidden")
+            if not show_intersection_constraints:
+                details.append("Intersections hidden")
+            if selected_only_mode:
+                details.append("Selected only")
+            if details:
+                msg += " (" + ", ".join(details) + ")"
+            plotter.add_text(msg, position='upper_edge', color='white')
 
-            plotter.reset_camera()
-            plotter.render()
-    # =====================================
+        plotter.add_axes()
+        plotter.reset_camera()
+        plotter.render()
+        # =====================================
 
     # ======================================================================
     #  SEGMENT selection → drawing helpers
@@ -9346,51 +9306,43 @@ segmentation, triangulation, and visualization.
 
     def _update_all_segment_actors(self):
         """
-        Refresh colours / styles of EVERY segment actor after any tick change.
-        Optimized to only render once at the end for batch operations.
+        Refresh colours/styles after any tree tick change.
+        - If batched mode is ON (mouse selection OFF), just rebuild once.
+        - If per-segment mode (mouse selection ON), update actors in place.
         """
         if getattr(self, "current_refine_view", 0) != 2:
             return
 
-        # Batch update all actors efficiently without rendering each time
+        if getattr(self, "_segments_batched_mode", False):
+            # Rebuild the batched view in a single pass
+            self._update_refined_visualization()
+            return
+
+        # Per-segment path (original behavior)
         needs_render = False
-        
         for (s_idx, uid), actor in getattr(self, 'constraint_segment_actor_refs', {}).items():
             if not actor:
                 continue
-                
-            # Get current selection and hole state from tree
             is_checked = self._segment_checked(s_idx, uid)
             is_hole = self._segment_is_hole(s_idx, uid)
-            
-            # Update segment map with current states
             if (s_idx, uid) in getattr(self, '_refine_segment_map', {}):
                 self._refine_segment_map[(s_idx, uid)]["selected"] = is_checked
                 self._refine_segment_map[(s_idx, uid)]["is_hole"] = is_hole
-            
-            # Update actor appearance WITHOUT individual renders
             rgb, lw, pattern = self._segment_vis_props(s_idx, uid)
             try:
                 prop = actor.GetProperty()
-                current_color = prop.GetColor()
-                if (current_color[0], current_color[1], current_color[2]) != rgb:
+                if (prop.GetColor() != rgb) or (prop.GetLineWidth() != lw):
                     prop.SetColor(*rgb)
-                    needs_render = True
-                if prop.GetLineWidth() != lw:
                     prop.SetLineWidth(lw)
                     needs_render = True
-                prop.SetLineStipplePattern(pattern)
-                prop.SetLineStippleRepeatFactor(1)
-            except Exception:
-                # at least update colour if stipple unsupported
                 try:
-                    prop = actor.GetProperty()
-                    prop.SetColor(*rgb)
-                    needs_render = True
+                    prop.SetLineStipplePattern(pattern)
+                    prop.SetLineStippleRepeatFactor(1)
                 except Exception:
                     pass
+            except Exception:
+                pass
 
-        # Only render ONCE at the end if something actually changed
         if needs_render:
             current_plotter = self._get_current_refine_plotter()
             if current_plotter:
@@ -15439,7 +15391,7 @@ segmentation, triangulation, and visualization.
         tree.clear()
         tree.blockSignals(True)
 
-        # (surface_idx , seg_uid)  →  {'points':[...], 'ctype':'HULL'|'INT'}
+        # (surface_idx , seg_uid)  →  {'points':[...], 'type':'HULL'|'INTERSECTION', 'ctype':'HULL'|'INT'}
         self._refine_segment_map: Dict[Tuple[int, int], Dict] = {}
         seg_uid = 0
 
@@ -15462,8 +15414,7 @@ segmentation, triangulation, and visualization.
                 hull_item.setCheckState(0, Qt.Checked)
                 # Add hole checkbox for hull group
                 hull_item.setCheckState(4, Qt.Unchecked)
-                hull_item.setData(0, Qt.UserRole,
-                                {"type": "hull_group", "surface_idx": s_idx})
+                hull_item.setData(0, Qt.UserRole, {"type": "hull_group", "surface_idx": s_idx})
 
                 for i in range(len(hull)):
                     p1, p2 = hull[i], hull[(i + 1) % len(hull)]
@@ -15475,18 +15426,20 @@ segmentation, triangulation, and visualization.
                     # Add hole checkbox in column 4
                     seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
                     seg_item.setCheckState(4, Qt.Unchecked)  # Default: not a hole
-                    seg_item.setData(0, Qt.UserRole,
-                                    {"type": "constraint",
-                                    "surface_idx": s_idx,
-                                    "seg_uid": seg_uid})
+                    seg_item.setData(0, Qt.UserRole, {
+                        "type": "constraint",
+                        "surface_idx": s_idx,
+                        "seg_uid": seg_uid
+                    })
                     self._refine_segment_map[(s_idx, seg_uid)] = {
                         "points": [p1, p2],
-                        "ctype": "HULL",
-                        "type": "hull",
-                        "is_hole": False,  # Default: not a hole
-                        "selected": True,  # Default: selected (checked)
+                        "type": "HULL",     # normalized
+                        "ctype": "HULL",    # keep for compatibility
+                        "is_hole": False,
+                        "selected": True,
                     }
                     seg_uid += 1
+
             # ------------------ intersection lines ------------------------------
             inters = getattr(self, "refined_intersections_for_visualization", {}).get(s_idx, [])
             for line_id, inter_d in enumerate(inters):
@@ -15494,10 +15447,8 @@ segmentation, triangulation, and visualization.
                 if len(raw_pts) < 2:
                     continue
 
-                # NEW ───────────────────────────────────────────────────────────
                 # remove duplicates BUT keep the best special-point flag
                 deduped = self._dedupe_preserve_special(raw_pts)
-                # ───────────────────────────────────────────────────────────────
 
                 # split at every special point
                 seg_lists = split_line_at_special_points(deduped, default_size=1.0)
@@ -15510,8 +15461,7 @@ segmentation, triangulation, and visualization.
                 line_item.setCheckState(0, Qt.Checked)
                 # Add hole checkbox for intersection group
                 line_item.setCheckState(4, Qt.Unchecked)
-                line_item.setData(0, Qt.UserRole,
-                                  {"type": "intersection_group", "surface_idx": s_idx})
+                line_item.setData(0, Qt.UserRole, {"type": "intersection_group", "surface_idx": s_idx})
 
                 for k, seg_pts in enumerate(seg_lists):
                     for e in range(len(seg_pts) - 1):
@@ -15519,28 +15469,31 @@ segmentation, triangulation, and visualization.
 
                         seg_item = QTreeWidgetItem(line_item)
                         seg_item.setText(0, f"Seg {k}.{e}")
-                        seg_item.setText(1, "INT")  # Set type column
+                        seg_item.setText(1, "INTERSECTION")  # Set type column
                         seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
                         seg_item.setCheckState(0, Qt.Checked)
                         # Add hole checkbox in column 4
                         seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
                         seg_item.setCheckState(4, Qt.Unchecked)  # Default: not a hole
-                        seg_item.setData(0, Qt.UserRole,
-                                         {"type": "constraint",
-                                          "surface_idx": s_idx,
-                                          "seg_uid": seg_uid})
+                        seg_item.setData(0, Qt.UserRole, {
+                            "type": "constraint",
+                            "surface_idx": s_idx,
+                            "seg_uid": seg_uid
+                        })
 
                         self._refine_segment_map[(s_idx, seg_uid)] = {
                             "points": [p1, p2],
-                            "ctype": "INT",
-                            "type": "intersection",
-                            "is_hole": False,  # Default: not a hole
-                            "selected": True,  # Default: selected (checked)
+                            "type": "INTERSECTION",  # normalized
+                            "ctype": "INT",          # keep for compatibility
+                            "is_hole": False,
+                            "selected": True,
+                            "line_id": line_id,
                         }
                         seg_uid += 1
+
         tree.expandAll()
         tree.blockSignals(False)
-        logger.info("Segment-level constraint tree populated.")
+        logger.info("Segment-level constraint tree populated (types normalized to HULL/INTERSECTION).")
         
     def _collect_selected_refine_segments(self, surface_idx: int) -> List[List]:
         """Return list of point-pairs [p1, p2] for all checked segments."""
