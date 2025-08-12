@@ -19,7 +19,6 @@ except ImportError:
     HAVE_DIRECT_WRAPPER_INTERSECTION_UTILS = False
     print("WARNING (intersection_utils): DirectTriangleWrapper not found. Constrained triangulation might be limited.")
     # tr_standard is already imported above
-
 # Attempt to import PyVista for an alternative triangulation method
 try:
     import pyvista as pv
@@ -616,55 +615,157 @@ def isect2(v0, v1, v2, vv0, vv1, vv2, d0, d1, d2, isect, isectpoint):
 
 def triangle_triangle_intersection(tri1: Triangle, tri2: Triangle) -> List[Vector3D]:
     """
-    Calculate intersection between two triangles using robust Möller's algorithm.
-    Adds a pre-check to reject intersections between near-parallel but separated planes.
+    C++-like tri-tri intersection:
+    - No near-parallel prefilter
+    - Coplanar overlap handled via 2D projection and polygon-overlap sampling
+    - Only drop true slivers
     """
-    # Pre-check: near-parallel planes with non-zero separation => no intersection
+    import numpy as np
+
     n1 = tri1.normal(); n2 = tri2.normal()
-    n1_len = n1.length(); n2_len = n2.length()
-    if n1_len < 1e-14 or n2_len < 1e-14:
+    l1 = n1.length(); l2 = n2.length()
+    if l1 < 1e-14 or l2 < 1e-14:
         return []
-    n1u = n1 * (1.0 / n1_len); n2u = n2 * (1.0 / n2_len)
-    align = abs(n1u.dot(n2u))  # 1.0 == parallel
-    if align > 0.999:  # ~< 2.5°
-        # Characteristic size for scale-aware tolerance
-        e = [
-            (tri1.v2 - tri1.v1).length(),
-            (tri1.v3 - tri1.v1).length(),
-            (tri1.v3 - tri1.v2).length(),
-            (tri2.v2 - tri2.v1).length(),
-            (tri2.v3 - tri2.v1).length(),
-            (tri2.v3 - tri2.v2).length(),
-        ]
-        L = max(e) if e else 1.0
-        dist_tol = 1e-6 * L + 1e-12
-        # Distance of tri2 centroid to tri1 plane
-        c2 = tri2.centroid()
-        plane_sep = abs(n1u.dot(c2 - tri1.v1))
-        if plane_sep > dist_tol:
-            return []  # parallel and separated: ignore
-        
+
+    n1u = n1 * (1.0 / l1); n2u = n2 * (1.0 / l2)
+    align = abs(n1u.dot(n2u))
+
+    # Characteristic scale for tolerances
+    edges = [
+        (tri1.v2 - tri1.v1).length(),
+        (tri1.v3 - tri1.v1).length(),
+        (tri1.v3 - tri1.v2).length(),
+        (tri2.v2 - tri2.v1).length(),
+        (tri2.v3 - tri2.v1).length(),
+        (tri2.v3 - tri2.v2).length(),
+    ]
+    L = max(edges) if edges else 1.0
+    sliver_tol = 1e-12
+    plane_tol = 1e-8 * L + 1e-12
+
+    def as_np(p: Vector3D):
+        return np.array([p.x, p.y, p.z], dtype=float)
+
+    # Coplanar handling
+    # If near-parallel normals and plane-to-vertex distances are tiny both ways,
+    # treat as coplanar and compute overlap segment in-plane.
+    if align > 0.999999:
+        p0 = as_np(tri1.v1)
+        n = as_np(n1u)
+        def min_sep_to_plane(nu, p0, a, b, c):
+            return min(abs(nu.dot(as_np(a) - p0)),
+                       abs(nu.dot(as_np(b) - p0)),
+                       abs(nu.dot(as_np(c) - p0)))
+        if min_sep_to_plane(n, p0, tri2.v1, tri2.v2, tri2.v3) <= plane_tol and \
+           min_sep_to_plane(as_np(n2u), as_np(tri2.v1), tri1.v1, tri1.v2, tri1.v3) <= plane_tol:
+            # Build an orthonormal in-plane basis (u,v,n)
+            a = as_np(tri1.v2) - p0
+            if np.linalg.norm(a) < 1e-14:
+                a = as_np(tri1.v3) - p0
+            if np.linalg.norm(a) < 1e-14:
+                a = np.array([1.0, 0.0, 0.0])
+            u = a / np.linalg.norm(a)
+            v = np.cross(n, u)
+            v_norm = np.linalg.norm(v)
+            if v_norm < 1e-14:
+                # pick any orthogonal to n
+                tmp = np.array([1.0, 0.0, 0.0])
+                if abs(n.dot(tmp)) > 0.9:
+                    tmp = np.array([0.0, 1.0, 0.0])
+                u = np.cross(tmp, n); u /= np.linalg.norm(u)
+                v = np.cross(n, u); v /= np.linalg.norm(v)
+            else:
+                v /= v_norm
+
+            def proj2(p):
+                w = as_np(p) - p0
+                return np.array([u.dot(w), v.dot(w)], dtype=float)
+
+            t1 = [proj2(tri1.v1), proj2(tri1.v2), proj2(tri1.v3)]
+            t2 = [proj2(tri2.v1), proj2(tri2.v2), proj2(tri2.v3)]
+
+            # Collect overlap polygon samples: vertices inside the other + edge-edge 2D intersections
+            def inside(pt, tri):
+                # barycentric test in 2D
+                A, B, C = tri
+                v0 = C - A; v1 = B - A; v2 = pt - A
+                den = v0[0]*v1[1] - v1[0]*v0[1]
+                if abs(den) < 1e-16:
+                    return False
+                a = (v2[0]*v1[1] - v1[0]*v2[1]) / den
+                b = (v0[0]*v2[1] - v2[0]*v0[1]) / den
+                c = 1.0 - a - b
+                return a >= -1e-12 and b >= -1e-12 and c >= -1e-12
+
+            P = []
+            for pt in t1:
+                if inside(pt, t2): P.append(pt)
+            for pt in t2:
+                if inside(pt, t1): P.append(pt)
+
+            def segseg(p, q, r, s):
+                # segment intersection in 2D; returns list of intersection points (0,1 or 2 for colinear overlap endpoints)
+                def orient(a,b,c): return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
+                def on_seg(a,b,c):
+                    return min(a[0],b[0]) - 1e-12 <= c[0] <= max(a[0],b[0]) + 1e-12 and \
+                           min(a[1],b[1]) - 1e-12 <= c[1] <= max(a[1],b[1]) + 1e-12
+                o1 = orient(p,q,r); o2 = orient(p,q,s); o3 = orient(r,s,p); o4 = orient(r,s,q)
+                out = []
+                if abs(o1) < 1e-12 and on_seg(p,q,r): out.append(r)
+                if abs(o2) < 1e-12 and on_seg(p,q,s): out.append(s)
+                if abs(o3) < 1e-12 and on_seg(r,s,p): out.append(p)
+                if abs(o4) < 1e-12 and on_seg(r,s,q): out.append(q)
+                if (o1*o2 < 0) and (o3*o4 < 0):
+                    # proper intersection
+                    A = q - p; B = s - r; C = r - p
+                    den = A[0]*B[1] - A[1]*B[0]
+                    if abs(den) > 1e-16:
+                        t = (C[0]*B[1] - C[1]*B[0]) / den
+                        out.append(p + t*A)
+                return out
+
+                # Done
+
+            e1 = [(t1[0],t1[1]), (t1[1],t1[2]), (t1[2],t1[0])]
+            e2 = [(t2[0],t2[1]), (t2[1],t2[2]), (t2[2],t2[0])]
+            for a0,a1 in e1:
+                for b0,b1 in e2:
+                    for ip in segseg(a0,a1,b0,b1):
+                        P.append(ip)
+
+            if len(P) < 2:
+                return []
+
+            # Deduplicate and pick the farthest pair
+            Q = []
+            for pt in P:
+                if not any(np.linalg.norm(pt - q) <= 1e-12 for q in Q):
+                    Q.append(pt)
+            if len(Q) < 2:
+                return []
+
+            # farthest pair
+            maxd = 0.0; best = (Q[0], Q[0])
+            for i in range(len(Q)):
+                for j in range(i+1, len(Q)):
+                    d = np.linalg.norm(Q[i] - Q[j])
+                    if d > maxd:
+                        maxd = d; best = (Q[i], Q[j])
+            if maxd <= sliver_tol:
+                return []
+
+            # Map back to 3D: p = p0 + u*x + v*y
+            a3 = Vector3D(*(p0 + u*best[0][0] + v*best[0][1]))
+            b3 = Vector3D(*(p0 + u*best[1][0] + v*best[1][1]))
+            return [a3, b3]
+
+    # Non-coplanar: use the robust C++-ported routine
     pt1, pt2 = tri_tri_intersect_with_isectline(tri1, tri2)
-    if pt1 is not None and pt2 is not None:
-        # Scale-aware minimum length to drop tiny slivers
-        e = [
-            (tri1.v2 - tri1.v1).length(),
-            (tri1.v3 - tri1.v1).length(),
-            (tri1.v3 - tri1.v2).length(),
-            (tri2.v2 - tri2.v1).length(),
-            (tri2.v3 - tri2.v1).length(),
-            (tri2.v3 - tri2.v2).length(),
-        ]
-        L = max(e) if e else 1.0
-        min_len = 1e-6 * L
-        if (pt1 - pt2).length() > min_len:
-            if (tri1.contains_point(pt1) and tri1.contains_point(pt2)) or \
-               (tri2.contains_point(pt1) and tri2.contains_point(pt2)) or \
-               (tri1.contains_point(pt1) and tri2.contains_point(pt2)) or \
-               (tri1.contains_point(pt2) and tri2.contains_point(pt1)):
-                return [pt1, pt2]
+    if pt1 is None or pt2 is None:
         return []
-    return []
+    if (pt1 - pt2).length() <= sliver_tol:
+        return []
+    return [pt1, pt2]
 
 
 def line_triangle_intersection(
@@ -845,8 +946,46 @@ def calculate_surface_surface_intersection(surface1_idx: int, surface2_idx: int,
                 logger.info(f"  Segment {i}: ({seg[0].x:.3f},{seg[0].y:.3f},{seg[0].z:.3f}) -> ({seg[1].x:.3f},{seg[1].y:.3f},{seg[1].z:.3f})")
         
         # Connect intersection segments into continuous curves (like C++ does)
+        # Connect intersection segments into continuous curves (like C++ does)
         connected_curves = connect_intersection_segments(intersection_segments)
-        
+
+        # Optional post-connection regularization (C++-like RefineByLength)
+        # Optional post-connection regularization (C++-like RefineByLength)
+        refined_curves = []
+        for curve in connected_curves:
+            if len(curve) < 2:
+                refined_curves.append(curve)
+                continue
+
+            # Estimate target length from current spacing (median)
+            seg_lens = []
+            for i in range(len(curve) - 1):
+                seg_lens.append((curve[i + 1] - curve[i]).length())
+            target_length = float(np.median(seg_lens)) if seg_lens else 1.0
+            if target_length <= 1e-12:
+                target_length = 1.0
+
+            # Wrap curve points in an Intersection so the refiner receives .points
+            tmp_intersection = Intersection(surface1_idx, surface2_idx, False)
+            for pt in curve:
+                tmp_intersection.add_point(pt)
+
+            try:
+                refined_pts = refine_intersection_line_by_length(
+                    tmp_intersection,
+                    target_length=target_length,
+                    min_angle_deg=20.0,
+                    uniform_meshing=True,
+                )
+            except Exception:
+                refined_pts = None
+
+            refined_curves.append(refined_pts if refined_pts else curve)
+
+        connected_curves = refined_curves
+
+
+
         logger.info(f"Surface {surface1_idx}-{surface2_idx}: Connected into {len(connected_curves)} curves")
         
         # Return multiple intersection objects - one for each curve
@@ -912,7 +1051,7 @@ def connect_intersection_segments(segments, tolerance=1e-10):
     logger.info(f"After filtering: {len(validated_points)//2} valid segments")
     
     # Much stricter compatibility: avoid jumping to nearby but different lines
-    def is_direction_compatible(tangent: Vector3D, candidate_vec: Vector3D, min_dot: float = 0.95) -> bool:
+    def is_direction_compatible(tangent: Vector3D, candidate_vec: Vector3D, min_dot: float = 0.10) -> bool:
         t_len = tangent.length()
         c_len = candidate_vec.length()
         if t_len < 1e-14 or c_len < 1e-14:
@@ -920,7 +1059,6 @@ def connect_intersection_segments(segments, tolerance=1e-10):
         t = tangent * (1.0 / t_len)
         c = candidate_vec * (1.0 / c_len)
         return t.dot(c) > min_dot
-
     curves = []
     curve_count = 0
     connect_tolerance_squared = 1e-12
@@ -1492,10 +1630,6 @@ def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, mode
             for seg2_idx, seg2 in enumerate(box.N2s):
                 p2a, p2b = seg2[0], seg2[1]
                 d2 = (p2b - p2a).normalized()
-
-                # Skip if near parallel; they should not form triple points when merely close
-                if abs(d1.dot(d2)) > parallel_dot_threshold:
-                    continue
 
                 # Calculate shortest distance between segments and their closest points
                 dist, closest1, closest2 = segment_segment_distance(p1a, p1b, p2a, p2b)
@@ -2534,207 +2668,242 @@ def run_constrained_triangulation_py(
     original_3d_points_for_plc: np.ndarray,
     config: dict,
 ):
-    """
-    COMPLETELY REWRITTEN: Triangulation using DirectTriangleWrapper approach from triangulation tab.
-    This mimics the successful triangulation method that works in the triangulation tab.
-    """
-    # --- basic checks --------------------------------------------------------
+    import numpy as np
+    from meshit.triangle_direct import DirectTriangleWrapper
+    from scipy.spatial import Delaunay, cKDTree
+    from scipy.interpolate import RBFInterpolator, CloughTocher2DInterpolator
+
     if plc_points_2d is None or len(plc_points_2d) < 3:
         raise ValueError("Not enough PLC points")
     if plc_segments_indices is None or len(plc_segments_indices) < 3:
         raise ValueError("Not enough PLC segments")
 
-    # Import DirectTriangleWrapper
-    try:
-        from meshit.triangle_direct import DirectTriangleWrapper
-    except ImportError:
-        logger.error("DirectTriangleWrapper not available! Falling back to basic Triangle")
-        # Fallback to the old approach
-        return _run_basic_triangle_fallback(plc_points_2d, plc_segments_indices, plc_holes_2d, 
-                                          surface_projection_params, original_3d_points_for_plc, config)
+    gradient  = float(config.get('gradient', 2.0))
+    min_angle = float(config.get('min_angle', 20.0))
+    target_sz = float(config.get('target_size', 20.0))
+    interp    = str(config.get('interp', 'Thin Plate Spline (TPS)'))
+    smoothing = float(config.get('smoothing', 0.0))
 
-    # Extract triangulation parameters from config
-    gradient = config.get('gradient', 2.0)
-    min_angle = config.get('min_angle', 20.0)
-    target_size = config.get('target_size', 20.0)
-    
-    # CRITICAL FIX: If target size is too large, it creates sparse meshes that fail in TetGen
-    # Automatically reduce target size for complex surfaces
-    min_coords = np.min(plc_points_2d, axis=0)
-    max_coords = np.max(plc_points_2d, axis=0)
-    diagonal = np.sqrt(np.sum((max_coords - min_coords) ** 2))
-    
-    # If target size would create very sparse mesh, reduce it
-    max_reasonable_size = diagonal / 10.0  # Ensure at least 10 elements across diagonal
-    if target_size > max_reasonable_size:
-        old_target = target_size
-        target_size = max_reasonable_size
-        logger.warning(f"Target size {old_target:.2f} too large for complex surface (diagonal: {diagonal:.2f})")
-        logger.warning(f"Automatically reduced to {target_size:.2f} to prevent TetGen issues")
-    
-    # Use target_size from GUI (possibly adjusted)
-    base_size = target_size
-    
-    # Only fall back to diagonal-based calculation if target_size is unreasonable
-    if base_size <= 0:
-        base_size = diagonal / 15.0  # Fallback for unreasonable target_size
-        logger.warning(f"Target size {target_size:.2f} unreasonable, using fallback: {base_size:.2f}")
-    else:
-        logger.info(f"Using user target size: {base_size:.2f} (surface diagonal: {diagonal:.2f})")
-    
-    logger.info(f"Using DirectTriangleWrapper approach: gradient={gradient}, min_angle={min_angle}, base_size={base_size:.4f}")
+    # clamp target size
+    bb_min = np.min(plc_points_2d, axis=0); bb_max = np.max(plc_points_2d, axis=0)
+    diagonal = float(np.linalg.norm(bb_max - bb_min))
+    if target_sz > diagonal/10.0: target_sz = diagonal/10.0
 
-    # Initialize DirectTriangleWrapper with parameters
-    triangulator = DirectTriangleWrapper(
-        gradient=gradient,
-        min_angle=min_angle,
-        base_size=base_size
-    )
+    tri = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=target_sz)
+    tri.set_cpp_compatible_mode(True)
+    tri_res = tri.triangulate(points=plc_points_2d, segments=plc_segments_indices, holes=plc_holes_2d,
+                              uniform=True, create_transition=False, create_feature_points=False)
+    if tri_res is None or 'vertices' not in tri_res or 'triangles' not in tri_res:
+        raise RuntimeError("Constrained triangulation failed")
 
-    # CRITICAL FIX: Enable C++ MeshIt compatible Triangle switches
-    # This uses "pzYYu" switches like C++ MeshIt instead of "pzq" switches
-    # This should produce denser, higher quality meshes that work better with TetGen
-    triangulator.set_cpp_compatible_mode(True)
-    logger.info("✓ Enabled C++ MeshIt compatible Triangle switches for conforming mesh generation")
+    vertices_uv = np.asarray(tri_res['vertices'], float)
+    triangles   = np.asarray(tri_res['triangles'], int)
 
-    # Run triangulation using DirectTriangleWrapper (FAST PERFORMANCE OPTIMIZATIONS)
-    triangulation_result = triangulator.triangulate(
-        points=plc_points_2d,
-        segments=plc_segments_indices,
-        holes=plc_holes_2d,
-        uniform=True,  # Use uniform approach like triangulation tab
-        create_transition=False,  # PERFORMANCE: Disable expensive transition points
-        create_feature_points=False  # PERFORMANCE: Disable expensive feature points
-    )
+    # projection (use basis exactly as provided)
+    proj = surface_projection_params or {}
+    centroid = np.asarray(proj.get("centroid"), float)
+    basis    = np.asarray(proj.get("basis"), float)
+    if basis.shape != (2,3): raise RuntimeError("projection_params['basis'] must be (2,3)")
+    ex, ey = basis[0], basis[1]
+    ez = proj.get("normal");  ez = np.cross(ex, ey) if ez is None else np.asarray(ez, float)
+    ez /= max(np.linalg.norm(ez), 1e-15)
 
-    if triangulation_result is None or 'vertices' not in triangulation_result or 'triangles' not in triangulation_result:
-        raise RuntimeError("DirectTriangleWrapper triangulation failed to produce valid output.")
+    # local samples (u,v,w)
+    P = np.asarray(original_3d_points_for_plc, float)
+    C = P - centroid
+    sample_xy = np.column_stack([C @ ex, C @ ey])
+    sample_w  = C @ ez
 
-    vertices_2d = triangulation_result['vertices']
-    triangles = triangulation_result['triangles']
+    # interpolators in local frame
+    def z_plane(q):
+        tree = cKDTree(sample_xy); k = min(12, len(sample_xy))
+        d, idx = tree.query(q, k=k)
+        if k == 1: d = d[:, None]; idx = idx[:, None]
+        A = np.concatenate([sample_xy[idx], np.ones((idx.shape[0], idx.shape[1], 1))], axis=2); At = np.transpose(A,(0,2,1))
+        coef = np.linalg.solve(At@A, At@sample_w[idx][...,None])
+        a = coef[:,0,0]; b = coef[:,1,0]; c = coef[:,2,0]
+        return a*q[:,0] + b*q[:,1] + c
 
-    logger.info(f"DirectTriangleWrapper triangulation successful: {len(vertices_2d)} vertices, {len(triangles)} triangles")
+    def z_linear(q):
+        dela = Delaunay(sample_xy); out = np.empty(len(q), float); out[:] = np.nan
+        s = dela.find_simplex(q); inside = s >= 0
+        if np.any(inside):
+            T = dela.transform[s[inside]]; r = q[inside] - T[:,2]
+            bary = np.einsum('ijk,ik->ij', T[:,:2,:], r)
+            w0 = 1.0 - bary.sum(axis=1); w1 = bary[:,0]; w2 = bary[:,1]; inds = dela.simplices[s[inside]]
+            out[inside] = w0*sample_w[inds[:,0]] + w1*sample_w[inds[:,1]] + w2*sample_w[inds[:,2]]
+        if np.any(~inside):
+            out[~inside] = z_plane(q[~inside])
+        return out
 
-    # --- SOPHISTICATED 3D RECONSTRUCTION (from triangulation tab) -----------
-    
-    if surface_projection_params is None:
-        # 2D case - just add zero Z coordinate
-        if vertices_2d.shape[1] == 2:
-            final_vertices_3d = np.zeros((len(vertices_2d), 3))
-            final_vertices_3d[:, :2] = vertices_2d
-        else:
-            final_vertices_3d = vertices_2d
-    else:
-        # 3D case - sophisticated reconstruction like triangulation tab
-        centroid = np.asarray(surface_projection_params["centroid"])
-        basis = np.asarray(surface_projection_params["basis"])
-        normal = surface_projection_params.get("normal")
-        
-        # Project original 3D points to 2D for matching
-        centered_original = original_3d_points_for_plc - centroid
-        original_projected_2d = np.dot(centered_original, basis.T)
-        
-        final_vertices_3d = np.zeros((len(vertices_2d), 3))
-        
-        logger.info(f"FAST reconstructing {len(vertices_2d)} vertices from 2D to 3D...")
-        
-        # PERFORMANCE OPTIMIZATION: Use KDTree for O(log N) vertex matching instead of O(N²)
-        from scipy.spatial import cKDTree
-        original_kdtree = cKDTree(original_projected_2d)
-        tolerance = 1e-12
-        
-        # Collect unmatched vertices for batch interpolation
-        unmatched_indices = []
-        unmatched_vertices_2d = []
-        
-        # Fast vertex matching using spatial indexing
-        for i, vertex_2d in enumerate(vertices_2d):
-            # FAST: O(log N) lookup instead of O(N) linear search
-            distances, indices = original_kdtree.query(vertex_2d, k=1)
-            
-            if distances < tolerance and indices < len(original_3d_points_for_plc):
-                final_vertices_3d[i] = original_3d_points_for_plc[indices]
-            else:
-                # Collect for batch interpolation
-                unmatched_indices.append(i)
-                unmatched_vertices_2d.append(vertex_2d)
-        
-        # PERFORMANCE: Batch interpolation for all unmatched vertices
-        if unmatched_indices:
-            logger.info(f"FAST batch interpolating Z values for {len(unmatched_indices)} unmatched vertices")
-            
-            # Extract Z values from original points
-            original_z = original_3d_points_for_plc[:, 2]
-            
-            # Batch interpolation - much faster than individual calls
-            unmatched_array = np.array(unmatched_vertices_2d)
-            
+    def z_idw(q, power=4):
+        tree = cKDTree(sample_xy); k = min(64, len(sample_xy))
+        d, idx = tree.query(q, k=k)
+        if k == 1: d = d[:, None]; idx = idx[:, None]
+        r2 = np.maximum(d*d, 1e-24); w = 1.0/(r2**(power/2.0)); wsum = np.sum(w, axis=1)
+        return np.sum(w * sample_w[idx], axis=1) / wsum
+
+    def z_tps(q):
+        try:
+            rbf = RBFInterpolator(sample_xy, sample_w, kernel='thin_plate_spline', smoothing=smoothing)
+            return rbf(q)
+        except Exception:
+            return z_linear(q)
+
+    def z_kriging(q):
+        pts = sample_xy; vals = sample_w
+        n = len(pts)
+        if n < 3:
+            return z_plane(q)
+        bb = np.max(pts, axis=0) - np.min(pts, axis=0)
+        diag = float(np.linalg.norm(bb))
+        rng = max(1e-12, 0.5*diag)
+        sill = float(np.var(vals)) + 1e-12
+        nugget = 1e-6 * sill
+        dmat = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+        gamma = sill * (1.0 - np.exp(-dmat / rng))
+        C = sill - gamma
+        np.fill_diagonal(C, C.diagonal() + nugget)
+        A = np.empty((n+1, n+1), float)
+        A[:n,:n]=C; A[:n,n]=1.0; A[n,:n]=1.0; A[n,n]=0.0
+        try:
+            A_inv = np.linalg.inv(A)
+        except np.linalg.LinAlgError:
+            return z_linear(q)
+        out = np.empty(len(q), float)
+        for i, qi in enumerate(q):
+            dq = np.linalg.norm(pts - qi[None, :], axis=1)
+            gamma_q = sill * (1.0 - np.exp(-dq / rng))
+            cvec = (sill - gamma_q)
+            b = np.empty(n+1, float); b[:n]=cvec; b[n]=1.0
+            x = A_inv @ b
+            lamb = x[:n]
+            out[i] = float(np.dot(lamb, vals))
+        return out
+
+    def z_ct(q, k_neighbors=15, spike_factor=5.0):
+        tree_nn = cKDTree(sample_xy)
+        d_all, _ = tree_nn.query(sample_xy, k=min(8, len(sample_xy)))
+        global_med = float(np.median(d_all[:, 1])) if d_all.shape[1] > 1 else float(np.median(d_all))
+
+        ct = CloughTocher2DInterpolator(sample_xy, sample_w, fill_value=np.nan)
+        w_ct = ct(q)
+
+        w_out = np.empty(len(q), dtype=float)
+        for i, qi in enumerate(q):
+            d, idx = tree_nn.query(qi, k=min(k_neighbors, len(sample_xy)))
+            if np.isscalar(idx):
+                idx = np.array([idx]); d = np.array([d])
+            P = sample_xy[idx]
+            W = sample_w[idx]
+            A = np.column_stack([P, np.ones(P.shape[0])])
             try:
-                from scipy.interpolate import griddata
-                # Batch linear interpolation
-                interpolated_z_values = griddata(original_projected_2d, original_z, unmatched_array, method='linear')
-                
-                # Handle NaN values with nearest neighbor fallback
-                nan_mask = np.isnan(interpolated_z_values)
-                if np.any(nan_mask):
-                    interpolated_z_values[nan_mask] = griddata(original_projected_2d, original_z, unmatched_array[nan_mask], method='nearest')
-                
-                # Apply interpolated Z values to final vertices
-                for idx, vertex_idx in enumerate(unmatched_indices):
-                    vertex_2d = unmatched_vertices_2d[idx]
-                    interpolated_z = interpolated_z_values[idx]
-                    
-                    # Handle remaining NaN values
-                    if np.isnan(interpolated_z):
-                        interpolated_z = centroid[2]  # Fallback to centroid Z
-                    
-                    # Reconstruct 3D point
-                    vertex_3d = centroid.copy()
-                    vertex_3d += vertex_2d[0] * basis[0]
-                    vertex_3d += vertex_2d[1] * basis[1]
-                    vertex_3d[2] = float(interpolated_z)
-                    
-                    final_vertices_3d[vertex_idx] = vertex_3d
-                    
-            except Exception as e:
-                logger.warning(f"Batch Z interpolation failed: {e}. Using planar projection for {len(unmatched_indices)} vertices.")
-                # Fallback to simple plane projection for all unmatched
-                for vertex_idx in unmatched_indices:
-                    vertex_2d = vertices_2d[vertex_idx]
-                    vertex_3d = centroid + vertex_2d[0] * basis[0] + vertex_2d[1] * basis[1]
-                    final_vertices_3d[vertex_idx] = vertex_3d
+                coef, *_ = np.linalg.lstsq(A, W, rcond=None)
+                w_lp = coef[0]*qi[0] + coef[1]*qi[1] + coef[2]
+                w_fit = A @ coef
+                sigma = float(np.std(W - w_fit)) + 1e-12
+            except Exception:
+                w_lp = float(np.mean(W))
+                sigma = float(np.std(W - w_lp)) + 1e-12
 
-    # --- vertex deduplication with high precision (matching triangulation tab) -----
-    def vkey(vec):
-        return (round(vec[0], 12), round(vec[1], 12), round(vec[2], 12))
+            wc = w_ct[i]
+            if np.isnan(wc):
+                w_out[i] = w_lp
+                continue
 
+            mean_d = float(np.mean(d))
+            sparsity = mean_d / max(global_med, 1e-12)
+            alpha = 1.0 / (1.0 + (max(sparsity - 1.0, 0.0))**2)
+
+            delta = alpha * (wc - w_lp)
+            cap = spike_factor * sigma
+            w_out[i] = w_lp + float(np.clip(delta, -cap, cap))
+
+        return w_out
+    def z_robust_mls(q, k=24, iters=3, c=4.685, h_mult=2.0):
+        tree = cKDTree(sample_xy)
+        d_all, _ = tree.query(sample_xy, k=min(8, len(sample_xy)))
+        global_med = float(np.median(d_all[:, 1])) if d_all.shape[1] > 1 else float(np.median(d_all))
+        h = max(global_med * h_mult, 1e-9)
+
+        out = np.empty(len(q), dtype=float)
+        for i, qi in enumerate(q):
+            d, idx = tree.query(qi, k=min(k, len(sample_xy)))
+            if np.isscalar(idx):
+                out[i] = float(sample_w[idx]); continue
+
+            P = sample_xy[idx]
+            Wv = sample_w[idx]
+            w_dist = np.exp(- (d / h) ** 2).astype(float) + 1e-12
+
+            A = np.column_stack([P, np.ones(P.shape[0])])
+            coef, *_ = np.linalg.lstsq(A, Wv, rcond=None)
+
+            for _ in range(iters):
+                w_fit = A @ coef
+                r = Wv - w_fit
+                s = np.median(np.abs(r)) / 0.6745 + 1e-12
+                u = r / (c * s)
+                w_rob = np.where(np.abs(u) < 1.0, (1 - u**2)**2, 0.0)
+                W = (w_dist * w_rob)
+                if np.sum(W) < 1e-12:
+                    break
+                Aw = A * W[:, None]
+                try:
+                    coef = np.linalg.lstsq(Aw.T @ A, Aw.T @ Wv, rcond=None)[0]
+                except Exception:
+                    break
+
+            out[i] = coef[0]*qi[0] + coef[1]*qi[1] + coef[2]
+        return out
+    # choose method (Legacy maps to IDW + PLC snap)
+    if "Legacy" in interp:
+        w_out = z_idw(vertices_uv)
+    elif "Thin Plate" in interp:
+        w_out = z_tps(vertices_uv)
+    elif "Linear" in interp:
+        w_out = z_linear(vertices_uv)
+    elif "IDW" in interp:
+        w_out = z_idw(vertices_uv)
+    elif "Kriging" in interp:
+        w_out = z_kriging(vertices_uv)
+    elif "Clough" in interp:
+        w_out = z_ct(vertices_uv)
+    elif "MLS" in interp:
+        w_out = z_robust_mls(vertices_uv)
+    else:
+        w_out = z_plane(vertices_uv)
+
+    # map back to world
+    final_vertices_3d = centroid + np.outer(vertices_uv[:,0], ex) + np.outer(vertices_uv[:,1], ey) + np.outer(w_out, ez)
+
+    # PLC snap (keeps TetGen happy)
+    tol_uv = 1e-10
+    plc_kd = cKDTree(plc_points_2d)
+    dists, nn = plc_kd.query(vertices_uv, k=1)
+    snap_mask = dists <= tol_uv
+    if np.any(snap_mask):
+        final_vertices_3d[snap_mask] = original_3d_points_for_plc[nn[snap_mask]]
+
+    # dedupe + drop degenerates
+    def vkey(vec): return (round(vec[0],12), round(vec[1],12), round(vec[2],12))
     uniq_map, uniq_verts, remap = {}, [], {}
-    for old_idx, vec in enumerate(final_vertices_3d):
-        k = vkey(vec)
-        if k in uniq_map:
-            remap[old_idx] = uniq_map[k]
+    for i, v in enumerate(final_vertices_3d):
+        k = vkey(v)
+        if k in uniq_map: remap[i] = uniq_map[k]
         else:
-            new_idx = len(uniq_verts)
-            uniq_map[k] = new_idx
-            remap[old_idx] = new_idx
-            uniq_verts.append(vec)
-    
+            j = len(uniq_verts); uniq_map[k] = j; remap[i] = j; uniq_verts.append(v)
     final_vertices_3d = np.asarray(uniq_verts)
     triangles = np.vectorize(remap.get)(triangles)
 
-    # --- drop degenerate / zero-area triangles ---------------------
-    good_triangles = []
+    good = []
     for t in triangles:
-        if len({int(t[0]), int(t[1]), int(t[2])}) < 3:
-            continue
-        a, b, c = final_vertices_3d[t[0]], final_vertices_3d[t[1]], final_vertices_3d[t[2]]
-        area = 0.5 * np.linalg.norm(np.cross(b - a, c - a))
-        if area > 1e-12:
-            good_triangles.append(t)
-    
-    triangles = np.asarray(good_triangles, dtype=int)
+        if len({int(t[0]),int(t[1]),int(t[2])}) < 3: continue
+        a,b,c = final_vertices_3d[t[0]], final_vertices_3d[t[1]], final_vertices_3d[t[2]]
+        if 0.5*np.linalg.norm(np.cross(b-a, c-a)) > 1e-12:
+            good.append(t)
+    triangles = np.asarray(good, int)
 
-    logger.info(f"Final result: {len(final_vertices_3d)} vertices, {len(triangles)} triangles (after deduplication and cleanup)")
     return final_vertices_3d, triangles, []
 
 

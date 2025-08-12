@@ -449,6 +449,135 @@ class MeshItWorkflowGUI(QMainWindow):
             })
         self._refresh_material_list()
 
+    def _extract_boundary_segments_from_vtu(self, vtu_source) -> tuple[np.ndarray, list[list[np.ndarray]]]:
+        """
+        Returns:
+        points3d: (N,3) float array of surface points
+        rings: list of rings; each ring is a list of 3D points in order (closed)
+        Accepts:
+        vtu_source: a PyVista dataset or a file path (.vtu/.vtk/.vtp/.stl etc.)
+        """
+        import numpy as np
+        import pyvista as pv
+
+        # Load mesh
+        mesh = vtu_source if hasattr(vtu_source, "extract_surface") else pv.read(str(vtu_source))
+
+        # Ensure we have a PolyData surface
+        if not isinstance(mesh, pv.PolyData):
+            mesh = mesh.extract_surface()
+
+        # 1) Try “boundary edges only” (external border)
+        edges = mesh.extract_feature_edges(
+            boundary_edges=True, feature_edges=False, manifold_edges=False, non_manifold_edges=True
+        )
+        if edges.n_cells == 0:
+            # Fallback: allow sharp feature edges to help find an outline
+            edges = mesh.extract_feature_edges(
+                boundary_edges=True, feature_edges=True, feature_angle=150.0, manifold_edges=False, non_manifold_edges=True
+            )
+
+        # 2) Strip into ordered polylines
+        polylines = edges.strip() if edges.n_cells > 0 else pv.PolyData()
+
+        # 3) Decode polylines from VTK “lines” array
+        rings = []
+        if polylines.n_cells > 0 and polylines.lines.size > 0:
+            lines = polylines.lines.ravel()
+            pts = np.asarray(polylines.points, dtype=float)
+            i = 0
+            while i < len(lines):
+                n = int(lines[i]); i += 1
+                ids = lines[i:i + n]; i += n
+                if n >= 2:
+                    ring = pts[ids].astype(float)
+                    # enforce closed ring if endpoints match
+                    if np.linalg.norm(ring[0] - ring[-1]) > 1e-12:
+                        ring = np.vstack([ring, ring[0]])
+                    rings.append([p for p in ring])
+        else:
+            # Last fallback: use mesh boundary filter (can return triangles; we re‑extract edges)
+            boundary = mesh.extract_all_edges()
+            boundary = boundary.strip()
+            if boundary.n_cells > 0 and boundary.lines.size > 0:
+                lines = boundary.lines.ravel()
+                pts = np.asarray(boundary.points, dtype=float)
+                i = 0
+                while i < len(lines):
+                    n = int(lines[i]); i += 1
+                    ids = lines[i:i + n]; i += n
+                    if n >= 2:
+                        ring = pts[ids].astype(float)
+                        if np.linalg.norm(ring[0] - ring[-1]) > 1e-12:
+                            ring = np.vstack([ring, ring[0]])
+                        rings.append([p for p in ring])
+
+        # Points to carry as SDs if needed (prefer original surface points)
+        points3d = np.asarray(mesh.points, dtype=float)
+        return points3d, rings
+
+
+    def _rebuild_segments_from_vtu_boundaries(self) -> None:
+        """
+        For each dataset that came from a VTU, re‑derive its segments from the VTU boundary rings.
+        Expects each dataset to have either:
+        - dataset['file_path'] (path to the VTU), or
+        - dataset['pv_mesh'] (a PyVista mesh kept from import)
+        Updates:
+        - dataset['segments'] := list of segments [ [p0, p1], ... ] (3D points)
+        - dataset['points']   := (N,3) float array from the surface (if not present)
+        """
+        import numpy as np
+
+        updated = 0
+        for idx, ds in enumerate(self.datasets):
+            name = ds.get('name', f"Dataset {idx}")
+            # Heuristics to decide VTU origin; adapt if you store a reliable flag
+            is_vtu = (ds.get('format') == 'VTU') or (str(ds.get('file_path', '')).lower().endswith('.vtu'))
+            if not is_vtu:
+                continue
+
+            vtu_src = ds.get('pv_mesh') or ds.get('file_path')
+            if vtu_src is None:
+                logger.info(f"[VTU-SEG] Skipping {name}: no pv_mesh or file_path")
+                continue
+
+            try:
+                points3d, rings = self._extract_boundary_segments_from_vtu(vtu_src)
+                if not rings:
+                    logger.info(f"[VTU-SEG] {name}: no boundary rings found")
+                    continue
+
+                # Convert rings -> segments
+                segments = []
+                for ring in rings:
+                    if len(ring) < 2:
+                        continue
+                    # ensure closure in case previous step didn’t close
+                    if np.linalg.norm(np.asarray(ring[0]) - np.asarray(ring[-1])) > 1e-12:
+                        ring = list(ring) + [ring[0]]
+                    for i in range(len(ring) - 1):
+                        p0 = [float(ring[i][0]), float(ring[i][1]), float(ring[i][2])]
+                        p1 = [float(ring[i + 1][0]), float(ring[i + 1][1]), float(ring[i + 1][2])]
+                        segments.append([p0, p1])
+
+                if segments:
+                    ds['segments'] = segments
+                    if ('points' not in ds) or (ds['points'] is None) or (len(ds['points']) == 0):
+                        ds['points'] = points3d.astype(float)
+                    updated += 1
+                    logger.info(f"[VTU-SEG] {name}: built {len(segments)} segments from {len(rings)} ring(s)")
+                else:
+                    logger.info(f"[VTU-SEG] {name}: rings decoded but 0 segments produced")
+
+            except Exception as e:
+                logger.error(f"[VTU-SEG] {name}: failed to rebuild segments: {e}", exc_info=True)
+
+        if updated:
+            self.statusBar().showMessage(f"Rebuilt VTU boundary segments for {updated} dataset(s)")
+        else:
+            self.statusBar().showMessage("No VTU datasets updated")
+
     def _refresh_material_list(self) -> None:
         """Synchronise both list-widgets after any change."""
         # block all signals while we rebuild
@@ -1075,7 +1204,29 @@ class MeshItWorkflowGUI(QMainWindow):
         self.min_angle_input.setValue(20.0)
         self.min_angle_input.setSingleStep(1.0)
         quality_layout.addRow("Min Angle:", self.min_angle_input)
+        # Triangulation tab controls
+        # Triangulation tab controls
+        self.interp_combo = QComboBox()
+        self.interp_combo.addItems([
+            "Thin Plate Spline (TPS)",
+            "Linear (Barycentric)",
+            "IDW (p=4)",
+            "Local Plane",
+            "Kriging (Ordinary)",
+            "Cubic (Clough–Tocher)",
+            "Legacy (Hull + IDW + Boundary Snap)",
+            "MLS (Robust Moving Least Squares)"
+        ])
+        self.interp_combo.setCurrentIndex(0)
+        self.interp_smoothing_input = QDoubleSpinBox()
+        self.interp_smoothing_input.setDecimals(6)
+        self.interp_smoothing_input.setRange(0.0, 1e3)
+        self.interp_smoothing_input.setValue(0.0)
 
+        quality_layout.addRow("Interpolation", self.interp_combo)
+        quality_layout.addRow("Smoothing", self.interp_smoothing_input)
+
+        
         # Uniform triangulation
         self.uniform_checkbox = QCheckBox()
         self.uniform_checkbox.setChecked(True) # Default to uniform for consistent sizing
@@ -1203,7 +1354,6 @@ class MeshItWorkflowGUI(QMainWindow):
         self.clear_intersections_btn.setIcon(QIcon.fromTheme("edit-clear", QIcon()))
         self.clear_intersections_btn.clicked.connect(self._clear_intersection_results)
         controls_layout.addWidget(self.clear_intersections_btn)
-        
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
         
@@ -1388,7 +1538,26 @@ class MeshItWorkflowGUI(QMainWindow):
         # --- Global Mesh Settings ---
         mesh_settings_group = QGroupBox("Global Mesh Settings")
         mesh_settings_layout = QFormLayout(mesh_settings_group) # Use QFormLayout for label-input pairs
+        # Refine-mesh tab controls (for conforming meshes)
+        self.mesh_interp_combo = QComboBox()
+        self.mesh_interp_combo.addItems([
+            "Thin Plate Spline (TPS)",
+            "Linear (Barycentric)",
+            "IDW (p=4)",
+            "Local Plane",
+            "Kriging (Ordinary)",
+            "Cubic (Clough–Tocher)",
+            "Legacy (Hull + IDW + Boundary Snap)",
+            "MLS (Robust Moving Least Squares)"
+        ])
+        self.mesh_interp_combo.setCurrentIndex(0)
+        self.mesh_smoothing_input = QDoubleSpinBox()
+        self.mesh_smoothing_input.setDecimals(6)
+        self.mesh_smoothing_input.setRange(0.0, 1e3)
+        self.mesh_smoothing_input.setValue(0.0)
 
+        mesh_settings_layout.addRow("Interpolation", self.mesh_interp_combo)
+        mesh_settings_layout.addRow("Smoothing", self.mesh_smoothing_input)
         # Target Feature Size (controls conforming mesh density)
         self.mesh_target_feature_size_input = QDoubleSpinBox()
         self.mesh_target_feature_size_input.setRange(0.1, 500.0)
@@ -5125,23 +5294,71 @@ class MeshItWorkflowGUI(QMainWindow):
             if primary_key_ds not in self.datasets_intersections:
                 self.datasets_intersections[primary_key_ds] = []
 
-            def _same_intersection(e1, e2, tol=1e-8):
-                if {e1['dataset_id1'], e1['dataset_id2']} != {e2['dataset_id1'], e2['dataset_id2']}:
-                    return False
-                if e1['is_polyline_mesh'] != e2['is_polyline_mesh']:
-                    return False
-                pts1, pts2 = e1['points'], e2['points']
-                if len(pts1) != len(pts2):
-                    return False
-                def _close(p, q):
-                    return (abs(p[0] - q[0]) < tol and abs(p[1] - q[1]) < tol and abs(p[2] - q[2]) < tol)
-                ends_match = (_close(pts1[0], pts2[0]) and _close(pts1[-1], pts2[-1])) or (_close(pts1[0], pts2[-1]) and _close(pts1[-1], pts2[0]))
-                if not ends_match:
-                    return False
+            def _same_intersection(inter1: dict, inter2: dict, tol: float = 1e-6) -> bool:
                 import numpy as np
-                c1 = np.mean(np.asarray(pts1)[:, :3], axis=0)
-                c2 = np.mean(np.asarray(pts2)[:, :3], axis=0)
-                return np.linalg.norm(c1 - c2) < tol
+
+                def to_xyz_array(pts) -> np.ndarray:
+                    xyz = []
+
+                    def push_xyz(x, y, z):
+                        try:
+                            xyz.append([float(x), float(y), float(z)])
+                        except Exception:
+                            pass
+
+                    if pts is None:
+                        return np.empty((0, 3), dtype=float)
+
+                    for p in pts:
+                        # Segment as [p1, p2] where p* may be Vector3D or xyz-like
+                        if isinstance(p, (list, tuple)) and len(p) == 2 and all(
+                            hasattr(q, "x") and hasattr(q, "y") and hasattr(q, "z") for q in p
+                        ):
+                            push_xyz(p[0].x, p[0].y, p[0].z)
+                            push_xyz(p[1].x, p[1].y, p[1].z)
+                            continue
+
+                        # Vector3D
+                        if hasattr(p, "x") and hasattr(p, "y") and hasattr(p, "z"):
+                            push_xyz(p.x, p.y, p.z)
+                            continue
+
+                        # dict with x/y/z
+                        if isinstance(p, dict) and all(k in p for k in ("x", "y", "z")):
+                            push_xyz(p["x"], p["y"], p["z"])
+                            continue
+
+                        # plain sequence [x,y,z] or np array
+                        if isinstance(p, (list, tuple, np.ndarray)) and len(p) >= 3:
+                            push_xyz(p[0], p[1], p[2])
+                            continue
+
+                        # Unknown type: skip
+                        continue
+
+                    if not xyz:
+                        return np.empty((0, 3), dtype=float)
+                    return np.asarray(xyz, dtype=float)
+
+                pts1 = inter1.get("points", [])
+                pts2 = inter2.get("points", [])
+                arr1 = to_xyz_array(pts1)
+                arr2 = to_xyz_array(pts2)
+
+                if arr1.size == 0 or arr2.size == 0:
+                    return False
+
+                c1 = np.mean(arr1, axis=0)
+                c2 = np.mean(arr2, axis=0)
+                if not np.all(np.isfinite(c1)) or not np.all(np.isfinite(c2)):
+                    return False
+
+                # Optional: also compare the involved surface/polyline IDs if present
+                ids1 = tuple(sorted(inter1.get("pair_ids", inter1.get("ids", []))))
+                ids2 = tuple(sorted(inter2.get("pair_ids", inter2.get("ids", []))))
+                ids_match = (ids1 == ids2) if ids1 and ids2 else True
+
+                return ids_match and np.linalg.norm(c1 - c2) <= tol
 
             already_added = any(_same_intersection(existing, intersection_entry) for existing in self.datasets_intersections[primary_key_ds])
             if not already_added:
@@ -5206,7 +5423,13 @@ class MeshItWorkflowGUI(QMainWindow):
             QMessageBox.warning(self, "Input Error", "Invalid numeric parameters.")
             return
 
-        cfg = {"target_size": tgt, "min_angle": min_ang, "max_area": max_area}
+        cfg = {
+            "target_size": float(self.mesh_target_feature_size_input.value()),
+            "min_angle":  float(self.mesh_min_angle_input.value()),
+            "max_area":   float(self.mesh_target_feature_size_input.value())**2 * 1.5,
+            "interp":     self.mesh_interp_combo.currentText(),
+            "smoothing":  float(self.mesh_smoothing_input.value()),
+        }
         ok, total, fails = 0, 0, []
 
         for s_idx, ds in enumerate(self.datasets):
@@ -6822,7 +7045,104 @@ segmentation, triangulation, and visualization.
             return
         self._run_batch_computation("segments", len(datasets_with_hulls_indices))
     
-    
+    def _alpha_shape_outer_boundary(points_xy: np.ndarray, base_size: float) -> Optional[np.ndarray]:
+        import numpy as np
+        from scipy.spatial import Delaunay, cKDTree
+
+        if points_xy is None or len(points_xy) < 4:
+            return None
+
+        # Adaptive radius from density and GUI size
+        tree = cKDTree(points_xy)
+        dists, _ = tree.query(points_xy, k=min(8, len(points_xy)))
+        nn_med = float(np.median(dists[:, 1])) if dists.shape[1] > 1 else float(np.median(dists))
+        R = max(1.0 * nn_med, 0.75 * max(base_size, 1e-6))  # radius
+        alpha = 1.0 / max(R, 1e-12)
+
+        tri = Delaunay(points_xy)
+        simplices = tri.simplices
+        if len(simplices) == 0:
+            return None
+
+        pts = points_xy
+        kept = []
+        for tri_idx in simplices:
+            ia, ib, ic = tri_idx
+            pa, pb, pc = pts[ia], pts[ib], pts[ic]
+            a = np.linalg.norm(pb - pc)
+            b = np.linalg.norm(pa - pc)
+            c = np.linalg.norm(pa - pb)
+            s2 = max((a + b + c) * (b + c - a) * (a + c - b) * (a + b - c), 0.0)
+            if s2 == 0.0:
+                continue
+            area = 0.25 * np.sqrt(s2)
+            if area <= 1e-12:
+                continue
+            Rcirc = (a * b * c) / (4.0 * area)
+            if Rcirc < 1.0 / alpha:  # keep small-radius triangles
+                kept.append((ia, ib, ic))
+
+        if not kept:
+            return None
+
+        # Boundary edges = edges used by exactly one kept triangle
+        from collections import Counter, defaultdict
+        edge_counter = Counter()
+        for ia, ib, ic in kept:
+            for e in ((ia, ib), (ib, ic), (ic, ia)):
+                edge = tuple(sorted(e))
+                edge_counter[edge] += 1
+
+        boundary_edges = [e for e, cnt in edge_counter.items() if cnt == 1]
+        if len(boundary_edges) < 3:
+            return None
+
+        # Build adjacency and trace outer ring
+        adj = defaultdict(list)
+        for i, j in boundary_edges:
+            adj[i].append(j)
+            adj[j].append(i)
+
+        # Pick start on the extreme (leftmost) boundary vertex
+        start = min(adj.keys(), key=lambda idx: (pts[idx][0], pts[idx][1]))
+        ring = [start]
+        prev = None
+        cur = start
+        for _ in range(len(boundary_edges) + 5):
+            nbrs = adj[cur]
+            # choose neighbor with smallest left turn to keep turning consistently
+            if prev is None:
+                nxt = nbrs[0]
+            else:
+                v_prev = pts[cur] - pts[prev]
+                best = None
+                best_angle = +1e9
+                for nb in nbrs:
+                    if nb == prev:
+                        continue
+                    v_nb = pts[nb] - pts[cur]
+                    # prefer smallest rightward angle to continue around boundary
+                    cross = v_prev[0] * v_nb[1] - v_prev[1] * v_nb[0]
+                    dot = np.dot(v_prev, v_nb)
+                    angle = -np.arctan2(cross, dot)  # negative to bias consistent turn
+                    if angle < best_angle:
+                        best_angle = angle
+                        best = nb
+                nxt = best if best is not None else (nbrs[0] if len(nbrs) > 0 else None)
+            if nxt is None:
+                break
+            if nxt == ring[0]:
+                ring.append(nxt)
+                break
+            ring.append(nxt)
+            prev, cur = cur, nxt
+
+        if len(ring) < 4 or ring[0] != ring[-1]:
+            return None
+
+        # Ensure uniqueness and return XY polyline (closed)
+        coords = pts[np.array(ring[:-1], dtype=int)]
+        return coords
     def _run_triangulation_for_dataset(self, dataset_index):
         """Run triangulation for a specific dataset index. Returns True on success, False on error."""
         if not (0 <= dataset_index < len(self.datasets)):
@@ -6840,260 +7160,442 @@ segmentation, triangulation, and visualization.
         gradient = self.gradient_input.value()
         min_angle = self.min_angle_input.value()
         uniform = self.uniform_checkbox.isChecked()
-
-        try:
-            base_size = float(self.target_feature_size_input.value())
-            if base_size <= 1e-6:
-                base_size = 1.0
-        except ValueError:
-            base_size = 1.0
+        interp_label = self.interp_combo.currentText() if hasattr(self, "interp_combo") else "Thin Plate Spline (TPS)"
+        smoothing = float(self.interp_smoothing_input.value()) if hasattr(self, "interp_smoothing_input") else 0.0
 
         try:
             import numpy as np
-            import time
-            from scipy.spatial import cKDTree, ConvexHull
+            from scipy.spatial import Delaunay, cKDTree, ConvexHull
+            from scipy.interpolate import RBFInterpolator, CloughTocher2DInterpolator
+            from meshit.triangle_direct import DirectTriangleWrapper
 
-            start_time = time.time()
-
-            # 1) Unique boundary points and segment indices (as provided)
-            unique_points_list, point_to_index, segment_indices = [], {}, []
-            current_index = 0
-            for segment in segments_data:
-                p0, p1 = np.asarray(segment[0], float), np.asarray(segment[1], float)
-                t0, t1 = tuple(np.round(p0, 12)), tuple(np.round(p1, 12))
-                if t0 not in point_to_index:
-                    point_to_index[t0] = current_index
-                    unique_points_list.append(p0)
-                    i0 = current_index; current_index += 1
-                else:
-                    i0 = point_to_index[t0]
-                if t1 not in point_to_index:
-                    point_to_index[t1] = current_index
-                    unique_points_list.append(p1)
-                    i1 = current_index; current_index += 1
-                else:
-                    i1 = point_to_index[t1]
-                segment_indices.append([i0, i1])
-
-            boundary_xyz = np.asarray(unique_points_list, dtype=float)
-            boundary_segs = np.asarray(segment_indices, dtype=int)
-
-            # 2) Compute surface normal from SDs and build rotation like C++
+            # Common rotation basis (C++ rotate-by-normal)
             all_pts = np.asarray(dataset['points'], dtype=float)
-
             centred = all_pts - all_pts.mean(axis=0, keepdims=True)
             _, _, vh = np.linalg.svd(centred, full_matrices=False)
-            normal = vh[-1]
-            if normal[2] < 0.0:
-                normal = -normal
-
+            normal = vh[-1];  normal = -normal if normal[2] < 0.0 else normal
             z_axis = np.array([0.0, 0.0, 1.0], dtype=float)
 
-            # C++-style rotation (Rodrigues) using axis = cross(normal, z)
             def build_rot(n, onto_z=True):
                 if onto_z:
-                    axis = np.cross(n, z_axis)
-                    c = float(np.dot(z_axis, n))
+                    axis = np.cross(n, z_axis); c = float(np.dot(z_axis, n))
                 else:
-                    axis = np.cross(z_axis, n)
-                    c = float(np.dot(n, z_axis))
-                axis_norm = np.linalg.norm(axis)
-                if 1.0 - abs(c) < 1e-12 or axis_norm < 1e-15:
-                    return np.eye(3, dtype=float)
-                axis = axis / axis_norm
-                s = np.sqrt(1.0 - c * c)
-                C = 1.0 - c
+                    axis = np.cross(z_axis, n); c = float(np.dot(n, z_axis))
+                an = np.linalg.norm(axis)
+                if 1.0 - abs(c) < 1e-12 or an < 1e-15:
+                    return np.eye(3)
+                axis = axis / an; s = np.sqrt(1.0 - c*c); C = 1.0 - c
                 r1 = np.array([axis[0]*axis[0]*C + c,        axis[0]*axis[1]*C - axis[2]*s, axis[0]*axis[2]*C + axis[1]*s])
                 r2 = np.array([axis[1]*axis[0]*C + axis[2]*s, axis[1]*axis[1]*C + c,        axis[1]*axis[2]*C - axis[0]*s])
                 r3 = np.array([axis[2]*axis[0]*C - axis[1]*s, axis[2]*axis[1]*C + axis[0]*s, axis[2]*axis[2]*C + c       ])
                 return np.vstack([r1, r2, r3])
 
-            R = build_rot(normal, onto_z=True)
-            R_inv = build_rot(normal, onto_z=False)  # exact inverse per C++ construction
-
-            # Rotate boundary and SDs
-            boundary_rot = (R @ boundary_xyz.T).T
+            R = build_rot(normal, onto_z=True); R_inv = build_rot(normal, onto_z=False)
             all_pts_rot = (R @ all_pts.T).T
 
-            # Helper: order boundary ring from unordered segments (if present)
-            def order_ring(indices, pts):
-                adj = {}
-                for a, b in indices:
-                    adj.setdefault(a, []).append(b)
-                    adj.setdefault(b, []).append(a)
-                if not adj:
-                    return None
-                start = next((i for i, nbrs in adj.items() if len(nbrs) == 2), None)
-                if start is None:
-                    start = list(adj.keys())[0]
-                ring = [start]
-                prev = None
-                cur = start
-                for _ in range(len(adj) + 5):
-                    nxts = adj[cur]
-                    nxt = nxts[0] if nxts[0] != prev else (nxts[1] if len(nxts) > 1 else None)
-                    if nxt is None:
-                        break
-                    if nxt == ring[0]:
-                        ring.append(nxt)
-                        break
-                    ring.append(nxt)
-                    prev, cur = cur, nxt
-                return np.array(ring, dtype=int)
+            # Build boundary points/segments from provided segments_data
+            unique_points_list, point_to_index, segment_indices = [], {}, []
+            cur = 0
+            for seg in segments_data:
+                p0, p1 = np.asarray(seg[0], float), np.asarray(seg[1], float)
+                t0, t1 = tuple(np.round(p0, 12)), tuple(np.round(p1, 12))
+                if t0 not in point_to_index: point_to_index[t0]=cur; unique_points_list.append(p0); i0=cur; cur+=1
+                else: i0 = point_to_index[t0]
+                if t1 not in point_to_index: point_to_index[t1]=cur; unique_points_list.append(p1); i1=cur; cur+=1
+                else: i1 = point_to_index[t1]
+                segment_indices.append([i0, i1])
+            boundary_xyz = np.asarray(unique_points_list, float)
+            boundary_segs = np.asarray(segment_indices, int)
 
-            provided_order = order_ring(boundary_segs, boundary_rot)
-            provided_xy = boundary_rot[:, :2]
-            ring_xy = provided_xy[provided_order[:-1]] if provided_order is not None else None
+            # Legacy branch: original hull+IDW+boundary-snap pipeline
+            if "Legacy" in interp_label:
+                boundary_rot = (R @ boundary_xyz.T).T
+                provided_xy = boundary_rot[:, :2]
 
-            # Compute convex hull of rotated SDs (C++ does hull in rotated plane)
-            ch = ConvexHull(all_pts_rot[:, :2])
-            hull_xy = all_pts_rot[ch.vertices, :2]
+                def order_ring(indices):
+                    adj = {}
+                    for a, b in indices:
+                        adj.setdefault(a, []).append(b)
+                        adj.setdefault(b, []).append(a)
+                    if not adj:
+                        return None
+                    start = next((i for i, nbrs in adj.items() if len(nbrs) == 2), None)
+                    if start is None:
+                        start = list(adj.keys())[0]
+                    ring = [start]; prev = None; cur_i = start
+                    for _ in range(len(adj) + 5):
+                        nbrs = adj[cur_i]
+                        nxt = nbrs[0] if nbrs[0] != prev else (nbrs[1] if len(nbrs) > 1 else None)
+                        if nxt is None: break
+                        if nxt == ring[0]: ring.append(nxt); break
+                        ring.append(nxt); prev, cur_i = cur_i, nxt
+                    return np.array(ring, int)
 
-            # Compare polygon areas to detect rectangular/global hulls
-            def poly_area(poly):
-                x = poly[:, 0]; y = poly[:, 1]
-                return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+                provided_order = order_ring(boundary_segs)
+                ring_xy = provided_xy[provided_order[:-1]] if provided_order is not None else None
 
-            area_provided = poly_area(ring_xy) if ring_xy is not None and len(ring_xy) >= 3 else 0.0
-            area_hull = poly_area(hull_xy) if len(hull_xy) >= 3 else 0.0
+                ch = ConvexHull(all_pts_rot[:, :2])
+                hull_xy = all_pts_rot[ch.vertices, :2]
 
-            # Decide boundary source:
-            # If provided boundary differs a lot from hull in rotated plane, rebuild from hull.
-            use_hull = (area_hull > 0 and (area_provided == 0 or abs(area_provided - area_hull) / area_hull > 0.25))
+                def poly_area(poly):
+                    if poly is None or len(poly) < 3: return 0.0
+                    x = poly[:, 0]; y = poly[:, 1]
+                    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
 
-            if use_hull:
-                # Refine hull by length, preserving vertices
-                ring = np.vstack([hull_xy, hull_xy[0]])
-                segs = []
-                refined_xy = []
-                total_idx = 0
+                area_provided = poly_area(ring_xy)
+                area_hull = poly_area(hull_xy)
+                use_hull = (area_hull > 0 and (area_provided == 0 or abs(area_provided - area_hull) / area_hull > 0.25))
 
-                def subdivide(p, q, L):
-                    d = np.linalg.norm(q - p)
-                    if d <= L * 1.001:
-                        return [p, q]
-                    n = max(1, int(np.ceil(d / L)))
-                    t = np.linspace(0.0, 1.0, n + 1)
-                    return [p * (1 - tt) + q * tt for tt in t]
+                try:
+                    base_size = float(self.target_feature_size_input.value())
+                    if base_size <= 1e-6: base_size = 1.0
+                except Exception:
+                    base_size = 1.0
 
-                for i in range(len(ring) - 1):
-                    pts_i = subdivide(ring[i], ring[i + 1], base_size)
-                    if i > 0:
-                        pts_i = pts_i[1:]  # avoid duplicate
-                    refined_xy.extend(pts_i)
+                if use_hull:
+                    ring = np.vstack([hull_xy, hull_xy[0]])
+                    refined = []
+                    for i in range(len(ring) - 1):
+                        p, q = ring[i], ring[i+1]
+                        d = np.linalg.norm(q - p)
+                        n = max(1, int(np.ceil(d / base_size)))
+                        t = np.linspace(0.0, 1.0, n + 1)
+                        seg_pts = [p*(1-tk) + q*tk for tk in t]
+                        if i > 0: seg_pts = seg_pts[1:]
+                        refined.extend(seg_pts)
+                    boundary_xy = np.asarray(refined, float)
+                    idxs = np.arange(len(boundary_xy), dtype=int)
+                    boundary_segs_for_tria = np.column_stack([idxs, np.roll(idxs, -1)])
+                    boundary_segs_for_tria[-1, 1] = 0
+                    tree_b = cKDTree(all_pts_rot[:, :2])
+                    di_b, ii_b = tree_b.query(boundary_xy, k=1)
+                    boundary_rot_for_snap = np.column_stack([boundary_xy, all_pts_rot[ii_b, 2]])
+                else:
+                    boundary_xy = provided_xy
+                    boundary_segs_for_tria = boundary_segs
+                    boundary_rot_for_snap = boundary_rot
 
-                refined_xy = np.asarray(refined_xy, dtype=float)
-                # Build segments for refined ring
-                idxs = np.arange(len(refined_xy), dtype=int)
-                segs = np.column_stack([idxs, np.roll(idxs, -1)])
-                segs[-1, 1] = 0  # close
+                triangulator = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=base_size)
+                tri_res = triangulator.triangulate(points=boundary_xy, segments=boundary_segs_for_tria, uniform=uniform, create_transition=True)
+                if tri_res is None or 'vertices' not in tri_res or 'triangles' not in tri_res:
+                    raise ValueError("Triangulation failed.")
+                vertices_xy = tri_res['vertices']; triangles = tri_res['triangles']
 
-                boundary_xy = refined_xy
-                boundary_segs_for_tria = segs
-                # For boundary Z snapping, build a boundary map in rotated coords
-                # Reuse Z from nearest SDs on the boundary (exact keying done later)
-                boundary_rot_from_xy = np.zeros((len(boundary_xy), 3))
-                boundary_rot_from_xy[:, :2] = boundary_xy
-                # Interpolate provisional Z from SDs to have keys
-                tree_b = cKDTree(all_pts_rot[:, :2])
-                di_b, ii_b = tree_b.query(boundary_xy, k=1)
-                boundary_rot_from_xy[:, 2] = all_pts_rot[ii_b, 2]
-                boundary_rot_for_snap = boundary_rot_from_xy
-            else:
-                # Use provided segments projected to rotated XY
-                boundary_xy = provided_xy
-                boundary_segs_for_tria = boundary_segs
-                boundary_rot_for_snap = boundary_rot
+                # Legacy IDW(1/r^4) + boundary snap
+                sample_xy = all_pts_rot[:, :2]; sample_z = all_pts_rot[:, 2]
+                tree = cKDTree(sample_xy)
+                k = min(64, len(sample_xy))
+                dists, idxs = tree.query(vertices_xy, k=k)
+                if k == 1: dists = dists[:, None]; idxs = idxs[:, None]
 
-            # 3) Triangulate in rotated XY
-            if not HAVE_DIRECT_WRAPPER:
-                raise ImportError("DirectTriangleWrapper not available")
-            from meshit.triangle_direct import DirectTriangleWrapper
-            triangulator = DirectTriangleWrapper(
-                gradient=gradient,
-                min_angle=min_angle,
-                base_size=base_size
-            )
-            tri_res = triangulator.triangulate(
-                points=boundary_xy,
-                segments=boundary_segs_for_tria,
-                uniform=uniform,
-                create_transition=True
-            )
+                def key_xy(xy): return (round(float(xy[0]), 9), round(float(xy[1]), 9))
+                boundary_map = {key_xy(p[:2]): float(p[2]) for p in boundary_rot_for_snap}
+
+                final_vertices_rot3d = np.zeros((len(vertices_xy), 3), float)
+                final_vertices_rot3d[:, :2] = vertices_xy
+                for i in range(len(vertices_xy)):
+                    kxy = key_xy(vertices_xy[i])
+                    if kxy in boundary_map:
+                        final_vertices_rot3d[i, 2] = boundary_map[kxy]; continue
+                    di = dists[i]; ii = idxs[i]
+                    r2 = np.maximum(di*di, 1e-24); w = 1.0 / (r2 * r2); wsum = float(np.sum(w))
+                    final_vertices_rot3d[i, 2] = float(np.sum(w * sample_z[ii]) / wsum) if wsum > 0 else float(np.mean(sample_z))
+
+                final_vertices_3d = (R_inv @ final_vertices_rot3d.T).T
+                dataset['triangulation_result'] = {'vertices': final_vertices_3d, 'triangles': triangles}
+                logger.info(f"Triangulation for {dataset_name} (Legacy) completed. V={len(final_vertices_3d)}, T={len(triangles)}")
+                return True
+
+            # Modern methods: TPS / Linear / IDW / Plane / Kriging / Clough–Tocher (no boundary snap)
+            boundary_rot3d = (R @ boundary_xyz.T).T
+            boundary_xy = boundary_rot3d[:, :2].copy()
+            boundary_segs_for_tria = boundary_segs
+
+            triangulator = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=float(self.target_feature_size_input.value()) if self.target_feature_size_input.value() > 1e-6 else 1.0)
+            tri_res = triangulator.triangulate(points=boundary_xy, segments=boundary_segs_for_tria, holes=np.empty((0, 2)), uniform=uniform, create_transition=True)
             if tri_res is None or 'vertices' not in tri_res or 'triangles' not in tri_res:
-                raise ValueError("Triangulation failed to produce valid output.")
+                raise ValueError("Triangulation failed.")
+            vertices_xy = tri_res['vertices']; triangles = tri_res['triangles']
 
-            vertices_xy = tri_res['vertices']
-            triangles = tri_res['triangles']
+            sample_xy = all_pts_rot[:, :2]; sample_z = all_pts_rot[:, 2]
 
-            # 4) Interpolate Z on rotated 2D domain (IDW 1/r^4) with boundary snap
-            sample_xy = all_pts_rot[:, :2]
-            sample_z = all_pts_rot[:, 2]
-            tree = cKDTree(sample_xy)
-            k = min(64, len(sample_xy))
-            dists, idxs = tree.query(vertices_xy, k=k)
-            if k == 1:
-                dists = dists[:, None]
-                idxs = idxs[:, None]
+            def interp_linear(q):
+                dela = Delaunay(sample_xy); out = np.empty(len(q), float); out[:] = np.nan
+                s = dela.find_simplex(q); inside = s >= 0
+                if np.any(inside):
+                    T = dela.transform[s[inside]]; r = q[inside] - T[:, 2]
+                    bary = np.einsum('ijk,ik->ij', T[:, :2, :], r)
+                    w0 = 1.0 - bary.sum(axis=1); w1 = bary[:, 0]; w2 = bary[:, 1]
+                    inds = dela.simplices[s[inside]]
+                    out[inside] = w0*sample_z[inds[:, 0]] + w1*sample_z[inds[:, 1]] + w2*sample_z[inds[:, 2]]
+                if np.any(~inside):
+                    tree = cKDTree(sample_xy); k = min(12, len(sample_xy))
+                    d, idx = tree.query(q[~inside], k=k)
+                    if k==1: d=d[:,None]; idx=idx[:,None]
+                    P = sample_xy[idx]; Z = sample_z[idx]
+                    A = np.concatenate([P, np.ones((P.shape[0],P.shape[1],1))], axis=2); At = np.transpose(A,(0,2,1))
+                    coef = np.linalg.solve(At@A, At@Z[...,None]); a=coef[:,0,0]; b=coef[:,1,0]; c=coef[:,2,0]
+                    uv = q[~inside]; out[~inside] = a*uv[:,0] + b*uv[:,1] + c
+                return out
 
-            def key_xy(xy):
-                return (round(float(xy[0]), 9), round(float(xy[1]), 9))
+            def interp_idw(q, power=4):
+                tree = cKDTree(sample_xy); k = min(64, len(sample_xy))
+                d, idx = tree.query(q, k=k)
+                if k==1: d=d[:,None]; idx=idx[:,None]
+                r2 = np.maximum(d*d, 1e-24); w = 1.0/(r2**(power/2.0)); wsum = np.sum(w, axis=1)
+                return np.sum(w * sample_z[idx], axis=1) / wsum
 
-            boundary_map = {key_xy(xy[:2]): float(xy[2]) for xy in boundary_rot_for_snap}
+            def interp_plane(q):
+                tree = cKDTree(sample_xy); k = min(12, len(sample_xy))
+                d, idx = tree.query(q, k=k)
+                if k==1: d=d[:,None]; idx=idx[:,None]
+                P = sample_xy[idx]; Z = sample_z[idx]
+                A = np.concatenate([P, np.ones((P.shape[0],P.shape[1],1))], axis=2); At = np.transpose(A,(0,2,1))
+                coef = np.linalg.solve(At@A, At@Z[...,None]); a=coef[:,0,0]; b=coef[:,1,0]; c=coef[:,2,0]
+                return a*q[:,0] + b*q[:,1] + c
 
-            final_vertices_rot3d = np.zeros((len(vertices_xy), 3), dtype=float)
-            final_vertices_rot3d[:, :2] = vertices_xy
+            def interp_tps(q):
+                try:
+                    rbf = RBFInterpolator(sample_xy, sample_z, kernel='thin_plate_spline', smoothing=float(smoothing))
+                    return rbf(q)
+                except Exception:
+                    return interp_linear(q)
 
-            for i in range(len(vertices_xy)):
-                kxy = key_xy(vertices_xy[i])
-                if kxy in boundary_map:
-                    final_vertices_rot3d[i, 2] = boundary_map[kxy]
-                    continue
-                di = dists[i]
-                ii = idxs[i]
-                r2 = np.maximum(di * di, 1e-24)
-                w = 1.0 / (r2 * r2)  # 1/(r^4)
-                wsum = float(np.sum(w))
-                final_vertices_rot3d[i, 2] = float(np.sum(w * sample_z[ii]) / wsum) if wsum > 0 else float(np.mean(sample_z))
+            def interp_kriging(q):
+                pts = sample_xy; vals = sample_z
+                n = len(pts)
+                if n < 3:
+                    return interp_plane(q)
+                bb = np.max(pts, axis=0) - np.min(pts, axis=0)
+                diag = float(np.linalg.norm(bb))
+                rng = max(1e-12, 0.5*diag)
+                sill = float(np.var(vals)) + 1e-12
+                nugget = 1e-6 * sill
+                dmat = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+                gamma = sill * (1.0 - np.exp(-dmat / rng))
+                C = sill - gamma
+                np.fill_diagonal(C, C.diagonal() + nugget)
+                A = np.empty((n+1, n+1), float)
+                A[:n,:n]=C; A[:n,n]=1.0; A[n,:n]=1.0; A[n,n]=0.0
+                try:
+                    A_inv = np.linalg.inv(A)
+                except np.linalg.LinAlgError:
+                    return interp_linear(q)
+                out = np.empty(len(q), float)
+                for i, qi in enumerate(q):
+                    dq = np.linalg.norm(pts - qi[None, :], axis=1)
+                    gamma_q = sill * (1.0 - np.exp(-dq / rng))
+                    cvec = (sill - gamma_q)
+                    b = np.empty(n+1, float); b[:n]=cvec; b[n]=1.0
+                    x = A_inv @ b
+                    lamb = x[:n]
+                    out[i] = float(np.dot(lamb, vals))
+                return out
 
-            # 5) Rotate back to original orientation
+            from scipy.interpolate import CloughTocher2DInterpolator
+
+            def interp_ct(q, k_neighbors=12, spike_factor=3.0):
+                # Precompute once
+                tree_nn = cKDTree(sample_xy)
+                # Global median spacing (2nd nn) to detect sparsity
+                d_all, _ = tree_nn.query(sample_xy, k=min(8, len(sample_xy)))
+                global_med = float(np.median(d_all[:, 1])) if d_all.shape[1] > 1 else float(np.median(d_all))
+
+                ct = CloughTocher2DInterpolator(sample_xy, sample_z, fill_value=np.nan)
+                z_ct = ct(q)
+
+                z_out = np.empty(len(q), dtype=float)
+                for i, qi in enumerate(q):
+                    # Local plane fit
+                    d, idx = tree_nn.query(qi, k=min(k_neighbors, len(sample_xy)))
+                    if np.isscalar(idx):
+                        idx = np.array([idx]); d = np.array([d])
+                    P = sample_xy[idx]                # (m,2)
+                    Z = sample_z[idx]                 # (m,)
+                    A = np.column_stack([P, np.ones(P.shape[0])])  # (m,3)
+                    try:
+                        coef, *_ = np.linalg.lstsq(A, Z, rcond=None)   # a,b,c
+                        z_lp = coef[0]*qi[0] + coef[1]*qi[1] + coef[2]
+                        z_fit = A @ coef
+                        sigma = float(np.std(Z - z_fit)) + 1e-12
+                    except Exception:
+                        # Fallback: simple mean
+                        z_lp = float(np.mean(Z))
+                        sigma = float(np.std(Z - z_lp)) + 1e-12
+
+                    zc = z_ct[i]
+                    if np.isnan(zc):
+                        z_out[i] = z_lp
+                        continue
+
+                    # Blend down CT in sparse zones
+                    mean_d = float(np.mean(d))
+                    sparsity = mean_d / max(global_med, 1e-12)
+                    alpha = 1.0 / (1.0 + (max(sparsity - 1.0, 0.0))**2)  # in [0,1], smaller when sparse
+
+                    # Clamp CT residual to local noise
+                    delta = alpha * (zc - z_lp)
+                    cap = spike_factor * sigma
+                    z_out[i] = z_lp + float(np.clip(delta, -cap, cap))
+
+                return z_out
+            def interp_robust_mls(q, k=24, iters=3, c=4.685, h_mult=2.0):
+                # q: (M,2) in rotated plane; sample_xy/sample_z in scope
+                tree = cKDTree(sample_xy)
+                # global scale from sampling density (median 2nd-NN)
+                d_all, _ = tree.query(sample_xy, k=min(8, len(sample_xy)))
+                global_med = float(np.median(d_all[:, 1])) if d_all.shape[1] > 1 else float(np.median(d_all))
+                h = max(global_med * h_mult, 1e-9)
+
+                out = np.empty(len(q), dtype=float)
+                for i, qi in enumerate(q):
+                    # neighbors
+                    d, idx = tree.query(qi, k=min(k, len(sample_xy)))
+                    if np.isscalar(idx):  # single neighbor fallback
+                        out[i] = float(sample_z[idx])
+                        continue
+
+                    P = sample_xy[idx]             # (k,2)
+                    Z = sample_z[idx]              # (k,)
+                    # distance kernel (Gaussian)
+                    w_dist = np.exp(- (d / h) ** 2).astype(float) + 1e-12
+
+                    # initialize plane coeffs by ordinary LS
+                    A = np.column_stack([P, np.ones(P.shape[0])])      # (k,3)
+                    coef, *_ = np.linalg.lstsq(A, Z, rcond=None)       # a,b,c
+
+                    for _ in range(iters):
+                        z_fit = A @ coef
+                        r = Z - z_fit
+                        # robust scale
+                        s = np.median(np.abs(r)) / 0.6745 + 1e-12
+                        u = r / (c * s)
+                        # Tukey biweight in residuals
+                        w_rob = np.where(np.abs(u) < 1.0, (1 - u**2)**2, 0.0)
+                        W = (w_dist * w_rob)
+                        if np.sum(W) < 1e-12:
+                            break
+                        # weighted LS: (A^T W A)x = A^T W Z
+                        Aw = A * W[:, None]
+                        try:
+                            coef = np.linalg.lstsq(Aw.T @ A, Aw.T @ Z, rcond=None)[0]
+                        except Exception:
+                            break
+
+                    out[i] = coef[0]*qi[0] + coef[1]*qi[1] + coef[2]
+                return out
+            if "Thin Plate" in interp_label: z_out = interp_tps(vertices_xy)
+            elif "Linear" in interp_label:  z_out = interp_linear(vertices_xy)
+            elif "IDW" in interp_label:     z_out = interp_idw(vertices_xy)
+            elif "Kriging" in interp_label: z_out = interp_kriging(vertices_xy)
+            elif "Clough" in interp_label:  z_out = interp_ct(vertices_xy)
+            elif "MLS" in interp_label:  z_out = interp_robust_mls(vertices_xy)  
+            else:                            z_out = interp_plane(vertices_xy)
+
+            final_vertices_rot3d = np.column_stack([vertices_xy, z_out])
             final_vertices_3d = (R_inv @ final_vertices_rot3d.T).T
 
-            dataset['triangulation_result'] = {
-                'vertices': final_vertices_3d,
-                'triangles': triangles,
-            }
-
-            elapsed = time.time() - start_time
-            logger.info(f"Triangulation for {dataset_name} completed in {elapsed:.2f}s. "
-                        f"Vertices: {len(final_vertices_3d)}, Triangles: {len(triangles)}")
+            dataset['triangulation_result'] = {'vertices': final_vertices_3d, 'triangles': triangles}
+            logger.info(f"Triangulation for {dataset_name} completed. V={len(final_vertices_3d)}, T={len(triangles)}")
             return True
 
         except Exception as e:
             logger.error(f"Error during triangulation for '{dataset_name}': {e}", exc_info=True)
             return False
+    def _attach_vtu_constraints_to_all_datasets(self) -> None:
+        """
+        Parse VTU 'CON' style constraints and attach to each dataset as:
+        dataset['constraints'] = [
+            { 'type': 'SEGMENTS'|'HOLES', 'points': (M,3) float array },
+            ...
+        ]
+        If no constraints found, leaves dataset unchanged.
+        """
+        import numpy as np
+        import pyvista as pv
 
+        updated = 0
+        for idx, ds in enumerate(self.datasets):
+            path = ds.get('file_path')
+            if not path or not str(path).lower().endswith('.vtu'):
+                continue
+
+            try:
+                mesh = pv.read(path)
+                # Ensure PolyData
+                if not isinstance(mesh, pv.PolyData):
+                    mesh = mesh.extract_surface()
+
+                # We look for line cells (polylines) that carry matType per-cell info
+                # Common names seen in C++: matType, matR, matG, matB
+                matType = None
+                for key in list(mesh.cell_data.keys()):
+                    if key.lower() == 'mattype':
+                        matType = np.asarray(mesh.cell_data[key]).astype(int)
+                        break
+
+                constraints = []
+                if mesh.n_cells > 0 and mesh.lines.size > 0:
+                    lines = mesh.lines.ravel()
+                    pts = np.asarray(mesh.points, dtype=float)
+                    i = 0
+                    cell_id = 0
+                    while i < len(lines):
+                        n = int(lines[i]); i += 1
+                        ids = lines[i:i + n]; i += n
+                        if n >= 2:
+                            ring_pts = pts[ids].astype(float)
+                            # Treat as closed if endpoints coincide
+                            if np.linalg.norm(ring_pts[0] - ring_pts[-1]) > 1e-12:
+                                ring_pts = np.vstack([ring_pts, ring_pts[0]])
+
+                            ctype = 'SEGMENTS'
+                            if matType is not None and 0 <= cell_id < len(matType):
+                                if matType[cell_id] == 2:
+                                    ctype = 'HOLES'
+                                elif matType[cell_id] == 1:
+                                    ctype = 'UNDEFINED'
+                                else:
+                                    ctype = 'SEGMENTS'
+
+                            constraints.append({
+                                'type': ctype,
+                                'points': ring_pts
+                            })
+                        cell_id += 1
+
+                if constraints:
+                    ds['constraints'] = constraints
+                    updated += 1
+            except Exception as e:
+                logger.warning(f"[VTU-CON] Failed to attach constraints for {ds.get('name', idx)}: {e}")
+
+        if updated:
+            self.statusBar().showMessage(f"Attached VTU constraints for {updated} dataset(s)")
     def run_triangulation(self):
-        """Run triangulation on the segments and points of the *active* dataset (primarily for context menu)"""
-        # Check if we have an active dataset
+        # Refresh VTU boundary segments before triangulating the active dataset
+        self._rebuild_segments_from_vtu_boundaries()
+        self._attach_vtu_constraints_to_all_datasets()
+
         if self.current_dataset_index < 0 or self.current_dataset_index >= len(self.datasets):
             self.statusBar().showMessage("Error: No active dataset selected")
             QMessageBox.critical(self, "Error", "No active dataset selected")
             return
-
-        self.statusBar().showMessage(f"Running triangulation for {self.datasets[self.current_dataset_index]['name']}...") # Add status message here for single run
+        self.statusBar().showMessage(f"Running triangulation for {self.datasets[self.current_dataset_index]['name']}...")
         success = self._run_triangulation_for_dataset(self.current_dataset_index)
-
         if success:
-            # Update statistics and visualization after computing for the active one
             self._update_statistics()
             self._visualize_all_triangulations()
-            self._update_visualization() # Ensure other dependent views are updated/cleared
-            self.notebook.setCurrentIndex(3)  # Switch to triangulation tab
+            self._update_visualization()
+            self.notebook.setCurrentIndex(3)
             self.statusBar().showMessage(f"Completed triangulation for {self.datasets[self.current_dataset_index]['name']}") # Add success message here
 
     def run_all_triangulations(self):
-        """Run triangulation for all datasets that have segments using a worker thread."""
+        # Ensure VTU datasets have true boundary rings as segments
+        self._rebuild_segments_from_vtu_boundaries()
+        self._attach_vtu_constraints_to_all_datasets()
+
+
         datasets_with_segments_indices = [i for i, d in enumerate(self.datasets) if d.get('segments') is not None]
         if not datasets_with_segments_indices:
             QMessageBox.information(self, "No Segments", "No datasets have computed segments. Please compute segments first.")
