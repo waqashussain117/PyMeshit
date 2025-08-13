@@ -16063,9 +16063,11 @@ segmentation, triangulation, and visualization.
             Surface
                 Hull segments →  Seg 0, Seg 1, …
                 Intersection n → Seg 0, Seg 1, …
-        Every Seg-item represents one two-point constraint segment.
+        Every Seg-item represents ONE selectable block:
+        - For intersections: between TRIPLE_POINTs and endpoints (or wrapping for closed loops)
+        - For hull: per-edge as before
         """
-        from meshit.intersection_utils import split_line_at_special_points
+        from meshit.intersection_utils import Vector3D
 
         if not hasattr(self, "refine_constraint_tree"):
             return
@@ -16077,6 +16079,92 @@ segmentation, triangulation, and visualization.
         # (surface_idx , seg_uid)  →  {'points':[...], 'type':'HULL'|'INTERSECTION', 'ctype':'HULL'|'INT'}
         self._refine_segment_map: Dict[Tuple[int, int], Dict] = {}
         seg_uid = 0
+
+        def get_type(p):
+            # Works for Vector3D or [x, y, z, type]
+            if hasattr(p, "point_type") and p.point_type is not None:
+                return p.point_type
+            if hasattr(p, "type") and p.type is not None:
+                return p.type
+            if isinstance(p, (list, tuple)) and len(p) > 3:
+                return p[3]
+            return "DEFAULT"
+
+        def is_closed_loop(pts):
+            if len(pts) < 3:
+                return False
+            # Use distance and loop markers
+            def as_xyz(q):
+                if hasattr(q, "x"):
+                    return (float(q.x), float(q.y), float(q.z))
+                return (float(q[0]), float(q[1]), float(q[2]))
+            x1, y1, z1 = as_xyz(pts[0])
+            x2, y2, z2 = as_xyz(pts[-1])
+            d = ((x1 - x2)**2 + (y1 - y2)**2 + (z1 - z2)**2) ** 0.5
+            if d < 1e-4:
+                return True
+            last_t = get_type(pts[-1])
+            if ("LOOP_END" in last_t) or ("CIRCULAR" in last_t):
+                return True
+            # Optional: if any point marked CIRCULAR
+            for q in pts:
+                if "CIRCULAR" in get_type(q):
+                    return True
+            return False
+
+        def segment_by_triples(pts):
+            """
+            Return list of segments (each a list of points), split only at TRIPLE_POINTs,
+            and at endpoints. For closed loops, wrap between last and first triple.
+            """
+            if len(pts) < 2:
+                return []
+            n = len(pts)
+            triples = [i for i, q in enumerate(pts) if get_type(q) == "TRIPLE_POINT"]
+
+            closed = is_closed_loop(pts)
+            segments = []
+
+            # No triple points
+            if not triples:
+                # One segment: whole polyline (or loop); we do not add a duplicate closing edge here.
+                segments.append(pts[:])
+                return segments
+
+            # At least one triple
+            if closed:
+                # For loops, cut between consecutive triples and wrap
+                # Deduplicate potential triple at both ends if first and last coincide
+                tri = sorted(set(triples))
+                # Build circular segments
+                for a, b in zip(tri, tri[1:] + tri[:1]):
+                    if a <= b:
+                        seg = pts[a:b+1]
+                    else:
+                        # wrap-around: from a..end, then start..b
+                        seg = pts[a:] + pts[:b+1]
+                    if len(seg) >= 2:
+                        segments.append(seg)
+            else:
+                # Open polyline: endpoints are split points too
+                splits = [0] + sorted(triples) + [n - 1]
+                # Remove immediate duplicates (e.g., triple at index 0)
+                dedup_splits = []
+                for s in splits:
+                    if not dedup_splits or dedup_splits[-1] != s:
+                        dedup_splits.append(s)
+                # Build segments between consecutive split indices
+                for a, b in zip(dedup_splits[:-1], dedup_splits[1:]):
+                    if b - a >= 1:
+                        seg = pts[a:b+1]
+                        if len(seg) >= 2:
+                            segments.append(seg)
+
+            return segments
+
+        def _dedupe_preserve_special_local(pts):
+            # reuse existing logic to preserve best special type at same coords
+            return self._dedupe_preserve_special(pts)
 
         for s_idx, ds in enumerate(self.datasets):
             if ds.get("type") == "polyline":
@@ -16131,10 +16219,10 @@ segmentation, triangulation, and visualization.
                     continue
 
                 # remove duplicates BUT keep the best special-point flag
-                deduped = self._dedupe_preserve_special(raw_pts)
+                deduped = _dedupe_preserve_special_local(raw_pts)
 
-                # split at every special point
-                seg_lists = split_line_at_special_points(deduped, default_size=1.0)
+                # Build blocks ONLY between triple points and endpoints
+                seg_lists = segment_by_triples(deduped)
                 if not seg_lists:
                     continue
 
@@ -16147,36 +16235,33 @@ segmentation, triangulation, and visualization.
                 line_item.setData(0, Qt.UserRole, {"type": "intersection_group", "surface_idx": s_idx})
 
                 for k, seg_pts in enumerate(seg_lists):
-                    for e in range(len(seg_pts) - 1):
-                        p1, p2 = seg_pts[e], seg_pts[e + 1]
+                    seg_item = QTreeWidgetItem(line_item)
+                    seg_item.setText(0, f"Seg {k}")
+                    seg_item.setText(1, "INTERSECTION")  # Set type column
+                    seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
+                    seg_item.setCheckState(0, Qt.Checked)
+                    # Add hole checkbox in column 4
+                    seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
+                    seg_item.setCheckState(4, Qt.Unchecked)  # Default: not a hole
+                    seg_item.setData(0, Qt.UserRole, {
+                        "type": "constraint",
+                        "surface_idx": s_idx,
+                        "seg_uid": seg_uid
+                    })
 
-                        seg_item = QTreeWidgetItem(line_item)
-                        seg_item.setText(0, f"Seg {k}.{e}")
-                        seg_item.setText(1, "INTERSECTION")  # Set type column
-                        seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
-                        seg_item.setCheckState(0, Qt.Checked)
-                        # Add hole checkbox in column 4
-                        seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
-                        seg_item.setCheckState(4, Qt.Unchecked)  # Default: not a hole
-                        seg_item.setData(0, Qt.UserRole, {
-                            "type": "constraint",
-                            "surface_idx": s_idx,
-                            "seg_uid": seg_uid
-                        })
-
-                        self._refine_segment_map[(s_idx, seg_uid)] = {
-                            "points": [p1, p2],
-                            "type": "INTERSECTION",  # normalized
-                            "ctype": "INT",          # keep for compatibility
-                            "is_hole": False,
-                            "selected": True,
-                            "line_id": line_id,
-                        }
-                        seg_uid += 1
+                    self._refine_segment_map[(s_idx, seg_uid)] = {
+                        "points": seg_pts,           # full block (not pairwise)
+                        "type": "INTERSECTION",      # normalized
+                        "ctype": "INT",              # keep for compatibility
+                        "is_hole": False,
+                        "selected": True,
+                        "line_id": line_id,
+                    }
+                    seg_uid += 1
 
         tree.expandAll()
         tree.blockSignals(False)
-        logger.info("Segment-level constraint tree populated (types normalized to HULL/INTERSECTION).")
+        logger.info("Segment-level constraint tree populated (intersection segments between TRIPLE_POINTs and endpoints).")
         
     def _collect_selected_refine_segments(self, surface_idx: int) -> List[List]:
         """Return list of point-pairs [p1, p2] for all checked segments."""
