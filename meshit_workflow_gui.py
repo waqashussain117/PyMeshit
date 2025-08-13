@@ -5368,14 +5368,9 @@ class MeshItWorkflowGUI(QMainWindow):
             QMessageBox.warning(self, "Refinement Error", f"Error during length-based refinement: {str(e)}")
             return
 
-        # --- Refine convex hulls by length (unchanged from your version) ---
-        # --- Keep convex hull geometry EXACTLY (no length-based resampling) ---
-        # --- Keep convex hull geometry EXACTLY (no length-based resampling) ---
-        # --- Refine convex hulls by length (geometry-preserving, per-surface) ---
+                # --- Refine convex hulls by length (Segmentation-style, C++-equivalent) ---
         try:
             refined_hull_count = 0
-
-            # temp surface idx -> original dataset idx
             temp_to_orig = {ti: oi for oi, ti in temp_model.surface_original_to_temp_idx_map.items()}
 
             for temp_idx, temp_surface in enumerate(temp_model.surfaces):
@@ -5384,34 +5379,43 @@ class MeshItWorkflowGUI(QMainWindow):
 
                 orig_idx = temp_to_orig.get(temp_idx, -1)
 
-                # Per‑surface target size from the table (fallback to unified)
+                # Table-driven target; optionally clamp by object size when non-uniform
                 eff_target_length = _get_target_for_surface(orig_idx)
                 if not uniform_meshing and getattr(temp_surface, 'size', 0.0) > 1e-6:
                     eff_target_length = min(eff_target_length, temp_surface.size)
                 if eff_target_length <= 1e-6:
                     eff_target_length = 0.1
 
-                # Use the same robust routine as Segmentation; this inserts points on edges without moving geometry
+                # Build a line preserving original point types (DO NOT force anchors).
+                # This allows DEFAULT hull vertices to be removed (coarsened) by RefineByLength.
                 class _HullLine:
                     def __init__(self, pts):
-                        self.points = pts  # list[Vector3D] with point_type preserved
+                        self.points = []
+                        for p in pts:
+                            self.points.append(
+                                Vector3D(
+                                    p.x, p.y, p.z,
+                                    point_type=getattr(p, "point_type", getattr(p, "type", "DEFAULT")) or "DEFAULT"
+                                )
+                            )
 
                 hull_line = _HullLine(temp_surface.convex_hull)
+
                 refined = refine_intersection_line_by_length(
                     hull_line,
-                    target_length=eff_target_length,
+                    target_length=float(eff_target_length),
                     min_angle_deg=min_angle_deg,
-                    uniform_meshing=uniform_meshing
+                    uniform_meshing=uniform_meshing  # round to nearest like C++
                 )
 
-                # Keep “open ring” semantics consistent (avoid duplicate last==first)
+                # For a closed ring, avoid duplicating the first point at the end
                 if len(refined) >= 2 and (refined[0] - refined[-1]).length_squared() < 1e-24:
                     refined = refined[:-1]
 
                 temp_surface.convex_hull = refined
                 refined_hull_count += 1
 
-            logger.info(f"Refined {refined_hull_count} convex hull(s) by length (geometry preserved, per-surface).")
+            logger.info(f"Refined {refined_hull_count} convex hull(s) by RefineByLength (DEFAULT removed, table-driven).")
         except Exception as e:
             logger.error(f"Error during convex hull length refinement: {e}", exc_info=True)
             QMessageBox.warning(self, "Refinement Error", f"Error during convex hull length refinement: {str(e)}")

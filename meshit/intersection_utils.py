@@ -1832,274 +1832,73 @@ def make_corners_special(convex_hull: List[Vector3D], angle_threshold_deg: float
 
 def align_intersections_to_convex_hull(surface_idx: int, model):
     """
-    Align intersection points to the convex hull of a surface.
-    This closely follows the C++ MeshIt alignIntersectionsToConvexHull function.
-    
-    Key behaviors:
-    1. Snap intersection endpoints to existing special hull points if close enough
-    2. Project intersection endpoints onto hull segments and create new special points
-    3. Insert these new special points into the convex hull
-    4. Clean up and refine the hull
-    
-    Args:
-        surface_idx: Index of the surface in model.surfaces
-        model: MeshItModel instance (temporary model wrapper from GUI)
+    Geometry-preserving alignment only (no resampling here).
+    - Do not simplify/resample/split hull edges here
+    - Only snap intersection endpoints to existing special hull vertices
+    - If not snapped, project to closest hull edge and INSERT a new special vertex on that edge
+    - Keep original hull vertex types so downstream RefineByLength can remove DEFAULT points
     """
     surface = model.surfaces[surface_idx]
-    
-    if not hasattr(surface, 'convex_hull') or not surface.convex_hull:
-        logger.warning(f"Surface {surface_idx} has no convex hull for alignment.")
+    if not hasattr(surface, "convex_hull") or not surface.convex_hull or len(surface.convex_hull) < 3:
+        logger.warning(f"Surface {surface_idx} has no valid convex hull for alignment.")
         return
-    
-    if len(surface.convex_hull) < 3:
-        logger.warning(f"Surface {surface_idx} convex hull has < 3 points, skipping alignment.")
-        return
-    
-    logger.info(f"Aligning intersections to convex hull for surface {surface_idx}")
-    
-    original_hull_size = len(surface.convex_hull)
-    logger.info(f"Original hull size for surface {surface_idx}: {original_hull_size} points")
-    
-    # Simplify overly complex hulls before processing (similar to C++ MeshIt approach)
-    MAX_HULL_POINTS = 100  # Reasonable limit for hull complexity
-    if original_hull_size > MAX_HULL_POINTS:
-        logger.info(f"Hull with {original_hull_size} points is too complex, applying simplification...")
-        
-        # Use the same target size logic as hull refinement for consistent sizing
-        tgt = getattr(surface, "size", 0.1)
-        if tgt <= 1e-6:
-            tgt = 0.1
-            
-        logger.info(f"Using target size {tgt:.6f} for hull simplification")
-        
-        # Calculate total perimeter of the hull
-        total_perimeter = 0.0
-        for i in range(original_hull_size):
-            p1 = surface.convex_hull[i]
-            p2 = surface.convex_hull[(i + 1) % original_hull_size]
-            total_perimeter += (p2 - p1).length()
-        
-        # Calculate target number of points based on perimeter and target size
-        target_points = max(8, min(MAX_HULL_POINTS, int(total_perimeter / tgt)))
-        logger.info(f"Hull perimeter: {total_perimeter:.3f}, target points: {target_points}")
-        
-        if target_points < original_hull_size:
-            # Simplify by sampling points at regular intervals along the perimeter
-            simplified_hull = []
-            target_spacing = total_perimeter / target_points
-            current_distance = 0.0
-            next_target = 0.0
-            
-            # Always include first point
-            simplified_hull.append(surface.convex_hull[0])
-            next_target = target_spacing
-            
-            for i in range(original_hull_size):
-                p1 = surface.convex_hull[i]
-                p2 = surface.convex_hull[(i + 1) % original_hull_size]
-                segment_length = (p2 - p1).length()
-                
-                # Check if we need to add points along this segment
-                while current_distance + segment_length >= next_target and len(simplified_hull) < target_points:
-                    # Calculate interpolation factor
-                    remaining_distance = next_target - current_distance
-                    t = remaining_distance / segment_length if segment_length > 1e-10 else 0.0
-                    
-                    # Create interpolated point
-                    interp_point = Vector3D(
-                        p1.x + t * (p2.x - p1.x),
-                        p1.y + t * (p2.y - p1.y),
-                        p1.z + t * (p2.z - p1.z)
-                    )
-                    
-                    # Preserve corner points if they're close to the interpolated point
-                    pt_type = getattr(p1, 'point_type', getattr(p1, 'type', "DEFAULT"))
-                    if pt_type == "CORNER" and t < 0.1:
-                        simplified_hull.append(p1)
-                    elif i == original_hull_size - 1:  # Last segment, check p2 for corner
-                        pt_type2 = getattr(p2, 'point_type', getattr(p2, 'type', "DEFAULT"))
-                        if pt_type2 == "CORNER" and t > 0.9:
-                            simplified_hull.append(p2)
-                        else:
-                            simplified_hull.append(interp_point)
-                    else:
-                        simplified_hull.append(interp_point)
-                    
-                    next_target += target_spacing
-                
-                current_distance += segment_length
-            
-            # Ensure we have a reasonable number of points
-            if len(simplified_hull) >= 3:
-                surface.convex_hull = simplified_hull
-                logger.info(f"Simplified hull from {original_hull_size} to {len(surface.convex_hull)} points using target size {tgt:.6f}")
-            else:
-                logger.warning(f"Hull simplification resulted in too few points ({len(simplified_hull)}), keeping original")
-        else:
-            logger.info(f"Hull already has appropriate size ({original_hull_size} points for target {target_points})")
-    
-    # Process all intersections that involve this surface
-    for intersection_idx, intersection in enumerate(model.intersections):
-        # Check if this surface is involved in this intersection
-        is_surface1 = not model.is_polyline.get(intersection.id1, True)
-        is_surface2 = not model.is_polyline.get(intersection.id2, True)
-        
-        surface_is_id1 = is_surface1 and intersection.id1 == surface_idx
-        surface_is_id2 = is_surface2 and intersection.id2 == surface_idx
-        
-        if not (surface_is_id1 or surface_is_id2):
+
+    snap_tol = 1e-8
+    proj_tol = 1e-6
+
+    # 1) Align endpoints to hull without moving existing vertices
+    for inter in model.intersections:
+        # Is this intersection touching this surface?
+        is_surface1 = not model.is_polyline.get(inter.id1, True)
+        is_surface2 = not model.is_polyline.get(inter.id2, True)
+        if not ((is_surface1 and inter.id1 == surface_idx) or (is_surface2 and inter.id2 == surface_idx)):
             continue
-            
-        if len(intersection.points) < 1:
+        if not inter.points:
             continue
-        
-        # Process first and last points of the intersection Taking points from the C ++ Version of Meshit
-        points_to_process = []
-        if len(intersection.points) == 1:
-            points_to_process = [(0, intersection.points[0])] # 0 represents the first point, -1 represents the last point
-        else:
-            points_to_process = [(0, intersection.points[0]), (-1, intersection.points[-1])]
-        
-        for point_idx_in_intersection, intersection_point in points_to_process:
-            # Try to align this intersection point to the convex hull
-            aligned = False
-            
-            # Step 1: Check if close to existing special hull points
-            for hull_pt_idx, hull_pt in enumerate(surface.convex_hull):
-                # Only snap to special points (non-DEFAULT)
-                hull_pt_type = getattr(hull_pt, 'point_type', getattr(hull_pt, 'type', "DEFAULT"))
-                if hull_pt_type != "DEFAULT":
-                    distance = (intersection_point - hull_pt).length()
-                    if distance < 1e-8:  # Very close to special point # 1e-8 means 0.00000001
-                        # Snap intersection point to the special hull point
-                        if point_idx_in_intersection == 0:
-                            intersection.points[0] = hull_pt
-                        else:
-                            intersection.points[-1] = hull_pt
-                        aligned = True
-                        logger.info(f"*** Snapped intersection point to existing special hull point at ({hull_pt.x:.3f}, {hull_pt.y:.3f}, {hull_pt.z:.3f}) ***")
-                        break
-            
-            if aligned:
-                continue
-            
-            # Step 2: Project onto hull segments and create new special points
-            for segment_idx in range(len(surface.convex_hull)):
-                p1 = surface.convex_hull[segment_idx]
-                p2 = surface.convex_hull[(segment_idx + 1) % len(surface.convex_hull)]
-                
-                # Project intersection point onto this hull segment
-                closest_pt_on_segment = closest_point_on_segment(intersection_point, p1, p2)
-                distance_to_segment = (intersection_point - closest_pt_on_segment).length()
-                
-                if distance_to_segment < 1e-8:  # Very close to this segment
-                    # Check if the projection point is already an existing hull vertex
-                    is_existing_vertex = False
-                    for existing_hull_pt in surface.convex_hull:
-                        if (closest_pt_on_segment - existing_hull_pt).length() < 1e-8:
-                            # Snap to existing vertex
-                            if point_idx_in_intersection == 0:
-                                intersection.points[0] = existing_hull_pt
-                            else:
-                                intersection.points[-1] = existing_hull_pt
-                            is_existing_vertex = True
-                            logger.info(f"*** Snapped intersection point to existing hull vertex at ({existing_hull_pt.x:.3f}, {existing_hull_pt.y:.3f}, {existing_hull_pt.z:.3f}) ***")
-                            break
-                    
-                    if not is_existing_vertex:
-                        # Create new special point and insert into hull
-                        new_hull_point = Vector3D(
-                            closest_pt_on_segment.x,
-                            closest_pt_on_segment.y,
-                            closest_pt_on_segment.z,
-                            point_type="COMMON_INTERSECTION_CONVEXHULL_POINT"
-                        )
-                        
-                        # Update intersection point to reference the new hull point
-                        if point_idx_in_intersection == 0:
-                            intersection.points[0] = new_hull_point
-                        else:
-                            intersection.points[-1] = new_hull_point
-                        
-                        # Insert the new point into the convex hull at the correct position
-                        insert_position = segment_idx + 1
-                        surface.convex_hull.insert(insert_position, new_hull_point)
-                        
-                        logger.info(f"*** Created COMMON_INTERSECTION_CONVEXHULL_POINT at ({new_hull_point.x:.3f}, {new_hull_point.y:.3f}, {new_hull_point.z:.3f}) and inserted into hull ***")
-                    
-                    aligned = True
+
+        endpoints = [(0, inter.points[0])] if len(inter.points) == 1 else [(0, inter.points[0]), (-1, inter.points[-1])]
+        for ep_idx, ep in endpoints:
+            # Try snap to existing special hull vertex
+            snapped = False
+            for v in surface.convex_hull:
+                vtype = getattr(v, "point_type", getattr(v, "type", "DEFAULT"))
+                if vtype != "DEFAULT" and (ep - v).length() < snap_tol:
+                    inter.points[0 if ep_idx == 0 else -1] = v
+                    snapped = True
                     break
-            
-            if not aligned:
-                logger.warning(f"Could not align intersection point ({intersection_point.x:.3f}, {intersection_point.y:.3f}, {intersection_point.z:.3f}) to convex hull")
-    
-    # Clean up the convex hull after all insertions
-    if hasattr(surface, 'convex_hull') and surface.convex_hull:
-        original_count = len(surface.convex_hull)
-        surface.convex_hull = clean_identical_points(surface.convex_hull)
-        final_count = len(surface.convex_hull)
-        
-        if final_count != original_count:
-            logger.info(f"Cleaned convex hull: {original_count} -> {final_count} points")
-        
-                # -------------------------------------------------------------
-        # Split any edge longer than 1.3*target_len.
-        # Do NOT remove existing vertices – keeps topology intact.
-        # -------------------------------------------------------------
-        tgt = getattr(surface, "size", 0.1)
-        logger.info(f"Hull refinement for surface {surface_idx}: target size = {tgt:.6f}, hull length = {len(surface.convex_hull)} points")
-        
-        if tgt > 1e-6:
-            refined = []
-            segments_refined = 0
-            total_segments = len(surface.convex_hull)
-            segment_lengths = []
-            
-            for i in range(len(surface.convex_hull)):
-                p1 = surface.convex_hull[i]
-                p2 = surface.convex_hull[(i + 1) % len(surface.convex_hull)]
+            if snapped:
+                continue
 
-                refined.append(p1)                    # always keep vertex
+            # Otherwise project to closest edge; insert a special vertex there
+            best_d, best_i, best_p = float("inf"), None, None
+            n = len(surface.convex_hull)
+            for i in range(n):
+                a = surface.convex_hull[i]
+                b = surface.convex_hull[(i + 1) % n]
+                p = closest_point_on_segment(ep, a, b)
+                d = (p - ep).length()
+                if d < best_d:
+                    best_d, best_i, best_p = d, i, p
 
-                seg_len = (p2 - p1).length()
-                segment_lengths.append(seg_len)
-                
-                if seg_len > 1.3 * tgt:               # oversize → split
-                    n_seg = max(1, round(seg_len / tgt))
-                    step = (p2 - p1) / n_seg
-                    segments_refined += 1
-                    
-                    for k in range(1, n_seg):
-                        refined.append(
-                            Vector3D(p1.x + step.x * k,
-                                     p1.y + step.y * k,
-                                     p1.z + step.z * k,
-                                     point_type="DEFAULT")
-                        )
+            if best_p is not None and best_d < proj_tol:
+                # If point already exists at the projection location, snap
+                for v in surface.convex_hull:
+                    if (best_p - v).length() < snap_tol:
+                        inter.points[0 if ep_idx == 0 else -1] = v
+                        break
+                else:
+                    # Insert a new special vertex on the hull edge
+                    nv = Vector3D(best_p.x, best_p.y, best_p.z, point_type="COMMON_INTERSECTION_CONVEXHULL_POINT")
+                    surface.convex_hull.insert(int(best_i) + 1, nv)
+                    inter.points[0 if ep_idx == 0 else -1] = nv
 
-            # Log segment length statistics
-            if segment_lengths:
-                min_len, max_len, avg_len = min(segment_lengths), max(segment_lengths), sum(segment_lengths)/len(segment_lengths)
-                threshold = 1.3 * tgt
-                logger.info(f"Hull segments: min={min_len:.6f}, max={max_len:.6f}, avg={avg_len:.6f}, threshold={threshold:.6f}")
-            
-            surface.convex_hull = clean_identical_points(refined)
-            logger.info(f"Hull refinement result: {segments_refined}/{total_segments} segments refined, {len(refined)} → {len(surface.convex_hull)} points")
-            logger.info(f"Refined hull → {len(surface.convex_hull)} pts")
-            
-            logger.info(f"Refined convex hull for surface {surface_idx}: final count = {len(surface.convex_hull)} points")
-        
-        # Count special points for debugging
-        special_count = 0
-        for pt in surface.convex_hull:
-            pt_type = getattr(pt, 'point_type', getattr(pt, 'type', "DEFAULT"))
-            if pt_type != "DEFAULT":
-                special_count += 1
-                # logger.info(f"  Special hull point: ({pt.x:.3f}, {pt.y:.3f}, {pt.z:.3f}) type={pt_type}")
-        surface.hull_points = surface.convex_hull[:]  # shallow copy
-        
-        logger.info(f"Convex hull alignment complete for surface {surface_idx}: {special_count} special points out of {len(surface.convex_hull)} total")
+    # 2) Remove true duplicates only (no geometry changes)
+    surface.convex_hull = clean_identical_points(surface.convex_hull, tolerance=1e-12)
 
+    # 3) Bookkeeping
+    surface.hull_points = surface.convex_hull[:]
+    special_count = sum(1 for p in surface.convex_hull if getattr(p, "point_type", getattr(p, "type", "DEFAULT")) != "DEFAULT")
+    logger.info(f"Convex hull alignment complete for surface {surface_idx}: {special_count} special / {len(surface.convex_hull)} total")
 def calculate_size_of_intersections(model):
     """
     Calculate sizes for intersections based on the associated objects.
