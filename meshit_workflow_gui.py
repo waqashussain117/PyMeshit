@@ -16127,24 +16127,28 @@ segmentation, triangulation, and visualization.
 
             # No triple points
             if not triples:
-                # One segment: whole polyline (or loop); we do not add a duplicate closing edge here.
-                segments.append(pts[:])
+                # One segment: whole polyline (or loop)
+                seg = pts[:]
+                if closed and seg[0] != seg[-1]:
+                    seg = seg + [seg[0]]  # re-close the loop
+                segments.append(seg)
                 return segments
 
             # At least one triple
             if closed:
-                # For loops, cut between consecutive triples and wrap
-                # Deduplicate potential triple at both ends if first and last coincide
                 tri = sorted(set(triples))
-                # Build circular segments
-                for a, b in zip(tri, tri[1:] + tri[:1]):
-                    if a <= b:
-                        seg = pts[a:b+1]
-                    else:
-                        # wrap-around: from a..end, then start..b
-                        seg = pts[a:] + pts[:b+1]
-                    if len(seg) >= 2:
-                        segments.append(seg)
+                if len(tri) == 1:
+                    # Special case: only one triple in a closed loop
+                    segments.append(pts[:])  # entire loop as one block
+                else:
+                    for a, b in zip(tri, tri[1:] + tri[:1]):
+                        if a <= b:
+                            seg = pts[a:b+1]
+                        else:
+                            seg = pts[a:] + pts[:b+1]
+                        if len(seg) >= 2:
+                            segments.append(seg)
+
             else:
                 # Open polyline: endpoints are split points too
                 splits = [0] + sorted(triples) + [n - 1]
@@ -16161,10 +16165,6 @@ segmentation, triangulation, and visualization.
                             segments.append(seg)
 
             return segments
-
-        def _dedupe_preserve_special_local(pts):
-            # reuse existing logic to preserve best special type at same coords
-            return self._dedupe_preserve_special(pts)
 
         for s_idx, ds in enumerate(self.datasets):
             if ds.get("type") == "polyline":
@@ -16218,11 +16218,8 @@ segmentation, triangulation, and visualization.
                 if len(raw_pts) < 2:
                     continue
 
-                # remove duplicates BUT keep the best special-point flag
-                deduped = _dedupe_preserve_special_local(raw_pts)
-
-                # Build blocks ONLY between triple points and endpoints
-                seg_lists = segment_by_triples(deduped)
+                # DIRECTLY use raw_pts; no deduplication
+                seg_lists = segment_by_triples(raw_pts)
                 if not seg_lists:
                     continue
 
@@ -16261,8 +16258,7 @@ segmentation, triangulation, and visualization.
 
         tree.expandAll()
         tree.blockSignals(False)
-        logger.info("Segment-level constraint tree populated (intersection segments between TRIPLE_POINTs and endpoints).")
-        
+        logger.info("Segment-level constraint tree populated (intersection segments between TRIPLE_POINTs and endpoints, no dedup).")
     def _collect_selected_refine_segments(self, surface_idx: int) -> List[List]:
         """Return list of point-pairs [p1, p2] for all checked segments."""
         if not hasattr(self, "refine_constraint_tree"):
