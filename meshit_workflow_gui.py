@@ -1612,395 +1612,264 @@ class MeshItWorkflowGUI(QMainWindow):
         
         if not hasattr(self, 'triple_points'):
             self.triple_points = []
+
+    def _init_mesh_refine_table(self):
+        # Table for Refine & Mesh per-surface mesh target size
+        from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy
+        if not hasattr(self, 'mesh_length_by_surface'):
+            self.mesh_length_by_surface = {}
+
+        self._mesh_table_updating = False
+
+        self.mesh_refine_group = QGroupBox("Per-Surface Mesh Density (Target Size)")
+        lay = QVBoxLayout(self.mesh_refine_group)
+
+        self.mesh_refine_table = QTableWidget(0, 2, self.mesh_refine_group)
+        self.mesh_refine_table.setHorizontalHeaderLabels(["Surface", "Target Size"])
+
+        header = self.mesh_refine_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(True)
+
+        self.mesh_refine_table.verticalHeader().setVisible(False)
+        self.mesh_refine_table.setEditTriggers(self.mesh_refine_table.DoubleClicked | self.mesh_refine_table.EditKeyPressed)
+
+        # Professional sizing
+        self.mesh_refine_table.setMinimumHeight(220)
+        self.mesh_refine_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.mesh_refine_table.setAlternatingRowColors(True)
+
+        self.mesh_refine_table.cellChanged.connect(self._on_mesh_refine_cell_changed)
+        lay.addWidget(self.mesh_refine_table)
+
+        self._refresh_mesh_refine_table()
     def _setup_refine_mesh_tab(self):
-        """Sets up the Refine & Mesh Settings tab with three sub-tabs for better organization."""
+        """Three-pane layout with Actions → Mesh Settings → Per‑Surface stacked on the left."""
+        from PyQt5.QtWidgets import (
+            QHBoxLayout, QVBoxLayout, QWidget, QGroupBox, QFormLayout, QLabel, QCheckBox, QComboBox,
+            QDoubleSpinBox, QPushButton, QTreeWidget, QFrame, QTabWidget, QSplitter, QSizePolicy,
+            QHeaderView
+        )
+        from PyQt5.QtCore import Qt
+
         tab_layout = QHBoxLayout(self.refine_mesh_tab)
 
-        # --- Control panel (left side) ---
-        control_panel = QWidget()
-        control_panel.setMaximumWidth(350)  # Limit width
-        control_layout = QVBoxLayout(control_panel)
+        # ── LEFT: Actions → Mesh Settings → Per‑Surface (stacked, resizable) ─────
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
 
-        # -- Refinement Controls --
-        refinement_group = QGroupBox("Intersection Refinement")
-        refinement_layout = QVBoxLayout(refinement_group)
-
+        # Actions
+        actions_group = QGroupBox("Actions")
+        ag = QVBoxLayout(actions_group)
+        # Initialize selection data (fixes AttributeError)
+        self.refine_constraint_data = {}                     # {surface_idx: {...}}
+        self.refine_selected_constraint_segments = {}        # {surface_idx: {...}}
+        self._refine_updating_constraint_tree = False
         self.refine_intersections_btn = QPushButton("Refine Intersection Lines")
-        self.refine_intersections_btn.setToolTip(
-            "Align intersection line endpoints to the convex hulls of involved surfaces."
-        )
         self.refine_intersections_btn.clicked.connect(self._refine_intersection_lines_action)
-        refinement_layout.addWidget(self.refine_intersections_btn)
-        
-        # Add the new "Generate Conforming Surface Meshes" button
+        ag.addWidget(self.refine_intersections_btn)
+
         self.generate_conforming_meshes_btn = QPushButton("Generate Conforming Surface Meshes")
         self.generate_conforming_meshes_btn.clicked.connect(self._generate_conforming_meshes_action)
-        self.generate_conforming_meshes_btn.setEnabled(False)  # Enabled after refinement
-        self.generate_conforming_meshes_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                font-weight: bold;
-                padding: 8px;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:disabled {
-                background-color: #BDBDBD;
-                color: #9E9E9E;
-            }
-        """)
-        refinement_layout.addWidget(self.generate_conforming_meshes_btn)
-        
+        self.generate_conforming_meshes_btn.setEnabled(False)
+        ag.addWidget(self.generate_conforming_meshes_btn)
+
         self.show_original_lines_checkbox = QCheckBox("Show Original Lines")
         self.show_original_lines_checkbox.setChecked(True)
         self.show_original_lines_checkbox.toggled.connect(self._update_refined_visualization)
-        refinement_layout.addWidget(self.show_original_lines_checkbox)
-        
+        ag.addWidget(self.show_original_lines_checkbox)
+
         self.show_conforming_meshes_checkbox = QCheckBox("Show Conforming Meshes")
         self.show_conforming_meshes_checkbox.setChecked(True)
         self.show_conforming_meshes_checkbox.toggled.connect(self._update_refined_visualization)
-        refinement_layout.addWidget(self.show_conforming_meshes_checkbox)
-        
-        control_layout.addWidget(refinement_group)
+        ag.addWidget(self.show_conforming_meshes_checkbox)
 
-        # --- Granular Constraint Selection (for conforming mesh generation) ---
-        constraint_group = QGroupBox("Constraint Selection for Conforming Meshes")
-        constraint_layout = QVBoxLayout(constraint_group)
-        
-        # Initialize constraint selection data for Tab 6
-        self.refine_constraint_data = {}  # {surface_idx: {hull: segments, intersections: segments}}
-        self.refine_selected_constraint_segments = {}  # {surface_idx: {constraint_type: [selected_segment_indices]}}
-        self._refine_updating_constraint_tree = False  # Flag to prevent excessive updates
-        
-        # Constraint selection buttons
-        constraint_buttons_layout = QHBoxLayout()
-        
-        self.refine_select_intersection_constraints_only_btn = QPushButton("Select Intersection Constraints Only")
-        self.refine_select_intersection_constraints_only_btn.clicked.connect(self._refine_select_intersection_constraints_only)
-        constraint_buttons_layout.addWidget(self.refine_select_intersection_constraints_only_btn)
-        
-        self.refine_select_hull_constraints_only_btn = QPushButton("Select Hull Constraints Only")
-        self.refine_select_hull_constraints_only_btn.clicked.connect(self._refine_select_hull_constraints_only)
-        constraint_buttons_layout.addWidget(self.refine_select_hull_constraints_only_btn)
-        
-        constraint_layout.addLayout(constraint_buttons_layout)
-        
-        # Hierarchical constraint tree (Surface → Constraint Type → Segments)
-        self.refine_constraint_tree = QTreeWidget()
-        self.refine_constraint_tree.setHeaderLabels(["Constraint", "Type", "Segments", "Status", "Hole"])
-        self.refine_constraint_tree.itemChanged.connect(self._on_refine_constraint_tree_item_changed)
-        self.refine_constraint_tree.setMaximumHeight(300)
-        constraint_layout.addWidget(QLabel("Surface → Constraint Type → Segments:"))
-        constraint_layout.addWidget(self.refine_constraint_tree)
-        
-        
-        # Add hole control buttons
-        hole_controls_layout = QHBoxLayout()
-        mark_holes_btn = QPushButton("Mark Selected as Holes")
-        unmark_holes_btn = QPushButton("Unmark Selected as Holes")
-        mark_holes_btn.clicked.connect(self._mark_selected_as_holes)
-        unmark_holes_btn.clicked.connect(self._unmark_selected_as_holes)
-        hole_controls_layout.addWidget(mark_holes_btn)
-        hole_controls_layout.addWidget(unmark_holes_btn)
-        hole_controls_layout.addStretch()
-        constraint_layout.addLayout(hole_controls_layout)
-        
-        control_layout.addWidget(constraint_group)
-
-        # --- Global Mesh Settings ---
+        # Mesh settings (compact form)
         mesh_settings_group = QGroupBox("Global Mesh Settings")
-        mesh_settings_layout = QFormLayout(mesh_settings_group) # Use QFormLayout for label-input pairs
-        # Refine-mesh tab controls (for conforming meshes)
+        mg = QFormLayout(mesh_settings_group)
+
         self.mesh_interp_combo = QComboBox()
         self.mesh_interp_combo.addItems([
-            "Thin Plate Spline (TPS)",
-            "Linear (Barycentric)",
-            "IDW (p=4)",
-            "Local Plane",
-            "Kriging (Ordinary)",
-            "Cubic (Clough–Tocher)",
-            "Legacy (Hull + IDW + Boundary Snap)",
-            "MLS (Robust Moving Least Squares)"
+            "Thin Plate Spline (TPS)", "Linear (Barycentric)", "IDW (p=4)",
+            "Local Plane", "Kriging (Ordinary)", "Cubic (Clough–Tocher)",
+            "Legacy (Hull + IDW + Boundary Snap)", "MLS (Robust Moving Least Squares)"
         ])
         self.mesh_interp_combo.setCurrentIndex(0)
+        mg.addRow("Interpolation", self.mesh_interp_combo)
+
         self.mesh_smoothing_input = QDoubleSpinBox()
         self.mesh_smoothing_input.setDecimals(6)
         self.mesh_smoothing_input.setRange(0.0, 1e3)
         self.mesh_smoothing_input.setValue(0.0)
+        mg.addRow("Smoothing", self.mesh_smoothing_input)
 
-        mesh_settings_layout.addRow("Interpolation", self.mesh_interp_combo)
-        mesh_settings_layout.addRow("Smoothing", self.mesh_smoothing_input)
-        # Target Feature Size (controls conforming mesh density)
         self.mesh_target_feature_size_input = QDoubleSpinBox()
         self.mesh_target_feature_size_input.setRange(0.1, 500.0)
-        self.mesh_target_feature_size_input.setValue(15.0) # Default
+        self.mesh_target_feature_size_input.setValue(15.0)
         self.mesh_target_feature_size_input.setSingleStep(0.5)
         self.mesh_target_feature_size_input.setDecimals(1)
-        self.mesh_target_feature_size_input.setStyleSheet("""
-            QDoubleSpinBox {
-                font-weight: bold;
-                background-color: #E3F2FD;
-                border: 2px solid #2196F3;
-                border-radius: 4px;
-                padding: 2px;
-            }
-            QDoubleSpinBox:focus {
-                border-color: #1976D2;
-                background-color: #BBDEFB;
-            }
-        """)
-        self.mesh_target_feature_size_input.setVisible(False)
-        # Per-surface refinement (refine & mesh)
-        self.mesh_length_by_surface = {}
-        self._init_mesh_refine_table()
-        control_layout.addWidget(self.mesh_refine_group)
-        # Add value change handler for immediate feedback
         self.mesh_target_feature_size_input.valueChanged.connect(self._on_target_size_changed)
-        mesh_settings_layout.addRow("🎯 UNIFIED Mesh Density:", self.mesh_target_feature_size_input)
+        mg.addRow("Mesh Density", self.mesh_target_feature_size_input)
 
-        # Gradient (copied from triangulation tab's gradient_input)
         self.mesh_gradient_input = QDoubleSpinBox()
         self.mesh_gradient_input.setRange(1.0, 3.0)
-        self.mesh_gradient_input.setValue(2.0) # Default
+        self.mesh_gradient_input.setValue(2.0)
         self.mesh_gradient_input.setSingleStep(0.1)
-        mesh_settings_layout.addRow("Gradient:", self.mesh_gradient_input)
+        mg.addRow("Gradient", self.mesh_gradient_input)
 
-        # Min Angle (copied from triangulation tab's min_angle_input)
         self.mesh_min_angle_input = QDoubleSpinBox()
         self.mesh_min_angle_input.setRange(10.0, 30.0)
-        self.mesh_min_angle_input.setValue(20.0) # Default
-        self.mesh_min_angle_input.setSingleStep(1.0)
-        mesh_settings_layout.addRow("Min Angle:", self.mesh_min_angle_input)
+        self.mesh_min_angle_input.setValue(20.0)
+        mg.addRow("Min Angle", self.mesh_min_angle_input)
 
-        # Uniform Meshing (copied from triangulation tab's uniform_checkbox)
         self.mesh_uniform_checkbox = QCheckBox()
-        self.mesh_uniform_checkbox.setChecked(True) # Default
-        mesh_settings_layout.addRow("Uniform Meshing:", self.mesh_uniform_checkbox)
+        self.mesh_uniform_checkbox.setChecked(True)
+        mg.addRow("Uniform", self.mesh_uniform_checkbox)
 
-        # Add information labels for constraints
-        self.constraints_label = QLabel("<b>Mesh Constraints</b>")
-        self.constraints_label.setAlignment(Qt.AlignCenter)
-        mesh_settings_layout.addRow("", self.constraints_label)
+        # Per‑surface table
+        self.mesh_length_by_surface = {}
+        self._init_mesh_refine_table()  # builds self.mesh_refine_group
 
-        # Add a separator line
-        self.separator = QFrame()
-        self.separator.setFrameShape(QFrame.HLine)
-        self.separator.setFrameShadow(QFrame.Sunken)
-        mesh_settings_layout.addRow("", self.separator)
+        # Left vertical splitter for resizable sections
+        for w in (actions_group, mesh_settings_group, self.mesh_refine_group):
+            w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        # Add explanatory text with dynamic feedback  
-        self.target_size_info = QLabel("Unified control for all mesh operations")
-        self.target_size_info.setWordWrap(True)
-        self.target_size_info.setStyleSheet("color: #1976D2; font-style: italic;")
-        mesh_settings_layout.addRow("", self.target_size_info)
-        
-        # Initialize the feedback display now that target_size_info exists
-        self._on_target_size_changed(self.mesh_target_feature_size_input.value())
+        left_splitter = QSplitter(Qt.Vertical)
+        left_splitter.addWidget(actions_group)
+        left_splitter.addWidget(mesh_settings_group)
+        left_splitter.addWidget(self.mesh_refine_group)
+        left_splitter.setChildrenCollapsible(False)
+        left_splitter.setHandleWidth(8)
+        left_splitter.setOpaqueResize(True)
+        # Emphasize table a bit more by default
+        left_splitter.setSizes([200, 260, 380])
 
-        self.gradient_info = QLabel("Controls the sizing transition rate from smaller to larger elements")
-        self.gradient_info.setWordWrap(True)
-        mesh_settings_layout.addRow("", self.gradient_info)
+        left_layout.addWidget(left_splitter)
 
-        self.min_angle_info = QLabel("Ensures triangle quality by setting minimum internal angles")
-        self.min_angle_info.setWordWrap(True)
-        mesh_settings_layout.addRow("", self.min_angle_info)
+        # ── CENTER: Visualization ────────────────────────────────────────────────
+        center_panel = QWidget()
+        center_layout = QVBoxLayout(center_panel)
 
-        # Visual indicator for constraints impact (simple color code)
-        self.constraint_indicator = QLabel("◼ Strict constraints may result in more elements/longer processing")
-        self.constraint_indicator.setStyleSheet("color: orange;")
-        mesh_settings_layout.addRow("", self.constraint_indicator)
-
-        control_layout.addWidget(mesh_settings_group)
-
-        # Navigation buttons
-        nav_layout = QHBoxLayout()
-        prev_btn = QPushButton("← Previous (Intersections)")
-        prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(self.notebook.indexOf(self.intersection_tab)))
-        nav_layout.addWidget(prev_btn)
-        # No "Next" button for the last tab for now
-        control_layout.addLayout(nav_layout)
-        control_layout.addStretch()
-        tab_layout.addWidget(control_panel)
-
-        # --- Visualization Area with Sub-tabs (right side) ---
-        viz_group = QGroupBox("Refined Intersections & Mesh Preview")
-        viz_layout = QVBoxLayout(viz_group)
-
-        # Add surface selection dropdown and visibility controls above the 3D view
-        # This implements a dropdown-based visualization system similar to the C++ view dock
-        # (see mainwindow.cpp createViewDock() with faultsNamesCB, bordersNamesCB, etc.)
-        surface_control_group = QGroupBox("Surface Constraint Visualization")
-        surface_control_layout = QVBoxLayout(surface_control_group)
-        
-        # Surface selection dropdown (similar to C++ faultsNamesCB)
-        surface_selector_layout = QHBoxLayout()
-        surface_selector_layout.addWidget(QLabel("Surface:"))
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("Surface:"))
         self.refine_surface_selector = QComboBox()
-        self.refine_surface_selector.addItem("All Surfaces")  # Default option to show all
+        self.refine_surface_selector.addItem("All Surfaces")
         self.refine_surface_selector.currentTextChanged.connect(self._on_refine_surface_selection_changed)
-        surface_selector_layout.addWidget(self.refine_surface_selector)
-        
-        # Mouse selection toggle button
+        toolbar.addWidget(self.refine_surface_selector)
+
         self.mouse_selection_enabled_btn = QPushButton("Mouse Selection")
         self.mouse_selection_enabled_btn.setCheckable(True)
-        self.mouse_selection_enabled_btn.setChecked(False)
         self.mouse_selection_enabled_btn.toggled.connect(self._on_mouse_selection_toggled)
-        self.mouse_selection_enabled_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #f0f0f0;
-                border: 2px solid #ccc;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-weight: bold;
-            }
-            QPushButton:checked {
-                background-color: #4CAF50;
-                color: white;
-                border-color: #45a049;
-            }
-            QPushButton:hover {
-                border-color: #999;
-            }
-        """)
-        surface_selector_layout.addWidget(self.mouse_selection_enabled_btn)
-        
-        # Selection mode buttons (initially hidden)
-        self.selection_mode_btn = QPushButton("✅ Select Mode")
-        self.selection_mode_btn.setCheckable(True)
-        self.selection_mode_btn.setChecked(True)  # Default to select mode
-        self.selection_mode_btn.setVisible(False)  # Hidden initially
-        
-        self.deselection_mode_btn = QPushButton("❌ Deselect Mode")
-        self.deselection_mode_btn.setCheckable(True)
-        self.deselection_mode_btn.setChecked(False)
-        self.deselection_mode_btn.setVisible(False)  # Hidden initially
-        
-        # Make selection mode buttons mutually exclusive
-        self.selection_mode_group = QButtonGroup()
-        self.selection_mode_group.addButton(self.selection_mode_btn, 0)  # 0 = select mode
-        self.selection_mode_group.addButton(self.deselection_mode_btn, 1)  # 1 = deselect mode
-        self.selection_mode_group.buttonToggled.connect(self._on_selection_mode_changed)
-        
-        # Style the mode buttons
-        mode_button_style = """
-            QPushButton {
-                background-color: #f8f9fa;
-                border: 2px solid #dee2e6;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-weight: bold;
-                margin: 0px 2px;
-            }
-            QPushButton:checked {
-                background-color: #007bff;
-                color: white;
-                border-color: #0056b3;
-            }
-            QPushButton:hover {
-                border-color: #adb5bd;
-            }
-            QPushButton:checked:hover {
-                background-color: #0056b3;
-            }
-        """
-        self.selection_mode_btn.setStyleSheet(mode_button_style)
-        self.deselection_mode_btn.setStyleSheet(mode_button_style)
-        
-        surface_selector_layout.addWidget(self.selection_mode_btn)
-        surface_selector_layout.addWidget(self.deselection_mode_btn)
-        
-        surface_selector_layout.addStretch()
-        surface_control_layout.addLayout(surface_selector_layout)
-        
-        # Constraint type visibility checkboxes (similar to C++ scattered data, convex hull, etc.)
-        constraint_visibility_layout = QHBoxLayout()
-        
-        self.show_hull_constraints_checkbox = QCheckBox("Hull Constraints")
-        self.show_hull_constraints_checkbox.setChecked(True)
-        self.show_hull_constraints_checkbox.toggled.connect(self._on_constraint_filter_changed)
-        constraint_visibility_layout.addWidget(self.show_hull_constraints_checkbox)
-        
-        self.show_intersection_constraints_checkbox = QCheckBox("Intersection Constraints")
-        self.show_intersection_constraints_checkbox.setChecked(True)
-        self.show_intersection_constraints_checkbox.toggled.connect(self._on_constraint_filter_changed)
-        constraint_visibility_layout.addWidget(self.show_intersection_constraints_checkbox)
-        
-        self.show_selected_only_checkbox = QCheckBox("Selected Only")
-        self.show_selected_only_checkbox.setChecked(False)
-        self.show_selected_only_checkbox.toggled.connect(self._on_constraint_filter_changed)
-        constraint_visibility_layout.addWidget(self.show_selected_only_checkbox)
-        
-        constraint_visibility_layout.addStretch()
-        surface_control_layout.addLayout(constraint_visibility_layout)
-        
-        viz_layout.addWidget(surface_control_group)
+        toolbar.addWidget(self.mouse_selection_enabled_btn)
+        toolbar.addStretch()
+        center_layout.addLayout(toolbar)
 
-        # === CREATE SUB-TABS INSTEAD OF TOGGLE BUTTONS ===
         self.refine_view_tabs = QTabWidget()
+        self.refine_view_tabs.setDocumentMode(True)
         self.refine_view_tabs.currentChanged.connect(self._on_refine_view_tab_changed)
-        
-        # --- Tab 1: Intersections ---
+
         self.intersections_tab = QWidget()
         self.intersections_viz_frame = QFrame()
         self.intersections_viz_frame.setFrameShape(QFrame.StyledPanel)
-        self.intersections_viz_frame.setMinimumSize(400, 300)
         self.intersections_plot_layout = QVBoxLayout(self.intersections_viz_frame)
         self.intersections_plot_layout.setContentsMargins(0, 0, 0, 0)
-        
-        intersections_layout = QVBoxLayout(self.intersections_tab)
-        intersections_layout.addWidget(self.intersections_viz_frame)
+        il = QVBoxLayout(self.intersections_tab)
+        il.addWidget(self.intersections_viz_frame)
         self.refine_view_tabs.addTab(self.intersections_tab, "Intersections")
-        
-         # --- Tab 2: Meshes ---
+
         self.meshes_tab = QWidget()
         self.meshes_viz_frame = QFrame()
         self.meshes_viz_frame.setFrameShape(QFrame.StyledPanel)
-        self.meshes_viz_frame.setMinimumSize(400, 300)
         self.meshes_plot_layout = QVBoxLayout(self.meshes_viz_frame)
         self.meshes_plot_layout.setContentsMargins(0, 0, 0, 0)
-        
-        meshes_layout = QVBoxLayout(self.meshes_tab)
-        meshes_layout.addWidget(self.meshes_viz_frame)
+        ml = QVBoxLayout(self.meshes_tab)
+        ml.addWidget(self.meshes_viz_frame)
         self.refine_view_tabs.addTab(self.meshes_tab, "Meshes")
-        
-        # --- Tab 3: Segments ---
+
         self.segments_tab = QWidget()
         self.segments_viz_frame = QFrame()
         self.segments_viz_frame.setFrameShape(QFrame.StyledPanel)
-        self.segments_viz_frame.setMinimumSize(400, 300)
         self.segments_plot_layout = QVBoxLayout(self.segments_viz_frame)
         self.segments_plot_layout.setContentsMargins(0, 0, 0, 0)
-        
-        segments_layout = QVBoxLayout(self.segments_tab)
-        segments_layout.addWidget(self.segments_viz_frame)
+        sl = QVBoxLayout(self.segments_tab)
+        sl.addWidget(self.segments_viz_frame)
         self.refine_view_tabs.addTab(self.segments_tab, "Segments")
 
-       
-        
-        # Initialize plotters for each tab
         self._setup_refine_tab_plotters()
-        
-        # Set default view to intersections (index 0)
         self.current_refine_view = 0
         self.refine_view_tabs.setCurrentIndex(0)
-        
-        viz_layout.addWidget(self.refine_view_tabs, 1)
-        # Add summary labels for refinement and conforming mesh results
-        self.refinement_summary_label = QLabel("Run refinement to see summary")
+        center_layout.addWidget(self.refine_view_tabs, 1)
+
+        # ── RIGHT: Constraints + compact Stats ───────────────────────────────────
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_tabs = QTabWidget()
+        right_tabs.setDocumentMode(True)
+
+        # Constraints
+        constraints_tab = QWidget()
+        cl = QVBoxLayout(constraints_tab)
+
+        self.refine_constraint_tree = QTreeWidget()
+        self.refine_constraint_tree.setHeaderLabels(["Constraint", "Type", "Segments", "Status", "Hole"])
+        self.refine_constraint_tree.header().setSectionResizeMode(QHeaderView.Interactive)
+        self.refine_constraint_tree.header().setStretchLastSection(True)
+        self.refine_constraint_tree.itemChanged.connect(self._on_refine_constraint_tree_item_changed)
+        self.refine_constraint_tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        cl.addWidget(self.refine_constraint_tree, 1)
+
+        btns = QHBoxLayout()
+        self.refine_select_intersection_constraints_only_btn = QPushButton("Select Intersections")
+        self.refine_select_intersection_constraints_only_btn.clicked.connect(self._refine_select_intersection_constraints_only)
+        self.refine_select_hull_constraints_only_btn = QPushButton("Select Hull")
+        self.refine_select_hull_constraints_only_btn.clicked.connect(self._refine_select_hull_constraints_only)
+        btns.addWidget(self.refine_select_intersection_constraints_only_btn)
+        btns.addWidget(self.refine_select_hull_constraints_only_btn)
+        btns.addStretch()
+        cl.addLayout(btns)
+
+        right_tabs.addTab(constraints_tab, "Constraints")
+
+        # Stats (compact)
+        stats_tab = QWidget()
+        st = QVBoxLayout(stats_tab)
+        self.refinement_summary_label = QLabel("Refinement summary will appear here.")
         self.refinement_summary_label.setWordWrap(True)
-        self.refinement_summary_label.setTextFormat(Qt.RichText)
-        viz_layout.addWidget(self.refinement_summary_label)
-        
-        self.conforming_mesh_summary_label = QLabel("Generate conforming meshes to see mesh statistics")
+        self.refinement_summary_label.setStyleSheet("font-size: 10px; color: #444;")
+        self.refinement_summary_label.setMaximumHeight(90)
+        self.conforming_mesh_summary_label = QLabel("Mesh stats will appear here.")
         self.conforming_mesh_summary_label.setWordWrap(True)
-        self.conforming_mesh_summary_label.setTextFormat(Qt.RichText)
-        self.conforming_mesh_summary_label.setStyleSheet("border: 1px solid gray; padding: 5px; margin: 2px;")
-        viz_layout.addWidget(self.conforming_mesh_summary_label)
-        
-        tab_layout.addWidget(viz_group, 1)
+        self.conforming_mesh_summary_label.setStyleSheet("font-size: 10px; color: #444;")
+        self.conforming_mesh_summary_label.setMaximumHeight(90)
+        st.addWidget(self.refinement_summary_label)
+        st.addWidget(self.conforming_mesh_summary_label)
+        st.addStretch()
+        right_tabs.addTab(stats_tab, "Stats")
+
+        right_layout.addWidget(right_tabs)
+
+        # ── MAIN three‑way splitter ───────────────────────────────────────────────
+        main_splitter = QSplitter(Qt.Horizontal)
+        left_panel.setMinimumWidth(300)
+        right_panel.setMinimumWidth(320)
+        main_splitter.addWidget(left_panel)
+        main_splitter.addWidget(center_panel)
+        main_splitter.addWidget(right_panel)
+        main_splitter.setChildrenCollapsible(False)
+        main_splitter.setHandleWidth(8)
+        main_splitter.setOpaqueResize(True)
+        main_splitter.setSizes([380, 960, 420])   # big center view by default
+        main_splitter.setStretchFactor(0, 0)
+        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setStretchFactor(2, 0)
+
+        tab_layout.addWidget(main_splitter)
+
+        # Safety holders
+        if not hasattr(self, 'datasets_intersections'):
+            self.datasets_intersections = {}
+        if not hasattr(self, 'triple_points'):
+            self.triple_points = []
 
     def _setup_refine_tab_plotters(self):
         """Initialize PyVista plotters for each sub-tab"""

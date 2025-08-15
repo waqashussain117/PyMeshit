@@ -2109,15 +2109,6 @@ def run_intersection_workflow(model, progress_callback=None, tolerance=1e-5, con
             report_progress(f">...Constraint processing failed: {e}")
             logger.error(f"Constraint processing failed: {e}")
 
-    # --- Align intersections to convex hulls ---
-    report_progress(">Aligning intersections to convex hulls...")
-    for surface_idx in range(len(model.surfaces)):
-        try:
-            align_intersections_to_convex_hull(surface_idx, model)
-        except Exception as e:
-            logger.error(f"Error aligning intersections for surface {surface_idx}: {e}")
-    report_progress(">...Alignment finished")
-
     # --- Calculate sizes for intersections ---
     report_progress(">Calculating intersection sizes...")
     calculate_size_of_intersections(model)
