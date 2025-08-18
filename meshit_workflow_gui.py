@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import QToolButton
 from typing import List, Dict, Tuple, Optional, Any
 # import QAbsractItemView
 from PyQt5.QtWidgets import QAbstractItemView
-from meshit.intersection_utils import align_intersections_to_convex_hull, Vector3D, Intersection, refine_intersection_line_by_length, insert_triple_points
+from meshit.intersection_utils import align_intersections_to_convex_hull, Vector3D, Intersection, refine_intersection_line_by_length, insert_triple_points, refine_hull_with_interpolation
 from meshit.intersection_utils import prepare_plc_for_surface_triangulation, run_constrained_triangulation_py, calculate_triple_points, TriplePoint
 # Import PyQt5
 from meshit.intersection_utils import make_corners_special, Vector3D
@@ -5173,6 +5173,47 @@ class MeshItWorkflowGUI(QMainWindow):
         except Exception as e:
             logger.error(f"Error during corner point identification: {e}", exc_info=True)
             QMessageBox.warning(self, "Refinement Error", f"Error during corner point identification: {str(e)}")
+            return
+
+        # Step 2.5: Refine hull boundaries with interpolation (C++ MeshIt workflow step)
+        try:
+            # Get interpolation configuration from GUI
+            config = {
+                'interp': self.mesh_interp_combo.currentText() if hasattr(self, 'mesh_interp_combo') else 'Thin Plate Spline (TPS)',
+                'smoothing': getattr(self, 'interp_smoothing_input', type('obj', (object,), {'value': lambda: 0.0})()).value()
+            }
+            
+            refined_hulls_count = 0
+            for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
+                if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
+                    # Find the original dataset index for this temp surface
+                    original_idx = None
+                    for temp_idx, orig_idx in temp_model.original_indices_map.items():
+                        if (not temp_model.is_polyline.get(temp_idx, True) and 
+                            temp_model.surface_original_to_temp_idx_map.get(orig_idx) == temp_surface_idx):
+                            original_idx = orig_idx
+                            break
+                    
+                    if original_idx is not None and original_idx < len(self.datasets):
+                        # Get scattered data points for this surface
+                        dataset = self.datasets[original_idx]
+                        if 'points' in dataset and len(dataset['points']) > 0:
+                            # Convert numpy points to Vector3D objects
+                            scattered_points = [Vector3D(p[0], p[1], p[2]) for p in dataset['points']]
+                            
+                            # Refine the hull with interpolation
+                            original_hull = temp_surface.convex_hull[:]
+                            temp_surface.convex_hull = refine_hull_with_interpolation(
+                                temp_surface.convex_hull, scattered_points, config
+                            )
+                            refined_hulls_count += 1
+                            
+                            logger.info(f"Refined hull for surface {temp_surface_idx} (original {original_idx}) using {len(scattered_points)} scattered data points")
+            
+            logger.info(f"Hull interpolation refinement complete for {refined_hulls_count} surfaces using {config['interp']}")
+        except Exception as e:
+            logger.error(f"Error during hull interpolation refinement: {e}", exc_info=True)
+            QMessageBox.warning(self, "Refinement Error", f"Error during hull refinement: {str(e)}")
             return
 
         # Step 3: Align intersections to convex hulls

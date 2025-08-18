@@ -1830,6 +1830,213 @@ def make_corners_special(convex_hull: List[Vector3D], angle_threshold_deg: float
     return convex_hull
 
 
+def refine_hull_with_interpolation(raw_hull_points: List[Vector3D], 
+                                   scattered_data_points: List[Vector3D], 
+                                   config: Dict) -> List[Vector3D]:
+    """
+    Refine convex hull points by projecting them onto an interpolated surface model.
+    
+    This implements the missing C++ MeshIt workflow step that creates a smooth interpolated
+    surface from the scattered data and then projects the raw hull points onto this surface
+    to create a refined, geometrically accurate boundary.
+    
+    Args:
+        raw_hull_points: Original 3D boundary points calculated from scattered data
+        scattered_data_points: Full cloud of 3D scattered data points for the surface
+        config: Configuration dictionary containing interpolation settings
+        
+    Returns:
+        List of refined hull points projected onto the interpolated surface
+    """
+    if not raw_hull_points or not scattered_data_points:
+        logger.warning("Empty hull or scattered data points provided for hull refinement")
+        return raw_hull_points
+    
+    if len(scattered_data_points) < 3:
+        logger.warning("Insufficient scattered data points for interpolation")
+        return raw_hull_points
+        
+    try:
+        # Import required scipy modules
+        from scipy.interpolate import griddata, RBFInterpolator
+        from scipy.spatial.distance import pdist
+        
+        # Try to import sklearn PCA, fallback to manual PCA if not available
+        try:
+            from sklearn.decomposition import PCA
+            use_sklearn_pca = True
+        except ImportError:
+            logger.warning("scikit-learn not available, using manual PCA implementation")
+            use_sklearn_pca = False
+        
+        logger.info(f"Refining hull with {len(raw_hull_points)} points using {len(scattered_data_points)} scattered data points")
+        
+        # Convert scattered data to numpy arrays
+        scattered_3d = np.array([[p.x, p.y, p.z] for p in scattered_data_points])
+        hull_3d = np.array([[p.x, p.y, p.z] for p in raw_hull_points])
+        
+        # Step 1: Perform PCA on scattered data to establish local 2D coordinate system
+        if use_sklearn_pca:
+            pca = PCA(n_components=3)
+            pca.fit(scattered_3d)
+            scattered_pca = pca.transform(scattered_3d)
+            hull_pca = pca.transform(hull_3d)
+        else:
+            # Manual PCA implementation
+            # Center the data
+            mean_point = np.mean(scattered_3d, axis=0)
+            centered_data = scattered_3d - mean_point
+            
+            # Compute covariance matrix
+            cov_matrix = np.cov(centered_data.T)
+            
+            # Compute eigenvalues and eigenvectors
+            eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+            
+            # Sort by eigenvalues (descending)
+            idx = np.argsort(eigenvalues)[::-1]
+            eigenvalues = eigenvalues[idx]
+            eigenvectors = eigenvectors[:, idx]
+            
+            # Transform data to PCA space
+            scattered_pca = np.dot(centered_data, eigenvectors)
+            hull_centered = hull_3d - mean_point
+            hull_pca = np.dot(hull_centered, eigenvectors)
+            
+            # Store transformation info for inverse transform
+            pca_mean = mean_point
+            pca_components = eigenvectors
+        
+        # Use first two PCA components as 2D coordinates, third as Z values
+        scattered_2d = scattered_pca[:, :2]
+        scattered_z = scattered_pca[:, 2]
+        hull_2d = hull_pca[:, :2]
+        
+        # Step 2: Create interpolation model based on configuration
+        interp_method = config.get('interp', 'Thin Plate Spline (TPS)')
+        smoothing = config.get('smoothing', 0.0)
+        
+        logger.info(f"Using interpolation method: {interp_method}")
+        
+        # Check for sufficient data density
+        if len(scattered_data_points) < 10:
+            logger.warning("Low data density - using simple linear interpolation")
+            interp_method = "Linear (Barycentric)"
+        
+        refined_hull_pca = np.zeros_like(hull_pca)
+        refined_hull_pca[:, :2] = hull_2d  # Keep X,Y coordinates in PCA space
+        
+        if interp_method == "Thin Plate Spline (TPS)":
+            try:
+                # Use RBF with thin plate spline kernel
+                rbf = RBFInterpolator(scattered_2d, scattered_z, kernel='thin_plate_spline', 
+                                    smoothing=smoothing, epsilon=1.0)
+                refined_hull_pca[:, 2] = rbf(hull_2d)
+            except Exception as e:
+                logger.warning(f"TPS interpolation failed: {e}, falling back to linear")
+                refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
+                                                 method='linear', fill_value=np.nan)
+                
+        elif interp_method == "Linear (Barycentric)":
+            refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
+                                             method='linear', fill_value=np.nan)
+            
+        elif interp_method.startswith("IDW"):
+            # Extract power parameter (default p=4)
+            try:
+                power = float(interp_method.split('p=')[1].rstrip(')'))
+            except:
+                power = 4.0
+            
+            # Manual IDW implementation
+            refined_z = []
+            for hull_pt_2d in hull_2d:
+                distances = np.sqrt(np.sum((scattered_2d - hull_pt_2d)**2, axis=1))
+                
+                # Handle exact matches
+                exact_match_idx = np.where(distances < 1e-12)[0]
+                if len(exact_match_idx) > 0:
+                    refined_z.append(scattered_z[exact_match_idx[0]])
+                else:
+                    weights = 1.0 / (distances**power)
+                    weighted_sum = np.sum(weights * scattered_z)
+                    weight_sum = np.sum(weights)
+                    refined_z.append(weighted_sum / weight_sum)
+            
+            refined_hull_pca[:, 2] = np.array(refined_z)
+            
+        elif interp_method == "Cubic (Clough–Tocher)":
+            try:
+                refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
+                                                 method='cubic', fill_value=np.nan)
+            except Exception as e:
+                logger.warning(f"Cubic interpolation failed: {e}, falling back to linear")
+                refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
+                                                 method='linear', fill_value=np.nan)
+                
+        elif interp_method == "Kriging (Ordinary)":
+            try:
+                # Simple kriging implementation using RBF with gaussian kernel
+                rbf = RBFInterpolator(scattered_2d, scattered_z, kernel='gaussian', 
+                                    smoothing=smoothing, epsilon=1.0)
+                refined_hull_pca[:, 2] = rbf(hull_2d)
+            except Exception as e:
+                logger.warning(f"Kriging interpolation failed: {e}, falling back to linear")
+                refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
+                                                 method='linear', fill_value=np.nan)
+        else:
+            # Default to linear interpolation
+            logger.warning(f"Unknown interpolation method {interp_method}, using linear")
+            refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
+                                             method='linear', fill_value=np.nan)
+        
+        # Handle any NaN values by falling back to original Z coordinates
+        nan_mask = np.isnan(refined_hull_pca[:, 2])
+        if np.any(nan_mask):
+            logger.warning(f"Interpolation produced {np.sum(nan_mask)} NaN values, using original Z coordinates")
+            refined_hull_pca[nan_mask, 2] = hull_pca[nan_mask, 2]
+        
+        # Step 3: Transform refined hull points back to original 3D coordinate system
+        if use_sklearn_pca:
+            refined_hull_3d = pca.inverse_transform(refined_hull_pca)
+        else:
+            # Manual inverse transform
+            refined_hull_3d = np.dot(refined_hull_pca, pca_components.T) + pca_mean
+        
+        # Step 4: Create refined Vector3D objects preserving point types
+        refined_hull_points = []
+        for i, (orig_pt, refined_3d) in enumerate(zip(raw_hull_points, refined_hull_3d)):
+            refined_pt = Vector3D(refined_3d[0], refined_3d[1], refined_3d[2])
+            # Preserve original point type information
+            refined_pt.point_type = getattr(orig_pt, 'point_type', 'DEFAULT')
+            if hasattr(orig_pt, 'type'):
+                refined_pt.type = orig_pt.type
+            refined_hull_points.append(refined_pt)
+        
+        # Calculate refinement statistics
+        displacement_distances = [
+            (orig - refined).length() 
+            for orig, refined in zip(raw_hull_points, refined_hull_points)
+        ]
+        max_displacement = max(displacement_distances) if displacement_distances else 0.0
+        avg_displacement = np.mean(displacement_distances) if displacement_distances else 0.0
+        
+        logger.info(f"Hull refinement complete: max displacement = {max_displacement:.6f}, "
+                   f"avg displacement = {avg_displacement:.6f}")
+        
+        return refined_hull_points
+        
+    except ImportError as e:
+        logger.error(f"Required interpolation libraries not available: {e}")
+        logger.warning("Hull refinement skipped - returning original hull points")
+        return raw_hull_points
+        
+    except Exception as e:
+        logger.error(f"Error during hull interpolation refinement: {e}", exc_info=True)
+        logger.warning("Hull refinement failed - returning original hull points")
+        return raw_hull_points
+
+
 def align_intersections_to_convex_hull(surface_idx: int, model):
     """
     Geometry-preserving alignment only (no resampling here).
