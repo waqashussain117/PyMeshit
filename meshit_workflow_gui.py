@@ -4988,11 +4988,10 @@ class MeshItWorkflowGUI(QMainWindow):
     def _refine_intersection_lines_action(self):
         """
         Action to refine intersection lines by:
-        1. Identifying triple points at intersection line crossings
-        2. Identifying special points (angles > 135 degrees) on hulls and intersections 
-        3. Refining lines by dividing into segments of target length
-
-        Focus on keeping only convex hull and intersection lines without triangulated surfaces.
+        1. Identifying triple points and geometric corners.
+        2. Aligning intersection endpoints to the raw hull, creating a topologically correct boundary.
+        3. Refining this detailed hull by projecting it onto an interpolated surface (draping).
+        4. Refining all intersection and hull lines by length for meshing.
         """
         logger.info("Starting refinement of intersection lines...")
         self.statusBar().showMessage("Refining intersection lines...")
@@ -5006,7 +5005,6 @@ class MeshItWorkflowGUI(QMainWindow):
         self.original_intersections_backup = copy.deepcopy(self.datasets_intersections)
 
         try:
-            # Use per-surface values where available; fall back to unified for surfaces not in intersections
             per_surface_len = {}
             if hasattr(self, 'mesh_refine_table') and self.mesh_refine_table is not None:
                 from PyQt5.QtCore import Qt
@@ -5022,16 +5020,12 @@ class MeshItWorkflowGUI(QMainWindow):
                         except Exception:
                             pass
 
-            # Keep the unified value as a fallback only
             unified_fallback = float(self.mesh_target_feature_size_input.value())
 
             def _get_target_for_surface(idx: int) -> float:
                 v = per_surface_len.get(idx, unified_fallback)
                 return v if v > 1e-9 else unified_fallback
 
-            # pass through
-            target_feature_size = unified_fallback  # retained for legacy variables below
-            gradient = float(self.mesh_gradient_input.value())
             min_angle_deg = float(self.mesh_min_angle_input.value())
             uniform_meshing = self.mesh_uniform_checkbox.isChecked()
         except ValueError:
@@ -5073,34 +5067,19 @@ class MeshItWorkflowGUI(QMainWindow):
             data_wrapper = TempDataWrapper()
             data_wrapper.name = dataset_content.get('name', f"Dataset_{original_idx}")
 
-            current_geom_points_obj_array = None
             hull_points_obj_array = dataset_content.get('hull_points')
-
             if hull_points_obj_array is not None and len(hull_points_obj_array) > 0:
                 for hp in hull_points_obj_array:
                     point_type = hp[3] if len(hp) > 3 and isinstance(hp[3], str) else "DEFAULT"
                     data_wrapper.convex_hull.append(Vector3D(hp[0], hp[1], hp[2], point_type=point_type))
-                current_geom_points_obj_array = hull_points_obj_array
             else:
                 points_np = dataset_content.get('points')
                 if points_np is not None and len(points_np) > 0:
                     data_wrapper.convex_hull = [Vector3D(p[0], p[1], p[2]) for p in points_np]
-                    current_geom_points_obj_array = points_np
                 else:
                     logger.warning(f"Dataset {original_idx} ({data_wrapper.name}) has no hull_points or points. Skipping for temp_model.")
                     continue
 
-            if current_geom_points_obj_array is not None and len(current_geom_points_obj_array) > 1:
-                try:
-                    numeric_points = np.array(current_geom_points_obj_array[:, :3], dtype=np.float64)
-                    min_pt, max_pt = np.min(numeric_points, axis=0), np.max(numeric_points, axis=0)
-                    diag_length = np.linalg.norm(max_pt - min_pt)
-                    data_wrapper.size = diag_length / 10.0 if diag_length > 0 else 0.1
-                except Exception as e:
-                    logger.error(f"Error calculating size for dataset {original_idx}: {e}")
-                    data_wrapper.size = 0.1
-
-            # CRITICAL: Treat wells as polylines
             is_p = (dataset_content.get('type') in ('WELL', 'polyline') or
                     ('segments' in dataset_content and 'triangles' not in dataset_content and 'hull_points' not in dataset_content))
 
@@ -5118,20 +5097,16 @@ class MeshItWorkflowGUI(QMainWindow):
 
         if not temp_model.surfaces and not temp_model.polylines:
             QMessageBox.warning(self, "No Valid Datasets", "No datasets with geometry were prepared for refinement.")
-            self.statusBar().showMessage("Refinement failed: No valid datasets.", 5000)
             return
 
         logger.info(f"Temp model created: {len(temp_model.surfaces)} surfaces, {len(temp_model.polylines)} polylines.")
 
-        # Map intersections into temp model
         original_to_temp_combined_idx_map = {v: k for k, v in temp_model.original_indices_map.items()}
         for _, intersections_list in self.datasets_intersections.items():
             for intersection_data in intersections_list:
                 temp_combined_id1 = original_to_temp_combined_idx_map.get(intersection_data['dataset_id1'])
                 temp_combined_id2 = original_to_temp_combined_idx_map.get(intersection_data['dataset_id2'])
-                if temp_combined_id1 is None or temp_combined_id2 is None:
-                    logger.warning(f"Skipping intersection: Original IDs {intersection_data['dataset_id1']}/{intersection_data['dataset_id2']} not in temp_model map.")
-                    continue
+                if temp_combined_id1 is None or temp_combined_id2 is None: continue
                 new_int = Intersection(temp_combined_id1, temp_combined_id2, intersection_data['is_polyline_mesh'])
                 for pt_coords in intersection_data['points']:
                     new_int.add_point(Vector3D(pt_coords[0], pt_coords[1], pt_coords[2] if len(pt_coords) > 2 else 0.0))
@@ -5139,7 +5114,6 @@ class MeshItWorkflowGUI(QMainWindow):
 
         if not temp_model.intersections:
             QMessageBox.information(self, "No Intersections", "No intersections populated in temp_model.")
-            self.statusBar().showMessage("Refinement skipped: No intersections in temp model.", 5000)
             return
 
         # Step 1: Triple points
@@ -5149,8 +5123,7 @@ class MeshItWorkflowGUI(QMainWindow):
                     triple_points = calculate_triple_points(i, j, temp_model, tolerance=1e-5)
                     for tp in triple_points:
                         triple_point_obj = TriplePoint(tp)
-                        triple_point_obj.add_intersection(i)
-                        triple_point_obj.add_intersection(j)
+                        triple_point_obj.add_intersection(i); triple_point_obj.add_intersection(j)
                         tp.point_type = "TRIPLE_POINT"
                         temp_model.triple_points.append(triple_point_obj)
             insert_triple_points(temp_model)
@@ -5158,178 +5131,85 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.info(f"Found and inserted {len(temp_model.triple_points)} triple points.")
         except Exception as e:
             logger.error(f"Error during triple points calculation: {e}", exc_info=True)
-            QMessageBox.warning(self, "Refinement Error", f"Error during triple point identification: {str(e)}")
             return
 
         # Step 2: Corners on convex hulls
         try:
             from meshit.intersection_utils import make_corners_special
-            corner_points_count = 0
-            for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
+            for temp_surface in temp_model.surfaces:
                 if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
                     temp_surface.convex_hull = make_corners_special(temp_surface.convex_hull, angle_threshold_deg=135.0)
-                    corner_points_count += sum(1 for pt in temp_surface.convex_hull if getattr(pt, 'point_type', "DEFAULT") == "CORNER")
-            logger.info(f"Identified {corner_points_count} corner points across all convex hulls")
         except Exception as e:
             logger.error(f"Error during corner point identification: {e}", exc_info=True)
-            QMessageBox.warning(self, "Refinement Error", f"Error during corner point identification: {str(e)}")
             return
 
-        # Step 2.5: Refine hull boundaries with interpolation (C++ MeshIt workflow step)
-        try:
-            # Get interpolation configuration from GUI
-            config = {
-                'interp': self.mesh_interp_combo.currentText() if hasattr(self, 'mesh_interp_combo') else 'Thin Plate Spline (TPS)',
-                'smoothing': getattr(self, 'interp_smoothing_input', type('obj', (object,), {'value': lambda: 0.0})()).value()
-            }
-            
-            refined_hulls_count = 0
-            for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
-                if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
-                    # Find the original dataset index for this temp surface
-                    original_idx = None
-                    for temp_idx, orig_idx in temp_model.original_indices_map.items():
-                        if (not temp_model.is_polyline.get(temp_idx, True) and 
-                            temp_model.surface_original_to_temp_idx_map.get(orig_idx) == temp_surface_idx):
-                            original_idx = orig_idx
-                            break
-                    
-                    if original_idx is not None and original_idx < len(self.datasets):
-                        # Get scattered data points for this surface
-                        dataset = self.datasets[original_idx]
-                        if 'points' in dataset and len(dataset['points']) > 0:
-                            # Convert numpy points to Vector3D objects
-                            scattered_points = [Vector3D(p[0], p[1], p[2]) for p in dataset['points']]
-                            
-                            # Refine the hull with interpolation
-                            original_hull = temp_surface.convex_hull[:]
-                            temp_surface.convex_hull = refine_hull_with_interpolation(
-                                temp_surface.convex_hull, scattered_points, config
-                            )
-                            refined_hulls_count += 1
-                            
-                            logger.info(f"Refined hull for surface {temp_surface_idx} (original {original_idx}) using {len(scattered_points)} scattered data points")
-            
-            logger.info(f"Hull interpolation refinement complete for {refined_hulls_count} surfaces using {config['interp']}")
-        except Exception as e:
-            logger.error(f"Error during hull interpolation refinement: {e}", exc_info=True)
-            QMessageBox.warning(self, "Refinement Error", f"Error during hull refinement: {str(e)}")
-            return
-
-        # Step 3: Align intersections to convex hulls
+        # Step 3: Align intersections to hulls (defines hull topology)
         try:
             for temp_surface_list_idx in range(len(temp_model.surfaces)):
                 align_intersections_to_convex_hull(temp_surface_list_idx, temp_model)
             logger.info("Intersection alignment to convex hulls complete.")
         except Exception as e:
             logger.error(f"Error during convex hull alignment: {e}", exc_info=True)
-            QMessageBox.warning(self, "Refinement Error", f"Error during convex hull alignment: {str(e)}")
+            return
+        # Step 4: Refine convex hulls by length (creates dense hull for interpolation)
+        try:
+            temp_to_orig = {ti: oi for oi, ti in temp_model.surface_original_to_temp_idx_map.items()}
+            for temp_idx, temp_surface in enumerate(temp_model.surfaces):
+                if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
+                    orig_idx = temp_to_orig.get(temp_idx, -1)
+                    eff_target_length = _get_target_for_surface(orig_idx)
+                    class _HullLine:
+                        def __init__(self, pts): self.points = [Vector3D(p.x, p.y, p.z, point_type=getattr(p, "point_type", "DEFAULT")) for p in pts]
+                    refined = refine_intersection_line_by_length(
+                        _HullLine(temp_surface.convex_hull), float(eff_target_length), min_angle_deg, uniform_meshing
+                    )
+                    if len(refined) >= 2 and (refined[0] - refined[-1]).length_squared() < 1e-24:
+                        refined = refined[:-1]
+                    temp_surface.convex_hull = refined
+            logger.info(f"Refined convex hulls by length.")
+        except Exception as e:
+            logger.error(f"Error during convex hull length refinement: {e}", exc_info=True)
+            return
+        # Step 5: Refine hull with interpolation (corrects hull geometry)
+        try:
+            config = {
+                'interp': self.mesh_interp_combo.currentText(),
+                'smoothing': float(self.mesh_smoothing_input.value())
+            }
+            for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
+                if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
+                    original_idx = temp_model.original_indices_map.get(
+                        next((k for k, v in temp_model.surface_original_to_temp_idx_map.items() if v == temp_surface_idx), None)
+                    )
+                    if original_idx is not None and 'points' in self.datasets[original_idx]:
+                        scattered_points = [Vector3D(p[0], p[1], p[2]) for p in self.datasets[original_idx]['points']]
+                        temp_surface.convex_hull = refine_hull_with_interpolation(
+                            temp_surface.convex_hull, scattered_points, config
+                        )
+            logger.info(f"Hull interpolation refinement complete using {config['interp']}")
+        except Exception as e:
+            logger.error(f"Error during hull interpolation refinement: {e}", exc_info=True)
             return
 
-        # Step 4: Refine intersection lines by length
-        # Step 4: Refine intersection lines by length (per-surface)
+        # Step 6: Refine intersection lines by length
         try:
             for intersection in temp_model.intersections:
                 id1, id2 = intersection.id1, intersection.id2
-                is_poly1 = temp_model.is_polyline.get(id1, False)
-                is_poly2 = temp_model.is_polyline.get(id2, False)
-
-                # Temp objects
-                obj1 = temp_model.polylines[temp_model.polyline_original_to_temp_idx_map[temp_model.original_indices_map[id1]]] \
-                    if is_poly1 and temp_model.original_indices_map[id1] in temp_model.polyline_original_to_temp_idx_map else \
-                    (temp_model.surfaces[temp_model.surface_original_to_temp_idx_map[temp_model.original_indices_map[id1]]] \
-                    if temp_model.original_indices_map[id1] in temp_model.surface_original_to_temp_idx_map else None)
-
-                obj2 = temp_model.polylines[temp_model.polyline_original_to_temp_idx_map[temp_model.original_indices_map[id2]]] \
-                    if is_poly2 and temp_model.original_indices_map[id2] in temp_model.polyline_original_to_temp_idx_map else \
-                    (temp_model.surfaces[temp_model.surface_original_to_temp_idx_map[temp_model.original_indices_map[id2]]] \
-                    if temp_model.original_indices_map[id2] in temp_model.surface_original_to_temp_idx_map else None)
-
-                obj1_size = getattr(obj1, 'size', 0.1) or 0.1
-                obj2_size = getattr(obj2, 'size', 0.1) or 0.1
-
-                # Map temp ids -> original dataset indices
                 orig1 = temp_model.original_indices_map.get(id1, -1)
                 orig2 = temp_model.original_indices_map.get(id2, -1)
-
-                # Base target = min(table value of both surfaces)
-                t1 = _get_target_for_surface(orig1) if orig1 >= 0 else unified_fallback
-                t2 = _get_target_for_surface(orig2) if orig2 >= 0 else unified_fallback
+                t1 = _get_target_for_surface(orig1)
+                t2 = _get_target_for_surface(orig2)
                 eff_target_length = min(t1, t2)
-
-                # Optionally tighten by local object size when not uniform
-                if not uniform_meshing:
-                    local_min = min(s for s in [obj1_size, obj2_size] if s > 1e-6) if any(s > 1e-6 for s in [obj1_size, obj2_size]) else None
-                    if local_min is not None:
-                        eff_target_length = min(eff_target_length, local_min)
-
-                if eff_target_length <= 1e-6:
-                    eff_target_length = 0.1
-
                 intersection.points = refine_intersection_line_by_length(
-                    intersection,
-                    target_length=eff_target_length,
-                    min_angle_deg=min_angle_deg,
-                    uniform_meshing=uniform_meshing
+                    intersection, eff_target_length, min_angle_deg, uniform_meshing
                 )
             logger.info("Length-based refinement of intersection lines complete.")
         except Exception as e:
             logger.error(f"Error during length-based refinement: {e}", exc_info=True)
-            QMessageBox.warning(self, "Refinement Error", f"Error during length-based refinement: {str(e)}")
             return
 
-                # --- Refine convex hulls by length (Segmentation-style, C++-equivalent) ---
-        try:
-            refined_hull_count = 0
-            temp_to_orig = {ti: oi for oi, ti in temp_model.surface_original_to_temp_idx_map.items()}
-
-            for temp_idx, temp_surface in enumerate(temp_model.surfaces):
-                if not hasattr(temp_surface, 'convex_hull') or len(temp_surface.convex_hull) < 3:
-                    continue
-
-                orig_idx = temp_to_orig.get(temp_idx, -1)
-
-                # Table-driven target; optionally clamp by object size when non-uniform
-                eff_target_length = _get_target_for_surface(orig_idx)
-                if not uniform_meshing and getattr(temp_surface, 'size', 0.0) > 1e-6:
-                    eff_target_length = min(eff_target_length, temp_surface.size)
-                if eff_target_length <= 1e-6:
-                    eff_target_length = 0.1
-
-                # Build a line preserving original point types (DO NOT force anchors).
-                # This allows DEFAULT hull vertices to be removed (coarsened) by RefineByLength.
-                class _HullLine:
-                    def __init__(self, pts):
-                        self.points = []
-                        for p in pts:
-                            self.points.append(
-                                Vector3D(
-                                    p.x, p.y, p.z,
-                                    point_type=getattr(p, "point_type", getattr(p, "type", "DEFAULT")) or "DEFAULT"
-                                )
-                            )
-
-                hull_line = _HullLine(temp_surface.convex_hull)
-
-                refined = refine_intersection_line_by_length(
-                    hull_line,
-                    target_length=float(eff_target_length),
-                    min_angle_deg=min_angle_deg,
-                    uniform_meshing=uniform_meshing  # round to nearest like C++
-                )
-
-                # For a closed ring, avoid duplicating the first point at the end
-                if len(refined) >= 2 and (refined[0] - refined[-1]).length_squared() < 1e-24:
-                    refined = refined[:-1]
-
-                temp_surface.convex_hull = refined
-                refined_hull_count += 1
-
-            logger.info(f"Refined {refined_hull_count} convex hull(s) by RefineByLength (DEFAULT removed, table-driven).")
-        except Exception as e:
-            logger.error(f"Error during convex hull length refinement: {e}", exc_info=True)
-            QMessageBox.warning(self, "Refinement Error", f"Error during convex hull length refinement: {str(e)}")
-            return
+        # Step 6: Refine convex hulls by length
+        
 
         # Store intersection lines as constraints (unchanged)
         logger.info("Storing intersection lines as constraints for each surface...")
