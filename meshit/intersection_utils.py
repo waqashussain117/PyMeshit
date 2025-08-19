@@ -950,43 +950,8 @@ def calculate_surface_surface_intersection(surface1_idx: int, surface2_idx: int,
         connected_curves = connect_intersection_segments(intersection_segments)
 
         # Optional post-connection regularization (C++-like RefineByLength)
-        # Optional post-connection regularization (C++-like RefineByLength)
-        refined_curves = []
-        for curve in connected_curves:
-            if len(curve) < 2:
-                refined_curves.append(curve)
-                continue
 
-            # Estimate target length from current spacing (median)
-            seg_lens = []
-            for i in range(len(curve) - 1):
-                seg_lens.append((curve[i + 1] - curve[i]).length())
-            target_length = float(np.median(seg_lens)) if seg_lens else 1.0
-            if target_length <= 1e-12:
-                target_length = 1.0
-
-            # Wrap curve points in an Intersection so the refiner receives .points
-            tmp_intersection = Intersection(surface1_idx, surface2_idx, False)
-            for pt in curve:
-                tmp_intersection.add_point(pt)
-
-            try:
-                refined_pts = refine_intersection_line_by_length(
-                    tmp_intersection,
-                    target_length=target_length,
-                    min_angle_deg=20.0,
-                    uniform_meshing=True,
-                )
-            except Exception:
-                refined_pts = None
-
-            refined_curves.append(refined_pts if refined_pts else curve)
-
-        connected_curves = refined_curves
-
-
-
-        logger.info(f"Surface {surface1_idx}-{surface2_idx}: Connected into {len(connected_curves)} curves")
+        # logger.info(f"Surface {surface1_idx}-{surface2_idx}: Connected into {len(connected_curves)} curves")
         
         # Return multiple intersection objects - one for each curve
         # This matches the C++ behavior where each curve is a separate intersection
@@ -2306,20 +2271,6 @@ def run_intersection_workflow(model, progress_callback=None, tolerance=1e-5, con
     insert_triple_points(model, tolerance)
     report_progress(">...Triple Points finished")
 
-    # --- NEW: Constraint Processing Workflow ---
-    if config.get('use_constraint_processing', False):
-        report_progress(">Processing Constraints (C++ MeshIt Logic)...")
-        try:
-            integrate_constraint_processing_workflow(model, config)
-            report_progress(">...Constraint processing finished")
-        except Exception as e:
-            report_progress(f">...Constraint processing failed: {e}")
-            logger.error(f"Constraint processing failed: {e}")
-
-    # --- Calculate sizes for intersections ---
-    report_progress(">Calculating intersection sizes...")
-    calculate_size_of_intersections(model)
-    report_progress(">...Size calculation finished")
 
     return model
 

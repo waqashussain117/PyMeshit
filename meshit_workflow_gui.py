@@ -498,6 +498,35 @@ class MeshItWorkflowGUI(QMainWindow):
             if val <= 1e-9:
                 val = 1.0
             self.seg_length_by_surface[ds_idx] = val
+
+            # Propagate segmentation value as a default to mesh refine table
+            # but only if the user has not already set a mesh-specific value.
+            if not hasattr(self, 'mesh_length_by_surface'):
+                self.mesh_length_by_surface = {}
+            if ds_idx not in self.mesh_length_by_surface:
+                # Set the mesh default to the segmentation value so the
+                # refine-mesh table displays it. Update the table cell
+                # programmatically if the table exists.
+                try:
+                    self.mesh_length_by_surface[ds_idx] = val
+                    if hasattr(self, 'mesh_refine_table') and self.mesh_refine_table is not None:
+                        # Find corresponding row and update without triggering handler
+                        try:
+                            self._mesh_table_updating = True
+                            rows = self.mesh_refine_table.rowCount()
+                            for r in range(rows):
+                                mn = self.mesh_refine_table.item(r, 0)
+                                if mn and mn.data(Qt.UserRole) == ds_idx:
+                                    self.mesh_refine_table.setItem(r, 1, QTableWidgetItem(f"{val:.6g}"))
+                                    break
+                        except Exception:
+                            # Non-fatal - ignore UI update failures
+                            pass
+                        finally:
+                            self._mesh_table_updating = False
+                except Exception:
+                    # Ensure propagation failures don't break segmentation handling
+                    pass
         except Exception:
             pass
 
@@ -574,8 +603,22 @@ class MeshItWorkflowGUI(QMainWindow):
             if ds.get('type') in ('WELL', 'polyline'):
                 continue
             name = ds.get('name', f"Surface_{idx}")
-            default_sz = float(getattr(self.mesh_target_feature_size_input, "value", lambda: 15.0)())
-            value = float(self.mesh_length_by_surface.get(idx, default_sz))
+            # Prefer an explicit per-surface mesh value, else fall back to
+            # segmentation value (if available), else the unified mesh control.
+            unified_default = float(getattr(self.mesh_target_feature_size_input, "value", lambda: 15.0)())
+            seg_default = None
+            try:
+                if hasattr(self, 'seg_length_by_surface') and idx in self.seg_length_by_surface:
+                    seg_default = float(self.seg_length_by_surface[idx])
+            except Exception:
+                seg_default = None
+
+            if idx in self.mesh_length_by_surface:
+                value = float(self.mesh_length_by_surface.get(idx))
+            elif seg_default is not None:
+                value = float(seg_default)
+            else:
+                value = float(unified_default)
             row = self.mesh_refine_table.rowCount()
             self.mesh_refine_table.insertRow(row)
 
