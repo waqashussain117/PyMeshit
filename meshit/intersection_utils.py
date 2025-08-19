@@ -2005,22 +2005,18 @@ def refine_hull_with_interpolation(raw_hull_points: List[Vector3D],
 def align_intersections_to_convex_hull(surface_idx: int, model):
     """
     Geometry-preserving alignment only (no resampling here).
-    - Do not simplify/resample/split hull edges here
-    - Only snap intersection endpoints to existing special hull vertices
+    - Snap intersection endpoints to any hull vertex (not just special)
     - If not snapped, project to closest hull edge and INSERT a new special vertex on that edge
-    - Keep original hull vertex types so downstream RefineByLength can remove DEFAULT points
     """
     surface = model.surfaces[surface_idx]
     if not hasattr(surface, "convex_hull") or not surface.convex_hull or len(surface.convex_hull) < 3:
         logger.warning(f"Surface {surface_idx} has no valid convex hull for alignment.")
         return
 
-    snap_tol = 1e-8
-    proj_tol = 1e-6
+    snap_tol = 1e-5   # <<--- increased
+    proj_tol = 1e-3   # <<--- increased
 
-    # 1) Align endpoints to hull without moving existing vertices
     for inter in model.intersections:
-        # Is this intersection touching this surface?
         is_surface1 = not model.is_polyline.get(inter.id1, True)
         is_surface2 = not model.is_polyline.get(inter.id2, True)
         if not ((is_surface1 and inter.id1 == surface_idx) or (is_surface2 and inter.id2 == surface_idx)):
@@ -2030,13 +2026,13 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
 
         endpoints = [(0, inter.points[0])] if len(inter.points) == 1 else [(0, inter.points[0]), (-1, inter.points[-1])]
         for ep_idx, ep in endpoints:
-            # Try snap to existing special hull vertex
+            # Try snap to any hull vertex (not just special)
             snapped = False
             for v in surface.convex_hull:
-                vtype = getattr(v, "point_type", getattr(v, "type", "DEFAULT"))
-                if vtype != "DEFAULT" and (ep - v).length() < snap_tol:
+                if (ep - v).length() < snap_tol:
                     inter.points[0 if ep_idx == 0 else -1] = v
                     snapped = True
+                    logger.info(f"Snapped endpoint to hull vertex at ({v.x:.3f}, {v.y:.3f}, {v.z:.3f})")
                     break
             if snapped:
                 continue
@@ -2057,17 +2053,19 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
                 for v in surface.convex_hull:
                     if (best_p - v).length() < snap_tol:
                         inter.points[0 if ep_idx == 0 else -1] = v
+                        logger.info(f"Snapped endpoint to existing hull vertex at ({v.x:.3f}, {v.y:.3f}, {v.z:.3f})")
                         break
                 else:
                     # Insert a new special vertex on the hull edge
                     nv = Vector3D(best_p.x, best_p.y, best_p.z, point_type="COMMON_INTERSECTION_CONVEXHULL_POINT")
                     surface.convex_hull.insert(int(best_i) + 1, nv)
                     inter.points[0 if ep_idx == 0 else -1] = nv
+                    logger.info(f"Inserted new special vertex at ({nv.x:.3f}, {nv.y:.3f}, {nv.z:.3f}) on hull edge {best_i}")
 
-    # 2) Remove true duplicates only (no geometry changes)
+    # Remove true duplicates only (no geometry changes)
     surface.convex_hull = clean_identical_points(surface.convex_hull, tolerance=1e-12)
 
-    # 3) Bookkeeping
+    # Bookkeeping
     surface.hull_points = surface.convex_hull[:]
     special_count = sum(1 for p in surface.convex_hull if getattr(p, "point_type", getattr(p, "type", "DEFAULT")) != "DEFAULT")
     logger.info(f"Convex hull alignment complete for surface {surface_idx}: {special_count} special / {len(surface.convex_hull)} total")

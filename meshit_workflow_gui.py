@@ -5175,7 +5175,7 @@ class MeshItWorkflowGUI(QMainWindow):
         except Exception as e:
             logger.error(f"Error during triple points calculation: {e}", exc_info=True)
             return
-
+        
         # Step 2: Corners on convex hulls
         try:
             from meshit.intersection_utils import make_corners_special
@@ -5185,35 +5185,7 @@ class MeshItWorkflowGUI(QMainWindow):
         except Exception as e:
             logger.error(f"Error during corner point identification: {e}", exc_info=True)
             return
-
-        # Step 3: Align intersections to hulls (defines hull topology)
-        try:
-            for temp_surface_list_idx in range(len(temp_model.surfaces)):
-                align_intersections_to_convex_hull(temp_surface_list_idx, temp_model)
-            logger.info("Intersection alignment to convex hulls complete.")
-        except Exception as e:
-            logger.error(f"Error during convex hull alignment: {e}", exc_info=True)
-            return
-        # Step 4: Refine convex hulls by length (creates dense hull for interpolation)
-        try:
-            temp_to_orig = {ti: oi for oi, ti in temp_model.surface_original_to_temp_idx_map.items()}
-            for temp_idx, temp_surface in enumerate(temp_model.surfaces):
-                if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
-                    orig_idx = temp_to_orig.get(temp_idx, -1)
-                    eff_target_length = _get_target_for_surface(orig_idx)
-                    class _HullLine:
-                        def __init__(self, pts): self.points = [Vector3D(p.x, p.y, p.z, point_type=getattr(p, "point_type", "DEFAULT")) for p in pts]
-                    refined = refine_intersection_line_by_length(
-                        _HullLine(temp_surface.convex_hull), float(eff_target_length), min_angle_deg, uniform_meshing
-                    )
-                    if len(refined) >= 2 and (refined[0] - refined[-1]).length_squared() < 1e-24:
-                        refined = refined[:-1]
-                    temp_surface.convex_hull = refined
-            logger.info(f"Refined convex hulls by length.")
-        except Exception as e:
-            logger.error(f"Error during convex hull length refinement: {e}", exc_info=True)
-            return
-        # Step 5: Refine hull with interpolation (corrects hull geometry)
+        # Step 3: Refine hull with interpolation (corrects hull geometry)
         try:
             config = {
                 'interp': self.mesh_interp_combo.currentText(),
@@ -5234,6 +5206,34 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.error(f"Error during hull interpolation refinement: {e}", exc_info=True)
             return
 
+        # Step 4: Align intersections to hulls (defines hull topology)
+        try:
+            for temp_surface_list_idx in range(len(temp_model.surfaces)):
+                align_intersections_to_convex_hull(temp_surface_list_idx, temp_model)
+            logger.info("Intersection alignment to convex hulls complete.")
+        except Exception as e:
+            logger.error(f"Error during convex hull alignment: {e}", exc_info=True)
+            return
+        # Step 5: Refine convex hulls by length (creates dense hull for interpolation)
+        try:
+            temp_to_orig = {ti: oi for oi, ti in temp_model.surface_original_to_temp_idx_map.items()}
+            for temp_idx, temp_surface in enumerate(temp_model.surfaces):
+                if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
+                    orig_idx = temp_to_orig.get(temp_idx, -1)
+                    eff_target_length = _get_target_for_surface(orig_idx)
+                    class _HullLine:
+                        def __init__(self, pts): self.points = [Vector3D(p.x, p.y, p.z, point_type=getattr(p, "point_type", "DEFAULT")) for p in pts]
+                    refined = refine_intersection_line_by_length(
+                        _HullLine(temp_surface.convex_hull), float(eff_target_length), min_angle_deg, uniform_meshing
+                    )
+                    if len(refined) >= 2 and (refined[0] - refined[-1]).length_squared() < 1e-24:
+                        refined = refined[:-1]
+                    temp_surface.convex_hull = refined
+            logger.info(f"Refined convex hulls by length.")
+        except Exception as e:
+            logger.error(f"Error during convex hull length refinement: {e}", exc_info=True)
+            return
+        
         # Step 6: Refine intersection lines by length
         try:
             for intersection in temp_model.intersections:
@@ -5251,7 +5251,6 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.error(f"Error during length-based refinement: {e}", exc_info=True)
             return
 
-        # Step 6: Refine convex hulls by length
         
 
         # Store intersection lines as constraints (unchanged)
@@ -7152,7 +7151,7 @@ segmentation, triangulation, and visualization.
 
         try:
             import numpy as np
-            from scipy.spatial import Delaunay, cKDTree, ConvexHull
+            from scipy.spatial import Delaunay, cKDTree
             from scipy.interpolate import RBFInterpolator, CloughTocher2DInterpolator
             from meshit.triangle_direct import DirectTriangleWrapper
 
@@ -7164,10 +7163,8 @@ segmentation, triangulation, and visualization.
             z_axis = np.array([0.0, 0.0, 1.0], dtype=float)
 
             def build_rot(n, onto_z=True):
-                if onto_z:
-                    axis = np.cross(n, z_axis); c = float(np.dot(z_axis, n))
-                else:
-                    axis = np.cross(z_axis, n); c = float(np.dot(n, z_axis))
+                axis = np.cross(n, z_axis) if onto_z else np.cross(z_axis, n)
+                c = float(np.dot(z_axis, n)) if onto_z else float(np.dot(n, z_axis))
                 an = np.linalg.norm(axis)
                 if 1.0 - abs(c) < 1e-12 or an < 1e-15:
                     return np.eye(3)
@@ -7194,44 +7191,8 @@ segmentation, triangulation, and visualization.
             boundary_xyz = np.asarray(unique_points_list, float)
             boundary_segs = np.asarray(segment_indices, int)
 
-            # All interpolation methods now follow: Hull + Interpolation Method + Boundary Snapping pattern
-            # First, set up hull processing (common for all methods)
             boundary_rot = (R @ boundary_xyz.T).T
             provided_xy = boundary_rot[:, :2]
-
-            def order_ring(indices):
-                adj = {}
-                for a, b in indices:
-                    adj.setdefault(a, []).append(b)
-                    adj.setdefault(b, []).append(a)
-                if not adj:
-                    return None
-                start = next((i for i, nbrs in adj.items() if len(nbrs) == 2), None)
-                if start is None:
-                    start = list(adj.keys())[0]
-                ring = [start]; prev = None; cur_i = start
-                for _ in range(len(adj) + 5):
-                    nbrs = adj[cur_i]
-                    nxt = nbrs[0] if nbrs[0] != prev else (nbrs[1] if len(nbrs) > 1 else None)
-                    if nxt is None: break
-                    if nxt == ring[0]: ring.append(nxt); break
-                    ring.append(nxt); prev, cur_i = cur_i, nxt
-                return np.array(ring, int)
-
-            provided_order = order_ring(boundary_segs)
-            ring_xy = provided_xy[provided_order[:-1]] if provided_order is not None else None
-
-            ch = ConvexHull(all_pts_rot[:, :2])
-            hull_xy = all_pts_rot[ch.vertices, :2]
-
-            def poly_area(poly):
-                if poly is None or len(poly) < 3: return 0.0
-                x = poly[:, 0]; y = poly[:, 1]
-                return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
-
-            area_provided = poly_area(ring_xy)
-            area_hull = poly_area(hull_xy)
-            use_hull = (area_hull > 0 and (area_provided == 0 or abs(area_provided - area_hull) / area_hull > 0.25))
 
             try:
                 base_size = float(self._get_seg_target_length_for_dataset(dataset_index))
@@ -7239,52 +7200,26 @@ segmentation, triangulation, and visualization.
             except Exception:
                 base_size = 1.0
 
-            # Hull refinement (common for all methods)
-            if use_hull:
-                ring = np.vstack([hull_xy, hull_xy[0]])
-                refined = []
-                for i in range(len(ring) - 1):
-                    p, q = ring[i], ring[i+1]
-                    d = np.linalg.norm(q - p)
-                    n = max(1, int(np.ceil(d / base_size)))
-                    t = np.linspace(0.0, 1.0, n + 1)
-                    seg_pts = [p*(1-tk) + q*tk for tk in t]
-                    if i > 0: seg_pts = seg_pts[1:]
-                    refined.extend(seg_pts)
-                boundary_xy = np.asarray(refined, float)
-                idxs = np.arange(len(boundary_xy), dtype=int)
-                boundary_segs_for_tria = np.column_stack([idxs, np.roll(idxs, -1)])
-                boundary_segs_for_tria[-1, 1] = 0
-                tree_b = cKDTree(all_pts_rot[:, :2])
-                di_b, ii_b = tree_b.query(boundary_xy, k=1)
-                boundary_rot_for_snap = np.column_stack([boundary_xy, all_pts_rot[ii_b, 2]])
-            else:
-                boundary_xy = provided_xy
-                boundary_segs_for_tria = boundary_segs
-                boundary_rot_for_snap = boundary_rot
-
-            # Triangulation (common for all methods)
+            # Triangulation (no hull snapping for non-legacy)
             triangulator = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=base_size)
-            tri_res = triangulator.triangulate(points=boundary_xy, segments=boundary_segs_for_tria, uniform=uniform, create_transition=True)
+            tri_res = triangulator.triangulate(points=provided_xy, segments=boundary_segs, uniform=uniform, create_transition=True)
             if tri_res is None or 'vertices' not in tri_res or 'triangles' not in tri_res:
                 raise ValueError("Triangulation failed.")
             vertices_xy = tri_res['vertices']; triangles = tri_res['triangles']
 
-            # Prepare interpolation data (common for all methods)
+            # Prepare interpolation data
             sample_xy = all_pts_rot[:, :2]; sample_z = all_pts_rot[:, 2]
-            tree = cKDTree(sample_xy)
-            k = min(64, len(sample_xy))
-            dists, idxs = tree.query(vertices_xy, k=k)
-            if k == 1: dists = dists[:, None]; idxs = idxs[:, None]
 
-            # Boundary snapping map (common for all methods)
-            def key_xy(xy): return (round(float(xy[0]), 9), round(float(xy[1]), 9))
-            boundary_map = {key_xy(p[:2]): float(p[2]) for p in boundary_rot_for_snap}
-
-            # Legacy branch: original hull+IDW+boundary-snap pipeline
+            # Legacy branch keeps hull+snap
             if "Legacy" in interp_label:
+                tree = cKDTree(sample_xy)
+                k = min(64, len(sample_xy))
+                dists, idxs = tree.query(vertices_xy, k=k)
+                if k == 1: dists = dists[:, None]; idxs = idxs[:, None]
 
-                # Legacy IDW(1/r^4) + boundary snap
+                def key_xy(xy): return (round(float(xy[0]), 9), round(float(xy[1]), 9))
+                boundary_map = {key_xy(p[:2]): float(p[2]) for p in boundary_rot}
+
                 final_vertices_rot3d = np.zeros((len(vertices_xy), 3), float)
                 final_vertices_rot3d[:, :2] = vertices_xy
                 for i in range(len(vertices_xy)):
@@ -7300,8 +7235,7 @@ segmentation, triangulation, and visualization.
                 logger.info(f"Triangulation for {dataset_name} (Legacy) completed. V={len(final_vertices_3d)}, T={len(triangles)}")
                 return True
 
-            # All other methods: Hull + Specific Interpolation + Boundary Snapping
-            # Define interpolation functions
+            # Other methods: interpolation only, no hull/snap
             def interp_linear(q):
                 dela = Delaunay(sample_xy); out = np.empty(len(q), float); out[:] = np.nan
                 s = dela.find_simplex(q); inside = s >= 0
@@ -7344,155 +7278,19 @@ segmentation, triangulation, and visualization.
                 except Exception:
                     return interp_linear(q)
 
-            def interp_kriging(q):
-                pts = sample_xy; vals = sample_z
-                n = len(pts)
-                if n < 3:
-                    return interp_plane(q)
-                bb = np.max(pts, axis=0) - np.min(pts, axis=0)
-                diag = float(np.linalg.norm(bb))
-                rng = max(1e-12, 0.5*diag)
-                sill = float(np.var(vals)) + 1e-12
-                nugget = 1e-6 * sill
-                dmat = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
-                gamma = sill * (1.0 - np.exp(-dmat / rng))
-                C = sill - gamma
-                np.fill_diagonal(C, C.diagonal() + nugget)
-                A = np.empty((n+1, n+1), float)
-                A[:n,:n]=C; A[:n,n]=1.0; A[n,:n]=1.0; A[n,n]=0.0
-                try:
-                    A_inv = np.linalg.inv(A)
-                except np.linalg.LinAlgError:
-                    return interp_linear(q)
-                out = np.empty(len(q), float)
-                for i, qi in enumerate(q):
-                    dq = np.linalg.norm(pts - qi[None, :], axis=1)
-                    gamma_q = sill * (1.0 - np.exp(-dq / rng))
-                    cvec = (sill - gamma_q)
-                    b = np.empty(n+1, float); b[:n]=cvec; b[n]=1.0
-                    x = A_inv @ b
-                    lamb = x[:n]
-                    out[i] = float(np.dot(lamb, vals))
-                return out
-
-            def interp_ct(q, k_neighbors=12, spike_factor=3.0):
-                # Precompute once
-                tree_nn = cKDTree(sample_xy)
-                # Global median spacing (2nd nn) to detect sparsity
-                d_all, _ = tree_nn.query(sample_xy, k=min(8, len(sample_xy)))
-                global_med = float(np.median(d_all[:, 1])) if d_all.shape[1] > 1 else float(np.median(d_all))
-
-                ct = CloughTocher2DInterpolator(sample_xy, sample_z, fill_value=np.nan)
-                z_ct = ct(q)
-
-                z_out = np.empty(len(q), dtype=float)
-                for i, qi in enumerate(q):
-                    # Local plane fit
-                    d, idx = tree_nn.query(qi, k=min(k_neighbors, len(sample_xy)))
-                    if np.isscalar(idx):
-                        idx = np.array([idx]); d = np.array([d])
-                    P = sample_xy[idx]                # (m,2)
-                    Z = sample_z[idx]                 # (m,)
-                    A = np.column_stack([P, np.ones(P.shape[0])])  # (m,3)
-                    try:
-                        coef, *_ = np.linalg.lstsq(A, Z, rcond=None)   # a,b,c
-                        z_lp = coef[0]*qi[0] + coef[1]*qi[1] + coef[2]
-                        z_fit = A @ coef
-                        sigma = float(np.std(Z - z_fit)) + 1e-12
-                    except Exception:
-                        # Fallback: simple mean
-                        z_lp = float(np.mean(Z))
-                        sigma = float(np.std(Z - z_lp)) + 1e-12
-
-                    zc = z_ct[i]
-                    if np.isnan(zc):
-                        z_out[i] = z_lp
-                        continue
-
-                    # Blend down CT in sparse zones
-                    mean_d = float(np.mean(d))
-                    sparsity = mean_d / max(global_med, 1e-12)
-                    alpha = 1.0 / (1.0 + (max(sparsity - 1.0, 0.0))**2)  # in [0,1], smaller when sparse
-
-                    # Clamp CT residual to local noise
-                    delta = alpha * (zc - z_lp)
-                    cap = spike_factor * sigma
-                    z_out[i] = z_lp + float(np.clip(delta, -cap, cap))
-
-                return z_out
-            
-            def interp_robust_mls(q, k=24, iters=3, c=4.685, h_mult=2.0):
-                # q: (M,2) in rotated plane; sample_xy/sample_z in scope
-                tree = cKDTree(sample_xy)
-                # global scale from sampling density (median 2nd-NN)
-                d_all, _ = tree.query(sample_xy, k=min(8, len(sample_xy)))
-                global_med = float(np.median(d_all[:, 1])) if d_all.shape[1] > 1 else float(np.median(d_all))
-                h = max(global_med * h_mult, 1e-9)
-
-                out = np.empty(len(q), dtype=float)
-                for i, qi in enumerate(q):
-                    # neighbors
-                    d, idx = tree.query(qi, k=min(k, len(sample_xy)))
-                    if np.isscalar(idx):  # single neighbor fallback
-                        out[i] = float(sample_z[idx])
-                        continue
-
-                    P = sample_xy[idx]             # (k,2)
-                    Z = sample_z[idx]              # (k,)
-                    # distance kernel (Gaussian)
-                    w_dist = np.exp(- (d / h) ** 2).astype(float) + 1e-12
-
-                    # initialize plane coeffs by ordinary LS
-                    A = np.column_stack([P, np.ones(P.shape[0])])      # (k,3)
-                    coef, *_ = np.linalg.lstsq(A, Z, rcond=None)       # a,b,c
-
-                    for _ in range(iters):
-                        z_fit = A @ coef
-                        r = Z - z_fit
-                        # robust scale
-                        s = np.median(np.abs(r)) / 0.6745 + 1e-12
-                        u = r / (c * s)
-                        # Tukey biweight in residuals
-                        w_rob = np.where(np.abs(u) < 1.0, (1 - u**2)**2, 0.0)
-                        W = (w_dist * w_rob)
-                        if np.sum(W) < 1e-12:
-                            break
-                        # weighted LS: (A^T W A)x = A^T W Z
-                        Aw = A * W[:, None]
-                        try:
-                            coef = np.linalg.lstsq(Aw.T @ A, Aw.T @ Z, rcond=None)[0]
-                        except Exception:
-                            break
-
-                    out[i] = coef[0]*qi[0] + coef[1]*qi[1] + coef[2]
-                return out
-
-            # Apply interpolation method + boundary snapping
+            # choose method
             if "Thin Plate" in interp_label: 
                 z_out = interp_tps(vertices_xy)
             elif "Linear" in interp_label:  
                 z_out = interp_linear(vertices_xy)
             elif "IDW" in interp_label:     
                 z_out = interp_idw(vertices_xy)
-            elif "Kriging" in interp_label: 
-                z_out = interp_kriging(vertices_xy)
-            elif "Clough" in interp_label:  
-                z_out = interp_ct(vertices_xy)
-            elif "MLS" in interp_label:  
-                z_out = interp_robust_mls(vertices_xy)  
             else:                            
                 z_out = interp_plane(vertices_xy)
 
-            # Apply boundary snapping (common for all non-legacy methods)
             final_vertices_rot3d = np.zeros((len(vertices_xy), 3), float)
             final_vertices_rot3d[:, :2] = vertices_xy
             final_vertices_rot3d[:, 2] = z_out
-            
-            # Boundary snapping override
-            for i in range(len(vertices_xy)):
-                kxy = key_xy(vertices_xy[i])
-                if kxy in boundary_map:
-                    final_vertices_rot3d[i, 2] = boundary_map[kxy]
 
             final_vertices_3d = (R_inv @ final_vertices_rot3d.T).T
             dataset['triangulation_result'] = {'vertices': final_vertices_3d, 'triangles': triangles}
@@ -7502,6 +7300,7 @@ segmentation, triangulation, and visualization.
         except Exception as e:
             logger.error(f"Error during triangulation for '{dataset_name}': {e}", exc_info=True)
             return False
+
     def _attach_vtu_constraints_to_all_datasets(self) -> None:
         """
         Parse VTU 'CON' style constraints and attach to each dataset as:
