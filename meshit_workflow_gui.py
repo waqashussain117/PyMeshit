@@ -7151,90 +7151,97 @@ segmentation, triangulation, and visualization.
             boundary_xyz = np.asarray(unique_points_list, float)
             boundary_segs = np.asarray(segment_indices, int)
 
+            # All interpolation methods now follow: Hull + Interpolation Method + Boundary Snapping pattern
+            # First, set up hull processing (common for all methods)
+            boundary_rot = (R @ boundary_xyz.T).T
+            provided_xy = boundary_rot[:, :2]
+
+            def order_ring(indices):
+                adj = {}
+                for a, b in indices:
+                    adj.setdefault(a, []).append(b)
+                    adj.setdefault(b, []).append(a)
+                if not adj:
+                    return None
+                start = next((i for i, nbrs in adj.items() if len(nbrs) == 2), None)
+                if start is None:
+                    start = list(adj.keys())[0]
+                ring = [start]; prev = None; cur_i = start
+                for _ in range(len(adj) + 5):
+                    nbrs = adj[cur_i]
+                    nxt = nbrs[0] if nbrs[0] != prev else (nbrs[1] if len(nbrs) > 1 else None)
+                    if nxt is None: break
+                    if nxt == ring[0]: ring.append(nxt); break
+                    ring.append(nxt); prev, cur_i = cur_i, nxt
+                return np.array(ring, int)
+
+            provided_order = order_ring(boundary_segs)
+            ring_xy = provided_xy[provided_order[:-1]] if provided_order is not None else None
+
+            ch = ConvexHull(all_pts_rot[:, :2])
+            hull_xy = all_pts_rot[ch.vertices, :2]
+
+            def poly_area(poly):
+                if poly is None or len(poly) < 3: return 0.0
+                x = poly[:, 0]; y = poly[:, 1]
+                return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+            area_provided = poly_area(ring_xy)
+            area_hull = poly_area(hull_xy)
+            use_hull = (area_hull > 0 and (area_provided == 0 or abs(area_provided - area_hull) / area_hull > 0.25))
+
+            try:
+                base_size = float(self._get_seg_target_length_for_dataset(dataset_index))
+                if base_size <= 1e-6: base_size = 1.0
+            except Exception:
+                base_size = 1.0
+
+            # Hull refinement (common for all methods)
+            if use_hull:
+                ring = np.vstack([hull_xy, hull_xy[0]])
+                refined = []
+                for i in range(len(ring) - 1):
+                    p, q = ring[i], ring[i+1]
+                    d = np.linalg.norm(q - p)
+                    n = max(1, int(np.ceil(d / base_size)))
+                    t = np.linspace(0.0, 1.0, n + 1)
+                    seg_pts = [p*(1-tk) + q*tk for tk in t]
+                    if i > 0: seg_pts = seg_pts[1:]
+                    refined.extend(seg_pts)
+                boundary_xy = np.asarray(refined, float)
+                idxs = np.arange(len(boundary_xy), dtype=int)
+                boundary_segs_for_tria = np.column_stack([idxs, np.roll(idxs, -1)])
+                boundary_segs_for_tria[-1, 1] = 0
+                tree_b = cKDTree(all_pts_rot[:, :2])
+                di_b, ii_b = tree_b.query(boundary_xy, k=1)
+                boundary_rot_for_snap = np.column_stack([boundary_xy, all_pts_rot[ii_b, 2]])
+            else:
+                boundary_xy = provided_xy
+                boundary_segs_for_tria = boundary_segs
+                boundary_rot_for_snap = boundary_rot
+
+            # Triangulation (common for all methods)
+            triangulator = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=base_size)
+            tri_res = triangulator.triangulate(points=boundary_xy, segments=boundary_segs_for_tria, uniform=uniform, create_transition=True)
+            if tri_res is None or 'vertices' not in tri_res or 'triangles' not in tri_res:
+                raise ValueError("Triangulation failed.")
+            vertices_xy = tri_res['vertices']; triangles = tri_res['triangles']
+
+            # Prepare interpolation data (common for all methods)
+            sample_xy = all_pts_rot[:, :2]; sample_z = all_pts_rot[:, 2]
+            tree = cKDTree(sample_xy)
+            k = min(64, len(sample_xy))
+            dists, idxs = tree.query(vertices_xy, k=k)
+            if k == 1: dists = dists[:, None]; idxs = idxs[:, None]
+
+            # Boundary snapping map (common for all methods)
+            def key_xy(xy): return (round(float(xy[0]), 9), round(float(xy[1]), 9))
+            boundary_map = {key_xy(p[:2]): float(p[2]) for p in boundary_rot_for_snap}
+
             # Legacy branch: original hull+IDW+boundary-snap pipeline
             if "Legacy" in interp_label:
-                boundary_rot = (R @ boundary_xyz.T).T
-                provided_xy = boundary_rot[:, :2]
-
-                def order_ring(indices):
-                    adj = {}
-                    for a, b in indices:
-                        adj.setdefault(a, []).append(b)
-                        adj.setdefault(b, []).append(a)
-                    if not adj:
-                        return None
-                    start = next((i for i, nbrs in adj.items() if len(nbrs) == 2), None)
-                    if start is None:
-                        start = list(adj.keys())[0]
-                    ring = [start]; prev = None; cur_i = start
-                    for _ in range(len(adj) + 5):
-                        nbrs = adj[cur_i]
-                        nxt = nbrs[0] if nbrs[0] != prev else (nbrs[1] if len(nbrs) > 1 else None)
-                        if nxt is None: break
-                        if nxt == ring[0]: ring.append(nxt); break
-                        ring.append(nxt); prev, cur_i = cur_i, nxt
-                    return np.array(ring, int)
-
-                provided_order = order_ring(boundary_segs)
-                ring_xy = provided_xy[provided_order[:-1]] if provided_order is not None else None
-
-                ch = ConvexHull(all_pts_rot[:, :2])
-                hull_xy = all_pts_rot[ch.vertices, :2]
-
-                def poly_area(poly):
-                    if poly is None or len(poly) < 3: return 0.0
-                    x = poly[:, 0]; y = poly[:, 1]
-                    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
-
-                area_provided = poly_area(ring_xy)
-                area_hull = poly_area(hull_xy)
-                use_hull = (area_hull > 0 and (area_provided == 0 or abs(area_provided - area_hull) / area_hull > 0.25))
-
-                try:
-                    base_size = float(self._get_seg_target_length_for_dataset(dataset_index))
-                    if base_size <= 1e-6: base_size = 1.0
-                except Exception:
-                    base_size = 1.0
-
-                if use_hull:
-                    ring = np.vstack([hull_xy, hull_xy[0]])
-                    refined = []
-                    for i in range(len(ring) - 1):
-                        p, q = ring[i], ring[i+1]
-                        d = np.linalg.norm(q - p)
-                        n = max(1, int(np.ceil(d / base_size)))
-                        t = np.linspace(0.0, 1.0, n + 1)
-                        seg_pts = [p*(1-tk) + q*tk for tk in t]
-                        if i > 0: seg_pts = seg_pts[1:]
-                        refined.extend(seg_pts)
-                    boundary_xy = np.asarray(refined, float)
-                    idxs = np.arange(len(boundary_xy), dtype=int)
-                    boundary_segs_for_tria = np.column_stack([idxs, np.roll(idxs, -1)])
-                    boundary_segs_for_tria[-1, 1] = 0
-                    tree_b = cKDTree(all_pts_rot[:, :2])
-                    di_b, ii_b = tree_b.query(boundary_xy, k=1)
-                    boundary_rot_for_snap = np.column_stack([boundary_xy, all_pts_rot[ii_b, 2]])
-                else:
-                    boundary_xy = provided_xy
-                    boundary_segs_for_tria = boundary_segs
-                    boundary_rot_for_snap = boundary_rot
-
-                triangulator = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=base_size)
-                tri_res = triangulator.triangulate(points=boundary_xy, segments=boundary_segs_for_tria, uniform=uniform, create_transition=True)
-                if tri_res is None or 'vertices' not in tri_res or 'triangles' not in tri_res:
-                    raise ValueError("Triangulation failed.")
-                vertices_xy = tri_res['vertices']; triangles = tri_res['triangles']
 
                 # Legacy IDW(1/r^4) + boundary snap
-                sample_xy = all_pts_rot[:, :2]; sample_z = all_pts_rot[:, 2]
-                tree = cKDTree(sample_xy)
-                k = min(64, len(sample_xy))
-                dists, idxs = tree.query(vertices_xy, k=k)
-                if k == 1: dists = dists[:, None]; idxs = idxs[:, None]
-
-                def key_xy(xy): return (round(float(xy[0]), 9), round(float(xy[1]), 9))
-                boundary_map = {key_xy(p[:2]): float(p[2]) for p in boundary_rot_for_snap}
-
                 final_vertices_rot3d = np.zeros((len(vertices_xy), 3), float)
                 final_vertices_rot3d[:, :2] = vertices_xy
                 for i in range(len(vertices_xy)):
@@ -7250,20 +7257,8 @@ segmentation, triangulation, and visualization.
                 logger.info(f"Triangulation for {dataset_name} (Legacy) completed. V={len(final_vertices_3d)}, T={len(triangles)}")
                 return True
 
-            # Modern methods: TPS / Linear / IDW / Plane / Kriging / Clough–Tocher (no boundary snap)
-            boundary_rot3d = (R @ boundary_xyz.T).T
-            boundary_xy = boundary_rot3d[:, :2].copy()
-            boundary_segs_for_tria = boundary_segs
-
-            bs = float(self._get_seg_target_length_for_dataset(dataset_index))
-            triangulator = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=bs if bs > 1e-6 else 1.0)
-            tri_res = triangulator.triangulate(points=boundary_xy, segments=boundary_segs_for_tria, holes=np.empty((0, 2)), uniform=uniform, create_transition=True)
-            if tri_res is None or 'vertices' not in tri_res or 'triangles' not in tri_res:
-                raise ValueError("Triangulation failed.")
-            vertices_xy = tri_res['vertices']; triangles = tri_res['triangles']
-
-            sample_xy = all_pts_rot[:, :2]; sample_z = all_pts_rot[:, 2]
-
+            # All other methods: Hull + Specific Interpolation + Boundary Snapping
+            # Define interpolation functions
             def interp_linear(q):
                 dela = Delaunay(sample_xy); out = np.empty(len(q), float); out[:] = np.nan
                 s = dela.find_simplex(q); inside = s >= 0
@@ -7337,8 +7332,6 @@ segmentation, triangulation, and visualization.
                     out[i] = float(np.dot(lamb, vals))
                 return out
 
-            from scipy.interpolate import CloughTocher2DInterpolator
-
             def interp_ct(q, k_neighbors=12, spike_factor=3.0):
                 # Precompute once
                 tree_nn = cKDTree(sample_xy)
@@ -7384,6 +7377,7 @@ segmentation, triangulation, and visualization.
                     z_out[i] = z_lp + float(np.clip(delta, -cap, cap))
 
                 return z_out
+            
             def interp_robust_mls(q, k=24, iters=3, c=4.685, h_mult=2.0):
                 # q: (M,2) in rotated plane; sample_xy/sample_z in scope
                 tree = cKDTree(sample_xy)
@@ -7429,17 +7423,35 @@ segmentation, triangulation, and visualization.
 
                     out[i] = coef[0]*qi[0] + coef[1]*qi[1] + coef[2]
                 return out
-            if "Thin Plate" in interp_label: z_out = interp_tps(vertices_xy)
-            elif "Linear" in interp_label:  z_out = interp_linear(vertices_xy)
-            elif "IDW" in interp_label:     z_out = interp_idw(vertices_xy)
-            elif "Kriging" in interp_label: z_out = interp_kriging(vertices_xy)
-            elif "Clough" in interp_label:  z_out = interp_ct(vertices_xy)
-            elif "MLS" in interp_label:  z_out = interp_robust_mls(vertices_xy)  
-            else:                            z_out = interp_plane(vertices_xy)
 
-            final_vertices_rot3d = np.column_stack([vertices_xy, z_out])
+            # Apply interpolation method + boundary snapping
+            if "Thin Plate" in interp_label: 
+                z_out = interp_tps(vertices_xy)
+            elif "Linear" in interp_label:  
+                z_out = interp_linear(vertices_xy)
+            elif "IDW" in interp_label:     
+                z_out = interp_idw(vertices_xy)
+            elif "Kriging" in interp_label: 
+                z_out = interp_kriging(vertices_xy)
+            elif "Clough" in interp_label:  
+                z_out = interp_ct(vertices_xy)
+            elif "MLS" in interp_label:  
+                z_out = interp_robust_mls(vertices_xy)  
+            else:                            
+                z_out = interp_plane(vertices_xy)
+
+            # Apply boundary snapping (common for all non-legacy methods)
+            final_vertices_rot3d = np.zeros((len(vertices_xy), 3), float)
+            final_vertices_rot3d[:, :2] = vertices_xy
+            final_vertices_rot3d[:, 2] = z_out
+            
+            # Boundary snapping override
+            for i in range(len(vertices_xy)):
+                kxy = key_xy(vertices_xy[i])
+                if kxy in boundary_map:
+                    final_vertices_rot3d[i, 2] = boundary_map[kxy]
+
             final_vertices_3d = (R_inv @ final_vertices_rot3d.T).T
-
             dataset['triangulation_result'] = {'vertices': final_vertices_3d, 'triangles': triangles}
             logger.info(f"Triangulation for {dataset_name} completed. V={len(final_vertices_3d)}, T={len(triangles)}")
             return True

@@ -2853,6 +2853,7 @@ def run_constrained_triangulation_py(
 
             out[i] = coef[0]*qi[0] + coef[1]*qi[1] + coef[2]
         return out
+    
     # choose method (Legacy maps to IDW + PLC snap)
     if "Legacy" in interp:
         w_out = z_idw(vertices_uv)
