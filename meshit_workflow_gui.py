@@ -5193,19 +5193,47 @@ class MeshItWorkflowGUI(QMainWindow):
             }
             for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
                 if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
+                    raw_hull_points = [Vector3D(p.x, p.y, p.z, point_type=getattr(p, "point_type", "DEFAULT")) for p in temp_surface.convex_hull]
                     original_idx = temp_model.original_indices_map.get(
                         next((k for k, v in temp_model.surface_original_to_temp_idx_map.items() if v == temp_surface_idx), None)
                     )
                     if original_idx is not None and 'points' in self.datasets[original_idx]:
                         scattered_points = [Vector3D(p[0], p[1], p[2]) for p in self.datasets[original_idx]['points']]
-                        temp_surface.convex_hull = refine_hull_with_interpolation(
-                            temp_surface.convex_hull, scattered_points, config
+                        refined_hull_3d = refine_hull_with_interpolation(
+                            raw_hull_points, scattered_points, config
                         )
-            logger.info(f"Hull interpolation refinement complete using {config['interp']}")
-        except Exception as e:
-            logger.error(f"Error during hull interpolation refinement: {e}", exc_info=True)
-            return
+                        
 
+                    # Step 4: Create refined Vector3D objects preserving point types
+                    refined_hull_points = []
+                    for i, (orig_pt, refined_3d) in enumerate(zip(raw_hull_points, refined_hull_3d)):
+                        # If refined_3d is already a Vector3D, just copy it
+                        if isinstance(refined_3d, Vector3D):
+                            refined_pt = Vector3D(refined_3d.x, refined_3d.y, refined_3d.z)
+                        else:
+                            refined_pt = Vector3D(refined_3d[0], refined_3d[1], refined_3d[2])
+                        # Preserve original point type information
+                        refined_pt.point_type = getattr(orig_pt, 'point_type', 'DEFAULT')
+                        if hasattr(orig_pt, 'type'):
+                            refined_pt.type = orig_pt.type
+                        refined_hull_points.append(refined_pt)
+
+                    # --- NEW: Snap refined hull points back to original endpoints if close ---
+                    snap_tol = 1e-5
+                    for i, (orig_pt, refined_pt) in enumerate(zip(raw_hull_points, refined_hull_points)):
+                        if (orig_pt - refined_pt).length() < snap_tol:
+                            # Use the original point exactly (preserves endpoint for snapping)
+                            refined_hull_points[i] = orig_pt
+
+                    # Calculate refinement statistics
+                    displacement_distances = [
+                        (orig - refined).length() 
+                        for orig, refined in zip(raw_hull_points, refined_hull_points)
+                    ]
+                    temp_surface.convex_hull = refined_hull_points
+        except Exception as e:
+            logger.error(f"Error during hull refinement: {e}", exc_info=True)
+            return
         # Step 4: Align intersections to hulls (defines hull topology)
         try:
             for temp_surface_list_idx in range(len(temp_model.surfaces)):
@@ -7277,7 +7305,6 @@ segmentation, triangulation, and visualization.
                     return rbf(q)
                 except Exception:
                     return interp_linear(q)
-
             # choose method
             if "Thin Plate" in interp_label: 
                 z_out = interp_tps(vertices_xy)

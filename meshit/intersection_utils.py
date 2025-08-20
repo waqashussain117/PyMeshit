@@ -2013,7 +2013,7 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
         logger.warning(f"Surface {surface_idx} has no valid convex hull for alignment.")
         return
 
-    snap_tol = 1e-5   # <<--- increased
+    snap_tol = 1e-4  # <<--- increased
     proj_tol = 1e-3   # <<--- increased
 
     for inter in model.intersections:
