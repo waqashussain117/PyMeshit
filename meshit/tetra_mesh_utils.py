@@ -20,7 +20,7 @@ class TetrahedralMeshGenerator:
     def __init__(self, datasets: List[Dict], selected_surfaces: set, 
                  border_surface_indices: set, unit_surface_indices: set, 
                  fault_surface_indices: set, materials: List[Dict] = None,
-                 surface_data: Dict = None):
+                 surface_data: Dict = None, holes: List = None):
         """
         Initialize the tetrahedral mesh generator.
         
@@ -32,6 +32,7 @@ class TetrahedralMeshGenerator:
             fault_surface_indices: Set of fault surface indices.
             materials: List of material definitions with locations.
             surface_data: Dictionary of conforming mesh data {surface_idx: mesh_data}.
+            holes: List of hole points [(x, y, z), ...] to be passed to TetGen.
         """
         self.datasets = datasets
         self.selected_surfaces = selected_surfaces
@@ -40,6 +41,7 @@ class TetrahedralMeshGenerator:
         self.fault_surface_indices = fault_surface_indices
         self.materials = materials or []
         self.surface_data = surface_data or {}
+        self.external_holes = holes or []  # Holes passed from GUI
         self.tetrahedral_mesh = None
         
         # PLC data containers
@@ -49,6 +51,7 @@ class TetrahedralMeshGenerator:
         self.plc_regions = None
         self.plc_edge_constraints = None
         self.plc_edge_markers = None
+        self.plc_holes = None  # Store hole points
 
     def generate_tetrahedral_mesh(self, tetgen_switches: str = "pq1.414aAY") -> Optional[pv.UnstructuredGrid]:
         """
@@ -71,6 +74,14 @@ class TetrahedralMeshGenerator:
             # Step 2: Create a TetGen object.
             tet = tetgen.TetGen(self.plc_vertices, self.plc_facets, self.plc_facet_markers)
             
+            # Step 2.5: Add holes to TetGen if any exist
+            if hasattr(self, 'plc_holes') and self.plc_holes is not None and len(self.plc_holes) > 0:
+                for hole_point in self.plc_holes:
+                    hole_coords = (float(hole_point[0]), float(hole_point[1]), float(hole_point[2]))
+                    tet.add_hole(hole_coords)
+                    logger.info(f"Added hole to TetGen at ({hole_coords[0]:.3f}, {hole_coords[1]:.3f}, {hole_coords[2]:.3f})")
+                logger.info(f"✓ Added {len(self.plc_holes)} holes to TetGen mesh")
+            
             # Step 3: Add edge constraints.
             if self.plc_edge_constraints is not None and len(self.plc_edge_constraints) > 0:
                 tet.edge_list = self.plc_edge_constraints.tolist()
@@ -84,15 +95,40 @@ class TetrahedralMeshGenerator:
                 
                 if volumetric_regions:
                     # Only add VOLUMETRIC materials (units/formations) as 3D regions
+                    # Check for holes and avoid placing material points in hole regions
+                    hole_distance_threshold = 5.0  # Minimum distance from hole centers
+                    
                     for i, region in enumerate(volumetric_regions):
                         region_id = int(region[3])  # material attribute
                         point = (float(region[0]), float(region[1]), float(region[2]))
                         max_vol = float(region[4]) if region[4] > 0 else 0.0  # TetGen expects 0.0 for no constraint
                         
+                        # Check if this material point is too close to any hole
+                        too_close_to_hole = False
+                        if hasattr(self, 'plc_holes') and self.plc_holes is not None and len(self.plc_holes) > 0:
+                            for hole in self.plc_holes:
+                                distance = np.linalg.norm(np.array(point) - np.array(hole))
+                                if distance < hole_distance_threshold:
+                                    logger.warning(f"Material point {point} is {distance:.2f} units from hole at {hole}. Adjusting position.")
+                                    # Move the material point away from the hole
+                                    direction = np.array(point) - np.array(hole)
+                                    if np.linalg.norm(direction) > 1e-10:
+                                        direction = direction / np.linalg.norm(direction)
+                                        adjusted_point = np.array(hole) + direction * hole_distance_threshold * 1.5
+                                        point = tuple(adjusted_point)
+                                        logger.info(f"Adjusted material point to {point}")
+                                    break
+                        
                         tet.add_region(region_id, point, max_vol)
                         logger.info(f"Added 3D region {region_id}: point={point}, max_vol={max_vol}")
                     
-                    logger.info(f"✓ C++ Style: Added {len(volumetric_regions)} 3D regions (units/formations) to TetGen")
+                    # Log hole information for debugging
+                    if hasattr(self, 'plc_holes') and self.plc_holes is not None and len(self.plc_holes) > 0:
+                        logger.info(f"✓ C++ Style: Added {len(volumetric_regions)} 3D regions (units/formations) to TetGen, avoiding {len(self.plc_holes)} holes")
+                        for hole in self.plc_holes:
+                            logger.debug(f"Hole at ({hole[0]:.3f}, {hole[1]:.3f}, {hole[2]:.3f})")
+                    else:
+                        logger.info(f"✓ C++ Style: Added {len(volumetric_regions)} 3D regions (units/formations) to TetGen")
                     
                 if surface_materials:
                     logger.info(f"✓ C++ Style: {len(surface_materials)} 2D materials (faults) handled as surface constraints")
@@ -181,13 +217,12 @@ class TetrahedralMeshGenerator:
     
     def _build_plc_from_precomputed_meshes(self):
         """
-        Builds the final PLC by combining pre-computed conforming meshes (preferred) 
-        with fallback constraint-based triangulation. This hybrid approach ensures 
-        maximum reliability while maintaining C++ MeshIt compatibility.
+        Builds the final PLC by combining pre-computed conforming meshes (preferred)
+        with fallback constraint-based triangulation, and adds WELL polylines as edge
+        constraints (C++: wells are 1D, not triangulated).
         """
         logger.info("Building final PLC from pre-computed conforming meshes...")
 
-        # Helper to safely extract 3D coordinates from various point formats
         def _xyz(pt) -> List[float]:
             if isinstance(pt, Vector3D):
                 return [float(pt.x), float(pt.y), float(pt.z)]
@@ -196,89 +231,82 @@ class TetrahedralMeshGenerator:
             else:
                 raise ValueError(f"Unsupported point type: {type(pt)}")
 
-        # ---------- helpers ----------
         key_to_global_idx = {}
         global_vertices = []
         global_facets = []
         global_facet_markers = []
         edge_constraints = set()
+        global_holes = []
 
-        # CRITICAL: Separate surface types for proper handling
         boundary_surfaces = (self.border_surface_indices | self.unit_surface_indices) & self.selected_surfaces
         fault_surfaces = self.fault_surface_indices & self.selected_surfaces
-        
         logger.info(f"Processing {len(boundary_surfaces)} boundary surfaces, {len(fault_surfaces)} fault surfaces")
 
-        # ======================================================================
-        # 1. PREFERRED APPROACH: Use pre-computed conforming meshes (like old function)
-        # ======================================================================
+        # Holes from stored constraints and GUI
+        logger.info("Collecting holes from stored constraints...")
+        self._collect_holes_from_datasets(global_holes)
+        if self.external_holes:
+            for hole in self.external_holes:
+                global_holes.append(hole)
+            logger.info(f"Added {len(self.external_holes)} external holes from GUI")
+
+        # 1) Use precomputed conforming meshes
         surfaces_with_precomputed = set()
-        
         for s_idx in boundary_surfaces | fault_surfaces:
             if s_idx not in self.surface_data:
                 continue
-                
+
             conforming_mesh = self.surface_data[s_idx]
             local_vertices = conforming_mesh.get('vertices')
             local_triangles = conforming_mesh.get('triangles')
+            local_holes = conforming_mesh.get('holes', [])
 
             if local_vertices is None or local_triangles is None or len(local_vertices) == 0:
                 continue
 
-            # Add vertices to global pool
-            local_to_global_map = {}
-            for local_idx, vertex in enumerate(local_vertices):
-                key = (round(vertex[0], 9), round(vertex[1], 9), round(vertex[2], 9))
-                global_idx = key_to_global_idx.get(key)
-                if global_idx is None:
-                    global_idx = len(global_vertices)
-                    key_to_global_idx[key] = global_idx
-                    global_vertices.append(_xyz(vertex))
-                local_to_global_map[local_idx] = global_idx
+            # Add holes from this surface
+            for hole in (local_holes or []):
+                global_holes.append(_xyz(hole))
 
-            # Add triangles as facets with proper markers
+            # Map vertices to global
+            local_to_global = {}
+            for lv_idx, v in enumerate(local_vertices):
+                key = (round(v[0], 9), round(v[1], 9), round(v[2], 9))
+                g = key_to_global_idx.get(key)
+                if g is None:
+                    g = len(global_vertices)
+                    key_to_global_idx[key] = g
+                    global_vertices.append(_xyz(v))
+                local_to_global[lv_idx] = g
+
+            # Add triangles as facets with markers
             for tri in local_triangles:
-                global_tri = [local_to_global_map.get(v_idx) for v_idx in tri[:3]]
-                if all(v is not None for v in global_tri) and len(set(global_tri)) == 3:
-                    # Validate triangle area
-                    v0, v1, v2 = [global_vertices[i] for i in global_tri]
-                    area = 0.5 * np.linalg.norm(np.cross(np.array(v1) - np.array(v0), np.array(v2) - np.array(v0)))
+                gtri = [local_to_global.get(vidx) for vidx in tri[:3]]
+                if all(t is not None for t in gtri) and len(set(gtri)) == 3:
+                    v0, v1, v2 = [global_vertices[i] for i in gtri]
+                    area = 0.5 * np.linalg.norm(np.cross(np.array(v1) - np.array(v0),
+                                                        np.array(v2) - np.array(v0)))
                     if area > 1e-12:
-                        global_facets.append(global_tri)
-                        # C++ style markers: high values for faults
+                        global_facets.append(gtri)
+                        global_facet_markers.append(1000 + s_idx if s_idx in fault_surfaces else s_idx)
                         if s_idx in fault_surfaces:
-                            global_facet_markers.append(1000 + s_idx)
-                        else:
-                            global_facet_markers.append(s_idx)
-                        
-                        # For faults, also add edges as constraints (with validation)
-                        if s_idx in fault_surfaces:
-                            for i in range(3):
-                                v1_idx = global_tri[i]
-                                v2_idx = global_tri[(i + 1) % 3]
-                                if v1_idx != v2_idx:
-                                    edge_tuple = tuple(sorted((v1_idx, v2_idx)))
-                                    # Only add edge if it doesn't create conflicts
-                                    if not self._edge_creates_conflict(edge_tuple, edge_constraints):
-                                        edge_constraints.add(edge_tuple)
+                            for k in range(3):
+                                e = tuple(sorted((gtri[k], gtri[(k + 1) % 3])))
+                                if e[0] != e[1]:
+                                    edge_constraints.add(e)
 
             surfaces_with_precomputed.add(s_idx)
             surface_name = self.datasets[s_idx].get("name", f"Surface_{s_idx}")
-            logger.info(f"✓ Used pre-computed conforming mesh for '{surface_name}': {len(local_vertices)} vertices, {len(local_triangles)} triangles")
+            logger.info(f"✓ Used precomputed mesh for '{surface_name}': {len(local_vertices)} vertices, {len(local_triangles)} triangles")
 
-        # ======================================================================
-        # 2. FALLBACK: Constraint-based triangulation for missing surfaces
-        # ======================================================================
+        # 2) Fallback triangulation for missing surfaces (unchanged core logic)
         missing_surfaces = (boundary_surfaces | fault_surfaces) - surfaces_with_precomputed
-        
         if missing_surfaces:
             logger.info(f"Fallback: Generating triangles for {len(missing_surfaces)} surfaces without pre-computed meshes")
-            
+
             # First add constraint vertices to global pool
             for s_idx in missing_surfaces:
                 dataset = self.datasets[s_idx]
-                
-                # Add refined hull points
                 hull_points = dataset.get("hull_points", [])
                 if hull_points is not None:
                     for p in hull_points:
@@ -286,8 +314,7 @@ class TetrahedralMeshGenerator:
                         if key not in key_to_global_idx:
                             key_to_global_idx[key] = len(global_vertices)
                             global_vertices.append(_xyz(p))
-                
-                # Add refined intersection line points
+
                 for constraint in dataset.get("stored_constraints", []):
                     if constraint.get("type") == "intersection_line":
                         for p in constraint.get("points", []):
@@ -300,216 +327,193 @@ class TetrahedralMeshGenerator:
             for s_idx in missing_surfaces:
                 dataset = self.datasets[s_idx]
                 surface_name = dataset.get("name", f"Surface_{s_idx}")
-                
-                # Build PLC for this surface
-                surface_plc_points_3d = []
-                surface_plc_segments = []
-                point_map = {}
+                surface_plc_points_3d, surface_plc_segments, point_map = [], [], {}
 
-                def add_surface_point(p_coords):
-                    key = (round(p_coords[0], 9), round(p_coords[1], 9), round(p_coords[2], 9))
+                def add_surface_point(p):
+                    key = (round(p[0], 9), round(p[1], 9), round(p[2], 9))
                     idx = point_map.get(key)
                     if idx is None:
                         idx = len(surface_plc_points_3d)
                         point_map[key] = idx
-                        surface_plc_points_3d.append(_xyz(p_coords))
+                        surface_plc_points_3d.append(_xyz(p))
                     return idx
 
-                # Collect hull segments (for boundary surfaces)
                 if s_idx in boundary_surfaces:
                     hull_points = dataset.get("hull_points", [])
                     if hull_points is not None and len(hull_points) > 1:
                         for i in range(len(hull_points) - 1):
-                            p1_idx = add_surface_point(hull_points[i])
-                            p2_idx = add_surface_point(hull_points[i+1])
-                            if p1_idx != p2_idx:
-                                surface_plc_segments.append([p1_idx, p2_idx])
+                            p1 = add_surface_point(hull_points[i])
+                            p2 = add_surface_point(hull_points[i + 1])
+                            if p1 != p2:
+                                surface_plc_segments.append([p1, p2])
 
-                # Collect intersection line segments
                 for constraint in dataset.get("stored_constraints", []):
                     if constraint.get("type") == "intersection_line":
-                        points = constraint.get("points", [])
-                        for i in range(len(points) - 1):
-                            p1_idx = add_surface_point(points[i])
-                            p2_idx = add_surface_point(points[i+1])
-                            if p1_idx != p2_idx:
-                                surface_plc_segments.append([p1_idx, p2_idx])
-                
+                        pts = constraint.get("points", [])
+                        for i in range(len(pts) - 1):
+                            p1 = add_surface_point(pts[i])
+                            p2 = add_surface_point(pts[i + 1])
+                            if p1 != p2:
+                                surface_plc_segments.append([p1, p2])
+
                 if not surface_plc_points_3d or not surface_plc_segments:
                     logger.warning(f"Skipping fallback triangulation for '{surface_name}' - insufficient constraint data")
                     continue
 
-                # Robust triangulation with multiple fallback strategies
-                local_triangles = self._triangulate_surface_constraints(
-                    surface_plc_points_3d, surface_plc_segments, surface_name
-                )
-                
-                if local_triangles is None or len(local_triangles) == 0:
+                local_tris = self._triangulate_surface_constraints(surface_plc_points_3d, surface_plc_segments, surface_name)
+                if local_tris is None or len(local_tris) == 0:
                     logger.warning(f"Fallback triangulation failed for '{surface_name}' - surface excluded")
                     continue
-                
-                # Map to global indices
-                for tri in local_triangles:
-                    global_tri = []
-                    valid_tri = True
-                    for local_v_idx in tri:
-                        local_pt_coords = surface_plc_points_3d[local_v_idx]
-                        key = (round(local_pt_coords[0], 9), round(local_pt_coords[1], 9), round(local_pt_coords[2], 9))
-                        global_v_idx = key_to_global_idx.get(key)
-                        if global_v_idx is None:
-                            valid_tri = False
+
+                # Map to global
+                for tri in local_tris:
+                    gtri = []
+                    valid = True
+                    for lv in tri:
+                        coords = surface_plc_points_3d[lv]
+                        key = (round(coords[0], 9), round(coords[1], 9), round(coords[2], 9))
+                        g = key_to_global_idx.get(key)
+                        if g is None:
+                            valid = False
                             break
-                        global_tri.append(global_v_idx)
-                    
-                    if valid_tri and len(set(global_tri)) == 3:
-                        global_facets.append(global_tri)
-                        if s_idx in fault_surfaces:
-                            global_facet_markers.append(1000 + s_idx)
-                        else:
-                            global_facet_markers.append(s_idx)
+                        gtri.append(g)
+                    if valid and len(set(gtri)) == 3:
+                        global_facets.append(gtri)
+                        global_facet_markers.append(1000 + s_idx if s_idx in fault_surfaces else s_idx)
 
-                logger.info(f"✓ Fallback triangulation successful for '{surface_name}': {len(local_triangles)} triangles")
+                logger.info(f"✓ Fallback triangulation successful for '{surface_name}': {len(local_tris)} triangles")
 
-        # ======================================================================
-        # 3. ADD INTERSECTION LINE CONSTRAINTS (with geometric validation)
-        # ======================================================================
-        constraint_point_failures = 0
+        # 3) Add intersection line constraints (existing logic, kept permissive)
         validated_edge_constraints = set()
-        
         for s_idx in self.selected_surfaces:
-            if s_idx >= len(self.datasets): 
+            if s_idx >= len(self.datasets):
                 continue
-                
             dataset = self.datasets[s_idx]
             for constraint in dataset.get("stored_constraints", []):
                 if constraint.get("type") == "intersection_line":
-                    points = constraint.get("points", [])
-                    if len(points) < 2: 
+                    pts = constraint.get("points", [])
+                    if len(pts) < 2:
                         continue
-                    
-                    for i in range(len(points) - 1):
-                        key1 = (round(points[i][0], 9), round(points[i][1], 9), round(points[i][2], 9))
-                        key2 = (round(points[i+1][0], 9), round(points[i+1][1], 9), round(points[i+1][2], 9))
-                        g_idx1, g_idx2 = key_to_global_idx.get(key1), key_to_global_idx.get(key2)
-                        
-                        if g_idx1 is not None and g_idx2 is not None and g_idx1 != g_idx2:
-                            # Check basic validity but be less aggressive than before
-                            edge_tuple = tuple(sorted((g_idx1, g_idx2)))
-                            edge_len = np.linalg.norm(np.array(global_vertices[g_idx1]) - np.array(global_vertices[g_idx2]))
-                            
-                            # Only reject if edge is degenerate or clearly problematic
-                            if edge_len > 1e-10 and not self._edge_intersects_triangles(edge_tuple, global_facets, global_vertices):
-                                validated_edge_constraints.add(edge_tuple)
-                            else:
-                                logger.debug(f"Skipped problematic edge constraint: {edge_tuple} (length: {edge_len:.2e})")
-                        elif g_idx1 is None or g_idx2 is None:
-                            # Try relaxed precision matching
-                            if g_idx1 is None:
-                                for existing_key, existing_gidx in key_to_global_idx.items():
-                                    if (abs(existing_key[0] - key1[0]) < 1e-8 and 
-                                        abs(existing_key[1] - key1[1]) < 1e-8 and 
-                                        abs(existing_key[2] - key1[2]) < 1e-8):
-                                        g_idx1 = existing_gidx
-                                        break
-                            if g_idx2 is None:
-                                for existing_key, existing_gidx in key_to_global_idx.items():
-                                    if (abs(existing_key[0] - key2[0]) < 1e-8 and 
-                                        abs(existing_key[1] - key2[1]) < 1e-8 and 
-                                        abs(existing_key[2] - key2[2]) < 1e-8):
-                                        g_idx2 = existing_gidx
-                                        break
-                            
-                            if g_idx1 is not None and g_idx2 is not None and g_idx1 != g_idx2:
-                                edge_tuple = tuple(sorted((g_idx1, g_idx2)))
-                                edge_len = np.linalg.norm(np.array(global_vertices[g_idx1]) - np.array(global_vertices[g_idx2]))
-                                
-                                # Only reject if edge is degenerate
-                                if edge_len > 1e-10:
-                                    validated_edge_constraints.add(edge_tuple)
-                            else:
-                                constraint_point_failures += 1
+                    for i in range(len(pts) - 1):
+                        k1 = (round(pts[i][0], 9), round(pts[i][1], 9), round(pts[i][2], 9))
+                        k2 = (round(pts[i+1][0], 9), round(pts[i+1][1], 9), round(pts[i+1][2], 9))
+                        g1, g2 = key_to_global_idx.get(k1), key_to_global_idx.get(k2)
+                        if g1 is not None and g2 is not None and g1 != g2:
+                            e = tuple(sorted((g1, g2)))
+                            validated_edge_constraints.add(e)
 
-        if constraint_point_failures > 0:
-            logger.warning(f"Some constraint points could not be matched to global vertices: {constraint_point_failures} failures")
+        # 4) NEW: Add WELL polylines as edge constraints (no triangulation)
+        well_edges_added = 0
+        for d in self.datasets:
+            if d.get('type') == 'WELL':
+                pts = d.get('refined_well_points') or d.get('points')  # prefer refined wells
+                if pts is None or len(pts) < 2:
+                    continue
+                gidxs = []
+                for p in pts:
+                    key = (round(float(p[0]), 9), round(float(p[1]), 9), round(float(p[2]), 9))
+                    g = key_to_global_idx.get(key)
+                    if g is None:
+                        g = len(global_vertices)
+                        key_to_global_idx[key] = g
+                        global_vertices.append(_xyz(p))
+                    gidxs.append(g)
+                for i in range(len(gidxs) - 1):
+                    if gidxs[i] != gidxs[i + 1]:
+                        e = tuple(sorted((gidxs[i], gidxs[i + 1])))
+                        validated_edge_constraints.add(e)
+                        well_edges_added += 1
+        if well_edges_added > 0:
+            logger.info(f"✓ Added {well_edges_added} well edge constraints")
 
-        # ======================================================================
-        # 4. GEOMETRIC VALIDATION AND CLEANUP (C++ style)
-        # ======================================================================
-        logger.info(f"Validating PLC geometry before TetGen...")
-        
-        # Remove degenerate triangles
+        # 5) Validate triangles (light cleanup)
         validated_facets = []
         validated_facet_markers = []
-        
         for i, tri in enumerate(global_facets):
             if self._is_valid_triangle(tri, global_vertices):
                 validated_facets.append(tri)
                 validated_facet_markers.append(global_facet_markers[i])
-            else:
-                logger.debug(f"Removed degenerate triangle: {tri}")
 
-        # Check for and resolve overlapping triangles (simplified approach)
-        final_facets, final_facet_markers = self._resolve_overlapping_triangles(
-            validated_facets, validated_facet_markers, global_vertices
-        )
-
-        logger.info(f"Geometric validation: {len(global_facets)} -> {len(final_facets)} triangles, "
-                   f"{len(edge_constraints)} -> {len(validated_edge_constraints)} constraints")
-
-        # CRITICAL FIX: If we have very few triangles compared to surfaces, this indicates
-        # low-quality conforming meshes that may cause TetGen issues (like in the failing case)
-        triangles_per_surface = len(final_facets) / max(1, len(surfaces_with_precomputed))
-        if triangles_per_surface < 200:  # Working case had ~600 triangles per surface
-            logger.warning(f"Low triangle density detected: {triangles_per_surface:.1f} triangles/surface")
-            logger.warning("This may indicate conforming meshes were generated with inappropriate settings")
-            logger.warning("Consider regenerating conforming meshes with smaller target edge length")
-
-        # If we removed too many edge constraints, add back some basic ones
-        # This prevents the "all constraints removed" issue seen in failing case
-        if len(edge_constraints) > 0 and len(validated_edge_constraints) == 0:
-            logger.warning("All edge constraints were removed - adding back essential fault constraints")
-            # Add back constraints for fault edges only (critical for complex geometry)
-            for s_idx in fault_surfaces:
-                if s_idx in surfaces_with_precomputed:
-                    # Add a minimal set of constraints for fault boundaries
-                    conforming_mesh = self.surface_data[s_idx]
-                    local_triangles = conforming_mesh.get('triangles', [])
-                    if local_triangles:
-                        # Add constraints for first and last few triangles (boundary edges)
-                        for tri_idx in [0, len(local_triangles)//2, -1]:
-                            if tri_idx < len(local_triangles):
-                                tri = local_triangles[tri_idx]
-                                for i in range(3):
-                                    v1_local = tri[i]
-                                    v2_local = tri[(i+1) % 3]
-                                    if v1_local < len(conforming_mesh.get('vertices', [])) and v2_local < len(conforming_mesh.get('vertices', [])):
-                                        v1_coords = conforming_mesh['vertices'][v1_local]
-                                        v2_coords = conforming_mesh['vertices'][v2_local]
-                                        
-                                        # Find global indices
-                                        key1 = (round(v1_coords[0], 9), round(v1_coords[1], 9), round(v1_coords[2], 9))
-                                        key2 = (round(v2_coords[0], 9), round(v2_coords[1], 9), round(v2_coords[2], 9))
-                                        g_idx1 = key_to_global_idx.get(key1)
-                                        g_idx2 = key_to_global_idx.get(key2)
-                                        
-                                        if g_idx1 is not None and g_idx2 is not None and g_idx1 != g_idx2:
-                                            edge_tuple = tuple(sorted((g_idx1, g_idx2)))
-                                            validated_edge_constraints.add(edge_tuple)
-            
-            logger.info(f"Added {len(validated_edge_constraints)} essential fault constraints back")
-
-        # Final assignment to class attributes
+        # Final assignment
         self.plc_vertices = np.asarray(global_vertices, dtype=np.float64)
-        self.plc_facets = np.asarray(final_facets, dtype=np.int32)
-        self.plc_facet_markers = np.asarray(final_facet_markers, dtype=np.int32)
+        self.plc_facets = np.asarray(validated_facets, dtype=np.int32)
+        self.plc_facet_markers = np.asarray(validated_facet_markers, dtype=np.int32)
         self.plc_edge_constraints = np.asarray(list(validated_edge_constraints), dtype=np.int32) if validated_edge_constraints else np.empty((0, 2), dtype=np.int32)
         self.plc_edge_markers = np.arange(1, len(self.plc_edge_constraints) + 1, dtype=np.int32)
+        self.plc_holes = np.asarray(global_holes, dtype=np.float64) if global_holes else np.empty((0, 3), dtype=np.float64)
 
-        precomputed_count = len(surfaces_with_precomputed)
-        fallback_count = len(missing_surfaces) - len([s for s in missing_surfaces if s not in surfaces_with_precomputed])
+        logger.info(f"Final PLC built: {len(self.plc_vertices)} vertices, {len(self.plc_facets)} facets, {len(self.plc_edge_constraints)} edge constraints"
+                    + (f", {len(global_holes)} holes" if len(global_holes) > 0 else ""))
+    
+    def _collect_holes_from_datasets(self, global_holes):
+        """
+        Collect hole centers from stored constraints in datasets.
+        This is needed because conforming mesh data doesn't include hole information.
+        """
+        hole_count = 0
+        processed_holes = set()  # Avoid duplicates
         
-        logger.info(f"Final PLC built: {len(self.plc_vertices)} vertices, {len(self.plc_facets)} facets, {len(self.plc_edge_constraints)} edge constraints")
-        logger.info(f"✓ Surface processing: {precomputed_count} from conforming meshes, {fallback_count} from constraint triangulation")
+        for s_idx in self.selected_surfaces:
+            if s_idx >= len(self.datasets):
+                continue
+                
+            dataset = self.datasets[s_idx]
+            surface_name = dataset.get("name", f"Surface_{s_idx}")
+            
+            # Look for intersection line constraints that might be marked as holes
+            for constraint in dataset.get("stored_constraints", []):
+                constraint_type = constraint.get("type")
+                is_hole = constraint.get("is_hole", False)
+                
+                if constraint_type == "intersection_line" and is_hole:
+                    # Get hole center from constraint points
+                    points = constraint.get("points", [])
+                    if points:
+                        # Calculate centroid of intersection line points
+                        hole_center = self._calculate_hole_center(points)
+                        if hole_center:
+                            # Create a unique key for this hole to avoid duplicates
+                            hole_key = (round(hole_center[0], 3), round(hole_center[1], 3), round(hole_center[2], 3))
+                            if hole_key not in processed_holes:
+                                global_holes.append(hole_center)
+                                processed_holes.add(hole_key)
+                                hole_count += 1
+                                logger.info(f"Collected hole from '{surface_name}' intersection at ({hole_center[0]:.3f}, {hole_center[1]:.3f}, {hole_center[2]:.3f})")
+        
+        if hole_count > 0:
+            logger.info(f"✓ Collected {hole_count} holes from stored constraints")
+        else:
+            logger.info("No holes found in stored constraints - will check for GUI hole data")
+    
+    def _calculate_hole_center(self, points):
+        """Calculate the center point of a hole from its boundary points."""
+        if not points:
+            return None
+        
+        # Convert points to numpy array for easier calculation
+        import numpy as np
+        
+        try:
+            # Handle different point formats
+            coords = []
+            for pt in points:
+                if hasattr(pt, 'x'):  # Vector3D-like object
+                    coords.append([pt.x, pt.y, pt.z])
+                elif isinstance(pt, (list, tuple)) and len(pt) >= 3:
+                    coords.append([pt[0], pt[1], pt[2]])
+                else:
+                    continue
+            
+            if not coords:
+                return None
+                
+            coords_array = np.array(coords)
+            center = np.mean(coords_array, axis=0)
+            return [float(center[0]), float(center[1]), float(center[2])]
+            
+        except Exception as e:
+            logger.warning(f"Failed to calculate hole center: {e}")
+            return None
 
     def _edge_intersects_triangles(self, edge_tuple, triangles, vertices):
         """
@@ -701,6 +705,7 @@ class TetrahedralMeshGenerator:
         self.plc_facet_markers = np.asarray(global_facet_markers, dtype=np.int32)
         self.plc_edge_constraints = np.asarray(list(edge_constraints), dtype=np.int32) if edge_constraints else np.empty((0, 2), dtype=np.int32)
         self.plc_edge_markers = np.arange(1, len(self.plc_edge_constraints) + 1, dtype=np.int32)
+        self.plc_holes = np.empty((0, 3), dtype=np.float64)  # No holes in fallback method
 
         logger.info(f"Final PLC built: {len(self.plc_vertices)} vertices, {len(self.plc_facets)} facets, {len(self.plc_edge_constraints)} edge constraints")
 

@@ -453,7 +453,7 @@ class DirectTriangleWrapper:
                 area_constraint = self.base_size * self.base_size * 0.5
                 
                 # Simplified options - no expensive callbacks or complex features
-                tri_options = f'pzq{effective_min_angle:.1f}a{area_constraint:.8f}'
+                tri_options = f'pzYYa{area_constraint:.8f}'
         else:
             # Non-uniform approach for complex cases
             hull_points = self._get_hull_points_fast(points)

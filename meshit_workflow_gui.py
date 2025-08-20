@@ -22,9 +22,10 @@ from PyQt5.QtWidgets import QToolButton
 from typing import List, Dict, Tuple, Optional, Any
 # import QAbsractItemView
 from PyQt5.QtWidgets import QAbstractItemView
-from meshit.intersection_utils import align_intersections_to_convex_hull, Vector3D, Intersection, refine_intersection_line_by_length, insert_triple_points
+from meshit.intersection_utils import align_intersections_to_convex_hull, Vector3D, Intersection, refine_intersection_line_by_length, insert_triple_points, refine_hull_with_interpolation
 from meshit.intersection_utils import prepare_plc_for_surface_triangulation, run_constrained_triangulation_py, calculate_triple_points, TriplePoint
 # Import PyQt5
+from meshit.intersection_utils import make_corners_special, Vector3D
 # import QMessageBox
 from meshit.pre_tetra_constraint_manager import PreTetraConstraintManager
 from PyQt5.QtWidgets import QMenu, QTreeWidgetItemIterator
@@ -126,16 +127,14 @@ class ComputationWorker(QObject):
 
         for i in range(total_datasets):
             if not self._is_running:
-                logger.info(f"Worker: Hull computation loop canceled at index {i}.")
                 break
-            dataset_name = self.gui.datasets[i].get('name', f"Dataset {i}")
-            logger.debug(f"Worker: Computing hull for '{dataset_name}' (index {i}).")
-            # Moved the check inside the loop iteration, just before the potentially long call
-            if not self._is_running:
-                 logger.info(f"Worker: Hull computation canceled just before processing index {i}.")
-                 break
-            success = self.gui._compute_hull_for_dataset(i) # Call GUI's compute method
-            logger.debug(f"Worker: Hull computation for index {i} finished (Success: {success}).")
+            dataset = self.gui.datasets[i]
+            dataset_name = dataset.get('name', f"Dataset {i}")
+            # Skip wells
+            if dataset.get('type') == 'WELL':
+                self.dataset_finished.emit(i, dataset_name, True)
+                continue
+            success = self.gui._compute_hull_for_dataset(i)
             self.dataset_finished.emit(i, dataset_name, success)
             if success:
                 success_count += 1
@@ -143,31 +142,29 @@ class ComputationWorker(QObject):
         elapsed = time.time() - start_time
         logger.info(f"Worker: Hull batch finished. Success: {success_count}/{total_datasets}. Elapsed: {elapsed:.2f}s.")
         self.batch_finished.emit(success_count, total_datasets, elapsed)
+
         # self._is_running = False # Resetting here might be redundant if worker is deleted
 
     def compute_segments_batch(self):
         """Worker method to compute segments for all eligible datasets."""
         logger.info("Worker: Starting segment computation batch.")
-        datasets_with_hulls_indices = [i for i, d in enumerate(self.gui.datasets) if d.get('hull_points') is not None]
-
-        if not datasets_with_hulls_indices:
+        eligible = [i for i, d in enumerate(self.gui.datasets)
+                    if d.get('type') != 'WELL' and d.get('hull_points') is not None]
+        if not eligible:
             self.error_occurred.emit("No datasets have computed hulls.")
             self.batch_finished.emit(0, 0, 0)
             logger.info("Worker: Segment batch finished (no eligible datasets).")
             return
 
         success_count = 0
-        total_eligible = len(datasets_with_hulls_indices)
+        total_eligible = len(eligible)
         start_time = time.time()
 
-        for i in datasets_with_hulls_indices:
+        for i in eligible:
             if not self._is_running:
-                 break
+                break
             dataset_name = self.gui.datasets[i].get('name', f"Dataset {i}")
-             # Moved the check inside the loop iteration
-            if not self._is_running:
-                 break
-            success = self.gui._compute_segments_for_dataset(i) # Call GUI's compute method
+            success = self.gui._compute_segments_for_dataset(i)
             self.dataset_finished.emit(i, dataset_name, success)
             if success:
                 success_count += 1
@@ -175,35 +172,28 @@ class ComputationWorker(QObject):
         elapsed = time.time() - start_time
         logger.info(f"Worker: Segment batch finished. Success: {success_count}/{total_eligible}. Elapsed: {elapsed:.2f}s.")
         self.batch_finished.emit(success_count, total_eligible, elapsed)
-        # self._is_running = False
+
 
     def compute_triangulations_batch(self):
         """Worker method to compute triangulations for all eligible datasets."""
         logger.info("Worker: Starting triangulation computation batch.")
-        datasets_with_segments_indices = [i for i, d in enumerate(self.gui.datasets) if d.get('segments') is not None]
-
-        if not datasets_with_segments_indices:
+        eligible = [i for i, d in enumerate(self.gui.datasets)
+                    if d.get('type') != 'WELL' and d.get('segments') is not None]
+        if not eligible:
             self.error_occurred.emit("No datasets have computed segments.")
             self.batch_finished.emit(0, 0, 0)
             logger.info("Worker: Triangulation batch finished (no eligible datasets).")
             return
 
         success_count = 0
-        total_eligible = len(datasets_with_segments_indices)
+        total_eligible = len(eligible)
         start_time = time.time()
 
-        for i in datasets_with_segments_indices:
+        for i in eligible:
             if not self._is_running:
-                 logger.info(f"Worker: Triangulation computation loop canceled at index {i}.")
-                 break
+                break
             dataset_name = self.gui.datasets[i].get('name', f"Dataset {i}")
-            logger.debug(f"Worker: Computing triangulation for '{dataset_name}' (index {i}).")
-             # Moved the check inside the loop iteration
-            if not self._is_running:
-                 logger.info(f"Worker: Triangulation computation canceled just before processing index {i}.")
-                 break
-            success = self.gui._run_triangulation_for_dataset(i) # Call GUI's compute method
-            logger.debug(f"Worker: Triangulation computation for index {i} finished (Success: {success}).")
+            success = self.gui._run_triangulation_for_dataset(i)
             self.dataset_finished.emit(i, dataset_name, success)
             if success:
                 success_count += 1
@@ -211,7 +201,7 @@ class ComputationWorker(QObject):
         elapsed = time.time() - start_time
         logger.info(f"Worker: Triangulation batch finished. Success: {success_count}/{total_eligible}. Elapsed: {elapsed:.2f}s.")
         self.batch_finished.emit(success_count, total_eligible, elapsed)
-        # self._is_running = False
+            # self._is_running = False
 
     def compute_global_intersections_task(self):
         """Worker task to trigger global intersection computation on the GUI instance."""
@@ -446,7 +436,222 @@ class MeshItWorkflowGUI(QMainWindow):
         return material_group
 
 
+    def _init_seg_refine_table(self):
+        # Table for Segmentation per-surface RefineByLength
+        # Uses dataset index as stable key; stores it in Qt.UserRole per row
+        from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem
+        if not hasattr(self, 'seg_length_by_surface'):
+            self.seg_length_by_surface = {}
+        self._seg_table_updating = False
 
+        self.seg_refine_group = QGroupBox("Per-Surface RefineByLength (Segmentation)")
+        lay = QVBoxLayout(self.seg_refine_group)
+        self.seg_refine_table = QTableWidget(0, 2, self.seg_refine_group)
+        self.seg_refine_table.setHorizontalHeaderLabels(["Surface", "Length"])
+        self.seg_refine_table.horizontalHeader().setStretchLastSection(True)
+        self.seg_refine_table.verticalHeader().setVisible(False)
+        self.seg_refine_table.setEditTriggers(self.seg_refine_table.DoubleClicked | self.seg_refine_table.EditKeyPressed)
+        self.seg_refine_table.cellChanged.connect(self._on_seg_refine_cell_changed)
+        lay.addWidget(self.seg_refine_table)
+
+        self._refresh_seg_refine_table()
+
+    def _refresh_seg_refine_table(self):
+        # Populate rows for all non-WELL datasets
+        from PyQt5.QtWidgets import QTableWidgetItem
+        from PyQt5.QtCore import Qt
+        if not hasattr(self, 'seg_refine_table'):
+            return
+        self._seg_table_updating = True
+        self.seg_refine_table.setRowCount(0)
+        for idx, ds in enumerate(self.datasets):
+            if ds.get('type') in ('WELL', 'polyline'):
+                continue
+            name = ds.get('name', f"Surface_{idx}")
+            # default from unified if available
+            default_len = float(getattr(self.target_feature_size_input, "value", lambda: 15.0)())
+            value = float(self.seg_length_by_surface.get(idx, default_len))
+            row = self.seg_refine_table.rowCount()
+            self.seg_refine_table.insertRow(row)
+
+            item_name = QTableWidgetItem(name)
+            item_name.setFlags(item_name.flags() & ~Qt.ItemIsEditable)
+            item_name.setData(Qt.UserRole, idx)  # store dataset index
+            self.seg_refine_table.setItem(row, 0, item_name)
+
+            item_val = QTableWidgetItem(f"{value:.6g}")
+            self.seg_refine_table.setItem(row, 1, item_val)
+        self._seg_table_updating = False
+
+    def _on_seg_refine_cell_changed(self, row, col):
+        # Persist edits into self.seg_length_by_surface
+        from PyQt5.QtCore import Qt
+        if self._seg_table_updating or col != 1:
+            return
+        item_name = self.seg_refine_table.item(row, 0)
+        item_val = self.seg_refine_table.item(row, 1)
+        if not item_name or not item_val:
+            return
+        try:
+            ds_idx = int(item_name.data(Qt.UserRole))
+            val = float(item_val.text())
+            if val <= 1e-9:
+                val = 1.0
+            self.seg_length_by_surface[ds_idx] = val
+
+            # Propagate segmentation value as a default to mesh refine table
+            # but only if the user has not already set a mesh-specific value.
+            if not hasattr(self, 'mesh_length_by_surface'):
+                self.mesh_length_by_surface = {}
+            if ds_idx not in self.mesh_length_by_surface:
+                # Set the mesh default to the segmentation value so the
+                # refine-mesh table displays it. Update the table cell
+                # programmatically if the table exists.
+                try:
+                    self.mesh_length_by_surface[ds_idx] = val
+                    if hasattr(self, 'mesh_refine_table') and self.mesh_refine_table is not None:
+                        # Find corresponding row and update without triggering handler
+                        try:
+                            self._mesh_table_updating = True
+                            rows = self.mesh_refine_table.rowCount()
+                            for r in range(rows):
+                                mn = self.mesh_refine_table.item(r, 0)
+                                if mn and mn.data(Qt.UserRole) == ds_idx:
+                                    self.mesh_refine_table.setItem(r, 1, QTableWidgetItem(f"{val:.6g}"))
+                                    break
+                        except Exception:
+                            # Non-fatal - ignore UI update failures
+                            pass
+                        finally:
+                            self._mesh_table_updating = False
+                except Exception:
+                    # Ensure propagation failures don't break segmentation handling
+                    pass
+        except Exception:
+            pass
+
+    def _get_seg_target_length_for_dataset(self, dataset_index: int) -> float:
+        """
+        Return per-surface RefineByLength from the Segmentation table.
+        - Reads from self.seg_length_by_surface cache if present
+        - Else, scans the table for the row matching dataset_index (Qt.UserRole on col 0),
+        parses the value, caches it, and returns it
+        - Final fallback: 15.0
+        """
+        try:
+            # Cached value takes precedence
+            if hasattr(self, 'seg_length_by_surface') and dataset_index in self.seg_length_by_surface:
+                return float(self.seg_length_by_surface[dataset_index])
+
+            # Try to read from the table directly
+            if hasattr(self, 'seg_refine_table') and self.seg_refine_table is not None:
+                from PyQt5.QtCore import Qt
+                rows = self.seg_refine_table.rowCount()
+                for r in range(rows):
+                    item_name = self.seg_refine_table.item(r, 0)
+                    if not item_name:
+                        continue
+                    ds_idx = item_name.data(Qt.UserRole)
+                    if ds_idx is None:
+                        continue
+                    if int(ds_idx) == int(dataset_index):
+                        item_val = self.seg_refine_table.item(r, 1)
+                        if item_val:
+                            try:
+                                val = float(item_val.text())
+                                if val > 1e-9:
+                                    # Cache and return
+                                    if not hasattr(self, 'seg_length_by_surface'):
+                                        self.seg_length_by_surface = {}
+                                    self.seg_length_by_surface[dataset_index] = val
+                                    return val
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+        # Strict fallback that does NOT use the unified spinbox
+        return 15.0
+
+    def _init_mesh_refine_table(self):
+        # Table for Refine & Mesh per-surface mesh target size
+        from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem
+        if not hasattr(self, 'mesh_length_by_surface'):
+            self.mesh_length_by_surface = {}
+        self._mesh_table_updating = False
+
+        self.mesh_refine_group = QGroupBox("Per-Surface Mesh Density (Target Size)")
+        lay = QVBoxLayout(self.mesh_refine_group)
+        self.mesh_refine_table = QTableWidget(0, 2, self.mesh_refine_group)
+        self.mesh_refine_table.setHorizontalHeaderLabels(["Surface", "Target Size"])
+        self.mesh_refine_table.horizontalHeader().setStretchLastSection(True)
+        self.mesh_refine_table.verticalHeader().setVisible(False)
+        self.mesh_refine_table.setEditTriggers(self.mesh_refine_table.DoubleClicked | self.mesh_refine_table.EditKeyPressed)
+        self.mesh_refine_table.cellChanged.connect(self._on_mesh_refine_cell_changed)
+        lay.addWidget(self.mesh_refine_table)
+
+        self._refresh_mesh_refine_table()
+
+    def _refresh_mesh_refine_table(self):
+        # Populate rows for all non-WELL datasets
+        from PyQt5.QtWidgets import QTableWidgetItem
+        from PyQt5.QtCore import Qt
+        if not hasattr(self, 'mesh_refine_table'):
+            return
+        self._mesh_table_updating = True
+        self.mesh_refine_table.setRowCount(0)
+        for idx, ds in enumerate(self.datasets):
+            if ds.get('type') in ('WELL', 'polyline'):
+                continue
+            name = ds.get('name', f"Surface_{idx}")
+            # Prefer an explicit per-surface mesh value, else fall back to
+            # segmentation value (if available), else the unified mesh control.
+            unified_default = float(getattr(self.mesh_target_feature_size_input, "value", lambda: 15.0)())
+            seg_default = None
+            try:
+                if hasattr(self, 'seg_length_by_surface') and idx in self.seg_length_by_surface:
+                    seg_default = float(self.seg_length_by_surface[idx])
+            except Exception:
+                seg_default = None
+
+            if idx in self.mesh_length_by_surface:
+                value = float(self.mesh_length_by_surface.get(idx))
+            elif seg_default is not None:
+                value = float(seg_default)
+            else:
+                value = float(unified_default)
+            row = self.mesh_refine_table.rowCount()
+            self.mesh_refine_table.insertRow(row)
+
+            item_name = QTableWidgetItem(name)
+            item_name.setFlags(item_name.flags() & ~Qt.ItemIsEditable)
+            item_name.setData(Qt.UserRole, idx)  # store dataset index
+            self.mesh_refine_table.setItem(row, 0, item_name)
+
+            item_val = QTableWidgetItem(f"{value:.6g}")
+            self.mesh_refine_table.setItem(row, 1, item_val)
+        self._mesh_table_updating = False
+
+    def _on_mesh_refine_cell_changed(self, row, col):
+        # Persist edits into self.mesh_length_by_surface
+        from PyQt5.QtCore import Qt
+        if self._mesh_table_updating or col != 1:
+            return
+        item_name = self.mesh_refine_table.item(row, 0)
+        item_val = self.mesh_refine_table.item(row, 1)
+        if not item_name or not item_val:
+            return
+        try:
+            ds_idx = int(item_name.data(Qt.UserRole))
+            val = float(item_val.text())
+            if val <= 1e-9:
+                val = 1.0
+            self.mesh_length_by_surface[ds_idx] = val
+        except Exception:
+            pass
+
+    def _get_mesh_target_size_for_surface(self, dataset_index: int) -> float:
+        unified = float(getattr(self.mesh_target_feature_size_input, "value", lambda: 15.0)())
+        return float(self.mesh_length_by_surface.get(dataset_index, unified))
     # ──────────────────────────────────────────────────────────────────────
     # 4)  INTERNAL HELPERS / SLOTS
     # ──────────────────────────────────────────────────────────────────────
@@ -458,6 +663,135 @@ class MeshItWorkflowGUI(QMainWindow):
                 "attribute":1
             })
         self._refresh_material_list()
+
+    def _extract_boundary_segments_from_vtu(self, vtu_source) -> tuple[np.ndarray, list[list[np.ndarray]]]:
+        """
+        Returns:
+        points3d: (N,3) float array of surface points
+        rings: list of rings; each ring is a list of 3D points in order (closed)
+        Accepts:
+        vtu_source: a PyVista dataset or a file path (.vtu/.vtk/.vtp/.stl etc.)
+        """
+        import numpy as np
+        import pyvista as pv
+
+        # Load mesh
+        mesh = vtu_source if hasattr(vtu_source, "extract_surface") else pv.read(str(vtu_source))
+
+        # Ensure we have a PolyData surface
+        if not isinstance(mesh, pv.PolyData):
+            mesh = mesh.extract_surface()
+
+        # 1) Try “boundary edges only” (external border)
+        edges = mesh.extract_feature_edges(
+            boundary_edges=True, feature_edges=False, manifold_edges=False, non_manifold_edges=True
+        )
+        if edges.n_cells == 0:
+            # Fallback: allow sharp feature edges to help find an outline
+            edges = mesh.extract_feature_edges(
+                boundary_edges=True, feature_edges=True, feature_angle=150.0, manifold_edges=False, non_manifold_edges=True
+            )
+
+        # 2) Strip into ordered polylines
+        polylines = edges.strip() if edges.n_cells > 0 else pv.PolyData()
+
+        # 3) Decode polylines from VTK “lines” array
+        rings = []
+        if polylines.n_cells > 0 and polylines.lines.size > 0:
+            lines = polylines.lines.ravel()
+            pts = np.asarray(polylines.points, dtype=float)
+            i = 0
+            while i < len(lines):
+                n = int(lines[i]); i += 1
+                ids = lines[i:i + n]; i += n
+                if n >= 2:
+                    ring = pts[ids].astype(float)
+                    # enforce closed ring if endpoints match
+                    if np.linalg.norm(ring[0] - ring[-1]) > 1e-12:
+                        ring = np.vstack([ring, ring[0]])
+                    rings.append([p for p in ring])
+        else:
+            # Last fallback: use mesh boundary filter (can return triangles; we re‑extract edges)
+            boundary = mesh.extract_all_edges()
+            boundary = boundary.strip()
+            if boundary.n_cells > 0 and boundary.lines.size > 0:
+                lines = boundary.lines.ravel()
+                pts = np.asarray(boundary.points, dtype=float)
+                i = 0
+                while i < len(lines):
+                    n = int(lines[i]); i += 1
+                    ids = lines[i:i + n]; i += n
+                    if n >= 2:
+                        ring = pts[ids].astype(float)
+                        if np.linalg.norm(ring[0] - ring[-1]) > 1e-12:
+                            ring = np.vstack([ring, ring[0]])
+                        rings.append([p for p in ring])
+
+        # Points to carry as SDs if needed (prefer original surface points)
+        points3d = np.asarray(mesh.points, dtype=float)
+        return points3d, rings
+
+
+    def _rebuild_segments_from_vtu_boundaries(self) -> None:
+        """
+        For each dataset that came from a VTU, re‑derive its segments from the VTU boundary rings.
+        Expects each dataset to have either:
+        - dataset['file_path'] (path to the VTU), or
+        - dataset['pv_mesh'] (a PyVista mesh kept from import)
+        Updates:
+        - dataset['segments'] := list of segments [ [p0, p1], ... ] (3D points)
+        - dataset['points']   := (N,3) float array from the surface (if not present)
+        """
+        import numpy as np
+
+        updated = 0
+        for idx, ds in enumerate(self.datasets):
+            name = ds.get('name', f"Dataset {idx}")
+            # Heuristics to decide VTU origin; adapt if you store a reliable flag
+            is_vtu = (ds.get('format') == 'VTU') or (str(ds.get('file_path', '')).lower().endswith('.vtu'))
+            if not is_vtu:
+                continue
+
+            vtu_src = ds.get('pv_mesh') or ds.get('file_path')
+            if vtu_src is None:
+                logger.info(f"[VTU-SEG] Skipping {name}: no pv_mesh or file_path")
+                continue
+
+            try:
+                points3d, rings = self._extract_boundary_segments_from_vtu(vtu_src)
+                if not rings:
+                    logger.info(f"[VTU-SEG] {name}: no boundary rings found")
+                    continue
+
+                # Convert rings -> segments
+                segments = []
+                for ring in rings:
+                    if len(ring) < 2:
+                        continue
+                    # ensure closure in case previous step didn’t close
+                    if np.linalg.norm(np.asarray(ring[0]) - np.asarray(ring[-1])) > 1e-12:
+                        ring = list(ring) + [ring[0]]
+                    for i in range(len(ring) - 1):
+                        p0 = [float(ring[i][0]), float(ring[i][1]), float(ring[i][2])]
+                        p1 = [float(ring[i + 1][0]), float(ring[i + 1][1]), float(ring[i + 1][2])]
+                        segments.append([p0, p1])
+
+                if segments:
+                    ds['segments'] = segments
+                    if ('points' not in ds) or (ds['points'] is None) or (len(ds['points']) == 0):
+                        ds['points'] = points3d.astype(float)
+                    updated += 1
+                    logger.info(f"[VTU-SEG] {name}: built {len(segments)} segments from {len(rings)} ring(s)")
+                else:
+                    logger.info(f"[VTU-SEG] {name}: rings decoded but 0 segments produced")
+
+            except Exception as e:
+                logger.error(f"[VTU-SEG] {name}: failed to rebuild segments: {e}", exc_info=True)
+
+        if updated:
+            self.statusBar().showMessage(f"Rebuilt VTU boundary segments for {updated} dataset(s)")
+        else:
+            self.statusBar().showMessage("No VTU datasets updated")
 
     def _refresh_material_list(self) -> None:
         """Synchronise both list-widgets after any change."""
@@ -634,6 +968,17 @@ class MeshItWorkflowGUI(QMainWindow):
         load_multiple_action.triggered.connect(self.load_multiple_files)
         file_menu.addAction(load_multiple_action)
 
+        # Add Well loaders
+        load_well_action = QAction("Load &Well File...", self)
+        load_well_action.setStatusTip("Load a single well (polyline) file")
+        load_well_action.triggered.connect(self.load_well_file)
+        file_menu.addAction(load_well_action)
+
+        load_multiple_wells_action = QAction("Load Multiple &Wells...", self)
+        load_multiple_wells_action.setStatusTip("Load multiple well (polyline) files")
+        load_multiple_wells_action.triggered.connect(self.load_multiple_well_files)
+        file_menu.addAction(load_multiple_wells_action)
+
         
         file_menu.addSeparator()
 
@@ -696,7 +1041,87 @@ class MeshItWorkflowGUI(QMainWindow):
         about_action = help_menu.addAction("&About")
         about_action.setStatusTip("Show information about the application")
         about_action.triggered.connect(self._show_about)
-    
+    def load_well_file(self):
+        """Load a single well (polyline) file. Wells are 1D and not triangulated."""
+        self.statusBar().showMessage("Loading well file...")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select a well (polyline) file", "",
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
+        )
+        if not file_path:
+            self.statusBar().showMessage("Well file loading canceled")
+            return
+
+        try:
+            points = self._read_point_file(file_path)
+            if points is None or len(points) == 0:
+                QMessageBox.critical(self, "Error", "No valid points found in well file")
+                self.statusBar().showMessage("Error: No valid points found in well file")
+                return
+
+            filename = os.path.basename(file_path)
+            dataset = {
+                'name': filename,
+                'type': 'WELL',            # CRITICAL: mark as WELL
+                'points': points,          # 3D polyline points in order
+                'visible': True,
+                'color': self._get_next_color()
+            }
+            self.datasets.append(dataset)
+            self.current_dataset_index = len(self.datasets) - 1
+
+            # Update UI
+            self._update_dataset_list()
+            self._update_statistics()
+            self._update_visualization()
+
+            self.statusBar().showMessage(f"Successfully loaded well with {len(points)} points from {filename}")
+        except Exception as e:
+            self.statusBar().showMessage(f"Error loading well file: {str(e)}")
+            logger.error(f"Error loading well file: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Error loading well file: {str(e)}")
+
+
+    def load_multiple_well_files(self):
+        """Load multiple well (polyline) files as separate WELL datasets."""
+        self.statusBar().showMessage("Loading multiple well files...")
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select well (polyline) files", "",
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
+        )
+        if not file_paths:
+            self.statusBar().showMessage("Well file loading canceled")
+            return
+
+        successful = 0
+        for file_path in file_paths:
+            try:
+                points = self._read_point_file(file_path)
+                if points is None or len(points) == 0:
+                    logger.warning(f"No valid points found in well file: {file_path}")
+                    continue
+                filename = os.path.basename(file_path)
+                dataset = {
+                    'name': filename,
+                    'type': 'WELL',
+                    'points': points,
+                    'visible': True,
+                    'color': self._get_next_color()
+                }
+                self.datasets.append(dataset)
+                self.current_dataset_index = len(self.datasets) - 1
+                successful += 1
+            except Exception as e:
+                logger.error(f"Error loading well file {file_path}: {str(e)}")
+
+        if successful > 0:
+            self._update_dataset_list()
+            self._update_statistics()
+            self._update_visualization()
+            self.statusBar().showMessage(f"Successfully loaded {successful} well(s)")
+        else:
+            self.statusBar().showMessage("No valid wells loaded")
+            QMessageBox.critical(self, "Error", "No valid wells loaded")
     def _setup_file_tab(self):
         """Sets up the file loading tab with controls and visualization area"""
         # Main layout for the tab
@@ -713,7 +1138,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
         # Buttons for loading files
         load_btn = QPushButton("Load Single File...")
-        load_btn.setToolTip("Load points from a single file (.txt, .csv, .pts)")
+        load_btn.setToolTip("Load points from a single file (.txt, .csv, .dat, .vtu)")
         load_btn.clicked.connect(self.load_file)
         file_layout.addWidget(load_btn)
         
@@ -722,6 +1147,7 @@ class MeshItWorkflowGUI(QMainWindow):
         load_multiple_btn.setToolTip("Load points from multiple files as separate datasets")
         load_multiple_btn.clicked.connect(self.load_multiple_files)
         file_layout.addWidget(load_multiple_btn)
+        
         
         
         control_layout.addWidget(file_group)
@@ -901,7 +1327,10 @@ class MeshItWorkflowGUI(QMainWindow):
         target_size_layout.addRow("Target Feature Size:", self.target_feature_size_input)
         segment_layout.addLayout(target_size_layout)
         # --- END EDIT ---
-
+        # Per-surface refinement (segmentation)
+        self.seg_length_by_surface = {}
+        self._init_seg_refine_table()
+        segment_layout.addWidget(self.seg_refine_group)
         # Compute segments button
         compute_btn = QPushButton("Compute Segmentation (All Datasets)") # Update button text
         compute_btn.setObjectName("compute_btn") # Set the object name
@@ -993,7 +1422,29 @@ class MeshItWorkflowGUI(QMainWindow):
         self.min_angle_input.setValue(20.0)
         self.min_angle_input.setSingleStep(1.0)
         quality_layout.addRow("Min Angle:", self.min_angle_input)
+        # Triangulation tab controls
+        # Triangulation tab controls
+        self.interp_combo = QComboBox()
+        self.interp_combo.addItems([
+            "Thin Plate Spline (TPS)",
+            "Linear (Barycentric)",
+            "IDW (p=4)",
+            "Local Plane",
+            "Kriging (Ordinary)",
+            "Cubic (Clough–Tocher)",
+            "Legacy (Hull + IDW + Boundary Snap)",
+            "MLS (Robust Moving Least Squares)"
+        ])
+        self.interp_combo.setCurrentIndex(0)
+        self.interp_smoothing_input = QDoubleSpinBox()
+        self.interp_smoothing_input.setDecimals(6)
+        self.interp_smoothing_input.setRange(0.0, 1e3)
+        self.interp_smoothing_input.setValue(0.0)
 
+        quality_layout.addRow("Interpolation", self.interp_combo)
+        quality_layout.addRow("Smoothing", self.interp_smoothing_input)
+
+        
         # Uniform triangulation
         self.uniform_checkbox = QCheckBox()
         self.uniform_checkbox.setChecked(True) # Default to uniform for consistent sizing
@@ -1121,7 +1572,6 @@ class MeshItWorkflowGUI(QMainWindow):
         self.clear_intersections_btn.setIcon(QIcon.fromTheme("edit-clear", QIcon()))
         self.clear_intersections_btn.clicked.connect(self._clear_intersection_results)
         controls_layout.addWidget(self.clear_intersections_btn)
-        
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
         
@@ -1205,265 +1655,492 @@ class MeshItWorkflowGUI(QMainWindow):
         
         if not hasattr(self, 'triple_points'):
             self.triple_points = []
+
+    def _init_mesh_refine_table(self):
+        # Table for Refine & Mesh per-surface mesh target size
+        from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy
+        if not hasattr(self, 'mesh_length_by_surface'):
+            self.mesh_length_by_surface = {}
+
+        self._mesh_table_updating = False
+
+        self.mesh_refine_group = QGroupBox("Per-Surface Mesh Density (Target Size)")
+        lay = QVBoxLayout(self.mesh_refine_group)
+
+        self.mesh_refine_table = QTableWidget(0, 2, self.mesh_refine_group)
+        self.mesh_refine_table.setHorizontalHeaderLabels(["Surface", "Target Size"])
+
+        header = self.mesh_refine_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(True)
+
+        self.mesh_refine_table.verticalHeader().setVisible(False)
+        self.mesh_refine_table.setEditTriggers(self.mesh_refine_table.DoubleClicked | self.mesh_refine_table.EditKeyPressed)
+
+        # Professional sizing
+        self.mesh_refine_table.setMinimumHeight(220)
+        self.mesh_refine_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.mesh_refine_table.setAlternatingRowColors(True)
+
+        self.mesh_refine_table.cellChanged.connect(self._on_mesh_refine_cell_changed)
+        lay.addWidget(self.mesh_refine_table)
+
+        self._refresh_mesh_refine_table()
     def _setup_refine_mesh_tab(self):
-        """Sets up the Refine & Mesh Settings tab."""
+        """Three-pane layout with Actions → Mesh Settings → Per‑Surface stacked on the left."""
+        from PyQt5.QtWidgets import (
+            QHBoxLayout, QVBoxLayout, QWidget, QGroupBox, QFormLayout, QLabel, QCheckBox, QComboBox,
+            QDoubleSpinBox, QPushButton, QTreeWidget, QFrame, QTabWidget, QSplitter, QSizePolicy,
+            QHeaderView
+        )
+        from PyQt5.QtCore import Qt
+
         tab_layout = QHBoxLayout(self.refine_mesh_tab)
 
-        # --- Control panel (left side) ---
-        control_panel = QWidget()
-        control_panel.setMaximumWidth(350)  # Limit width
-        control_layout = QVBoxLayout(control_panel)
+        # ── LEFT: Actions → Mesh Settings → Per‑Surface (stacked, resizable) ─────
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
 
-        # -- Refinement Controls --
-        refinement_group = QGroupBox("Intersection Refinement")
-        refinement_layout = QVBoxLayout(refinement_group)
-
+        # Actions
+        actions_group = QGroupBox("Actions")
+        ag = QVBoxLayout(actions_group)
+        # Initialize selection data (fixes AttributeError)
+        self.refine_constraint_data = {}                     # {surface_idx: {...}}
+        self.refine_selected_constraint_segments = {}        # {surface_idx: {...}}
+        self._refine_updating_constraint_tree = False
         self.refine_intersections_btn = QPushButton("Refine Intersection Lines")
-        self.refine_intersections_btn.setToolTip(
-            "Align intersection line endpoints to the convex hulls of involved surfaces."
-        )
         self.refine_intersections_btn.clicked.connect(self._refine_intersection_lines_action)
-        refinement_layout.addWidget(self.refine_intersections_btn)
-        
-        # Add the new "Generate Conforming Surface Meshes" button
+        ag.addWidget(self.refine_intersections_btn)
+
         self.generate_conforming_meshes_btn = QPushButton("Generate Conforming Surface Meshes")
-        self.generate_conforming_meshes_btn.setToolTip(
-            "Generate conforming 2D meshes for each surface using refined convex hulls and intersection lines as constraints.\n"
-            "This follows the C++ core.cpp workflow and prepares surfaces for tetrahedral meshing."
-        )
         self.generate_conforming_meshes_btn.clicked.connect(self._generate_conforming_meshes_action)
-        self.generate_conforming_meshes_btn.setEnabled(False)  # Enabled after refinement
-        self.generate_conforming_meshes_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                font-weight: bold;
-                padding: 8px;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:disabled {
-                background-color: #BDBDBD;
-                color: #9E9E9E;
-            }
-        """)
-        refinement_layout.addWidget(self.generate_conforming_meshes_btn)
-        
+        self.generate_conforming_meshes_btn.setEnabled(False)
+        ag.addWidget(self.generate_conforming_meshes_btn)
+
         self.show_original_lines_checkbox = QCheckBox("Show Original Lines")
         self.show_original_lines_checkbox.setChecked(True)
         self.show_original_lines_checkbox.toggled.connect(self._update_refined_visualization)
-        refinement_layout.addWidget(self.show_original_lines_checkbox)
-        
+        ag.addWidget(self.show_original_lines_checkbox)
+
         self.show_conforming_meshes_checkbox = QCheckBox("Show Conforming Meshes")
         self.show_conforming_meshes_checkbox.setChecked(True)
         self.show_conforming_meshes_checkbox.toggled.connect(self._update_refined_visualization)
-        refinement_layout.addWidget(self.show_conforming_meshes_checkbox)
-        
-        control_layout.addWidget(refinement_group)
+        ag.addWidget(self.show_conforming_meshes_checkbox)
 
-        # --- Granular Constraint Selection (for conforming mesh generation) ---
-        constraint_group = QGroupBox("Constraint Selection for Conforming Meshes")
-        constraint_layout = QVBoxLayout(constraint_group)
-        
-        # Initialize constraint selection data for Tab 6
-        self.refine_constraint_data = {}  # {surface_idx: {hull: segments, intersections: segments}}
-        self.refine_selected_constraint_segments = {}  # {surface_idx: {constraint_type: [selected_segment_indices]}}
-        self._refine_updating_constraint_tree = False  # Flag to prevent excessive updates
-        
-        # Constraint selection buttons
-        constraint_buttons_layout = QHBoxLayout()
-        
-        self.refine_select_intersection_constraints_only_btn = QPushButton("Select Intersection Constraints Only")
-        self.refine_select_intersection_constraints_only_btn.setToolTip("Select only intersection line constraints (deselect hull constraints)")
-        self.refine_select_intersection_constraints_only_btn.clicked.connect(self._refine_select_intersection_constraints_only)
-        constraint_buttons_layout.addWidget(self.refine_select_intersection_constraints_only_btn)
-        
-        self.refine_select_hull_constraints_only_btn = QPushButton("Select Hull Constraints Only")
-        self.refine_select_hull_constraints_only_btn.setToolTip("Select only hull constraints (deselect intersection constraints)")
-        self.refine_select_hull_constraints_only_btn.clicked.connect(self._refine_select_hull_constraints_only)
-        constraint_buttons_layout.addWidget(self.refine_select_hull_constraints_only_btn)
-        
-        constraint_layout.addLayout(constraint_buttons_layout)
-        
-        # Hierarchical constraint tree (Surface → Constraint Type → Segments)
-        self.refine_constraint_tree = QTreeWidget()
-        self.refine_constraint_tree.setHeaderLabels(["Constraint", "Type", "Segments", "Status"])
-        self.refine_constraint_tree.itemChanged.connect(self._on_refine_constraint_tree_item_changed)
-        self.refine_constraint_tree.setMaximumHeight(300)
-        constraint_layout.addWidget(QLabel("Surface → Constraint Type → Segments:"))
-        constraint_layout.addWidget(self.refine_constraint_tree)
-        
-        control_layout.addWidget(constraint_group)
-        # --- view-mode toggles ------------------------------------------------
-        view_layout = QHBoxLayout()
-        self.view_btn_grp = QButtonGroup(self)
-        for idx, txt in enumerate(("Intersections", "Meshes", "Segments")):
-            b = QToolButton()
-            b.setText(txt)
-            b.setCheckable(True)
-            b.setToolButtonStyle(Qt.ToolButtonTextOnly)
-            self.view_btn_grp.addButton(b, idx)
-            view_layout.addWidget(b)
-        self.view_btn_grp.button(0).setChecked(True)
-        self.current_refine_view = 0
-        self.view_btn_grp.idClicked.connect(self._handle_view_toggle)
-        control_layout.addLayout(view_layout)
+        # Mesh settings (compact form)
         mesh_settings_group = QGroupBox("Global Mesh Settings")
-        mesh_settings_layout = QFormLayout(mesh_settings_group) # Use QFormLayout for label-input pairs
+        mg = QFormLayout(mesh_settings_group)
 
-        # Target Feature Size (controls conforming mesh density)
+        self.mesh_interp_combo = QComboBox()
+        self.mesh_interp_combo.addItems([
+            "Thin Plate Spline (TPS)", "Linear (Barycentric)", "IDW (p=4)",
+            "Local Plane", "Kriging (Ordinary)", "Cubic (Clough–Tocher)",
+            "Legacy (Hull + IDW + Boundary Snap)", "MLS (Robust Moving Least Squares)"
+        ])
+        self.mesh_interp_combo.setCurrentIndex(0)
+        mg.addRow("Interpolation", self.mesh_interp_combo)
+
+        self.mesh_smoothing_input = QDoubleSpinBox()
+        self.mesh_smoothing_input.setDecimals(6)
+        self.mesh_smoothing_input.setRange(0.0, 1e3)
+        self.mesh_smoothing_input.setValue(0.0)
+        mg.addRow("Smoothing", self.mesh_smoothing_input)
+
         self.mesh_target_feature_size_input = QDoubleSpinBox()
         self.mesh_target_feature_size_input.setRange(0.1, 500.0)
-        self.mesh_target_feature_size_input.setValue(15.0) # Default
+        self.mesh_target_feature_size_input.setValue(15.0)
         self.mesh_target_feature_size_input.setSingleStep(0.5)
         self.mesh_target_feature_size_input.setDecimals(1)
-        self.mesh_target_feature_size_input.setToolTip(
-            "🎯 UNIFIED MESH DENSITY CONTROL 🎯\n"
-            "Controls density for BOTH:\n"
-            "• 'Refine Intersection Lines' operation\n"
-            "• 'Compute Conforming Mesh' operation\n\n"
-            "Settings:\n"
-            "• Lower values (1-5) = Very fine/dense mesh\n"
-            "• Medium values (10-20) = Balanced mesh  \n"
-            "• Higher values (30+) = Coarse/sparse mesh\n\n"
-            "✅ Now properly synchronized across all operations!"
-        )
-        self.mesh_target_feature_size_input.setStyleSheet("""
-            QDoubleSpinBox {
-                font-weight: bold;
-                background-color: #E3F2FD;
-                border: 2px solid #2196F3;
-                border-radius: 4px;
-                padding: 2px;
-            }
-            QDoubleSpinBox:focus {
-                border-color: #1976D2;
-                background-color: #BBDEFB;
-            }
-        """)
-        # Add value change handler for immediate feedback
         self.mesh_target_feature_size_input.valueChanged.connect(self._on_target_size_changed)
-        mesh_settings_layout.addRow("🎯 UNIFIED Mesh Density:", self.mesh_target_feature_size_input)
+        mg.addRow("Mesh Density", self.mesh_target_feature_size_input)
 
-        # Gradient (copied from triangulation tab's gradient_input)
         self.mesh_gradient_input = QDoubleSpinBox()
         self.mesh_gradient_input.setRange(1.0, 3.0)
-        self.mesh_gradient_input.setValue(2.0) # Default
+        self.mesh_gradient_input.setValue(2.0)
         self.mesh_gradient_input.setSingleStep(0.1)
-        mesh_settings_layout.addRow("Gradient:", self.mesh_gradient_input)
+        mg.addRow("Gradient", self.mesh_gradient_input)
 
-        # Min Angle (copied from triangulation tab's min_angle_input)
         self.mesh_min_angle_input = QDoubleSpinBox()
         self.mesh_min_angle_input.setRange(10.0, 30.0)
-        self.mesh_min_angle_input.setValue(20.0) # Default
-        self.mesh_min_angle_input.setSingleStep(1.0)
-        mesh_settings_layout.addRow("Min Angle:", self.mesh_min_angle_input)
+        self.mesh_min_angle_input.setValue(20.0)
+        mg.addRow("Min Angle", self.mesh_min_angle_input)
 
-        # Uniform Meshing (copied from triangulation tab's uniform_checkbox)
         self.mesh_uniform_checkbox = QCheckBox()
-        self.mesh_uniform_checkbox.setChecked(True) # Default
-        mesh_settings_layout.addRow("Uniform Meshing:", self.mesh_uniform_checkbox)
+        self.mesh_uniform_checkbox.setChecked(True)
+        mg.addRow("Uniform", self.mesh_uniform_checkbox)
 
-        # Add information labels for constraints
-        self.constraints_label = QLabel("<b>Mesh Constraints</b>")
-        self.constraints_label.setAlignment(Qt.AlignCenter)
-        mesh_settings_layout.addRow("", self.constraints_label)
+        # Per‑surface table
+        self.mesh_length_by_surface = {}
+        self._init_mesh_refine_table()  # builds self.mesh_refine_group
 
-        # Add a separator line
-        self.separator = QFrame()
-        self.separator.setFrameShape(QFrame.HLine)
-        self.separator.setFrameShadow(QFrame.Sunken)
-        mesh_settings_layout.addRow("", self.separator)
+        # Left vertical splitter for resizable sections
+        for w in (actions_group, mesh_settings_group, self.mesh_refine_group):
+            w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        # Add explanatory text with dynamic feedback  
-        self.target_size_info = QLabel("Unified control for all mesh operations")
-        self.target_size_info.setWordWrap(True)
-        self.target_size_info.setStyleSheet("color: #1976D2; font-style: italic;")
-        mesh_settings_layout.addRow("", self.target_size_info)
-        
-        # Initialize the feedback display now that target_size_info exists
-        self._on_target_size_changed(self.mesh_target_feature_size_input.value())
+        left_splitter = QSplitter(Qt.Vertical)
+        left_splitter.addWidget(actions_group)
+        left_splitter.addWidget(mesh_settings_group)
+        left_splitter.addWidget(self.mesh_refine_group)
+        left_splitter.setChildrenCollapsible(False)
+        left_splitter.setHandleWidth(8)
+        left_splitter.setOpaqueResize(True)
+        # Emphasize table a bit more by default
+        left_splitter.setSizes([200, 260, 380])
 
-        self.gradient_info = QLabel("Controls the sizing transition rate from smaller to larger elements")
-        self.gradient_info.setWordWrap(True)
-        mesh_settings_layout.addRow("", self.gradient_info)
+        left_layout.addWidget(left_splitter)
 
-        self.min_angle_info = QLabel("Ensures triangle quality by setting minimum internal angles")
-        self.min_angle_info.setWordWrap(True)
-        mesh_settings_layout.addRow("", self.min_angle_info)
+        # ── CENTER: Visualization ────────────────────────────────────────────────
+        center_panel = QWidget()
+        center_layout = QVBoxLayout(center_panel)
 
-        # Visual indicator for constraints impact (simple color code)
-        self.constraint_indicator = QLabel("◼ Strict constraints may result in more elements/longer processing")
-        self.constraint_indicator.setStyleSheet("color: orange;")
-        mesh_settings_layout.addRow("", self.constraint_indicator)
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("Surface:"))
+        self.refine_surface_selector = QComboBox()
+        self.refine_surface_selector.addItem("All Surfaces")
+        self.refine_surface_selector.currentTextChanged.connect(self._on_refine_surface_selection_changed)
+        toolbar.addWidget(self.refine_surface_selector)
 
-        control_layout.addWidget(mesh_settings_group)
-        # Placeholder for future "Generate Mesh" button
-        # generate_mesh_btn = QPushButton("Generate Final Mesh (Placeholder)")
-        # generate_mesh_btn.setEnabled(False) # Disabled for now
-        # control_layout.addWidget(generate_mesh_btn)
+        self.mouse_selection_enabled_btn = QPushButton("Mouse Selection")
+        self.mouse_selection_enabled_btn.setCheckable(True)
+        self.mouse_selection_enabled_btn.toggled.connect(self._on_mouse_selection_toggled)
+        toolbar.addWidget(self.mouse_selection_enabled_btn)
+        toolbar.addStretch()
+        center_layout.addLayout(toolbar)
 
-        # Navigation buttons
-        nav_layout = QHBoxLayout()
-        prev_btn = QPushButton("← Previous (Intersections)")
-        prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(self.notebook.indexOf(self.intersection_tab)))
-        nav_layout.addWidget(prev_btn)
-        # No "Next" button for the last tab for now
-        control_layout.addLayout(nav_layout)
-        control_layout.addStretch()
-        tab_layout.addWidget(control_panel)
+        self.refine_view_tabs = QTabWidget()
+        self.refine_view_tabs.setDocumentMode(True)
+        self.refine_view_tabs.currentChanged.connect(self._on_refine_view_tab_changed)
 
-        # --- Visualization Area (right side) ---
-        viz_group = QGroupBox("Refined Intersections & Mesh Preview")
-        viz_layout = QVBoxLayout(viz_group)
+        self.intersections_tab = QWidget()
+        self.intersections_viz_frame = QFrame()
+        self.intersections_viz_frame.setFrameShape(QFrame.StyledPanel)
+        self.intersections_plot_layout = QVBoxLayout(self.intersections_viz_frame)
+        self.intersections_plot_layout.setContentsMargins(0, 0, 0, 0)
+        il = QVBoxLayout(self.intersections_tab)
+        il.addWidget(self.intersections_viz_frame)
+        self.refine_view_tabs.addTab(self.intersections_tab, "Intersections")
 
-        self.refine_mesh_viz_frame = QFrame() # Use the class attribute
-        self.refine_mesh_viz_frame.setFrameShape(QFrame.StyledPanel)
-        self.refine_mesh_viz_frame.setMinimumSize(400, 300)
-        self.refine_mesh_plot_layout = QVBoxLayout(self.refine_mesh_viz_frame)
-        self.refine_mesh_plot_layout.setContentsMargins(0, 0, 0, 0)
+        self.meshes_tab = QWidget()
+        self.meshes_viz_frame = QFrame()
+        self.meshes_viz_frame.setFrameShape(QFrame.StyledPanel)
+        self.meshes_plot_layout = QVBoxLayout(self.meshes_viz_frame)
+        self.meshes_plot_layout.setContentsMargins(0, 0, 0, 0)
+        ml = QVBoxLayout(self.meshes_tab)
+        ml.addWidget(self.meshes_viz_frame)
+        self.refine_view_tabs.addTab(self.meshes_tab, "Meshes")
 
-        if HAVE_PYVISTA:
-            try:
-                from pyvistaqt import QtInteractor
-                plotter = QtInteractor(self.refine_mesh_viz_frame)
-                self.refine_mesh_plot_layout.addWidget(plotter.interactor)
-                plotter.set_background([0.318, 0.341, 0.431])
-                plotter.add_text("Refine intersections to visualize or load data.", position='upper_edge', color='white')
-                # Store in both attribute and dictionary
-                self.refine_mesh_plotter = plotter
-                self.plotters['refine_mesh'] = plotter
-                logger.info("Successfully created refine_mesh_plotter")
-            except Exception as e:
-                logger.error(f"Error initializing Refine/Mesh plotter: {e}", exc_info=True)
-                placeholder = QLabel(f"Error initializing PyVista plotter: {e}")
+        self.segments_tab = QWidget()
+        self.segments_viz_frame = QFrame()
+        self.segments_viz_frame.setFrameShape(QFrame.StyledPanel)
+        self.segments_plot_layout = QVBoxLayout(self.segments_viz_frame)
+        self.segments_plot_layout.setContentsMargins(0, 0, 0, 0)
+        sl = QVBoxLayout(self.segments_tab)
+        sl.addWidget(self.segments_viz_frame)
+        self.refine_view_tabs.addTab(self.segments_tab, "Segments")
+
+        self._setup_refine_tab_plotters()
+        self.current_refine_view = 0
+        self.refine_view_tabs.setCurrentIndex(0)
+        center_layout.addWidget(self.refine_view_tabs, 1)
+
+        # ── RIGHT: Constraints + compact Stats ───────────────────────────────────
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_tabs = QTabWidget()
+        right_tabs.setDocumentMode(True)
+
+        # Constraints
+        constraints_tab = QWidget()
+        cl = QVBoxLayout(constraints_tab)
+
+        self.refine_constraint_tree = QTreeWidget()
+        self.refine_constraint_tree.setHeaderLabels(["Constraint", "Type", "Segments", "Status", "Hole"])
+        self.refine_constraint_tree.header().setSectionResizeMode(QHeaderView.Interactive)
+        self.refine_constraint_tree.header().setStretchLastSection(True)
+        self.refine_constraint_tree.itemChanged.connect(self._on_refine_constraint_tree_item_changed)
+        self.refine_constraint_tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        cl.addWidget(self.refine_constraint_tree, 1)
+
+        btns = QHBoxLayout()
+        self.refine_select_intersection_constraints_only_btn = QPushButton("Select Intersections")
+        self.refine_select_intersection_constraints_only_btn.clicked.connect(self._refine_select_intersection_constraints_only)
+        self.refine_select_hull_constraints_only_btn = QPushButton("Select Hull")
+        self.refine_select_hull_constraints_only_btn.clicked.connect(self._refine_select_hull_constraints_only)
+        btns.addWidget(self.refine_select_intersection_constraints_only_btn)
+        btns.addWidget(self.refine_select_hull_constraints_only_btn)
+        btns.addStretch()
+        cl.addLayout(btns)
+
+        right_tabs.addTab(constraints_tab, "Constraints")
+
+        # Stats (compact)
+        stats_tab = QWidget()
+        st = QVBoxLayout(stats_tab)
+        self.refinement_summary_label = QLabel("Refinement summary will appear here.")
+        self.refinement_summary_label.setWordWrap(True)
+        self.refinement_summary_label.setStyleSheet("font-size: 10px; color: #444;")
+        self.refinement_summary_label.setMaximumHeight(90)
+        self.conforming_mesh_summary_label = QLabel("Mesh stats will appear here.")
+        self.conforming_mesh_summary_label.setWordWrap(True)
+        self.conforming_mesh_summary_label.setStyleSheet("font-size: 10px; color: #444;")
+        self.conforming_mesh_summary_label.setMaximumHeight(90)
+        st.addWidget(self.refinement_summary_label)
+        st.addWidget(self.conforming_mesh_summary_label)
+        st.addStretch()
+        right_tabs.addTab(stats_tab, "Stats")
+
+        right_layout.addWidget(right_tabs)
+
+        # ── MAIN three‑way splitter ───────────────────────────────────────────────
+        main_splitter = QSplitter(Qt.Horizontal)
+        left_panel.setMinimumWidth(300)
+        right_panel.setMinimumWidth(320)
+        main_splitter.addWidget(left_panel)
+        main_splitter.addWidget(center_panel)
+        main_splitter.addWidget(right_panel)
+        main_splitter.setChildrenCollapsible(False)
+        main_splitter.setHandleWidth(8)
+        main_splitter.setOpaqueResize(True)
+        main_splitter.setSizes([380, 960, 420])   # big center view by default
+        main_splitter.setStretchFactor(0, 0)
+        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setStretchFactor(2, 0)
+
+        tab_layout.addWidget(main_splitter)
+
+        # Safety holders
+        if not hasattr(self, 'datasets_intersections'):
+            self.datasets_intersections = {}
+        if not hasattr(self, 'triple_points'):
+            self.triple_points = []
+
+    def _setup_refine_tab_plotters(self):
+        """Initialize PyVista plotters for each sub-tab"""
+        if not HAVE_PYVISTA:
+            # Add placeholder labels for each tab if PyVista is not available
+            for viz_frame, tab_name in [
+                (self.intersections_viz_frame, "Intersections"),
+                (self.meshes_viz_frame, "Meshes"), 
+                (self.segments_viz_frame, "Segments")
+            ]:
+                placeholder = QLabel(f"PyVista is required for 3D {tab_name.lower()} visualization.")
+                placeholder.setAlignment(Qt.AlignCenter)
+                if tab_name == "Intersections":
+                    self.intersections_plot_layout.addWidget(placeholder)
+                elif tab_name == "Meshes":
+                    self.meshes_plot_layout.addWidget(placeholder)
+                else:  # Segments
+                    self.segments_plot_layout.addWidget(placeholder)
+            return
+
+        try:
+            from pyvistaqt import QtInteractor
+            
+            # Initialize plotters for each tab
+            self.plotters = getattr(self, 'plotters', {})
+            
+            # Intersections plotter
+            self.intersections_plotter = QtInteractor(self.intersections_viz_frame)
+            self.intersections_plot_layout.addWidget(self.intersections_plotter.interactor)
+            self.intersections_plotter.set_background([0.318, 0.341, 0.431])
+            self.intersections_plotter.add_text("Refine intersections to visualize refined intersection lines.", 
+                                               position='upper_edge', color='white')
+            self.plotters['intersections'] = self.intersections_plotter
+            
+            # Meshes plotter
+            self.meshes_plotter = QtInteractor(self.meshes_viz_frame)
+            self.meshes_plot_layout.addWidget(self.meshes_plotter.interactor)
+            self.meshes_plotter.set_background([0.318, 0.341, 0.431])
+            self.meshes_plotter.add_text("Generate conforming meshes to visualize surface meshes.", 
+                                       position='upper_edge', color='white')
+            self.plotters['meshes'] = self.meshes_plotter
+            
+            # Segments plotter
+            self.segments_plotter = QtInteractor(self.segments_viz_frame)
+            self.segments_plot_layout.addWidget(self.segments_plotter.interactor)
+            self.segments_plotter.set_background([0.318, 0.341, 0.431])
+            self.segments_plotter.add_text("Click on constraint segments to select/deselect them.", 
+                                         position='upper_edge', color='white')
+            self.plotters['segments'] = self.segments_plotter
+            
+            # Set the default main plotter reference for backward compatibility
+            self.refine_mesh_plotter = self.intersections_plotter
+            self.plotters['refine_mesh'] = self.intersections_plotter
+            
+            # Initialize constraint actor persistence system
+            self.constraint_segment_actor_refs = {}
+            self._constraint_actors_built = False
+            self._last_segment_count = 0
+            self._constraint_actors_persistent = True
+            
+            logger.info("Successfully created all refine mesh tab plotters and initialized constraint actor system")
+            
+        except Exception as e:
+            logger.error(f"Error initializing Refine/Mesh plotters: {e}", exc_info=True)
+            # Add error placeholders for each tab
+            for viz_frame, layout, tab_name in [
+                (self.intersections_viz_frame, self.intersections_plot_layout, "Intersections"),
+                (self.meshes_viz_frame, self.meshes_plot_layout, "Meshes"), 
+                (self.segments_viz_frame, self.segments_plot_layout, "Segments")
+            ]:
+                placeholder = QLabel(f"Error initializing {tab_name} PyVista plotter: {e}")
                 placeholder.setAlignment(Qt.AlignCenter)
                 placeholder.setWordWrap(True)
-                self.refine_mesh_plot_layout.addWidget(placeholder)
-                self.refine_mesh_plotter = None
-        else:
-            placeholder = QLabel("PyVista is required for 3D visualization.")
-            placeholder.setAlignment(Qt.AlignCenter)
-            self.refine_mesh_plot_layout.addWidget(placeholder)
+                layout.addWidget(placeholder)
+            
+            # Set None references
+            self.intersections_plotter = None
+            self.meshes_plotter = None
+            self.segments_plotter = None
             self.refine_mesh_plotter = None
 
-        viz_layout.addWidget(self.refine_mesh_viz_frame, 1)
-        
-        # Add summary labels for refinement and conforming mesh results
-        self.refinement_summary_label = QLabel("Run refinement to see summary")
-        self.refinement_summary_label.setWordWrap(True)
-        self.refinement_summary_label.setTextFormat(Qt.RichText)
-        viz_layout.addWidget(self.refinement_summary_label)
-        
-        self.conforming_mesh_summary_label = QLabel("Generate conforming meshes to see mesh statistics")
-        self.conforming_mesh_summary_label.setWordWrap(True)
-        self.conforming_mesh_summary_label.setTextFormat(Qt.RichText)
-        self.conforming_mesh_summary_label.setStyleSheet("border: 1px solid gray; padding: 5px; margin: 2px;")
-        viz_layout.addWidget(self.conforming_mesh_summary_label)
-        
-        tab_layout.addWidget(viz_group, 1)
+    def _on_refine_view_tab_changed(self, index):
+        """Handle switching between refine view sub-tabs."""
+        old_view = getattr(self, 'current_refine_view', 0)
+        self.current_refine_view = index
+
+        logger.info(f"[REFINE] Tab changed from {old_view} to {index}")
+
+        # Update main plotter reference; ensure Segments plotter exists on demand
+        if hasattr(self, 'plotters') and self.plotters is not None:
+            if index == 0:
+                self.refine_mesh_plotter = getattr(self, 'intersections_plotter', None)
+            elif index == 1:
+                self.refine_mesh_plotter = getattr(self, 'meshes_plotter', None)
+            elif index == 2:
+                self.refine_mesh_plotter = self._ensure_segments_plotter()
+                # Inspect widget tree now that tab is active
+                self._debug_segments_widget_tree("tab-changed")
+            logger.info(f"[REFINE] refine_mesh_plotter set to tab {index} ({'OK' if self.refine_mesh_plotter else 'None'})")
+
+        if old_view != index:
+            self._ensure_constraint_actors_persistence()
+
+            # Disable mouse selection when leaving segments view
+            if old_view == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
+                if self.mouse_selection_enabled_btn.isChecked():
+                    self.mouse_selection_enabled_btn.setChecked(False)
+
+            logger.info("[REFINE] Calling _update_refined_visualization after tab change")
+            self._update_refined_visualization()
+
+            if index == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
+                self.mouse_selection_enabled_btn.setEnabled(True)
+            elif hasattr(self, 'mouse_selection_enabled_btn'):
+                self.mouse_selection_enabled_btn.setEnabled(index == 2)
+
+    def _clear_refine_tab_plotters(self):
+        """Clear all refine tab plotters"""
+        for plotter_name in ['intersections_plotter', 'meshes_plotter', 'segments_plotter']:
+            plotter = getattr(self, plotter_name, None)
+            if plotter and hasattr(plotter, 'clear'):
+                try:
+                    plotter.clear()
+                except Exception as e:
+                    logger.warning(f"Error clearing {plotter_name}: {e}")
+    def _ensure_segments_plotter(self):
+        """
+        Lazily create/attach the Segments QtInteractor if missing.
+        Returns the plotter or None if PyVistaQt is unavailable.
+        """
+        try:
+            have_pv = bool(HAVE_PYVISTA)
+        except NameError:
+            have_pv = False
+        logger.info(f"[SEGMENTS] ensure plotter: HAVE_PYVISTA={have_pv}")
+
+        if not have_pv:
+            logger.warning("[SEGMENTS] PyVista not available; cannot create Segments plotter")
+            return None
+
+        # Basic widget sanity
+        try:
+            logger.info(f"[SEGMENTS] segments_viz_frame exists: {hasattr(self, 'segments_viz_frame')} type={type(getattr(self, 'segments_viz_frame', None))}")
+        except Exception:
+            logger.warning("[SEGMENTS] unable to inspect segments_viz_frame")
+
+        # Import QtInteractor
+        try:
+            from pyvistaqt import QtInteractor
+            logger.info("[SEGMENTS] QtInteractor import OK")
+        except Exception as e:
+            logger.error(f"[SEGMENTS] QtInteractor import FAILED: {e}", exc_info=True)
+            return None
+
+        # Already present?
+        plotter = getattr(self, 'segments_plotter', None)
+        if plotter and hasattr(plotter, 'interactor'):
+            logger.info("[SEGMENTS] Reusing existing Segments plotter")
+            # Ensure it’s attached and visible
+            self._debug_segments_widget_tree("reuse")
+            return plotter
+
+        # Ensure layout exists
+        if not hasattr(self, 'segments_plot_layout') or self.segments_plot_layout is None:
+            try:
+                self.segments_plot_layout = QVBoxLayout(self.segments_viz_frame)
+                self.segments_plot_layout.setContentsMargins(0, 0, 0, 0)
+                logger.info("[SEGMENTS] Created segments_plot_layout and attached to frame")
+            except Exception as e:
+                logger.error(f"[SEGMENTS] Failed to create segments_plot_layout: {e}", exc_info=True)
+                return None
+        else:
+            logger.info("[SEGMENTS] segments_plot_layout already exists")
+
+        # Create and attach the interactor widget
+        try:
+            self.segments_plotter = QtInteractor(self.segments_viz_frame)
+            self.segments_plot_layout.addWidget(self.segments_plotter.interactor)
+            self.segments_plotter.set_background([0.318, 0.341, 0.431])
+            self.segments_plotter.add_text("Click on constraint segments to select/deselect them.",
+                                        position='upper_edge', color='white')
+            if not hasattr(self, 'plotters') or self.plotters is None:
+                self.plotters = {}
+            self.plotters['segments'] = self.segments_plotter
+            logger.info("[SEGMENTS] Segments plotter CREATED and interactor added to layout")
+            # Verify attachment
+            self._debug_segments_widget_tree("created")
+            return self.segments_plotter
+        except Exception as e:
+            logger.error(f"[SEGMENTS] Failed to create/attach Segments plotter: {e}", exc_info=True)
+            return None
+    def _get_current_refine_plotter(self):
+        """Get the currently active refine tab plotter (lazily ensures Segments plotter)."""
+        current_index = getattr(self, 'current_refine_view', 0)
+        if current_index == 0:
+            p = getattr(self, 'intersections_plotter', None)
+            logger.info(f"[REFINE] current plotter -> Intersections ({'OK' if p else 'None'})")
+            return p
+        elif current_index == 1:
+            p = getattr(self, 'meshes_plotter', None)
+            logger.info(f"[REFINE] current plotter -> Meshes ({'OK' if p else 'None'})")
+            return p
+        elif current_index == 2:
+            p = self._ensure_segments_plotter()
+            logger.info(f"[REFINE] current plotter -> Segments ({'OK' if p else 'None'})")
+            return p
+        logger.warning(f"[REFINE] current plotter -> Unknown tab index {current_index}")
+        return None
+    
+    def _ensure_constraint_actors_persistence(self):
+        """
+        Ensure constraint actors persist across tab switches and surface filter changes.
+        This prevents unnecessary rebuilding and improves performance.
+        """
+        if not hasattr(self, 'constraint_segment_actor_refs'):
+            self.constraint_segment_actor_refs = {}
+            
+        if not hasattr(self, '_constraint_actors_built'):
+            self._constraint_actors_built = False
+            
+        # Mark constraint actors as persistent to avoid clearing during tab switches
+        if hasattr(self, 'constraint_segment_actor_refs') and self.constraint_segment_actor_refs:
+            setattr(self, '_constraint_actors_persistent', True)
+            
+        # Initialize segment count tracking for change detection
+        if not hasattr(self, '_last_segment_count'):
+            self._last_segment_count = 0
+    
     # Event handlers - placeholder implementations
     # ─── Visibility helpers for the view selector ─────────────────────────
     def _show_intersection_actors(self, visible: bool):
@@ -1474,7 +2151,11 @@ class MeshItWorkflowGUI(QMainWindow):
                 a.SetVisibility(visible)
             except Exception:
                 pass
-        if self.refine_mesh_plotter:
+        # Render on the current active plotter
+        current_plotter = self._get_current_refine_plotter()
+        if current_plotter:
+            current_plotter.render()
+        elif self.refine_mesh_plotter:  # Fallback
             self.refine_mesh_plotter.render()
 
     def _show_conforming_mesh_actors(self, visible: bool):
@@ -1485,7 +2166,11 @@ class MeshItWorkflowGUI(QMainWindow):
                 a.SetVisibility(visible)
             except Exception:
                 pass
-        if self.refine_mesh_plotter:
+        # Render on the current active plotter
+        current_plotter = self._get_current_refine_plotter()
+        if current_plotter:
+            current_plotter.render()
+        elif self.refine_mesh_plotter:  # Fallback
             self.refine_mesh_plotter.render()
 
     def _show_constraint_segment_actors(self, visible: bool):
@@ -1496,12 +2181,1946 @@ class MeshItWorkflowGUI(QMainWindow):
                 a.SetVisibility(visible)
             except Exception:
                 pass
-        if self.refine_mesh_plotter:
+        # Render on the current active plotter
+        current_plotter = self._get_current_refine_plotter()
+        if current_plotter:
+            current_plotter.render()
+        elif self.refine_mesh_plotter:  # Fallback
             self.refine_mesh_plotter.render()
     def _handle_view_toggle(self, idx: int):
-        self.current_refine_view = idx
-        self._update_refined_visualization()
+        """Legacy method - now redirects to tab-based view switching"""
+        logger.info(f"Legacy _handle_view_toggle called with index {idx}, redirecting to tab system")
+        
+        # Update the tab widget to match the requested index
+        if hasattr(self, 'refine_view_tabs'):
+            self.refine_view_tabs.setCurrentIndex(idx)
+        else:
+            # Fallback to old behavior if tabs are not set up yet
+            old_view = getattr(self, 'current_refine_view', 0)
+            self.current_refine_view = idx
+            
+            # Only update visualization if view actually changed
+            if old_view != idx:
+                # Clear actors cache to force rebuild for the new view
+                if hasattr(self, '_constraint_actors_built'):
+                    self._constraint_actors_built = False
+                
+                # Disable mouse selection when leaving segments view
+                if old_view == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
+                    if self.mouse_selection_enabled_btn.isChecked():
+                        self.mouse_selection_enabled_btn.setChecked(False)
+                        
+                self._update_refined_visualization()
+                
+                # Re-enable mouse selection if returning to segments view and it was previously enabled
+                if idx == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
+                    # Enable the button but don't auto-check it - let user decide
+                    self.mouse_selection_enabled_btn.setEnabled(True)
+                elif hasattr(self, 'mouse_selection_enabled_btn'):
+                    # Disable mouse selection button for non-segments views
+                    self.mouse_selection_enabled_btn.setEnabled(idx == 2)
     
+    def _on_refine_surface_selection_changed(self, surface_name):
+        """
+        Called when the user changes the surface selection in the dropdown.
+        Updates the constraint visualization to show only the selected surface's constraints.
+        Similar to C++ setFShowGBox() function.
+        """
+        logger.info(f"Surface selection changed to: {surface_name}")
+
+        current_view = getattr(self, 'current_refine_view', 0)
+        if current_view != 2:
+            logger.info(f"Surface selection noted for view {current_view} (constraint visibility not applicable)")
+            if current_view == 0:
+                logger.info(f"Refreshing intersections visualization for surface filter: {surface_name}")
+                self._visualize_refined_intersections()
+            elif current_view == 1:
+                logger.info(f"Refreshing meshes visualization for surface filter: {surface_name}")
+                self._update_refined_visualization()
+            self._highlight_surface_in_constraint_tree(surface_name)
+            return
+
+        # Segments view
+        batched = bool(getattr(self, "_segments_batched_mode", False))
+        has_segment_actors = bool(getattr(self, 'constraint_segment_actor_refs', {}))
+
+        # In batched mode (mouse selection OFF) or when no actors exist → rebuild once (fast path)
+        if batched or not has_segment_actors:
+            logger.info("[SEGMENTS] Surface filter change: rebuilding batched view")
+            self._update_refined_visualization()
+        else:
+            # Per‑segment actors exist → fast toggle
+            if hasattr(self, 'constraint_segment_actor_refs') and self.constraint_segment_actor_refs:
+                logger.info(f"Updating constraint visibility for surface filter in Segments view (view={current_view})")
+                self._update_segment_visibility_for_surface_selection(surface_name)
+            else:
+                logger.warning("No constraint actors available for visibility update")
+
+        self._highlight_surface_in_constraint_tree(surface_name)
+
+    def _update_segment_visibility_for_surface_selection(self, selected_surface):
+        """
+        Fast visibility update for segment actors when surface selection changes.
+        No rebuilding - just toggle visibility.
+        """
+        if not hasattr(self, 'constraint_segment_actor_refs'):
+            logger.warning("No constraint_segment_actor_refs available for visibility update")
+            return
+            
+        # Get the current active plotter
+        plotter = self._get_current_refine_plotter()
+        if not plotter:
+            # Fallback to old method
+            plotter = self.plotters.get("refine_mesh")
+            if not plotter:
+                logger.warning("No refine_mesh plotter available for visibility update")
+                return
+
+        logger.info(f"Updating visibility for surface filter: '{selected_surface}'")
+        logger.info(f"Total constraint actors available: {len(self.constraint_segment_actor_refs)}")
+
+        # Get constraint type filters
+        show_hull = getattr(self, 'show_hull_constraints_checkbox', None)
+        show_intersections = getattr(self, 'show_intersection_constraints_checkbox', None)
+        show_selected_only = getattr(self, 'show_selected_only_checkbox', None)
+        
+        show_hull_constraints = show_hull.isChecked() if show_hull else True
+        show_intersection_constraints = show_intersections.isChecked() if show_intersections else True
+        show_selected_only_mode = show_selected_only.isChecked() if show_selected_only else False
+
+        # Helper function to check if a surface should be shown
+        def should_show_surface(dataset_idx):
+            if selected_surface == "All Surfaces":
+                return True
+            if dataset_idx < len(self.datasets):
+                dataset_name = self.datasets[dataset_idx].get("name", f"Surface_{dataset_idx}")
+                should_show = dataset_name == selected_surface
+                logger.debug(f"Surface check: idx={dataset_idx}, name='{dataset_name}', filter='{selected_surface}', show={should_show}")
+                return should_show
+            logger.debug(f"Surface check: idx={dataset_idx} out of range ({len(self.datasets)} datasets)")
+            return False
+
+        visible_count = 0
+        hidden_count = 0
+        surface_counts = {}  # Track how many segments per surface
+        
+        for (surf_idx, seg_uid), actor in self.constraint_segment_actor_refs.items():
+            # Track surface distribution
+            surface_counts[surf_idx] = surface_counts.get(surf_idx, 0) + 1
+            
+            # Check surface filter
+            should_show = should_show_surface(surf_idx)
+            
+            if should_show:
+                seg_info = getattr(self, '_refine_segment_map', {}).get((surf_idx, seg_uid), {})
+                
+                # Check constraint type filters
+                seg_type = seg_info.get("type", "")
+                if seg_type == "hull" and not show_hull_constraints:
+                    should_show = False
+                elif seg_type == "intersection" and not show_intersection_constraints:
+                    should_show = False
+
+                # Check if in selected-only mode
+                if should_show and show_selected_only_mode:
+                    is_selected = seg_info.get("selected", False)
+                    if not is_selected:
+                        should_show = False
+
+            # Apply visibility instantly
+            try:
+                actor.SetVisibility(should_show)
+                # Force the actor to update its visibility immediately
+                if hasattr(actor, 'Modified'):
+                    actor.Modified()
+                    
+                # NUCLEAR OPTION: If SetVisibility doesn't work, remove/add actor from plotter
+                if not should_show:
+                    # Try to remove actor from plotter entirely
+                    try:
+                        if hasattr(plotter, 'remove_actor') and actor in plotter.renderer.actors:
+                            plotter.remove_actor(actor)
+                            logger.debug(f"Removed actor ({surf_idx}, {seg_uid}) from plotter")
+                    except:
+                        pass
+                else:
+                    # Ensure actor is in plotter
+                    try:
+                        if hasattr(plotter, 'add_actor') and actor not in plotter.renderer.actors:
+                            plotter.add_actor(actor)
+                            logger.debug(f"Added actor ({surf_idx}, {seg_uid}) to plotter")
+                    except:
+                        pass
+                        
+                if should_show:
+                    visible_count += 1
+                else:
+                    hidden_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to set visibility for actor ({surf_idx}, {seg_uid}): {e}")
+                continue
+        
+        # Force complete render and refresh
+        try:
+            # NUCLEAR APPROACH: Since SetVisibility() doesn't work,
+            # physically remove all non-visible actors from the plotter
+            plotter.clear_actors()  # Remove ALL actors first
+            
+            # Re-add only the actors that should be visible
+            actors_readded = 0
+            for (surf_idx, seg_uid), actor in self.constraint_segment_actor_refs.items():
+                should_show = should_show_surface(surf_idx)
+                
+                if should_show:
+                    seg_info = getattr(self, '_refine_segment_map', {}).get((surf_idx, seg_uid), {})
+                    
+                    # Check constraint type filters
+                    seg_type = seg_info.get("type", "")
+                    if seg_type == "hull" and not show_hull_constraints:
+                        should_show = False
+                    elif seg_type == "intersection" and not show_intersection_constraints:
+                        should_show = False
+
+                    # Check if in selected-only mode
+                    if should_show and show_selected_only_mode:
+                        is_selected = seg_info.get("selected", False)
+                        if not is_selected:
+                            should_show = False
+                
+                # Only add actors that should be visible
+                if should_show:
+                    try:
+                        plotter.add_actor(actor)
+                        actors_readded += 1
+                        logger.debug(f"Re-added actor ({surf_idx}, {seg_uid}) to plotter")
+                    except Exception as e:
+                        logger.warning(f"Failed to re-add actor ({surf_idx}, {seg_uid}): {e}")
+            
+            logger.info(f"NUCLEAR FIX: Removed all actors, re-added {actors_readded} visible actors")
+            
+            # Standard rendering
+            plotter.render()
+            if hasattr(plotter, 'update'):
+                plotter.update()
+            if hasattr(plotter, 'ren_win') and plotter.ren_win:
+                plotter.ren_win.Render()
+                
+        except Exception as e:
+            logger.warning(f"Error during nuclear render fix: {e}")
+            # Fallback to standard render
+            try:
+                plotter.render()
+            except:
+                pass
+        
+        # Detailed logging
+        logger.info(f"Visibility update complete: {visible_count} visible, {hidden_count} hidden")
+        logger.info(f"Surface distribution: {surface_counts}")
+        
+        # Specific info about the selected surface
+        if selected_surface != "All Surfaces":
+            # Find which surface index corresponds to the selected surface name
+            target_surface_idx = None
+            for idx, dataset in enumerate(self.datasets):
+                if dataset.get("name", f"Surface_{idx}") == selected_surface:
+                    target_surface_idx = idx
+                    break
+            
+            if target_surface_idx is not None:
+                visible_for_selected = surface_counts.get(target_surface_idx, 0)
+                logger.info(f"Selected surface '{selected_surface}' (idx={target_surface_idx}) has {visible_for_selected} total segments")
+                
+                # VERIFY THE FIX: Check if the visibility was actually applied
+                visible_actors_for_surface = 0
+                for (surf_idx, seg_uid), actor in self.constraint_segment_actor_refs.items():
+                    if surf_idx == target_surface_idx and actor.GetVisibility():
+                        visible_actors_for_surface += 1
+                
+                logger.info(f"VERIFICATION: {visible_actors_for_surface} actors are actually visible for surface {target_surface_idx}")
+                
+                if visible_actors_for_surface != visible_count:
+                    logger.error(f"❌ VISIBILITY MISMATCH: Expected {visible_count} visible, but {visible_actors_for_surface} actors are actually visible!")
+                else:
+                    logger.info(f"✅ VISIBILITY CONFIRMED: All {visible_count} actors are properly visible")
+                    
+            else:
+                logger.warning(f"Could not find surface index for '{selected_surface}'")
+        
+        logger.info(f"Final result: {visible_count} segments visible for '{selected_surface}'")
+
+    def _on_constraint_filter_changed(self):
+        """
+        Fast constraint filter update when checkboxes change.
+        If batched mode: rebuild once. If per‑segment mode: visibility toggle.
+        """
+        if getattr(self, "current_refine_view", 0) != 2:
+            self._update_refined_visualization()
+            return
+
+        batched = bool(getattr(self, "_segments_batched_mode", False))
+        if batched:
+            logger.info("[SEGMENTS] Constraint filter changed → rebuilding batched view")
+            self._update_refined_visualization()
+            return
+
+        # Per‑segment actors exist, toggle visibility without rebuild
+        selected_surface = "All Surfaces"
+        if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
+            selected_surface = self.refine_surface_selector.currentText()
+        self._update_segment_visibility_for_surface_selection(selected_surface)
+
+    def _on_mouse_selection_toggled(self, enabled):
+        """
+        Toggle mouse-based constraint selection on/off.
+        When enabled we rebuild per-segment actors and enable picking.
+        When disabled we rebuild the fast batched view.
+        """
+        logger.info(f"Mouse selection {'enabled' if enabled else 'disabled'}")
+
+        # Show/hide selection mode buttons
+        if hasattr(self, 'selection_mode_btn') and hasattr(self, 'deselection_mode_btn'):
+            self.selection_mode_btn.setVisible(enabled)
+            self.deselection_mode_btn.setVisible(enabled)
+
+        if not hasattr(self, 'current_selection_mode'):
+            self.current_selection_mode = "select"
+
+        if not hasattr(self, 'highlight_timer'):
+            self.highlight_timer = QTimer()
+            self.highlight_timer.setSingleShot(True)
+            self.highlight_timer.timeout.connect(self._clear_selection_highlight)
+            self.highlight_timer.setInterval(500)
+
+        # Ensure we are on Segments tab
+        current_view = getattr(self, 'current_refine_view', 0)
+        if current_view != 2 and enabled:
+            if hasattr(self, 'refine_view_tabs'):
+                self.refine_view_tabs.setCurrentIndex(2)
+            else:
+                if hasattr(self, 'view_btn_grp'):
+                    self.view_btn_grp.button(2).setChecked(True)
+                self._handle_view_toggle(2)
+
+        plotter = self._get_current_refine_plotter() or self.plotters.get("refine_mesh")
+        if not plotter:
+            logger.warning("No refine_mesh plotter available for mouse selection")
+            return
+
+        # Rebuild visualization for the new mode
+        # - enabled: per-segment actors for picking
+        # - disabled: batched fast drawing
+        try:
+            self._update_refined_visualization()
+        except Exception as e:
+            logger.warning(f"Redraw after toggling mouse selection failed: {e}")
+
+        if enabled:
+            # Require per-segment actors
+            if not hasattr(self, 'constraint_segment_actor_refs'):
+                self.constraint_segment_actor_refs = {}
+            if not getattr(self, '_constraint_actors_built', False) or not self.constraint_segment_actor_refs:
+                logger.warning("No constraint actors available for mouse selection after rebuild")
+                return
+
+            try:
+                plotter.enable_cell_picking(
+                    callback=self._on_constraint_cell_clicked,
+                    show_message=False,
+                    font_size=12,
+                    color='yellow',
+                    through=True,
+                    start=True,
+                    show=True
+                )
+                self.mouse_selection_enabled_btn.setText("🖱️ Mouse ON")
+                logger.info("Constraint mouse selection enabled")
+            except Exception as cell_error:
+                logger.warning(f"Cell picking failed: {cell_error}")
+                try:
+                    from pyvista.plotting.opts import ElementType
+                    plotter.enable_element_picking(
+                        mode=ElementType.EDGE,
+                        callback=self._on_constraint_edge_clicked,
+                        show_message=False,
+                        font_size=10,
+                        color='yellow'
+                    )
+                    self.mouse_selection_enabled_btn.setText("🖱️ Mouse ON")
+                    logger.info("Constraint mouse selection enabled (edge picking fallback)")
+                except Exception as edge_error:
+                    logger.warning(f"Edge picking failed: {edge_error}")
+                    try:
+                        plotter.enable_mesh_picking(
+                            callback=self._on_constraint_clicked_single,
+                            show_message=False,
+                            font_size=10,
+                            color='yellow'
+                        )
+                        self.mouse_selection_enabled_btn.setText("🖱️ Mouse ON")
+                        logger.info("Constraint mouse selection enabled (mesh picking fallback)")
+                    except Exception as mesh_error:
+                        logger.error(f"All picking methods failed: {mesh_error}")
+                        return
+        else:
+            # Disable picking and rebuild fast view
+            try:
+                plotter.disable_picking()
+            except Exception:
+                pass
+            self.mouse_selection_enabled_btn.setText("🖱️ Mouse Selection")
+            try:
+                self._update_refined_visualization()
+            except Exception:
+                pass
+            logger.info("Constraint mouse selection disabled")
+
+    def _on_selection_mode_changed(self, button, checked):
+        """
+        Called when user switches between Select Mode and Deselect Mode.
+        Updates the behavior of rectangle selection.
+        """
+        if not checked:
+            return  # Only respond to button being checked, not unchecked
+            
+        mode_id = self.selection_mode_group.id(button)
+        if mode_id == 0:  # Select mode
+            self.current_selection_mode = "select"
+            logger.info("🔵 Selection mode: SELECT - Rectangle drag will select constraints")
+            # Update button styles to show active mode
+            self.selection_mode_btn.setText("✅ Select Mode (Active)")
+            self.deselection_mode_btn.setText("❌ Deselect Mode")
+        elif mode_id == 1:  # Deselect mode
+            self.current_selection_mode = "deselect"
+            logger.info("🔴 Selection mode: DESELECT - Rectangle drag will deselect constraints")
+            # Update button styles to show active mode
+            self.selection_mode_btn.setText("✅ Select Mode")
+            self.deselection_mode_btn.setText("❌ Deselect Mode (Active)")
+        
+        # Store the current mode for use in cell clicking callback
+        self.current_selection_mode = "select" if mode_id == 0 else "deselect"
+
+    def _clear_selection_highlight(self):
+        """
+        Clear the yellow selection highlight after a short delay.
+        This allows users to see the actual selection state of constraints.
+        """
+        try:
+            # Get the current active plotter
+            plotter = self._get_current_refine_plotter()
+            if not plotter:
+                # Fallback to old method
+                plotter = self.plotters.get("refine_mesh")
+            if plotter:
+                # Try multiple methods to clear PyVista highlighting
+                try:
+                    # Method 1: Clear pick selection if available
+                    if hasattr(plotter, 'clear_pick_selection'):
+                        plotter.clear_pick_selection()
+                        logger.debug("🔄 Cleared using clear_pick_selection()")
+                    
+                    # Method 2: Clear cell picking highlight
+                    elif hasattr(plotter, 'picked_cell') and plotter.picked_cell is not None:
+                        plotter.picked_cell = None
+                        logger.debug("🔄 Cleared picked_cell")
+                    
+                    # Method 3: Clear mesh picking highlight  
+                    elif hasattr(plotter, 'picked_mesh') and plotter.picked_mesh is not None:
+                        plotter.picked_mesh = None
+                        logger.debug("🔄 Cleared picked_mesh")
+                    
+                    # Method 4: Force render to clear any visual artifacts
+                    plotter.render()
+                    logger.debug("🔄 Cleared selection highlighting with render")
+                    
+                except AttributeError as ae:
+                    # Just render if specific clearing methods don't exist
+                    plotter.render()
+                    logger.debug(f"🔄 Used render fallback: {ae}")
+                    
+        except Exception as e:
+            logger.warning(f"Error clearing selection highlight: {e}")
+
+    def _update_constraint_visualization_colors(self):
+        """
+        Update the visual colors of constraint lines based on their selection state.
+        Green = selected, Gray = unselected (following the original constraint visualization system).
+        """
+        try:
+            # Get the current active plotter
+            plotter = self._get_current_refine_plotter()
+            if not plotter:
+                # Fallback to old method
+                plotter = self.plotters.get("refine_mesh")
+            if not plotter or not hasattr(self, 'constraint_segment_actor_refs'):
+                return
+                
+            # Get the tree for checking selection states
+            tree = getattr(self, 'refine_constraint_tree', None)
+            if not tree:
+                return
+                
+            logger.debug("🎨 Updating constraint visualization colors based on selection state")
+            
+            # Build a map of selection states for fast lookup
+            selection_states = {}  # {(surf_idx, seg_uid): is_selected}
+            
+            def collect_selection_states(item):
+                """Recursively collect selection states from tree"""
+                data = item.data(0, Qt.UserRole)
+                if data and data.get("type") == "constraint":
+                    surf_idx = data.get("surface_idx")
+                    seg_uid = data.get("seg_uid")
+                    is_selected = item.checkState(0) == Qt.Checked
+                    selection_states[(surf_idx, seg_uid)] = is_selected
+                
+                # Process child items
+                for i in range(item.childCount()):
+                    collect_selection_states(item.child(i))
+            
+            # Collect all selection states from tree
+            for i in range(tree.topLevelItemCount()):
+                collect_selection_states(tree.topLevelItem(i))
+            
+            # Update actor colors based on selection state
+            updated_count = 0
+            for (surf_idx, seg_uid), actor in self.constraint_segment_actor_refs.items():
+                is_selected = selection_states.get((surf_idx, seg_uid), False)
+                
+                # Set color: Green for selected, Gray for unselected
+                if is_selected:
+                    color = [0.0, 1.0, 0.0]  # Green
+                else:
+                    color = [0.5, 0.5, 0.5]  # Gray
+                
+                try:
+                    # Update actor color
+                    actor.GetProperty().SetColor(color)
+                    actor.Modified()  # Mark as modified to trigger render update
+                    updated_count += 1
+                except Exception as actor_error:
+                    logger.debug(f"Failed to update color for actor ({surf_idx}, {seg_uid}): {actor_error}")
+            
+            # Force render to show color changes
+            plotter.render()
+            logger.debug(f"🎨 Updated colors for {updated_count} constraint actors")
+            
+        except Exception as e:
+            logger.warning(f"Error updating constraint visualization colors: {e}")
+
+    def _synchronize_shared_intersection_segments(self, selected_segments):
+        """
+        Synchronize selection state for intersection segments that are shared across multiple surfaces.
+        When an intersection segment is selected/deselected on one surface, it should be 
+        selected/deselected on all other surfaces that share the same intersection.
+        """
+        try:
+            if not hasattr(self, 'refined_intersections_for_visualization') or not hasattr(self, 'refine_constraint_tree'):
+                return
+                
+            tree = self.refine_constraint_tree
+            if not tree:
+                return
+                
+            # Get current selection mode
+            mode = getattr(self, 'current_selection_mode', 'select')
+            
+            logger.debug(f"🔄 Synchronizing {len(selected_segments)} segments across surfaces (mode: {mode})")
+            
+            # Block signals to prevent recursion during synchronization
+            tree.blockSignals(True)
+            
+            try:
+                # For each segment that was just selected/deselected
+                for surf_idx, seg_uid in selected_segments:
+                    # Check if this is an intersection segment by finding its parent in the tree
+                    segment_item = self._find_tree_item_for_segment(surf_idx, seg_uid)
+                    if not segment_item:
+                        continue
+                        
+                    parent_item = segment_item.parent()
+                    if not parent_item:
+                        continue
+                        
+                    parent_data = parent_item.data(0, Qt.UserRole)
+                    if not parent_data or parent_data.get("type") != "intersection_group":
+                        continue  # Not an intersection segment, no sync needed
+                    
+                    # Get the intersection index
+                    try:
+                        intersection_idx = int(parent_item.text(0).split(" ")[-1])
+                    except (ValueError, IndexError):
+                        continue
+                    
+                    # Get the intersection data to find which surfaces are involved
+                    if surf_idx not in self.refined_intersections_for_visualization:
+                        continue
+                        
+                    if intersection_idx >= len(self.refined_intersections_for_visualization[surf_idx]):
+                        continue
+                        
+                    intersection_data = self.refined_intersections_for_visualization[surf_idx][intersection_idx]
+                    dataset_id1 = intersection_data.get('dataset_id1')
+                    dataset_id2 = intersection_data.get('dataset_id2')
+                    
+                    # Get the current selection state of the segment we just modified
+                    current_state = segment_item.checkState(0) == Qt.Checked
+                    
+                    logger.debug(f"Syncing intersection segment {seg_uid} from surface {surf_idx} to surfaces {dataset_id1}, {dataset_id2}")
+                    
+                    # Update the same segment on the other involved surfaces
+                    surfaces_to_sync = []
+                    if dataset_id1 is not None and dataset_id1 != surf_idx:
+                        surfaces_to_sync.append(dataset_id1)
+                    if dataset_id2 is not None and dataset_id2 != surf_idx:
+                        surfaces_to_sync.append(dataset_id2)
+                    
+                    for other_surface_idx in surfaces_to_sync:
+                        # Find the corresponding segment on the other surface
+                        other_segment_item = self._find_matching_intersection_segment(
+                            other_surface_idx, intersection_idx, seg_uid
+                        )
+                        
+                        if other_segment_item:
+                            # Set the same selection state
+                            new_state = Qt.Checked if current_state else Qt.Unchecked
+                            if other_segment_item.checkState(0) != new_state:
+                                other_segment_item.setCheckState(0, new_state)
+                                logger.debug(f"✅ Synced segment {seg_uid} on surface {other_surface_idx} to {current_state}")
+                
+            finally:
+                # Re-enable signals and update visualization
+                tree.blockSignals(False)
+                tree.update()
+                tree.repaint()
+                
+                # Update colors again to reflect synchronized changes
+                self._update_constraint_visualization_colors()
+                
+            logger.debug("🔄 Cross-surface synchronization complete")
+            
+        except Exception as e:
+            logger.warning(f"Error synchronizing shared intersection segments: {e}")
+
+    def _synchronize_shared_intersection_segments_background(self, selected_segments):
+        """
+        Background synchronization for intersection segments that respects surface filtering.
+        Updates tree states without affecting visual display - the surface filter remains active.
+        """
+        try:
+            if not hasattr(self, 'refined_intersections_for_visualization') or not hasattr(self, 'refine_constraint_tree'):
+                return
+                
+            tree = self.refine_constraint_tree
+            if not tree:
+                return
+                
+            # Get current selection mode and surface filter
+            mode = getattr(self, 'current_selection_mode', 'select')
+            current_surface_filter = "All Surfaces"
+            if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
+                current_surface_filter = self.refine_surface_selector.currentText()
+                
+            logger.debug(f"🔄 Background sync: {len(selected_segments)} segments (mode: {mode}, filter: {current_surface_filter})")
+            
+            # Block signals to prevent visual updates during background sync
+            tree.blockSignals(True)
+            
+            try:
+                # For each segment that was just selected/deselected
+                for surf_idx, seg_uid in selected_segments:
+                    # Only sync if this segment was actually from the filtered surface
+                    if current_surface_filter != "All Surfaces":
+                        # Check if this segment belongs to the currently filtered surface
+                        if surf_idx < len(self.datasets):
+                            dataset_entry = self.datasets[surf_idx]
+                            # Robustly obtain surface name whether the datasets list stores dicts or paths
+                            if isinstance(dataset_entry, dict):
+                                surface_name = dataset_entry.get("name", f"Surface_{surf_idx}")
+                            else:
+                                surface_name = os.path.basename(str(dataset_entry))
+                            if surface_name != current_surface_filter:
+                                continue  # Skip segments not from current surface filter
+                    
+                    # Find and sync intersection segments
+                    segment_item = self._find_tree_item_for_segment(surf_idx, seg_uid)
+                    if not segment_item:
+                        continue
+                        
+                    parent_item = segment_item.parent()
+                    if not parent_item:
+                        continue
+                        
+                    parent_data = parent_item.data(0, Qt.UserRole)
+                    if not parent_data or parent_data.get("type") != "intersection_group":
+                        continue  # Not an intersection segment
+                    
+                    # Get intersection data and sync to other surfaces
+                    try:
+                        intersection_idx = int(parent_item.text(0).split(" ")[-1])
+                    except (ValueError, IndexError):
+                        continue
+                    
+                    if surf_idx not in self.refined_intersections_for_visualization:
+                        continue
+                        
+                    if intersection_idx >= len(self.refined_intersections_for_visualization[surf_idx]):
+                        continue
+                        
+                    intersection_data = self.refined_intersections_for_visualization[surf_idx][intersection_idx]
+                    dataset_id1 = intersection_data.get('dataset_id1')
+                    dataset_id2 = intersection_data.get('dataset_id2')
+                    
+                    # Get current selection state
+                    current_state = segment_item.checkState(0) == Qt.Checked
+                    
+                    # Update other surfaces (background tree updates only)
+                    surfaces_to_sync = []
+                    if dataset_id1 is not None and dataset_id1 != surf_idx:
+                        surfaces_to_sync.append(dataset_id1)
+                    if dataset_id2 is not None and dataset_id2 != surf_idx:
+                        surfaces_to_sync.append(dataset_id2)
+                    
+                    for other_surface_idx in surfaces_to_sync:
+                        other_segment_item = self._find_matching_intersection_segment(
+                            other_surface_idx, intersection_idx, seg_uid
+                        )
+                        
+                        if other_segment_item:
+                            # Update tree state without triggering visual updates
+                            new_state = Qt.Checked if current_state else Qt.Unchecked
+                            if other_segment_item.checkState(0) != new_state:
+                                other_segment_item.setCheckState(0, new_state)
+                                logger.debug(f"📋 Background sync: segment {seg_uid} on surface {other_surface_idx} → {current_state}")
+                
+            finally:
+                # Re-enable signals but DON'T trigger visual updates
+                tree.blockSignals(False)
+                # NOTE: We deliberately don't call tree.update() or repaint() here
+                # NOTE: We deliberately don't call _update_constraint_visualization_colors() here
+                # This keeps the background sync invisible to the user interface
+                
+            logger.debug("🔄 Background synchronization complete (no visual changes)")
+            
+        except Exception as e:
+            logger.warning(f"Error in background synchronization: {e}")
+
+    def _find_tree_item_for_segment(self, surf_idx, seg_uid):
+        """
+        Find the tree item for a specific segment.
+        """
+        tree = getattr(self, 'refine_constraint_tree', None)
+        if not tree:
+            return None
+            
+        def search_item(item):
+            data = item.data(0, Qt.UserRole)
+            if data and data.get("type") == "constraint":
+                if data.get("surface_idx") == surf_idx and data.get("seg_uid") == seg_uid:
+                    return item
+            
+            # Search children
+            for i in range(item.childCount()):
+                result = search_item(item.child(i))
+                if result:
+                    return result
+            return None
+        
+        # Search all top-level items
+        for i in range(tree.topLevelItemCount()):
+            result = search_item(tree.topLevelItem(i))
+            if result:
+                return result
+        return None
+
+    def _find_matching_intersection_segment(self, surface_idx, intersection_idx, seg_uid):
+        """
+        Find the matching intersection segment on another surface.
+        """
+        tree = getattr(self, 'refine_constraint_tree', None)
+        if not tree:
+            return None
+            
+        # Find the surface item
+        for i in range(tree.topLevelItemCount()):
+            surface_item = tree.topLevelItem(i)
+            surface_data = surface_item.data(0, Qt.UserRole)
+            
+            if surface_data and surface_data.get("surface_idx") == surface_idx:
+                # Find the intersection group
+                for j in range(surface_item.childCount()):
+                    group_item = surface_item.child(j)
+                    group_data = group_item.data(0, Qt.UserRole)
+                    
+                    if (group_data and group_data.get("type") == "intersection_group"):
+                        try:
+                            item_intersection_idx = int(group_item.text(0).split(" ")[-1])
+                            if item_intersection_idx == intersection_idx:
+                                # Find the segment within this group
+                                for k in range(group_item.childCount()):
+                                    segment_item = group_item.child(k)
+                                    segment_data = segment_item.data(0, Qt.UserRole)
+                                    
+                                    if (segment_data and 
+                                        segment_data.get("type") == "constraint" and
+                                        segment_data.get("seg_uid") == seg_uid):
+                                        return segment_item
+                        except (ValueError, IndexError):
+                            continue
+        return None
+
+    def _on_constraint_edge_clicked(self, *args):
+        """
+        Called when user clicks on a constraint edge using element picking.
+        This is the most accurate method for selecting constraint lines since they are edges.
+        """
+        import traceback
+        try:
+            logger.info(f"=== EDGE CLICK DETECTED === Received {len(args)} arguments")
+            
+            # Edge picking typically provides: (mesh, cell_id, edge_id) or similar
+            if len(args) >= 1:
+                mesh = args[0]
+                logger.info(f"Clicked edge mesh type: {type(mesh)}")
+                
+                # Handle None mesh (edge picking sometimes fails)
+                if mesh is None:
+                    logger.warning("Edge picking returned None mesh - edge detection failed")
+                    return
+                
+                # Try to get edge info if available
+                if len(args) >= 2:
+                    cell_id = args[1]
+                    logger.info(f"Cell ID: {cell_id}")
+                    
+                if len(args) >= 3:
+                    edge_id = args[2]
+                    logger.info(f"Edge ID: {edge_id}")
+                
+                # Add mesh debugging
+                if hasattr(mesh, 'GetNumberOfPoints'):
+                    num_points = mesh.GetNumberOfPoints()
+                    logger.info(f"Clicked edge mesh has {num_points} points")
+                    
+                    if num_points >= 2:
+                        # Get first and last points for debugging
+                        first_point = mesh.GetPoint(0)
+                        last_point = mesh.GetPoint(num_points - 1)
+                        logger.info(f"Edge: start={first_point}, end={last_point}")
+                else:
+                    logger.warning("Edge mesh has no GetNumberOfPoints method")
+                    
+                # Use the standard method to find and select the segment
+                logger.info("Processing edge click through constraint clicked method...")
+                self._on_constraint_clicked(mesh)
+                
+            else:
+                logger.warning("No data received in edge picking callback")
+        except Exception as e:
+            logger.error(f"Error in edge picking callback: {e}")
+            traceback.print_exc()
+
+    def _on_constraint_cell_clicked(self, *args):
+        """
+        Called when user clicks on a constraint using cell picking.
+        This method gets the mesh from the picked cell and handles both single clicks and rectangle selections.
+        """
+        import traceback
+        try:
+            # Fast processing - reduced logging for speed
+            # logger.info(f"=== MOUSE CLICK DETECTED === Received {len(args)} arguments")
+            
+            # Cell picking can provide either a single mesh or a collection of picked cells
+            if len(args) >= 1:
+                picked_data = args[0]
+                logger.info(f"Picked data type: {type(picked_data)}")
+                
+                # Handle different types of picked data
+                meshes_to_process = []
+                
+                if hasattr(picked_data, 'n_blocks') and picked_data.n_blocks > 0:
+                    # MultiBlock - could be rectangle selection or single click
+                    total_points = sum(block.n_points for block in picked_data if block is not None and hasattr(block, 'n_points'))
+                    logger.info(f"MultiBlock with {picked_data.n_blocks} blocks, total points: {total_points}")
+                    
+                    # Extract all valid individual meshes from the MultiBlock
+                    for i in range(picked_data.n_blocks):
+                        block = picked_data[i]
+                        if block is not None and hasattr(block, 'n_points') and block.n_points >= 2:
+                            meshes_to_process.append(block)
+                    
+                    logger.info(f"Extracted {len(meshes_to_process)} valid meshes for processing")
+                    
+                elif hasattr(picked_data, 'n_points'):
+                    # Single mesh
+                    meshes_to_process = [picked_data]
+                    logger.info(f"Single mesh with {picked_data.n_points} points")
+                
+                # Get current surface filter FIRST to enable pre-filtering
+                selected_surface = "All Surfaces"
+                if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
+                    selected_surface = self.refine_surface_selector.currentText()
+                    # logger.info(f"Current surface filter: '{selected_surface}'")  # Removed for speed
+                
+                # CRITICAL FIX: Pre-filter meshes to only include those from visible actors
+                # This prevents PyVista from returning meshes from hidden constraint actors
+                filtered_meshes = []
+                skipped_count = 0
+                
+                for mesh in meshes_to_process:
+                    # Find the segment for this mesh
+                    clicked_segment = self._find_segment_by_mesh_comparison(mesh)
+                    
+                    if clicked_segment:
+                        surf_idx, seg_uid = clicked_segment
+                        
+                        # Check if this segment should be visible based on surface filter
+                        if self._is_surface_visible_in_filter(surf_idx, selected_surface):
+                            # Check if the actor is actually visible
+                            if self._is_constraint_actor_visible(surf_idx, seg_uid):
+                                filtered_meshes.append(mesh)
+                                logger.debug(f"✅ Including mesh for segment ({surf_idx}, {seg_uid})")
+                            else:
+                                skipped_count += 1
+                                logger.debug(f"❌ Skipping mesh for segment ({surf_idx}, {seg_uid}) - actor not visible")
+                        else:
+                            skipped_count += 1
+                            logger.debug(f"❌ Skipping mesh for segment ({surf_idx}, {seg_uid}) - surface not selected")
+                    else:
+                        skipped_count += 1
+                        logger.debug("❌ Skipping mesh - could not identify segment")
+                
+                logger.info(f"PRE-FILTER: {len(filtered_meshes)} valid, {skipped_count} skipped from {len(meshes_to_process)} total meshes")
+                
+                # Process only the filtered meshes
+                valid_segments = []
+                
+                for mesh in filtered_meshes:
+                    # Find the segment for this mesh (we know it exists since we pre-filtered)
+                    clicked_segment = self._find_segment_by_mesh_comparison(mesh)
+                    
+                    if clicked_segment:
+                        surf_idx, seg_uid = clicked_segment
+                        valid_segments.append((surf_idx, seg_uid))
+                        # logger.debug(f"✅ Will toggle segment ({surf_idx}, {seg_uid})")  # Removed for speed
+                
+                # Report results
+                if valid_segments:
+                    # Fast operation - minimal logging
+                    if len(valid_segments) == 1:
+                        operation = "Single click"
+                    else:
+                        operation = "Rectangle selection"
+                    
+                    mode_text = "selected" if getattr(self, 'current_selection_mode', 'select') == "select" else "deselected"
+                    
+                    # ULTRA-FAST BATCH PROCESSING - disable all tree signals during batch update
+                    tree = getattr(self, 'refine_constraint_tree', None)
+                    if tree:
+                        tree.blockSignals(True)
+                    
+                    try:
+                        # Process all segments in a single batch
+                        success_count = 0
+                        for surf_idx, seg_uid in valid_segments:
+                            if self._apply_selection_mode_to_segment_fast(surf_idx, seg_uid):
+                                success_count += 1
+                        
+                        logger.info(f"🎯 {operation}: {mode_text} {success_count}/{len(valid_segments)} segments")
+                        
+                    finally:
+                        # Re-enable tree signals after batch operation - THIS TRIGGERS THE VISUAL UPDATE
+                        if tree:
+                            tree.blockSignals(False)
+                            # CRITICAL: Emit a signal to update the tree visualization
+                            tree.update()
+                            tree.repaint()
+                            
+                        # CRITICAL FIX: Update constraint visualization colors after selection changes
+                        # This ensures green (selected) and gray (unselected) lines are properly updated
+                        self._update_constraint_visualization_colors()
+                        
+                        # CROSS-SURFACE SYNCHRONIZATION: Update shared intersection segments in the background
+                        # This only updates tree states, not visual display (surface filter still applies)
+                        self._synchronize_shared_intersection_segments_background(valid_segments)
+
+                        # Immediately clear any yellow picking highlight so the user sees the final colors
+                        self._clear_selection_highlight()
+                    
+                    # Start timer to ensure any residual highlight is cleared after a short delay
+                    if hasattr(self, 'highlight_timer'):
+                        try:
+                            self.highlight_timer.start()  # This will clear highlighting after 500ms
+                        except Exception as timer_error:
+                            logger.debug(f"Highlight timer error (non-critical): {timer_error}")
+                            # If timer fails, just do immediate clear
+                            self._clear_selection_highlight()
+                    
+                else:
+                    logger.warning("❌ No valid segments found for current surface filter")
+                    if skipped_count > 0:
+                        logger.info(f"💡 All {skipped_count} picked meshes were filtered out due to surface selection")
+                        logger.info(f"💡 Current filter: '{selected_surface}' - ensure you're clicking on visible constraints")
+                        logger.info(f"💡 Switch to 'All Surfaces' to interact with all constraints")
+                
+            else:
+                logger.warning("No data received in cell picking callback")
+                
+        except Exception as e:
+            logger.error(f"Error in cell picking callback: {e}")
+            traceback.print_exc()
+
+    def _is_surface_visible_in_filter(self, surf_idx, selected_surface):
+        """
+        Helper function to check if a surface should be shown based on the current filter.
+        """
+        if selected_surface == "All Surfaces":
+            return True
+        if surf_idx < len(self.datasets):
+            dataset_entry = self.datasets[surf_idx]
+            if isinstance(dataset_entry, dict):
+                dataset_name = dataset_entry.get("name", f"Surface_{surf_idx}")
+            else:
+                dataset_name = os.path.basename(str(dataset_entry))
+            return dataset_name == selected_surface
+        return False
+
+    def _is_constraint_actor_visible(self, surf_idx, seg_uid):
+        """
+        Check if a constraint actor is currently visible in the plotter.
+        This ensures we only select constraints that are actually displayed.
+        """
+        try:
+            if not hasattr(self, 'constraint_segment_actor_refs'):
+                return False
+                
+            actor = self.constraint_segment_actor_refs.get((surf_idx, seg_uid))
+            if not actor:
+                return False
+                
+            # Check if actor has visibility property and is visible
+            if hasattr(actor, 'GetVisibility'):
+                is_visible = actor.GetVisibility()
+                logger.debug(f"Actor ({surf_idx}, {seg_uid}) visibility: {is_visible}")
+                return bool(is_visible)
+            else:
+                # If we can't check visibility, assume it's visible
+                logger.debug(f"Actor ({surf_idx}, {seg_uid}) has no visibility check - assuming visible")
+                return True
+                
+        except Exception as e:
+            logger.debug(f"Error checking actor visibility for ({surf_idx}, {seg_uid}): {e}")
+            return False
+
+    def _find_segment_by_direct_lookup(self, clicked_mesh):
+        """
+        Simplified direct lookup approach that tries to match the exact mesh objects.
+        """
+        try:
+            if not hasattr(clicked_mesh, 'GetNumberOfPoints') or clicked_mesh.GetNumberOfPoints() < 2:
+                logger.warning("Invalid clicked mesh for direct lookup")
+                return None
+                
+            num_points = clicked_mesh.GetNumberOfPoints()
+            logger.info(f"Direct lookup for mesh with {num_points} points")
+            
+            # Get clicked mesh endpoints for comparison
+            clicked_start = clicked_mesh.GetPoint(0)
+            clicked_end = clicked_mesh.GetPoint(num_points - 1)
+            
+            logger.info(f"Clicked mesh: start={clicked_start}, end={clicked_end}")
+            
+            # Check all stored constraint actors to find exact match
+            best_match = None
+            best_score = float('inf')
+            
+            for (surf_idx, seg_uid), actor in getattr(self, 'constraint_segment_actor_refs', {}).items():
+                try:
+                    # Get the mesh from the actor
+                    if hasattr(actor, 'GetMapper') and actor.GetMapper():
+                        actor_mesh = actor.GetMapper().GetInput()
+                        if (actor_mesh and 
+                            hasattr(actor_mesh, 'GetNumberOfPoints') and 
+                            actor_mesh.GetNumberOfPoints() == num_points):
+                            
+                            # Get actor mesh endpoints
+                            actor_start = actor_mesh.GetPoint(0)
+                            actor_end = actor_mesh.GetPoint(num_points - 1)
+                            
+                            # Calculate exact distance between endpoints
+                            start_dist = ((clicked_start[0] - actor_start[0])**2 + 
+                                        (clicked_start[1] - actor_start[1])**2 + 
+                                        (clicked_start[2] - actor_start[2])**2)**0.5
+                            
+                            end_dist = ((clicked_end[0] - actor_end[0])**2 + 
+                                      (clicked_end[1] - actor_end[1])**2 + 
+                                      (clicked_end[2] - actor_end[2])**2)**0.5
+                            
+                            total_dist = start_dist + end_dist
+                            
+                            logger.debug(f"Actor ({surf_idx}, {seg_uid}): start_dist={start_dist:.6f}, end_dist={end_dist:.6f}, total={total_dist:.6f}")
+                            
+                            # Check for very close match (should be exact for line segments)
+                            if total_dist < 1e-6:  # Very tight tolerance for exact match
+                                logger.info(f"EXACT MATCH found: surf={surf_idx}, seg={seg_uid}, dist={total_dist:.10f}")
+                                return (surf_idx, seg_uid)
+                            
+                            # Track best match as fallback
+                            if total_dist < best_score:
+                                best_score = total_dist
+                                best_match = (surf_idx, seg_uid)
+                                
+                except Exception as e:
+                    logger.debug(f"Error checking actor ({surf_idx}, {seg_uid}): {e}")
+                    continue
+            
+            # Return best match if it's close enough
+            if best_match and best_score < 1.0:  # 1 unit tolerance
+                logger.info(f"BEST MATCH found: {best_match}, score={best_score:.6f}")
+                return best_match
+            
+            logger.warning(f"No suitable direct match found. Best score: {best_score:.6f}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error in direct lookup: {e}")
+            return None
+
+    def _on_constraint_point_clicked(self, *args):
+        """
+        Called when user clicks on a constraint using point picking.
+        Uses the clicked point location to find the nearest segment.
+        """
+        # Handle different callback signatures
+        if len(args) >= 1:
+            point = args[0]
+        else:
+            logger.warning("No point data received in callback")
+            return
+            
+        if not point or len(point) < 3:
+            logger.warning("Invalid click point received")
+            return
+            
+        logger.debug(f"Point clicked at: {point}")
+        
+        # Find the closest segment to the clicked point
+        clicked_segment = self._find_segment_by_click_point(point)
+        
+        if not clicked_segment:
+            logger.warning("Could not identify clicked constraint segment from point")
+            return
+            
+        surf_idx, seg_uid = clicked_segment
+        logger.info(f"Mouse clicked constraint at point {point}: surface {surf_idx}, segment {seg_uid}")
+        
+        # Check if this segment is currently visible (respects surface filter)
+        selected_surface = "All Surfaces"
+        if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
+            selected_surface = self.refine_surface_selector.currentText()
+            
+        # Helper function to check if a surface should be shown
+        def should_show_surface(dataset_idx):
+            if selected_surface == "All Surfaces":
+                return True
+            if dataset_idx < len(self.datasets):
+                dataset_name = self.datasets[dataset_idx].get("name", f"Surface_{dataset_idx}")
+                return dataset_name == selected_surface
+            return False
+        
+        if not should_show_surface(surf_idx):
+            logger.info(f"Clicked segment not in current surface filter: {selected_surface}")
+            return
+            
+        # Find the corresponding tree item and toggle its selection
+        self._toggle_segment_selection_in_tree(surf_idx, seg_uid)
+
+    def _find_segment_by_click_point(self, click_point):
+        """
+        Find the segment closest to the clicked point coordinates.
+        This provides the most accurate selection based on actual click location.
+        """
+        try:
+            click_x, click_y, click_z = click_point[0], click_point[1], click_point[2]
+            logger.debug(f"Finding segment closest to click point: ({click_x:.6f}, {click_y:.6f}, {click_z:.6f})")
+            
+            best_match = None
+            best_distance = float('inf')
+            candidates = []
+            
+            # Check all stored segments
+            for (surf_idx, seg_uid), seg_info in getattr(self, "_refine_segment_map", {}).items():
+                if 'points' not in seg_info or len(seg_info['points']) < 2:
+                    continue
+                    
+                seg_points = seg_info['points']
+                
+                # Find the minimum distance from click point to this segment
+                min_dist_to_segment = float('inf')
+                closest_point_on_segment = None
+                
+                # Check distance to each segment of the line
+                for i in range(len(seg_points) - 1):
+                    p1 = seg_points[i]
+                    p2 = seg_points[i + 1]
+                    
+                    # Calculate distance from click point to line segment
+                    dist_to_segment, closest_on_seg = self._point_to_line_segment_distance(
+                        (click_x, click_y, click_z), p1, p2
+                    )
+                    
+                    if dist_to_segment < min_dist_to_segment:
+                        min_dist_to_segment = dist_to_segment
+                        closest_point_on_segment = closest_on_seg
+                
+                # Also check distance to endpoints for very short segments
+                start_dist = ((click_x - seg_points[0][0])**2 + 
+                            (click_y - seg_points[0][1])**2 + 
+                            (click_z - seg_points[0][2])**2)**0.5
+                            
+                end_dist = ((click_x - seg_points[-1][0])**2 + 
+                          (click_y - seg_points[-1][1])**2 + 
+                          (click_z - seg_points[-1][2])**2)**0.5
+                
+                final_distance = min(min_dist_to_segment, start_dist, end_dist)
+                
+                candidates.append(((surf_idx, seg_uid), final_distance, surf_idx, seg_uid))
+                
+                if final_distance < best_distance:
+                    best_distance = final_distance
+                    best_match = (surf_idx, seg_uid)
+                    
+                logger.debug(f"Distance to surf={surf_idx}, seg={seg_uid}: {final_distance:.6f}")
+            
+            # Return best match if it's close enough
+            if best_match and best_distance < 5.0:  # 5 unit tolerance for click accuracy
+                logger.info(f"Best click-point match found with distance {best_distance:.6f}: {best_match}")
+                return best_match
+            elif candidates:
+                # Show top candidates for debugging
+                candidates.sort(key=lambda x: x[1])
+                logger.warning(f"No close click-point match found. Top 3 candidates:")
+                for i, (seg_info, dist, surf_idx, seg_uid) in enumerate(candidates[:3]):
+                    logger.warning(f"  {i+1}. surf={surf_idx}, seg={seg_uid}, dist={dist:.6f}")
+            
+            logger.warning(f"No suitable click-point match found. Best distance: {best_distance:.6f}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error in click point matching: {e}")
+            return None
+    
+    def _point_to_line_segment_distance(self, point, line_start, line_end):
+        """
+        Calculate the minimum distance from a point to a line segment.
+        Returns (distance, closest_point_on_segment).
+        """
+        try:
+            px, py, pz = point
+            x1, y1, z1 = line_start
+            x2, y2, z2 = line_end
+            
+            # Vector from line start to end
+            dx = x2 - x1
+            dy = y2 - y1
+            dz = z2 - z1
+            
+            # If line is actually a point
+            if dx*dx + dy*dy + dz*dz < 1e-12:
+                dist = ((px - x1)**2 + (py - y1)**2 + (pz - z1)**2)**0.5
+                return dist, (x1, y1, z1)
+            
+            # Parameter t for closest point on line
+            t = ((px - x1)*dx + (py - y1)*dy + (pz - z1)*dz) / (dx*dx + dy*dy + dz*dz)
+            
+            # Clamp t to [0, 1] to stay on segment
+            t = max(0, min(1, t))
+            
+            # Closest point on segment
+            closest_x = x1 + t * dx
+            closest_y = y1 + t * dy
+            closest_z = z1 + t * dz
+            
+            # Distance from point to closest point on segment
+            distance = ((px - closest_x)**2 + (py - closest_y)**2 + (pz - closest_z)**2)**0.5
+            
+            return distance, (closest_x, closest_y, closest_z)
+            
+        except Exception as e:
+            logger.debug(f"Error calculating point to line distance: {e}")
+            return float('inf'), None
+
+    def _on_constraint_clicked(self, mesh):
+        """
+        Called when user clicks on a constraint line in the visualization.
+        Finds the corresponding segment and returns the segment info.
+        Surface filtering is now handled by the caller.
+        """
+        logger.debug("=== CONSTRAINT CLICKED METHOD CALLED ===")
+        
+        if not mesh:
+            logger.warning("No mesh provided to constraint click handler")
+            return None
+        
+        try:
+            num_points = mesh.GetNumberOfPoints() if hasattr(mesh, 'GetNumberOfPoints') else 0
+            logger.debug(f"Constraint clicked: mesh with {num_points} points")
+        except:
+            logger.warning("Could not get point count from clicked mesh")
+            return None
+            
+        # Find the segment by looking through all actors and comparing mesh data
+        logger.debug("Looking for segment by mesh comparison...")
+        clicked_segment = self._find_segment_by_mesh_comparison(mesh)
+        
+        if not clicked_segment:
+            logger.debug("Could not identify clicked constraint segment")
+            # Add debug info about available mappings
+            if hasattr(self, '_mesh_geometry_map'):
+                logger.debug(f"Available mesh signatures: {len(self._mesh_geometry_map)}")
+            if hasattr(self, 'constraint_segment_actor_refs'):
+                logger.debug(f"Available actor refs: {len(self.constraint_segment_actor_refs)}")
+            return None
+            
+        surf_idx, seg_uid = clicked_segment
+        logger.debug(f"✅ Found segment: surface {surf_idx}, segment {seg_uid}")
+        
+        return clicked_segment
+
+    def _create_mesh_signature(self, mesh):
+        """
+        Create a unique geometric signature for a mesh that can be used as a dictionary key.
+        Simplified for better stability and matching.
+        """
+        try:
+            if not mesh or not hasattr(mesh, 'GetNumberOfPoints'):
+                return None
+                
+            num_points = mesh.GetNumberOfPoints()
+            if num_points < 2:
+                return None
+                
+            # Get all points with consistent precision
+            points = []
+            for i in range(num_points):
+                point = mesh.GetPoint(i)
+                # Use moderate precision for better matching stability
+                points.append((round(point[0], 8), round(point[1], 8), round(point[2], 8)))
+            
+            # Create signature from start point, end point, and length
+            start_point = points[0]
+            end_point = points[-1]
+            
+            # Calculate total length with consistent precision
+            total_length = 0.0
+            for i in range(1, len(points)):
+                dx = points[i][0] - points[i-1][0]
+                dy = points[i][1] - points[i-1][1] 
+                dz = points[i][2] - points[i-1][2]
+                total_length += (dx*dx + dy*dy + dz*dz)**0.5
+            
+            # Include midpoint if we have enough points  
+            if num_points >= 3:
+                mid_idx = num_points // 2
+                mid_point = points[mid_idx]
+            else:
+                mid_point = None
+            
+            # Build stable signature
+            signature = (start_point, end_point, mid_point, round(total_length, 8), num_points)
+                
+            return signature
+            
+        except Exception as e:
+            logger.debug(f"Error creating mesh signature: {e}")
+            return None
+
+    def _find_segment_by_mesh_comparison(self, clicked_mesh):
+        """
+        Find segment by comparing mesh properties with stored actors.
+        Enhanced with spatial proximity for better accuracy.
+        """
+        if not hasattr(clicked_mesh, 'GetNumberOfPoints') or clicked_mesh.GetNumberOfPoints() < 2:
+            logger.warning("Invalid clicked mesh - insufficient points")
+            return None
+        
+        logger.debug(f"Finding segment for mesh with {clicked_mesh.GetNumberOfPoints()} points")
+        
+        # Approach 1: Direct geometric signature lookup (fastest and most accurate)
+        clicked_signature = self._create_mesh_signature(clicked_mesh)
+        if clicked_signature and hasattr(self, '_mesh_geometry_map'):
+            direct_match = self._mesh_geometry_map.get(clicked_signature)
+            if direct_match:
+                logger.debug(f"Found direct signature match: {direct_match}")
+                return direct_match
+            else:
+                logger.debug(f"No direct signature match found for signature: {clicked_signature}")
+        
+        # Approach 2: Try with slightly different precision (handle floating point variations)
+        if clicked_signature:
+            # Try with reduced precision in case of minor floating point differences
+            reduced_precision_sig = self._create_reduced_precision_signature(clicked_mesh)
+            if reduced_precision_sig and hasattr(self, '_mesh_geometry_map_reduced'):
+                reduced_match = self._mesh_geometry_map_reduced.get(reduced_precision_sig)
+                if reduced_match:
+                    logger.debug(f"Found reduced precision match: {reduced_match}")
+                    return reduced_match
+        
+        # Approach 3: Spatial proximity matching (most reliable for click accuracy)
+        logger.debug("Falling back to spatial proximity matching")
+        return self._find_segment_by_spatial_proximity(clicked_mesh)
+    
+    def _find_segment_by_spatial_proximity(self, clicked_mesh):
+        """
+        Find the segment that is spatially closest to the clicked mesh.
+        This helps with click accuracy when mesh comparison fails.
+        """
+        try:
+            # Get clicked mesh center and bounds for comparison
+            clicked_points = []
+            num_points = clicked_mesh.GetNumberOfPoints()
+            for i in range(num_points):
+                point = clicked_mesh.GetPoint(i)
+                clicked_points.append(point)
+            
+            if len(clicked_points) < 2:
+                return None
+                
+            # Calculate clicked mesh center and start/end points
+            clicked_center = [
+                sum(p[0] for p in clicked_points) / len(clicked_points),
+                sum(p[1] for p in clicked_points) / len(clicked_points), 
+                sum(p[2] for p in clicked_points) / len(clicked_points)
+            ]
+            clicked_start = clicked_points[0]
+            clicked_end = clicked_points[-1]
+            
+            logger.debug(f"Clicked mesh center: {clicked_center}, start: {clicked_start}, end: {clicked_end}")
+            
+            best_match = None
+            best_distance = float('inf')
+            candidates = []
+            
+            for (surf_idx, seg_uid), actor in getattr(self, 'constraint_segment_actor_refs', {}).items():
+                try:
+                    # Get segment info from mapping
+                    actor_id = id(actor)
+                    segment_info = getattr(self, '_actor_id_to_segment_map', {}).get(actor_id)
+                    
+                    if not segment_info:
+                        continue
+                        
+                    # Get segment data from the stored constraint data
+                    if hasattr(self, '_refine_segment_map'):
+                        seg_data = self._refine_segment_map.get((surf_idx, seg_uid))
+                        if seg_data and 'points' in seg_data and len(seg_data['points']) >= 2:
+                            seg_points = seg_data['points']
+                            
+                            # Calculate segment center and endpoints
+                            seg_center = [
+                                sum(p[0] for p in seg_points) / len(seg_points),
+                                sum(p[1] for p in seg_points) / len(seg_points),
+                                sum(p[2] for p in seg_points) / len(seg_points)
+                            ]
+                            seg_start = seg_points[0]
+                            seg_end = seg_points[-1]
+                            
+                            # Calculate distance between centers
+                            center_dist = ((clicked_center[0] - seg_center[0])**2 + 
+                                         (clicked_center[1] - seg_center[1])**2 + 
+                                         (clicked_center[2] - seg_center[2])**2)**0.5
+                            
+                            # Also check start/end point distances for better matching
+                            start_dist = ((clicked_start[0] - seg_start[0])**2 + 
+                                        (clicked_start[1] - seg_start[1])**2 + 
+                                        (clicked_start[2] - seg_start[2])**2)**0.5
+                            
+                            end_dist = ((clicked_end[0] - seg_end[0])**2 + 
+                                      (clicked_end[1] - seg_end[1])**2 + 
+                                      (clicked_end[2] - seg_end[2])**2)**0.5
+                            
+                            # Combined distance score (center distance is most important)
+                            total_distance = center_dist + 0.1 * (start_dist + end_dist)
+                            
+                            candidates.append((segment_info, total_distance, surf_idx, seg_uid, center_dist))
+                            
+                            if total_distance < best_distance:
+                                best_distance = total_distance
+                                best_match = segment_info
+                                
+                            logger.debug(f"Spatial comparison surf={surf_idx}, seg={seg_uid}: "
+                                       f"center_dist={center_dist:.6f}, total_dist={total_distance:.6f}")
+                            
+                except Exception as e:
+                    logger.debug(f"Error in spatial comparison for segment ({surf_idx}, {seg_uid}): {e}")
+                    continue
+            
+            # Return best match if it's close enough
+            if best_match and best_distance < 10.0:  # Reasonable spatial tolerance
+                logger.info(f"Best spatial match found with distance {best_distance:.6f}: {best_match}")
+                return best_match
+            elif candidates:
+                # Show top candidates for debugging
+                candidates.sort(key=lambda x: x[1])
+                logger.warning(f"No close spatial match found. Top 3 candidates:")
+                for i, (seg_info, total_dist, surf_idx, seg_uid, center_dist) in enumerate(candidates[:3]):
+                    logger.warning(f"  {i+1}. surf={surf_idx}, seg={seg_uid}, "
+                                 f"center_dist={center_dist:.6f}, total_dist={total_dist:.6f}")
+            
+            logger.warning(f"No suitable spatial match found. Best distance: {best_distance:.6f}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error in spatial proximity matching: {e}")
+            return None
+    
+    def _create_reduced_precision_signature(self, mesh):
+        """
+        Create a mesh signature with reduced precision for fallback matching.
+        """
+        try:
+            if not mesh or not hasattr(mesh, 'GetNumberOfPoints'):
+                return None
+                
+            num_points = mesh.GetNumberOfPoints()
+            if num_points < 2:
+                return None
+                
+            # Get all points with reduced precision
+            points = []
+            for i in range(num_points):
+                point = mesh.GetPoint(i)
+                points.append((round(point[0], 6), round(point[1], 6), round(point[2], 6)))
+            
+            start_point = points[0]
+            end_point = points[-1]
+            
+            # Calculate total length
+            total_length = 0.0
+            for i in range(1, len(points)):
+                dx = points[i][0] - points[i-1][0]
+                dy = points[i][1] - points[i-1][1] 
+                dz = points[i][2] - points[i-1][2]
+                total_length += (dx*dx + dy*dy + dz*dz)**0.5
+            
+            # Include midpoint if we have enough points
+            if num_points >= 3:
+                mid_idx = num_points // 2
+                mid_point = points[mid_idx]
+            else:
+                mid_point = None
+                
+            return (start_point, end_point, mid_point, round(total_length, 6), num_points)
+            
+        except Exception as e:
+            logger.debug(f"Error creating reduced precision signature: {e}")
+            return None
+    
+    def _fallback_mesh_comparison(self, clicked_mesh):
+        """
+        Fallback mesh comparison using detailed geometric analysis.
+        """
+        if not hasattr(clicked_mesh, 'GetNumberOfPoints') or clicked_mesh.GetNumberOfPoints() < 2:
+            return None
+            
+    def _fallback_mesh_comparison(self, clicked_mesh):
+        """
+        Simplified and reliable mesh comparison using basic geometric properties.
+        """
+        if not hasattr(clicked_mesh, 'GetNumberOfPoints') or clicked_mesh.GetNumberOfPoints() < 2:
+            return None
+            
+        # Get the clicked mesh points for comparison
+        try:
+            clicked_points = []
+            num_points = clicked_mesh.GetNumberOfPoints()
+            for i in range(num_points):
+                point = clicked_mesh.GetPoint(i)
+                clicked_points.append(point)
+        except Exception:
+            return None
+            
+        if len(clicked_points) < 2:
+            return None
+            
+        # Create simple signature for the clicked mesh
+        clicked_start = clicked_points[0]
+        clicked_end = clicked_points[-1]
+        
+        # Calculate clicked mesh length
+        clicked_length = 0
+        for i in range(1, len(clicked_points)):
+            dx = clicked_points[i][0] - clicked_points[i-1][0]
+            dy = clicked_points[i][1] - clicked_points[i-1][1] 
+            dz = clicked_points[i][2] - clicked_points[i-1][2]
+            clicked_length += (dx*dx + dy*dy + dz*dz)**0.5
+        
+        logger.debug(f"Clicked mesh: {num_points} points, length={clicked_length:.6f}, start={clicked_start}, end={clicked_end}")
+        
+        # Find the best match by comparing with all stored segments
+        best_match = None
+        best_score = float('inf')
+        candidates = []
+        
+        for (surf_idx, seg_uid), actor in getattr(self, 'constraint_segment_actor_refs', {}).items():
+            try:
+                # Get actor ID and look up segment info
+                actor_id = id(actor)
+                segment_info = getattr(self, '_actor_id_to_segment_map', {}).get(actor_id)
+                
+                if segment_info and hasattr(actor, 'GetMapper') and actor.GetMapper():
+                    actor_mesh = actor.GetMapper().GetInput()
+                    if (actor_mesh and 
+                        hasattr(actor_mesh, 'GetNumberOfPoints') and 
+                        actor_mesh.GetNumberOfPoints() == num_points):
+                        
+                        # Get actor mesh points
+                        actor_points = []
+                        for i in range(num_points):
+                            actor_points.append(actor_mesh.GetPoint(i))
+                        
+                        if len(actor_points) < 2:
+                            continue
+                            
+                        # Simple geometric comparison
+                        actor_start = actor_points[0]
+                        actor_end = actor_points[-1]
+                        
+                        # Calculate actor mesh length
+                        actor_length = 0
+                        for i in range(1, len(actor_points)):
+                            dx = actor_points[i][0] - actor_points[i-1][0]
+                            dy = actor_points[i][1] - actor_points[i-1][1] 
+                            dz = actor_points[i][2] - actor_points[i-1][2]
+                            actor_length += (dx*dx + dy*dy + dz*dz)**0.5
+                        
+                        # Calculate differences
+                        start_dist = ((clicked_start[0] - actor_start[0])**2 + 
+                                    (clicked_start[1] - actor_start[1])**2 + 
+                                    (clicked_start[2] - actor_start[2])**2)**0.5
+                        
+                        end_dist = ((clicked_end[0] - actor_end[0])**2 + 
+                                  (clicked_end[1] - actor_end[1])**2 + 
+                                  (clicked_end[2] - actor_end[2])**2)**0.5
+                        
+                        length_diff = abs(clicked_length - actor_length)
+                        
+                        # Simple scoring
+                        score = start_dist + end_dist + length_diff
+                        
+                        candidates.append((segment_info, score, surf_idx, seg_uid))
+                        
+                        # Track best match
+                        if score < best_score:
+                            best_score = score
+                            best_match = segment_info
+                            
+                        logger.debug(f"Comparing surf={surf_idx}, seg={seg_uid}: "
+                                   f"score={score:.6f}, start_dist={start_dist:.6f}, "
+                                   f"end_dist={end_dist:.6f}, length_diff={length_diff:.6f}")
+                            
+            except Exception as e:
+                logger.debug(f"Error comparing mesh for segment ({surf_idx}, {seg_uid}): {e}")
+                continue
+        
+        # Return best match if it's good enough
+        if best_match and best_score < 10.0:  # More tolerant threshold
+            logger.info(f"Best match found with score {best_score:.6f}: {best_match}")
+            return best_match
+        elif candidates:
+            # Show top candidates for debugging
+            candidates.sort(key=lambda x: x[1])
+            logger.warning(f"No good match found. Top 3 candidates:")
+            for i, (seg_info, score, surf_idx, seg_uid) in enumerate(candidates[:3]):
+                logger.warning(f"  {i+1}. surf={surf_idx}, seg={seg_uid}, score={score:.6f}")
+            
+            # If we have candidates but none are very close, return the best one anyway
+            if candidates and candidates[0][1] < 50.0:  # Very generous fallback
+                best_candidate = candidates[0]
+                logger.info(f"Using best candidate as fallback: surf={best_candidate[2]}, seg={best_candidate[3]}, score={best_candidate[1]:.6f}")
+                return best_candidate[0]
+        
+        logger.warning(f"No suitable match found. Best score: {best_score:.6f}")
+        return None
+
+    def _apply_selection_mode_to_segment(self, surf_idx, seg_uid):
+        """
+        Apply the current selection mode (select or deselect) to a segment.
+        Unlike toggle, this respects the current selection mode.
+        Returns True if successful, False otherwise.
+        """
+        if not hasattr(self, 'current_selection_mode'):
+            self.current_selection_mode = "select"  # Default to select mode
+            
+        mode = self.current_selection_mode
+        
+        if not hasattr(self, 'refine_constraint_tree') or not self.refine_constraint_tree:
+            return False
+            
+        tree = self.refine_constraint_tree
+        
+        # DISABLE tree signals during batch operations to prevent lag
+        tree.blockSignals(True)
+        
+        try:
+            def find_and_set_segment(item):
+                """Recursively search for the segment and set its selection state"""
+                data = item.data(0, Qt.UserRole)
+                if data and data.get("type") == "constraint":
+                    item_surf_idx = data.get("surface_idx")
+                    item_seg_uid = data.get("seg_uid")
+                    
+                    if item_surf_idx == surf_idx and item_seg_uid == seg_uid:
+                        current_state = item.checkState(0)
+                        
+                        if mode == "select":
+                            # Force selection
+                            if current_state != Qt.Checked:
+                                item.setCheckState(0, Qt.Checked)
+                                return True
+                            else:
+                                return True
+                        elif mode == "deselect":
+                            # Force deselection
+                            if current_state == Qt.Checked:
+                                item.setCheckState(0, Qt.Unchecked)
+                                return True
+                            else:
+                                return True
+                
+                # Search child items
+                for i in range(item.childCount()):
+                    if find_and_set_segment(item.child(i)):
+                        return True
+                return False
+            
+            # Search all top-level items
+            for i in range(tree.topLevelItemCount()):
+                if find_and_set_segment(tree.topLevelItem(i)):
+                    return True
+            
+            return False
+            
+        finally:
+            # RE-ENABLE tree signals after batch operations
+            tree.blockSignals(False)
+            
+        return False
+
+    def _apply_selection_mode_to_segment_fast(self, surf_idx, seg_uid):
+        """
+        Ultra-fast version that assumes tree signals are already blocked.
+        NO signal blocking/unblocking overhead per segment.
+        """
+        if not hasattr(self, 'current_selection_mode'):
+            self.current_selection_mode = "select"
+            
+        mode = self.current_selection_mode
+        tree = getattr(self, 'refine_constraint_tree', None)
+        if not tree:
+            return False
+        
+        def find_and_set_segment_fast(item):
+            """Fast recursive search without signal overhead"""
+            data = item.data(0, Qt.UserRole)
+            if data and data.get("type") == "constraint":
+                item_surf_idx = data.get("surface_idx")
+                item_seg_uid = data.get("seg_uid")
+                
+                if item_surf_idx == surf_idx and item_seg_uid == seg_uid:
+                    current_state = item.checkState(0)
+                    
+                    if mode == "select" and current_state != Qt.Checked:
+                        item.setCheckState(0, Qt.Checked)
+                        return True
+                    elif mode == "deselect" and current_state == Qt.Checked:
+                        item.setCheckState(0, Qt.Unchecked)
+                        return True
+                    else:
+                        return True  # Already in desired state
+            
+            # Search child items
+            for i in range(item.childCount()):
+                if find_and_set_segment_fast(item.child(i)):
+                    return True
+            return False
+        
+        # Search all top-level items
+        for i in range(tree.topLevelItemCount()):
+            if find_and_set_segment_fast(tree.topLevelItem(i)):
+                return True
+        
+        return False
+
+    def _toggle_segment_selection_in_tree(self, surf_idx, seg_uid):
+        """
+        Find the tree item corresponding to the segment and toggle its checkbox.
+        Optimized for fast mouse selection with minimal tree operations.
+        Returns True if successful, False otherwise.
+        """
+        if not hasattr(self, 'refine_constraint_tree') or not self.refine_constraint_tree:
+            logger.warning("No constraint tree available for toggling")
+            return False
+            
+        tree = self.refine_constraint_tree
+        logger.info(f"Searching tree for segment: surface {surf_idx}, segment {seg_uid}")
+        
+        def find_and_toggle_segment(item):
+            """Recursively search for the segment and toggle it"""
+            data = item.data(0, Qt.UserRole)
+            if data and data.get("type") == "constraint":
+                item_surf_idx = data.get("surface_idx")
+                item_seg_uid = data.get("seg_uid")
+                
+                if item_surf_idx == surf_idx and item_seg_uid == seg_uid:
+                    # Found the segment! Toggle its selection
+                    current_state = item.checkState(0)
+                    new_state = Qt.Unchecked if current_state == Qt.Checked else Qt.Checked
+                    
+                    logger.info(f"Found tree item! Toggling from {current_state} to {new_state}")
+                    
+                    # Set flag to indicate this is a mouse-triggered change
+                    self._mouse_triggered_change = True
+                    
+                    # Temporarily disable tree change handler to prevent recursive updates
+                    self._refine_updating_constraint_tree = True
+                    try:
+                        item.setCheckState(0, new_state)
+                        
+                        # Update segment data directly for fast tracking
+                        if hasattr(self, '_refine_segment_map') and (surf_idx, seg_uid) in self._refine_segment_map:
+                            self._refine_segment_map[(surf_idx, seg_uid)]["selected"] = (new_state == Qt.Checked)
+                        
+                        # Fast single actor update instead of batch update
+                        if hasattr(self, '_apply_segment_state'):
+                            self._apply_segment_state(surf_idx, seg_uid, new_state == Qt.Checked)
+                        
+                    finally:
+                        self._refine_updating_constraint_tree = False
+                        # Clear the mouse trigger flag
+                        self._mouse_triggered_change = False
+                    
+                    # Scroll to and highlight the item briefly
+                    tree.scrollToItem(item)
+                    tree.setCurrentItem(item)
+                    
+                    logger.info(f"✅ Toggled segment {seg_uid} to {'selected' if new_state == Qt.Checked else 'deselected'}")
+                    return True
+                    
+            # Check children
+            for i in range(item.childCount()):
+                if find_and_toggle_segment(item.child(i)):
+                    return True
+            return False
+        
+        # Search through all top-level items
+        for i in range(tree.topLevelItemCount()):
+            if find_and_toggle_segment(tree.topLevelItem(i)):
+                return True
+        
+        logger.warning(f"❌ Could not find tree item for segment: surface {surf_idx}, segment {seg_uid}")
+        return False
+
+    def _on_constraint_clicked_single(self, mesh):
+        """
+        Fallback method for single mesh selection (used by mesh picking).
+        Handles surface filtering and tree toggling for a single mesh.
+        """
+        clicked_segment = self._on_constraint_clicked(mesh)
+        if not clicked_segment:
+            return
+            
+        surf_idx, seg_uid = clicked_segment
+        
+        # Get current surface filter
+        selected_surface = "All Surfaces"
+        if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
+            selected_surface = self.refine_surface_selector.currentText()
+        
+        # Check surface filter
+        if self._is_surface_visible_in_filter(surf_idx, selected_surface):
+            success = self._toggle_segment_selection_in_tree(surf_idx, seg_uid)
+            if success:
+                logger.info(f"🎯 Successfully toggled single constraint selection")
+            else:
+                logger.warning(f"❌ Failed to toggle constraint in tree")
+        else:
+            logger.warning(f"❌ Clicked segment not visible in current filter: '{selected_surface}'")
+
+    def _highlight_surface_in_constraint_tree(self, surface_name):
+        """
+        Highlights the corresponding surface in the constraint tree when selected in dropdown.
+        """
+        if not hasattr(self, 'refine_constraint_tree') or not self.refine_constraint_tree:
+            return
+            
+        # Expand/collapse tree items based on selection
+        tree = self.refine_constraint_tree
+        for i in range(tree.topLevelItemCount()):
+            surface_item = tree.topLevelItem(i)
+            surface_data = surface_item.data(0, Qt.UserRole)
+            
+            if surface_data and surface_data.get('type') == 'surface':
+                if surface_name == "All Surfaces":
+                    # Expand all surfaces when "All Surfaces" is selected
+                    surface_item.setExpanded(True)
+                else:
+                    # Only expand the selected surface
+                    dataset_idx = surface_data.get('surface_idx')
+                    if dataset_idx is not None and dataset_idx < len(self.datasets):
+                        dataset_name = self.datasets[dataset_idx].get("name", f"Surface_{dataset_idx}")
+                        if dataset_name == surface_name:
+                            surface_item.setExpanded(True)
+                            tree.scrollToItem(surface_item)
+                        else:
+                            surface_item.setExpanded(False)
+
+    def _populate_surface_selector(self):
+        """
+        Populates the surface selector dropdown with available surfaces.
+        Called after refinement operations to update the dropdown options.
+        """
+        if not hasattr(self, 'refine_surface_selector'):
+            return
+            
+        # Clear existing items except "All Surfaces"
+        self.refine_surface_selector.clear()
+        self.refine_surface_selector.addItem("All Surfaces")
+        
+        # Get surface names from the constraint tree
+        surfaces_added = set()
+        if hasattr(self, 'refine_constraint_tree') and self.refine_constraint_tree:
+            tree = self.refine_constraint_tree
+            logger.info(f"Extracting surfaces from constraint tree with {tree.topLevelItemCount()} top-level items")
+            
+            for i in range(tree.topLevelItemCount()):
+                surface_item = tree.topLevelItem(i)
+                surface_text = surface_item.text(0)
+                surface_data = surface_item.data(0, Qt.UserRole)
+                
+                logger.info(f"Top-level item {i}: text='{surface_text}', data={surface_data}")
+                
+                if surface_data and surface_data.get('type') == 'surface':
+                    surface_idx = surface_data.get('surface_idx')
+                    if surface_idx is not None and surface_idx < len(self.datasets):
+                        surface_name = self.datasets[surface_idx].get("name", f"Surface_{surface_idx}")
+                        if surface_name not in surfaces_added:
+                            self.refine_surface_selector.addItem(surface_name)
+                            surfaces_added.add(surface_name)
+                            logger.info(f"Added surface: {surface_name} (idx={surface_idx})")
+        else:
+            logger.warning("Constraint tree not found or empty")
+        
+        # Fallback: Add surfaces from datasets that have constraint data
+        if len(surfaces_added) == 0 and hasattr(self, 'refine_constraint_data'):
+            for dataset_idx in self.refine_constraint_data.keys():
+                if dataset_idx < len(self.datasets):
+                    surface_name = self.datasets[dataset_idx].get("name", f"Surface_{dataset_idx}")
+                    if surface_name not in surfaces_added:
+                        self.refine_surface_selector.addItem(surface_name)
+                        surfaces_added.add(surface_name)
+                
+        logger.info(f"Populated surface selector with {self.refine_surface_selector.count()} items: {[self.refine_surface_selector.itemText(i) for i in range(self.refine_surface_selector.count())]}")
+
     def _on_target_size_changed(self, value):
         """Provide immediate feedback when target size changes."""
         if value <= 5.0:
@@ -2373,14 +4992,49 @@ class MeshItWorkflowGUI(QMainWindow):
                 summary += f"• {original_total_points} → {refined_total_points} points<br>"
         
         return summary
+
+    def _add_wells_polyline_to_plotter(self, plotter, color_map=None):
+        """Render all WELL datasets as polylines on the given PyVista plotter."""
+        try:
+            import numpy as np
+            import pyvista as pv
+        except Exception:
+            return
+        if not hasattr(self, 'datasets') or not self.datasets or not plotter:
+            return
+
+        for idx, ds in enumerate(self.datasets):
+            if ds.get('type') != 'WELL':
+                continue
+            pts = ds.get('refined_well_points') or ds.get('points')
+            if pts is None or len(pts) < 2:
+                continue
+
+            pts = np.array(pts, dtype=float)
+            if pts.shape[1] < 3:
+                tmp = np.zeros((pts.shape[0], 3))
+                tmp[:, :pts.shape[1]] = pts
+                pts = tmp
+
+            n = len(pts)
+            # Polyline cell format: [n, 0, 1, 2, ... n-1]
+            lines = np.hstack(([n], np.arange(n, dtype=np.int32))).astype(np.int32)
+            poly = pv.PolyData(pts, lines=lines)
+            color = ds.get('color', self.DEFAULT_COLORS[idx % len(self.DEFAULT_COLORS)])
+            plotter.add_mesh(poly, color=color, line_width=3, opacity=0.9, label=f"{ds.get('name', 'Well')}")
+
+
+    def _add_wells_to_intersection_plotter(self):
+        """Convenience wrapper to add wells to the Intersection tab plotter."""
+        if hasattr(self, 'intersection_plotter') and self.intersection_plotter:
+            self._add_wells_polyline_to_plotter(self.intersection_plotter)
     def _refine_intersection_lines_action(self):
         """
         Action to refine intersection lines by:
-        1. Identifying triple points at intersection line crossings
-        2. Identifying special points (angles > 135 degrees) on hulls and intersections 
-        3. Refining lines by dividing into segments of target length
-        
-        Focus on keeping only convex hull and intersection lines without triangulated surfaces.
+        1. Identifying triple points and geometric corners.
+        2. Aligning intersection endpoints to the raw hull, creating a topologically correct boundary.
+        3. Refining this detailed hull by projecting it onto an interpolated surface (draping).
+        4. Refining all intersection and hull lines by length for meshing.
         """
         logger.info("Starting refinement of intersection lines...")
         self.statusBar().showMessage("Refining intersection lines...")
@@ -2390,35 +5044,48 @@ class MeshItWorkflowGUI(QMainWindow):
             self.statusBar().showMessage("Refinement skipped: No intersections found.", 5000)
             return
 
-        # --- Store original for summary ---
         import copy
         self.original_intersections_backup = copy.deepcopy(self.datasets_intersections)
 
-        # --- Get UI Parameters ---
         try:
-            target_feature_size = float(self.mesh_target_feature_size_input.value())  # Fixed: use .value() not .text()
-            gradient = float(self.mesh_gradient_input.value())  # Also fixed gradient
-            min_angle_deg = float(self.mesh_min_angle_input.value())  # Also fixed min_angle
+            per_surface_len = {}
+            if hasattr(self, 'mesh_refine_table') and self.mesh_refine_table is not None:
+                from PyQt5.QtCore import Qt
+                for r in range(self.mesh_refine_table.rowCount()):
+                    item_name = self.mesh_refine_table.item(r, 0)
+                    item_val = self.mesh_refine_table.item(r, 1)
+                    if item_name and item_val:
+                        try:
+                            ds_idx = int(item_name.data(Qt.UserRole))
+                            val = float(item_val.text())
+                            if val > 1e-9:
+                                per_surface_len[ds_idx] = val
+                        except Exception:
+                            pass
+
+            unified_fallback = float(self.mesh_target_feature_size_input.value())
+
+            def _get_target_for_surface(idx: int) -> float:
+                v = per_surface_len.get(idx, unified_fallback)
+                return v if v > 1e-9 else unified_fallback
+
+            min_angle_deg = float(self.mesh_min_angle_input.value())
             uniform_meshing = self.mesh_uniform_checkbox.isChecked()
         except ValueError:
             QMessageBox.warning(self, "Input Error", "Invalid numeric input for refinement parameters.")
             self.statusBar().showMessage("Refinement failed: Invalid input.", 5000)
             return
-        
-        # --- Temporary Model Setup ---
+
         class TempModelWrapper:
             def __init__(self):
-                self.surfaces = [] # List of TempDataWrapper for surfaces only (no triangulation needed)
-                self.polylines = [] # List of TempDataWrapper for polylines
-                self.intersections = [] # List of Intersection objects
-                self.triple_points = [] # List to store the triple points explicitly
-                
-                # Mappings
-                self.original_indices_map = {} 
+                self.surfaces = []
+                self.polylines = []
+                self.intersections = []
+                self.triple_points = []
+                self.original_indices_map = {}
                 self.is_polyline = {}
                 self.surface_original_to_temp_idx_map = {}
                 self.polyline_original_to_temp_idx_map = {}
-
 
         temp_model = TempModelWrapper()
 
@@ -2428,7 +5095,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 involved_original_indices.add(intersection_data['dataset_id1'])
                 involved_original_indices.add(intersection_data['dataset_id2'])
 
-        temp_data_idx_counter = 0 # This will be the key for original_indices_map and is_polyline
+        temp_data_idx_counter = 0
 
         for original_idx, dataset_content in enumerate(self.datasets):
             if original_idx not in involved_original_indices:
@@ -2436,52 +5103,29 @@ class MeshItWorkflowGUI(QMainWindow):
 
             class TempDataWrapper:
                 def __init__(self):
-                    self.convex_hull = [] # List of Vector3D
-                    self.size = 0.1 # Default size
+                    self.convex_hull = []
+                    self.size = 0.1
                     self.name = f"Dataset_{original_idx}"
-                    # self.vertices = [] # Could add if needed by some refinement step
 
             data_wrapper = TempDataWrapper()
             data_wrapper.name = dataset_content.get('name', f"Dataset_{original_idx}")
-            
-            current_geom_points = [] # For calculating size if hull_points is missing
-            hull_points_np = dataset_content.get('hull_points')
-            if hull_points_np is not None and len(hull_points_np) > 0:
-                data_wrapper.convex_hull = []
-                for hp in hull_points_np:
+
+            hull_points_obj_array = dataset_content.get('hull_points')
+            if hull_points_obj_array is not None and len(hull_points_obj_array) > 0:
+                for hp in hull_points_obj_array:
                     point_type = hp[3] if len(hp) > 3 and isinstance(hp[3], str) else "DEFAULT"
-                    data_wrapper.convex_hull.append(Vector3D(hp[0], hp[1], hp[2] if len(hp) > 2 else 0.0, point_type=point_type))
-                current_geom_points = hull_points_np
-            else: # Fallback: use 'points' if 'hull_points' is missing
+                    data_wrapper.convex_hull.append(Vector3D(hp[0], hp[1], hp[2], point_type=point_type))
+            else:
                 points_np = dataset_content.get('points')
                 if points_np is not None and len(points_np) > 0:
-                    data_wrapper.convex_hull = [Vector3D(p[0], p[1], p[2] if len(p) > 2 else 0.0) for p in points_np]
-                    current_geom_points = points_np
+                    data_wrapper.convex_hull = [Vector3D(p[0], p[1], p[2]) for p in points_np]
                 else:
                     logger.warning(f"Dataset {original_idx} ({data_wrapper.name}) has no hull_points or points. Skipping for temp_model.")
                     continue
-            
-            if len(current_geom_points) > 1:
-                min_pt, max_pt = np.min(current_geom_points, axis=0), np.max(current_geom_points, axis=0)
-                diag_length = np.linalg.norm(max_pt - min_pt)
-                data_wrapper.size = diag_length / 10.0 if diag_length > 0 else 0.1
-            
-            # Determine if it's a polyline (heuristic, improve if type is stored in dataset_content)
-            if original_idx == 0:  # Force first dataset to be a surface
-                is_p = False
-                logger.info(f"Dataset {original_idx} ({data_wrapper.name}) FORCED as surface for testing")
-            else:
-                # Original logic with triangulation check
-                is_p = (dataset_content.get('type') == 'polyline' or
-                        ('segments' in dataset_content and 'triangles' not in dataset_content and 'hull_points' not in dataset_content))
-                logger.info(f"Dataset {original_idx} ({data_wrapper.name}) classified as {'polyline' if is_p else 'surface'}")
-            if not is_p: # Check intersection involvement if not clearly a polyline
-                for _, intersection_list_check in self.datasets_intersections.items():
-                    for intersection_d_check in intersection_list_check:
-                        if intersection_d_check['is_polyline_mesh'] and intersection_d_check['dataset_id1'] == original_idx:
-                            is_p = True; break
-                    if is_p: break
-            
+
+            is_p = (dataset_content.get('type') in ('WELL', 'polyline') or
+                    ('segments' in dataset_content and 'triangles' not in dataset_content and 'hull_points' not in dataset_content))
+
             temp_model.original_indices_map[temp_data_idx_counter] = original_idx
             temp_model.is_polyline[temp_data_idx_counter] = is_p
 
@@ -2491,241 +5135,184 @@ class MeshItWorkflowGUI(QMainWindow):
             else:
                 temp_model.surface_original_to_temp_idx_map[original_idx] = len(temp_model.surfaces)
                 temp_model.surfaces.append(data_wrapper)
-            
+
             temp_data_idx_counter += 1
 
         if not temp_model.surfaces and not temp_model.polylines:
             QMessageBox.warning(self, "No Valid Datasets", "No datasets with geometry were prepared for refinement.")
-            self.statusBar().showMessage("Refinement failed: No valid datasets.", 5000)
             return
+
         logger.info(f"Temp model created: {len(temp_model.surfaces)} surfaces, {len(temp_model.polylines)} polylines.")
 
-        # Map original self.datasets_intersections to temp_model.intersections using temp_data_idx_counter keys
         original_to_temp_combined_idx_map = {v: k for k, v in temp_model.original_indices_map.items()}
-
         for _, intersections_list in self.datasets_intersections.items():
             for intersection_data in intersections_list:
                 temp_combined_id1 = original_to_temp_combined_idx_map.get(intersection_data['dataset_id1'])
                 temp_combined_id2 = original_to_temp_combined_idx_map.get(intersection_data['dataset_id2'])
-
-                if temp_combined_id1 is None or temp_combined_id2 is None:
-                    logger.warning(f"Skipping intersection: Original IDs {intersection_data['dataset_id1']}/{intersection_data['dataset_id2']} not in temp_model map.")
-                    continue
-                
+                if temp_combined_id1 is None or temp_combined_id2 is None: continue
                 new_int = Intersection(temp_combined_id1, temp_combined_id2, intersection_data['is_polyline_mesh'])
                 for pt_coords in intersection_data['points']:
                     new_int.add_point(Vector3D(pt_coords[0], pt_coords[1], pt_coords[2] if len(pt_coords) > 2 else 0.0))
                 temp_model.intersections.append(new_int)
-        
+
         if not temp_model.intersections:
             QMessageBox.information(self, "No Intersections", "No intersections populated in temp_model.")
-            self.statusBar().showMessage("Refinement skipped: No intersections in temp model.", 5000)
             return
-        logger.info(f"Temp model has {len(temp_model.intersections)} intersections to process.")
 
-        # --- Step 1: Identify Triple Points ---
+        # Step 1: Triple points
         try:
-            # Triple points are crucial for refinement - these are points where 3 or more surfaces intersect
-            # First find the triple points where multiple intersections meet
             for i in range(len(temp_model.intersections) - 1):
                 for j in range(i + 1, len(temp_model.intersections)):
-                    # Calculate triple points between pairs of intersections
                     triple_points = calculate_triple_points(i, j, temp_model, tolerance=1e-5)
                     for tp in triple_points:
-                        # Create a TriplePoint object
                         triple_point_obj = TriplePoint(tp)
-                        triple_point_obj.add_intersection(i)
-                        triple_point_obj.add_intersection(j)
-                        # Set point type explicitly to TRIPLE_POINT
+                        triple_point_obj.add_intersection(i); triple_point_obj.add_intersection(j)
                         tp.point_type = "TRIPLE_POINT"
                         temp_model.triple_points.append(triple_point_obj)
-            
-            # Insert the triple points into the intersections
             insert_triple_points(temp_model)
-            
-            # Store triple points for constraint references in the pre-tetrameshtab
-            self.triple_points = []
-            for tp in temp_model.triple_points:
-                self.triple_points.append({
-                    'point': tp.point,
-                    'intersections': tp.intersection_ids
-                })
-                
+            self.triple_points = [{'point': tp.point, 'intersections': tp.intersection_ids} for tp in temp_model.triple_points]
             logger.info(f"Found and inserted {len(temp_model.triple_points)} triple points.")
         except Exception as e:
             logger.error(f"Error during triple points calculation: {e}", exc_info=True)
-            QMessageBox.warning(self, "Refinement Error", f"Error during triple point identification: {str(e)}")
             return
         
-        # --- Step 2: Identify corner points on convex hulls (C++ MakeCornersSpecial) ---
+        # Step 2: Corners on convex hulls
         try:
             from meshit.intersection_utils import make_corners_special
-            
-            # Process each surface's convex hull to identify corner points first
-            # This mirrors the C++ workflow: calculate_convex_hull -> MakeCornersSpecial -> alignIntersectionsToConvexHull
-            corner_points_count = 0
-            for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
-                if not hasattr(temp_surface, 'convex_hull') or len(temp_surface.convex_hull) < 3:
-                    continue
-                
-                original_dataset_idx = temp_model.original_indices_map.get(temp_surface_idx)
-                logger.info(f"Identifying corner points on convex hull for surface {temp_surface_idx} (original dataset {original_dataset_idx})")
-                
-                # Apply corner detection using the same angle threshold as C++ MeshIt (135°)
-                temp_surface.convex_hull = make_corners_special(temp_surface.convex_hull, angle_threshold_deg=135.0)
-                
-                # Count corner points
-                for pt in temp_surface.convex_hull:
-                    pt_type = getattr(pt, 'point_type', getattr(pt, 'type', "DEFAULT"))
-                    if pt_type == "CORNER":
-                        corner_points_count += 1
-            
-            logger.info(f"Identified {corner_points_count} corner points across all convex hulls")
+            for temp_surface in temp_model.surfaces:
+                if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
+                    temp_surface.convex_hull = make_corners_special(temp_surface.convex_hull, angle_threshold_deg=135.0)
         except Exception as e:
             logger.error(f"Error during corner point identification: {e}", exc_info=True)
-            QMessageBox.warning(self, "Refinement Error", f"Error during corner point identification: {str(e)}")
             return
-        
-        # --- Step 3: Align intersections to convex hulls (C++ alignIntersectionsToConvexHull) ---
+        # Step 3: Refine hull with interpolation (corrects hull geometry)
         try:
-            # This step aligns intersection points with the convex hulls of surfaces
-            # Creates new special junction points where intersection lines meet convex hull boundaries
+            config = {
+                'interp': self.mesh_interp_combo.currentText(),
+                'smoothing': float(self.mesh_smoothing_input.value())
+            }
+            for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
+                if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
+                    raw_hull_points = [Vector3D(p.x, p.y, p.z, point_type=getattr(p, "point_type", "DEFAULT")) for p in temp_surface.convex_hull]
+                    original_idx = temp_model.original_indices_map.get(
+                        next((k for k, v in temp_model.surface_original_to_temp_idx_map.items() if v == temp_surface_idx), None)
+                    )
+                    if original_idx is not None and 'points' in self.datasets[original_idx]:
+                        scattered_points = [Vector3D(p[0], p[1], p[2]) for p in self.datasets[original_idx]['points']]
+                        refined_hull_3d = refine_hull_with_interpolation(
+                            raw_hull_points, scattered_points, config
+                        )
+                        
+
+                    # Step 4: Create refined Vector3D objects preserving point types
+                    refined_hull_points = []
+                    for i, (orig_pt, refined_3d) in enumerate(zip(raw_hull_points, refined_hull_3d)):
+                        # If refined_3d is already a Vector3D, just copy it
+                        if isinstance(refined_3d, Vector3D):
+                            refined_pt = Vector3D(refined_3d.x, refined_3d.y, refined_3d.z)
+                        else:
+                            refined_pt = Vector3D(refined_3d[0], refined_3d[1], refined_3d[2])
+                        # Preserve original point type information
+                        refined_pt.point_type = getattr(orig_pt, 'point_type', 'DEFAULT')
+                        if hasattr(orig_pt, 'type'):
+                            refined_pt.type = orig_pt.type
+                        refined_hull_points.append(refined_pt)
+
+                    # --- NEW: Snap refined hull points back to original endpoints if close ---
+                    snap_tol = 1e-5
+                    for i, (orig_pt, refined_pt) in enumerate(zip(raw_hull_points, refined_hull_points)):
+                        if (orig_pt - refined_pt).length() < snap_tol:
+                            # Use the original point exactly (preserves endpoint for snapping)
+                            refined_hull_points[i] = orig_pt
+
+                    # Calculate refinement statistics
+                    displacement_distances = [
+                        (orig - refined).length() 
+                        for orig, refined in zip(raw_hull_points, refined_hull_points)
+                    ]
+                    temp_surface.convex_hull = refined_hull_points
+        except Exception as e:
+            logger.error(f"Error during hull refinement: {e}", exc_info=True)
+            return
+        # Step 4: Align intersections to hulls (defines hull topology)
+        try:
             for temp_surface_list_idx in range(len(temp_model.surfaces)):
                 align_intersections_to_convex_hull(temp_surface_list_idx, temp_model)
             logger.info("Intersection alignment to convex hulls complete.")
         except Exception as e:
             logger.error(f"Error during convex hull alignment: {e}", exc_info=True)
-            QMessageBox.warning(self, "Refinement Error", f"Error during convex hull alignment: {str(e)}")
+            return
+        # Step 5: Refine convex hulls by length (creates dense hull for interpolation)
+        try:
+            temp_to_orig = {ti: oi for oi, ti in temp_model.surface_original_to_temp_idx_map.items()}
+            for temp_idx, temp_surface in enumerate(temp_model.surfaces):
+                if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
+                    orig_idx = temp_to_orig.get(temp_idx, -1)
+                    eff_target_length = _get_target_for_surface(orig_idx)
+                    class _HullLine:
+                        def __init__(self, pts): self.points = [Vector3D(p.x, p.y, p.z, point_type=getattr(p, "point_type", "DEFAULT")) for p in pts]
+                    refined = refine_intersection_line_by_length(
+                        _HullLine(temp_surface.convex_hull), float(eff_target_length), min_angle_deg, uniform_meshing
+                    )
+                    if len(refined) >= 2 and (refined[0] - refined[-1]).length_squared() < 1e-24:
+                        refined = refined[:-1]
+                    temp_surface.convex_hull = refined
+            logger.info(f"Refined convex hulls by length.")
+        except Exception as e:
+            logger.error(f"Error during convex hull length refinement: {e}", exc_info=True)
             return
         
-        # --- Step 4: Refine intersection lines by length ---
-            
-                # --- Step 4: Refine intersection lines by length ---
+        # Step 6: Refine intersection lines by length
         try:
-            # Custom angle thresholds for point classification in refine_intersection_line_by_length
-            # HC_ANGLE_THRESHOLD = 135.0  # Only keep special points with angles > 135 degrees
-            
             for intersection in temp_model.intersections:
-                # Determine effective target length based on involved objects
-                id1 = intersection.id1
-                id2 = intersection.id2
-                is_poly1 = temp_model.is_polyline.get(id1, False)
-                is_poly2 = temp_model.is_polyline.get(id2, False)
-                
-                # Get the data wrappers for the objects
-                obj1_data = None
-                if is_poly1:
-                    if temp_model.original_indices_map[id1] in temp_model.polyline_original_to_temp_idx_map:
-                        obj1_data = temp_model.polylines[temp_model.polyline_original_to_temp_idx_map[temp_model.original_indices_map[id1]]]
-                else:
-                    if temp_model.original_indices_map[id1] in temp_model.surface_original_to_temp_idx_map:
-                        obj1_data = temp_model.surfaces[temp_model.surface_original_to_temp_idx_map[temp_model.original_indices_map[id1]]]
-                
-                obj2_data = None
-                if is_poly2:
-                    if temp_model.original_indices_map[id2] in temp_model.polyline_original_to_temp_idx_map:
-                        obj2_data = temp_model.polylines[temp_model.polyline_original_to_temp_idx_map[temp_model.original_indices_map[id2]]]
-                else:
-                    if temp_model.original_indices_map[id2] in temp_model.surface_original_to_temp_idx_map:
-                        obj2_data = temp_model.surfaces[temp_model.surface_original_to_temp_idx_map[temp_model.original_indices_map[id2]]]
-                
-                # Get sizes
-                obj1_size = obj1_data.size if obj1_data and hasattr(obj1_data, 'size') else 0.1
-                obj2_size = obj2_data.size if obj2_data and hasattr(obj2_data, 'size') else 0.1
-                
-                # Determine effective target length
-                eff_target_length = target_feature_size
-                if not uniform_meshing:
-                    valid_sizes = [s for s in [obj1_size, obj2_size] if s > 1e-6]
-                    if valid_sizes:
-                        eff_target_length = min(valid_sizes)
-                    if target_feature_size > 1e-6 and target_feature_size < eff_target_length:
-                        eff_target_length = target_feature_size
-                
-                if eff_target_length <= 1e-6:
-                    eff_target_length = 0.1
-                
-                # Refine the intersection line
-                refined_points = refine_intersection_line_by_length(
-                    intersection, 
-                    target_length=eff_target_length,
-                    min_angle_deg=min_angle_deg,
-                    uniform_meshing=uniform_meshing
+                id1, id2 = intersection.id1, intersection.id2
+                orig1 = temp_model.original_indices_map.get(id1, -1)
+                orig2 = temp_model.original_indices_map.get(id2, -1)
+                t1 = _get_target_for_surface(orig1)
+                t2 = _get_target_for_surface(orig2)
+                eff_target_length = min(t1, t2)
+                intersection.points = refine_intersection_line_by_length(
+                    intersection, eff_target_length, min_angle_deg, uniform_meshing
                 )
-                
-                # Update the intersection with refined points
-                intersection.points = refined_points
-                
-            logger.info("Length-based refinement complete.")
+            logger.info("Length-based refinement of intersection lines complete.")
         except Exception as e:
             logger.error(f"Error during length-based refinement: {e}", exc_info=True)
-            QMessageBox.warning(self, "Refinement Error", f"Error during length-based refinement: {str(e)}")
             return
-                # --- STEP: Store intersection lines as constraints (C++ approach) ---
-        logger.info("Storing intersection lines as constraints for each surface...")
+
         
-            # ------------------------------------------------------------------
-        # STEP: Store intersection lines as constraints (C++ approach)
-        # ------------------------------------------------------------------
-        logger.info("Storing intersection lines as constraints for each surface…")
 
-        # 1.  Clear any previous constraints
-        for ds in self.datasets:
-            ds["stored_constraints"] = []
-
-        # 2.  One loop over all refined intersections
+        # Store intersection lines as constraints (unchanged)
+        logger.info("Storing intersection lines as constraints for each surface...")
+        for ds in self.datasets: ds["stored_constraints"] = []
         for inter in temp_model.intersections:
-            sid1 = temp_model.original_indices_map.get(inter.id1)   # first surface
-            sid2 = temp_model.original_indices_map.get(inter.id2)   # second surface
+            sid1 = temp_model.original_indices_map.get(inter.id1)
+            sid2 = temp_model.original_indices_map.get(inter.id2)
             if sid1 is None or sid2 is None:
                 continue
-
-            # ---- build the polyline ONCE ---------------------------------
-            pts_with_type = [
-                [pt.x, pt.y, pt.z,
-                getattr(pt, "point_type", getattr(pt, "type", "DEFAULT"))]
-                for pt in inter.points
-            ]
-            if len(pts_with_type) < 2:          # not a valid line
+            pts_with_type = [[pt.x, pt.y, pt.z, getattr(pt, "point_type", "DEFAULT")] for pt in inter.points]
+            if len(pts_with_type) < 2:
                 continue
-
-            # shared dictionary template (points list is the SAME object)
-            base_entry = {
-                "type": "intersection_line",
-                "points": pts_with_type          # <-- shared reference
-            }
-
-            # ---- append to both surfaces ---------------------------------
+            base_entry = {"type": "intersection_line", "points": pts_with_type}
             for ds_idx, other_idx in ((sid1, sid2), (sid2, sid1)):
-                if ds_idx is None or ds_idx >= len(self.datasets):
+                if ds_idx is None or ds_idx >= len(self.datasets): 
                     continue
-                entry = dict(base_entry)         # shallow copy of dict
+                entry = dict(base_entry)
                 entry["other_surface_id"] = other_idx
                 self.datasets[ds_idx]["stored_constraints"].append(entry)
                 self.datasets[ds_idx]["needs_constraint_update"] = True
-                logger.info(
-                    f"Stored intersection constraint for surface {ds_idx}: "
-                    f"{len(pts_with_type)} points (other surface {other_idx})"
-                )
+        logger.info("Constraint storage complete.")
 
-        logger.info("Constraint storage complete.")
-        
-        logger.info("Constraint storage complete.")
-        # --- Update main data structures and visualization ---
-        self.datasets_intersections.clear() 
+        # Repopulate datasets_intersections for visualization (unchanged)
+        self.datasets_intersections.clear()
         self.refined_intersections_for_visualization = {}
-        
         for temp_s_list_idx, temp_surface_data in enumerate(temp_model.surfaces):
-    # Find the original dataset index for this temp surface
             original_dataset_idx = None
             for orig_idx, temp_idx in temp_model.surface_original_to_temp_idx_map.items():
                 if temp_idx == temp_s_list_idx:
                     original_dataset_idx = orig_idx
                     break
-            
             if original_dataset_idx is not None:
                 if hasattr(temp_surface_data, 'convex_hull') and temp_surface_data.convex_hull:
-                    # Create hull points array with type information
                     hull_points_with_type = []
                     for p in temp_surface_data.convex_hull:
                         point_type = "DEFAULT"
@@ -2733,273 +5320,164 @@ class MeshItWorkflowGUI(QMainWindow):
                             point_type = p.type
                         elif hasattr(p, 'point_type') and p.point_type:
                             point_type = p.point_type
-                        
-                        # Store points with type as 4th element [x, y, z, type]
                         hull_points_with_type.append([p.x, p.y, p.z, point_type])
-                        logger.info(f"Copying hull point: ({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) type={point_type}")
 
-                    # Store hull points with their types
                     self.datasets[original_dataset_idx]['hull_points'] = np.array(hull_points_with_type, dtype=object)
                     logger.info(f"Updated convex hull for dataset {original_dataset_idx} with {len(hull_points_with_type)} points.")
-                else:
-                    logger.warning(f"No convex hull data in temp_surface_data for original_dataset_idx {original_dataset_idx} to copy back.")
             else:
                 logger.warning(f"Could not map temp_model.surfaces index {temp_s_list_idx} to an original dataset index for hull update.")
+
         for intersection in temp_model.intersections:
             original_id1 = temp_model.original_indices_map.get(intersection.id1)
             original_id2 = temp_model.original_indices_map.get(intersection.id2)
-
             if original_id1 is None or original_id2 is None:
                 logger.warning(f"Post-refinement: Skipping intersection due to missing original ID map for temp IDs {intersection.id1}/{intersection.id2}.")
                 continue
-            
-                      # Prepare points with embedded types for visualization compatibility
+
             points_for_entry = []
-            for p_obj in intersection.points: # Iterate over the point objects from refinement
-                p_type_str = "DEFAULT" # Default type if none found
+            for p_obj in intersection.points:
+                p_type_str = "DEFAULT"
                 if hasattr(p_obj, 'point_type') and p_obj.point_type:
                     p_type_str = p_obj.point_type
-                
                 points_for_entry.append([p_obj.x, p_obj.y, p_obj.z, p_type_str])
 
             intersection_entry = {
                 'dataset_id1': original_id1,
                 'dataset_id2': original_id2,
                 'is_polyline_mesh': intersection.is_polyline_mesh,
-                'points': points_for_entry, # Now contains [x,y,z,type_string]
-                # The separate 'point_types' list that was here before is no longer needed
-                # as the type is embedded directly with the coordinates for visualization.
+                'points': points_for_entry,
             }
-            
-            # Store in self.datasets_intersections (main data)
-            # Key by the dataset that is involved (can be either id1 or id2)
-            # To avoid duplicates if an intersection is processed from "both sides", use a combined key or primary key
-            primary_key_ds = min(original_id1, original_id2) # Consistent keying
+
+            primary_key_ds = min(original_id1, original_id2)
             if primary_key_ds not in self.datasets_intersections:
-                 self.datasets_intersections[primary_key_ds] = []
-            
-                        # ---------------------------------------------------------
-            # Geometry-aware duplicate check
-            # ---------------------------------------------------------
-            def _same_intersection(e1, e2, tol=1e-8):
-                # 1) same dataset pair (order-independent) and same polyline flag
-                if {e1['dataset_id1'], e1['dataset_id2']} != \
-                   {e2['dataset_id1'], e2['dataset_id2']}:
-                    return False
-                if e1['is_polyline_mesh'] != e2['is_polyline_mesh']:
-                    return False
+                self.datasets_intersections[primary_key_ds] = []
 
-                pts1, pts2 = e1['points'], e2['points']
-                if len(pts1) != len(pts2):
-                    return False
-
-                # 2) endpoints must match (allow reversed order)
-                def _close(p, q):
-                    return (abs(p[0] - q[0]) < tol and
-                            abs(p[1] - q[1]) < tol and
-                            abs(p[2] - q[2]) < tol)
-
-                ends_match = (_close(pts1[0], pts2[0]) and _close(pts1[-1], pts2[-1])) or \
-                             (_close(pts1[0], pts2[-1]) and _close(pts1[-1], pts2[0]))
-                if not ends_match:
-                    return False
-
-                # 3) cheap interior–shape test: centroid distance
+            def _same_intersection(inter1: dict, inter2: dict, tol: float = 1e-6) -> bool:
                 import numpy as np
-                c1 = np.mean(np.asarray(pts1)[:, :3], axis=0)
-                c2 = np.mean(np.asarray(pts2)[:, :3], axis=0)
-                return np.linalg.norm(c1 - c2) < tol
 
-            already_added = any(
-                _same_intersection(existing, intersection_entry)
-                for existing in self.datasets_intersections[primary_key_ds]
-            )
+                def to_xyz_array(pts) -> np.ndarray:
+                    xyz = []
 
+                    def push_xyz(x, y, z):
+                        try:
+                            xyz.append([float(x), float(y), float(z)])
+                        except Exception:
+                            pass
+
+                    if pts is None:
+                        return np.empty((0, 3), dtype=float)
+
+                    for p in pts:
+                        # Segment as [p1, p2] where p* may be Vector3D or xyz-like
+                        if isinstance(p, (list, tuple)) and len(p) == 2 and all(
+                            hasattr(q, "x") and hasattr(q, "y") and hasattr(q, "z") for q in p
+                        ):
+                            push_xyz(p[0].x, p[0].y, p[0].z)
+                            push_xyz(p[1].x, p[1].y, p[1].z)
+                            continue
+
+                        # Vector3D
+                        if hasattr(p, "x") and hasattr(p, "y") and hasattr(p, "z"):
+                            push_xyz(p.x, p.y, p.z)
+                            continue
+
+                        # dict with x/y/z
+                        if isinstance(p, dict) and all(k in p for k in ("x", "y", "z")):
+                            push_xyz(p["x"], p["y"], p["z"])
+                            continue
+
+                        # plain sequence [x,y,z] or np array
+                        if isinstance(p, (list, tuple, np.ndarray)) and len(p) >= 3:
+                            push_xyz(p[0], p[1], p[2])
+                            continue
+
+                        # Unknown type: skip
+                        continue
+
+                    if not xyz:
+                        return np.empty((0, 3), dtype=float)
+                    return np.asarray(xyz, dtype=float)
+
+                pts1 = inter1.get("points", [])
+                pts2 = inter2.get("points", [])
+                arr1 = to_xyz_array(pts1)
+                arr2 = to_xyz_array(pts2)
+
+                if arr1.size == 0 or arr2.size == 0:
+                    return False
+
+                c1 = np.mean(arr1, axis=0)
+                c2 = np.mean(arr2, axis=0)
+                if not np.all(np.isfinite(c1)) or not np.all(np.isfinite(c2)):
+                    return False
+
+                # Optional: also compare the involved surface/polyline IDs if present
+                ids1 = tuple(sorted(inter1.get("pair_ids", inter1.get("ids", []))))
+                ids2 = tuple(sorted(inter2.get("pair_ids", inter2.get("ids", []))))
+                ids_match = (ids1 == ids2) if ids1 and ids2 else True
+
+                return ids_match and np.linalg.norm(c1 - c2) <= tol
+
+            already_added = any(_same_intersection(existing, intersection_entry) for existing in self.datasets_intersections[primary_key_ds])
             if not already_added:
                 self.datasets_intersections[primary_key_ds].append(intersection_entry)
 
-                        # ---------------------------------------------------------
-            # Store in the VIS-layer dictionary
-            # ---------------------------------------------------------
             for vis_key_id in (original_id1, original_id2):
-
                 if vis_key_id not in self.refined_intersections_for_visualization:
                     self.refined_intersections_for_visualization[vis_key_id] = []
 
-                # geometry-aware duplicate test (order-agnostic)
                 def _same_line(a_pts, b_pts, tol=1e-8):
-                    """Return True iff the two polylines are identical
-                    (forward or reversed order) – every point must match."""
                     if len(a_pts) != len(b_pts):
                         return False
-
                     def _close(p, q):
-                        return (abs(p[0] - q[0]) < tol and
-                                abs(p[1] - q[1]) < tol and
-                                abs(p[2] - q[2]) < tol)
-
-                    # forward
+                        return (abs(p[0] - q[0]) < tol and abs(p[1] - q[1]) < tol and abs(p[2] - q[2]) < tol)
                     if all(_close(pa, pb) for pa, pb in zip(a_pts, b_pts)):
                         return True
-                    # reversed
                     if all(_close(pa, pb) for pa, pb in zip(a_pts, reversed(b_pts))):
                         return True
                     return False
-                    # centroid test
-                    import numpy as np
-                    c1 = np.mean(np.asarray(a_pts)[:, :3], axis=0)
-                    c2 = np.mean(np.asarray(b_pts)[:, :3], axis=0)
-                    return np.linalg.norm(c1 - c2) < tol
 
                 vis_already_added = any(
                     _same_line(intersection_entry['points'], ie['points']) and
                     ie['is_polyline_mesh'] == intersection_entry['is_polyline_mesh']
                     for ie in self.refined_intersections_for_visualization[vis_key_id]
                 )
-
                 if not vis_already_added:
-                    self.refined_intersections_for_visualization[vis_key_id].append(
-                        intersection_entry.copy()
-                    )
+                    self.refined_intersections_for_visualization[vis_key_id].append(intersection_entry.copy())
 
-        # --- NEW: Sync special convex hull points from intersections to hulls ---
-        for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
-            if not hasattr(temp_surface, 'convex_hull') or not temp_surface.convex_hull:
-                continue
-            # Find all intersection points for this surface that are special convex hull points
-            for intersection in temp_model.intersections:
-                # Only consider intersections involving this surface
-                if intersection.id1 != temp_surface_idx and intersection.id2 != temp_surface_idx:
-                    continue
-                for pt in intersection.points:
-                    # Only insert if it's a convex hull special point
-                    pt_type = getattr(pt, 'type', getattr(pt, 'point_type', None))
-                    if pt_type == "COMMON_INTERSECTION_CONVEXHULL_POINT":
-                        # Check if this point is already in the hull (within tolerance)
-                        already_in_hull = any(
-                            abs(pt.x - hp.x) < 1e-10 and abs(pt.y - hp.y) < 1e-10 and abs(pt.z - hp.z) < 1e-10
-                            for hp in temp_surface.convex_hull
-                        )
-                        if not already_in_hull:
-                            # Find the closest segment and insert
-                            min_dist = float('inf')
-                            insert_idx = 0
-                            for i in range(len(temp_surface.convex_hull) - 1):
-                                seg_start = temp_surface.convex_hull[i]
-                                seg_end = temp_surface.convex_hull[i+1]
-                                # Project pt onto segment
-                                seg_vec = Vector3D(seg_end.x - seg_start.x, seg_end.y - seg_start.y, seg_end.z - seg_start.z)
-                                seg_len2 = seg_vec.x**2 + seg_vec.y**2 + seg_vec.z**2
-                                if seg_len2 == 0:
-                                    continue
-                                t = ((pt.x - seg_start.x) * seg_vec.x + (pt.y - seg_start.y) * seg_vec.y + (pt.z - seg_start.z) * seg_vec.z) / seg_len2
-                                t = max(0, min(1, t))
-                                proj = Vector3D(
-                                    seg_start.x + (seg_end.x - seg_start.x) * t,
-                                    seg_start.y + (seg_end.y - seg_start.y) * t,
-                                    seg_start.z + (seg_end.z - seg_start.z) * t,
-                                    point_type=pt_type
-                                )
-                                dist = (Vector3D(pt.x, pt.y, pt.z) - proj).length()
-                                if dist < min_dist:
-                                    min_dist = dist
-                                    insert_idx = i + 1
-                            temp_surface.convex_hull.insert(insert_idx, pt)
-
-        for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
-            if hasattr(temp_surface, 'convex_hull') and temp_surface.convex_hull:
-                logger.info(f"After insertion, convex hull for surface {temp_surface_idx} has {len(temp_surface.convex_hull)} points.")
-                # Count special points by type
-                type_counts = {}
-                for hp in temp_surface.convex_hull:
-                    pt_type = getattr(hp, 'type', getattr(hp, 'point_type', 'NONE'))
-                    type_counts[pt_type] = type_counts.get(pt_type, 0) + 1
-                    if pt_type == "COMMON_INTERSECTION_CONVEXHULL_POINT":
-                        logger.info(f"  SPECIAL Hull pt: ({hp.x:.3f}, {hp.y:.3f}, {hp.z:.3f}) type={pt_type}")
-        
-                logger.info(f"  Hull point types: {type_counts}")
-        # Copy back modified convex hulls from temp_model.surfaces to self.datasets
-        for temp_s_list_idx, temp_surface_data in enumerate(temp_model.surfaces):
-            # Find the original_dataset_idx for temp_model.surfaces[temp_s_list_idx]
-            original_dataset_idx = -1
-            for orig_idx_key, temp_surf_map_idx_val in temp_model.surface_original_to_temp_idx_map.items():
-                if temp_surf_map_idx_val == temp_s_list_idx:
-                    original_dataset_idx = orig_idx_key
-                    break
-            
-            if original_dataset_idx != -1 and original_dataset_idx < len(self.datasets):
-                if hasattr(temp_surface_data, 'convex_hull') and temp_surface_data.convex_hull:
-                    # Create hull points array with type information
-                    hull_points_with_type = []
-                    for p in temp_surface_data.convex_hull:
-                        point_type = "DEFAULT"
-                        if hasattr(p, 'type') and p.type:
-                            point_type = p.type
-                        elif hasattr(p, 'point_type') and p.point_type:
-                            point_type = p.point_type
-                        
-                        # Store points with type as 4th element [x, y, z, type]
-                        hull_points_with_type.append([p.x, p.y, p.z, point_type])
-                        logger.info(f"Copying hull point: ({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) type={point_type}")
-
-                    # Store hull points with their types
-                    self.datasets[original_dataset_idx]['hull_points'] = np.array(hull_points_with_type, dtype=object)
-                    logger.info(f"Updated convex hull for dataset {original_dataset_idx} with {len(hull_points_with_type)} points.")
-                    logger.info(f"Updated convex hull for dataset {original_dataset_idx} ('{self.datasets[original_dataset_idx].get('name')}') with {len(hull_points_with_type)} points.")
-                else:
-                    logger.warning(f"No convex hull data in temp_surface_data for original_dataset_idx {original_dataset_idx} to copy back.")
-            else:
-                logger.warning(f"Could not map temp_model.surfaces index {temp_s_list_idx} to an original dataset index for hull update.")
-
-        summary = self._analyze_refinement_results() 
+        summary = self._analyze_refinement_results()
         self.refinement_summary_label.setText(summary)
 
         self.statusBar().showMessage("Intersection lines refined successfully.", 5000)
         logger.info("Intersection lines refined successfully.")
 
-        # At the very end of _refine_intersection_lines_action(), before the final success message:
         logger.info("Consolidating all refined points for triangulation...")
         self.consolidate_points_for_triangulation()
         logger.info("Consolidation complete!")
 
-        logger.info("Intersection lines refined successfully.")
-        
-        # Enable the "Generate Conforming Surface Meshes" button after successful refinement
         self.generate_conforming_meshes_btn.setEnabled(True)
         logger.info("Enabled conforming mesh generation button after successful refinement.")
-        
-        # --- NEW: Populate Tab 6 constraint tree after successful refinement ---
+
         try:
-            # Populate the Tab 6 constraint tree with refinement results
             self._populate_refine_constraint_tree()
             logger.info("Refinement complete. Populated constraint tree in 'Refine & Mesh' tab.")
-            
         except Exception as e:
             logger.error(f"Error populating constraint tree for Tab 6: {e}", exc_info=True)
-        
+        self._populate_surface_selector()
         self._update_refined_visualization()
 
     def _generate_conforming_meshes_action(self):
         """Generate conforming surface meshes from currently checked segments."""
         import numpy as np
-        target_size_setting = float(self.mesh_target_feature_size_input.value())
-        logger.info(f"Starting conforming surface mesh generation with target size: {target_size_setting}")
-        self.statusBar().showMessage(f"Generating conforming surface meshes (target size: {target_size_setting})…")
+        # Keep status/log but compute per-surface target size below
+        self.statusBar().showMessage("Generating conforming surface meshes…")
 
-        try:
-            tgt = float(self.mesh_target_feature_size_input.value())
-            min_ang = float(self.mesh_min_angle_input.value())
-            max_area = tgt * tgt * 1.5
-        except Exception:
-            QMessageBox.warning(self, "Input Error", "Invalid numeric parameters.")
-            return
-
-        cfg = {"target_size": tgt, "min_angle": min_ang, "max_area": max_area}
         ok, total, fails = 0, 0, []
-
         for s_idx, ds in enumerate(self.datasets):
-            if ds.get("type") == "polyline":
+            # Skip wells (polylines) entirely for triangulation
+            if ds.get("type") in ("WELL", "polyline"):
                 continue
+
             seg_lists = self._collect_selected_refine_segments(s_idx)
             if not seg_lists:
                 continue
@@ -3007,6 +5485,21 @@ class MeshItWorkflowGUI(QMainWindow):
             total += 1
             name = ds.get("name", f"Surface_{s_idx}")
             try:
+                # Build per-surface config
+                unified_target = float(self.mesh_target_feature_size_input.value())
+                per_surface_target = float(self._get_mesh_target_size_for_surface(s_idx))
+                # Clamp negative/silly inputs
+                if per_surface_target <= 1e-9:
+                    per_surface_target = max(1.0, unified_target)
+
+                cfg = {
+                    "target_size": per_surface_target,
+                    "min_angle":  float(self.mesh_min_angle_input.value()),
+                    "max_area":   float(per_surface_target) ** 2 * 1.5,
+                    "interp":     self.mesh_interp_combo.currentText(),
+                    "smoothing":  float(self.mesh_smoothing_input.value()),
+                }
+
                 surf_data = self._prepare_surface_data_for_triangulation(s_idx, ds, cfg)
                 if not surf_data:
                     raise RuntimeError("surface-data prep failed")
@@ -3021,43 +5514,35 @@ class MeshItWorkflowGUI(QMainWindow):
                 pts2d = (np.array([[p.x, p.y, p.z] for p in pts3d]) - centroid) @ basis.T
                 pts2d = pts2d[:, :2]
 
+                holes_2d = []
+                if holes:
+                    holes_3d = np.array([[h.x, h.y, h.z] for h in holes])
+                    holes_2d = (holes_3d - centroid) @ basis.T
+                    holes_2d = holes_2d[:, :2]
+
                 v3d, tris, _ = run_constrained_triangulation_py(
-                    pts2d, seg_arr, holes, proj,
+                    pts2d, seg_arr, holes_2d, proj,
                     np.array([[p.x, p.y, p.z] for p in pts3d]), cfg
                 )
 
                 if v3d is None or len(v3d) == 0 or tris is None or len(tris) == 0:
                     raise RuntimeError("triangulation returned empty result")
 
-                ds["conforming_mesh"] = {
-                    "vertices": v3d,
-                    "triangles": tris,
-                    "statistics": {
-                        "num_vertices": len(v3d),
-                        "num_triangles": len(tris),
-                        "num_constraints": len(seg_arr),
-                        "target_size": tgt,
-                        "surface_size": surf_data.get("size", "unknown"),
-                        "effective_mesh_density": f"{len(tris) / max(1, len(v3d)):.2f} triangles/vertex",
-                    },
-                }
+                ds.setdefault("conforming_mesh", {})
+                ds["conforming_mesh"]["vertices"] = v3d
+                ds["conforming_mesh"]["triangles"] = tris
+                ds["conforming_mesh"]["holes"] = [[h.x, h.y, h.z] for h in holes] if holes else []
+
                 ok += 1
-                density_ratio = len(tris) / max(1, len(v3d))
-                logger.info(f"✓ {name}: {len(v3d)} verts, {len(tris)} tris (density: {density_ratio:.2f} tri/vert, target: {tgt})")
+                logger.info(f"✓ Conforming mesh generated for '{name}': {len(v3d)} vertices, {len(tris)} triangles")
             except Exception as e:
-                logger.error(f"✗ {name}: {e}", exc_info=True)
-                fails.append((s_idx, name, str(e)))
+                fails.append((name, str(e)))
+                logger.error(f"Conforming mesh generation FAILED for '{name}': {e}")
 
-        msg = f"Conforming mesh generation finished: {ok}/{total} surfaces succeeded."
         if fails:
-            msg += "\n\nFailures:\n" + "\n".join(f"• {n}: {err}" for _, n, err in fails)
-            QMessageBox.warning(self, "Conforming Mesh Generation", msg)
-        else:
-            QMessageBox.information(self, "Conforming Mesh Generation", msg)
-
-        self.statusBar().showMessage(msg, 8000)
-        self._update_conforming_mesh_summary(ok, total, fails)
-        self._update_conforming_mesh_visualization()
+            logger.warning(f"Conforming mesh generation failures: {len(fails)}")
+        self._update_refined_visualization()
+        self.statusBar().showMessage(f"Conforming surface mesh generation finished: {ok}/{total} succeeded.", 6000)
 
 
     def _prepare_surface_data_for_triangulation(self, dataset_idx, dataset, config):
@@ -3647,58 +6132,75 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.error(f"Error adding intersection lines to visualization: {e}")
 
     def load_file(self):
-        """Load data from a file"""
+        """Load a single data file"""
         self.statusBar().showMessage("Loading file...")
-        
-        # Open file dialog
         file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select a point data file",
-            "",
-            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;All files (*.*)"
+            self, "Select a point data file", "",
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
         )
-        
         if not file_path:
             self.statusBar().showMessage("File loading canceled")
             return
-            
-        # Update status with file path
-        self.statusBar().showMessage(f"Loading file: {os.path.basename(file_path)}...")
-        
+
         try:
-            # Try to read the file
             points = self._read_point_file(file_path)
-            
             if points is not None and len(points) > 0:
-                self.points = points
-                
-                # Visualize the loaded points
-                self._plot_points(points)
-                
-                self.statusBar().showMessage(f"Successfully loaded {len(points)} points")
-                
-                # Clear any previous results from later steps
-                self.hull_points = None
-                self.segments = None
-                self.triangulation_result = None
-                
-                # Update other views
-                self._clear_hull_plot()
-                self._clear_segment_plot()
-                self._clear_triangulation_plot()
+                filename = os.path.basename(file_path)
+                dataset = {
+                    'name': filename,
+                    'type': 'SURFACE',   # mark as SURFACE
+                    'points': points,
+                    'visible': True,
+                    'color': self._get_next_color()
+                }
+                self.datasets.append(dataset)
+                self.current_dataset_index = len(self.datasets) - 1
+                self._clear_segmentation_visualization_flag()
+                self._update_dataset_list()
+                self._update_statistics()
+                self._visualize_all_points()
+                self.statusBar().showMessage(f"Successfully loaded {len(points)} points from {filename}")
             else:
                 self.statusBar().showMessage("Error: No valid points found in file")
                 QMessageBox.critical(self, "Error", "No valid points found in file")
-        
         except Exception as e:
             self.statusBar().showMessage(f"Error loading file: {str(e)}")
             logger.error(f"Error loading file: {str(e)}")
             QMessageBox.critical(self, "Error", f"Error loading file: {str(e)}")
+
     
     def _read_point_file(self, file_path):
         """Read points from a file, handling various delimiters and formats."""
         points = []
         try:
+            # Check file extension to determine reading method
+            ext = os.path.splitext(file_path)[1].lower()
+            
+            # Handle VTU files using PyVista (if available)
+            if ext == '.vtu':
+                if not HAVE_PYVISTA:
+                    raise ValueError("PyVista is required to read VTU files. Please install PyVista.")
+                
+                logger.info(f"Reading VTU file using PyVista: {file_path}")
+                mesh = pv.read(file_path)
+                
+                # Extract points from the mesh
+                if hasattr(mesh, 'points') and mesh.points is not None:
+                    points = mesh.points
+                    logger.info(f"Successfully extracted {len(points)} points from VTU mesh")
+                    
+                    # Ensure 3D format
+                    if points.shape[1] < 3:
+                        points_3d = np.zeros((len(points), 3))
+                        points_3d[:, :points.shape[1]] = points
+                        return points_3d
+                    
+                    return points[:, :3]  # Return first 3 columns (x, y, z)
+                else:
+                    raise ValueError("No point data found in VTU file")
+            
+            # Handle text-based files (.txt, .csv, .dat) with existing logic
+            # Handle text-based files (.txt, .csv, .dat) with existing logic
             # --- Primary Method: Line-by-line parsing for robustness --- 
             with open(file_path, 'r') as f:
                 for line_num, line in enumerate(f):
@@ -3747,7 +6249,7 @@ class MeshItWorkflowGUI(QMainWindow):
             else:
                  logger.info("Line-by-line parsing yielded no points, trying np.loadtxt.")
 
-            # --- Fallback Method: np.loadtxt --- 
+            # --- Fallback Method: np.loadtxt for text files --- 
             points = None # Reset points if primary method failed
             ext = os.path.splitext(file_path)[1].lower()
             delimiters_to_try = [None, '\t', ',', ' '] # None tries whitespace
@@ -3989,26 +6491,23 @@ class MeshItWorkflowGUI(QMainWindow):
     # ------------------------------------------------------------------------
 
 
+    # Replace the entire _compute_hull_for_dataset method with this:
     def _compute_hull_for_dataset(self, dataset_index: int) -> bool:
         """
         Compute (and store) the boundary poly-line for the selected dataset.
-        For 2D data, this is the convex hull.
-        For 3D sheet-like data, this finds the ordered "rim" or "outline" by:
-            1. Projecting all points to a 2D plane.
-            2. Performing a Delaunay triangulation on the 2D points.
-            3. Identifying the boundary edges (edges belonging to only one triangle).
-            4. Stitching these edges into a continuous, ordered polyline.
+        - For 2D data, this computes the convex hull.
+        - For 3D sheet-like data, this finds the ordered "rim" or "outline"
+        (which can be concave) by finding the boundary of a Delaunay triangulation.
+        
+        This version also identifies and marks geometric corners as "special points"
+        immediately after calculation, preparing it for robust segmentation.
 
-        Returns
-        -------
-        bool
-            True  -> hull stored in dataset['hull_points']
-            False -> error (logged)
+        Returns:
+            bool: True if a boundary was computed and stored in dataset['hull_points'].
         """
         from scipy.spatial import ConvexHull, Delaunay
         import traceback
 
-        # ------------ Basic checks ------------------------------------------------
         if not (0 <= dataset_index < len(self.datasets)):
             logger.error("Invalid dataset index %s for hull computation", dataset_index)
             return False
@@ -4016,60 +6515,48 @@ class MeshItWorkflowGUI(QMainWindow):
         ds = self.datasets[dataset_index]
         pts = ds.get("points")
         if pts is None or len(pts) < 3:
-            logger.warning("Dataset %s needs ≥3 points for hull", dataset_index)
+            logger.warning("Dataset '%s' has < 3 points, skipping hull computation.", ds.get('name'))
             return False
 
-        dim = pts.shape[1]
         try:
-            # ======================================================================
-            # 2-D CASE: Convex hull is correct and efficient here.
-            # ======================================================================
-            if dim == 2:
-                hull_on_plane = ConvexHull(pts)
-                hull_pts = pts[hull_on_plane.vertices]
+            dim = pts.shape[1]
+            hull_pts_np = None
 
-            # ======================================================================
-            # 3-D CASE: Use Delaunay triangulation to find the true boundary.
-            # ======================================================================
+            # --- BRANCH 1: Strict 2D data ---
+            # For pure 2D data, the convex hull is the correct and efficient approach.
+            if dim == 2:
+                logger.info(f"Computing 2D convex hull for '{ds.get('name')}'...")
+                hull = ConvexHull(pts)
+                hull_pts_2d = pts[hull.vertices]
+                # Convert to 3D for consistency, setting Z=0
+                hull_pts_np = np.hstack([hull_pts_2d, np.zeros((len(hull_pts_2d), 1))])
+
+            # --- BRANCH 2: 3D Data (Handles Convex and Concave Boundaries) ---
             else: # dim >= 3
-                # 1. Project all 3D points onto their best-fit 2D plane.
+                logger.info(f"Computing 3D data boundary for '{ds.get('name')}' using Delaunay triangulation...")
+                # 1. Project all 3D points onto their best-fit 2D plane using PCA.
                 _centroid, projected_pts_2d = self._pca_project(pts)
 
                 # 2. Perform Delaunay triangulation on the 2D projected points.
                 tri = Delaunay(projected_pts_2d)
 
-                # 3. Find the boundary edges. These are edges that appear only once.
+                # 3. Find the boundary edges (edges that appear in only one triangle).
                 edges = set()
-                # A map from vertex index to the list of edges it is part of.
-                edge_map = {}
-
-                for i, simplex in enumerate(tri.simplices):
+                for simplex in tri.simplices:
                     for j in range(3):
-                        p1_idx = simplex[j]
-                        p2_idx = simplex[(j + 1) % 3]
-                        
-                        # Canonical edge representation (sorted indices)
+                        p1_idx, p2_idx = simplex[j], simplex[(j + 1) % 3]
                         edge = tuple(sorted((p1_idx, p2_idx)))
-                        
-                        if p1_idx not in edge_map: edge_map[p1_idx] = []
-                        if p2_idx not in edge_map: edge_map[p2_idx] = []
-                        edge_map[p1_idx].append(edge)
-                        edge_map[p2_idx].append(edge)
-                        
                         if edge in edges:
-                            # This edge is shared, so it's not a boundary edge.
-                            edges.remove(edge)
+                            edges.remove(edge) # Internal edge, remove it.
                         else:
-                            # First time we see this edge.
-                            edges.add(edge)
+                            edges.add(edge) # Potential boundary edge.
                 
-                # 4. Stitch the unordered boundary edges into a continuous path.
                 if not edges:
-                    logger.warning("Delaunay method found no boundary edges. Falling back to convex hull.")
-                    hull_on_plane = ConvexHull(projected_pts_2d)
-                    hull_pts = pts[hull_on_plane.vertices]
+                    logger.warning("Delaunay method found no boundary edges. Falling back to convex hull on projected points.")
+                    hull = ConvexHull(projected_pts_2d)
+                    hull_pts_np = pts[hull.vertices]
                 else:
-                    # Start the walk.
+                    # 4. Stitch the unordered boundary edges into a continuous path.
                     ordered_indices = []
                     current_edge = edges.pop()
                     ordered_indices.extend(list(current_edge))
@@ -4077,8 +6564,7 @@ class MeshItWorkflowGUI(QMainWindow):
                     while edges:
                         last_point_idx = ordered_indices[-1]
                         found_next = False
-                        # Find the next edge connected to the last point.
-                        for edge in edges:
+                        for edge in list(edges): # Iterate over a copy
                             if last_point_idx in edge:
                                 next_point_idx = edge[1] if edge[0] == last_point_idx else edge[0]
                                 ordered_indices.append(next_point_idx)
@@ -4089,18 +6575,34 @@ class MeshItWorkflowGUI(QMainWindow):
                             logger.warning("Boundary walk broken. The result might be incomplete or have multiple loops.")
                             break
                     
-                    # 5. Create the final ordered polyline from the original 3D points.
-                    hull_pts = pts[ordered_indices]
+                    # 5. Get the final ordered polyline from the original 3D points.
+                    hull_pts_np = pts[ordered_indices]
 
-            # ------------ Close the poly-line for visualization -----------------
-            if len(hull_pts) > 0 and not np.array_equal(hull_pts[0], hull_pts[-1]):
-                hull_pts = np.vstack([hull_pts, hull_pts[0:1]])
+            # --- Post-processing for BOTH cases ---
 
-            # ------------ Store result and cleanup ------------------------------
-            ds["hull_points"] = hull_pts
+            # Ensure the polyline is closed for processing
+            if len(hull_pts_np) > 0 and not np.array_equal(hull_pts_np[0], hull_pts_np[-1]):
+                hull_pts_np = np.vstack([hull_pts_np, hull_pts_np[0:1]])
+            
+            # Convert numpy array to list of Vector3D objects, initializing type
+            hull_vector3d = [Vector3D(p[0], p[1], p[2], point_type="DEFAULT") for p in hull_pts_np]
+                
+            # Identify and mark special corner points using our utility function
+            hull_vector3d = make_corners_special(hull_vector3d)
+
+            # Store the final hull as a NumPy array of [x, y, z, type_string]
+            # This is the crucial format for passing feature info to the next steps.
+            hull_with_types = []
+            for p in hull_vector3d:
+                ptype = getattr(p, 'point_type', "DEFAULT")
+                hull_with_types.append([p.x, p.y, p.z, ptype])
+                
+            ds["hull_points"] = np.array(hull_with_types, dtype=object)
+
+            # Clear downstream results as they are now invalid
             ds.pop("segments", None)
             ds.pop("triangulation_result", None)
-            logger.info(f"Successfully computed boundary for '{ds.get('name')}' with {len(hull_pts)-1} vertices.")
+            logger.info(f"Successfully computed and analyzed boundary for '{ds.get('name')}' with {len(hull_pts_np)-1} vertices.")
             return True
 
         except Exception as exc:
@@ -4317,48 +6819,7 @@ segmentation, triangulation, and visualization.
             logger.error(f"Error creating simplified hull: {e}")
             return hull_points  # Return original if simplification fails
 
-    def _compute_segments_for_dataset_with_simplified_hull(self, dataset_index):
-        """
-        Alternative segmentation method using simplified 4-corner hull.
-        This is useful for very complex hulls where you want simple rectangular segmentation.
-        """
-        # Check index validity
-        if not (0 <= dataset_index < len(self.datasets)):
-            logger.error(f"Invalid dataset index {dataset_index} for segmentation.")
-            return False
-
-        dataset = self.datasets[dataset_index]
-        dataset_name = dataset.get('name', f"Dataset {dataset_index}")
-        
-        if dataset.get('hull_points') is None or len(dataset['hull_points']) < 4:
-            self.statusBar().showMessage(f"Skipping segments for {dataset_name}: Compute convex hull first")
-            logger.warning(f"Skipping segments for {dataset_name}: hull not computed.")
-            return False
-
-        try:
-            # Get the complex hull
-            original_hull = dataset['hull_points']
-            
-            # Create simplified 4-corner hull for segmentation
-            simplified_hull = self._create_simplified_hull_for_segmentation(original_hull)
-            
-            # Temporarily replace hull for segmentation
-            dataset['hull_points'] = simplified_hull
-            
-            # Run normal segmentation on simplified hull
-            success = self._compute_segments_for_dataset(dataset_index)
-            
-            # Restore original complex hull
-            dataset['hull_points'] = original_hull
-            
-            if success:
-                logger.info(f"Used simplified hull approach for segmentation of '{dataset_name}'")
-            
-            return success
-            
-        except Exception as e:
-            logger.error(f"Error in simplified hull segmentation for {dataset_name}: {str(e)}")
-            return False
+    
 
     def _find_point_at_distance_fast(self, hull_boundary, cumulative_distances, target_distance):
         """
@@ -4452,8 +6913,14 @@ segmentation, triangulation, and visualization.
             return hull_boundary[0] if len(hull_boundary) > 0 else np.array([0, 0])
 
     def _compute_segments_for_dataset(self, dataset_index):
-        """Compute the segmentation for a specific dataset index. Returns True on success, False on error."""
-        # Check index validity
+        """
+        Compute segmentation using the robust RefineByLength approach. This method
+        takes the pre-processed hull (with corner points marked) and refines it
+        based on the per-surface target feature size, preserving geometric features.
+
+        Returns:
+            bool: True on success, False on error.
+        """
         if not (0 <= dataset_index < len(self.datasets)):
             logger.error(f"Invalid dataset index {dataset_index} for segmentation.")
             return False
@@ -4461,138 +6928,51 @@ segmentation, triangulation, and visualization.
         dataset = self.datasets[dataset_index]
         dataset_name = dataset.get('name', f"Dataset {dataset_index}")
         
-        if dataset.get('hull_points') is None or len(dataset['hull_points']) < 4:  # 3 vertices + 1 closing point
-            self.statusBar().showMessage(f"Skipping segments for {dataset_name}: Compute convex hull first")
-            logger.warning(f"Skipping segments for {dataset_name}: hull not computed.")
-            return False # Indicate error or skip
-
-        # --- START EDIT: Get target size from new control ---
-        # Get the segmentation parameter from the UI
-        try:
-            effective_segment_length = float(self.target_feature_size_input.value())
-            if effective_segment_length <= 1e-6: # Use a small threshold instead of zero
-                logger.warning("Target Feature Size is too small, using default value (1.0).")
-                effective_segment_length = 1.0
-        except ValueError:
-            logger.warning("Invalid Target Feature Size, using default value (1.0).")
-            effective_segment_length = 1.0
-        # --- END EDIT ---
+        hull_points_with_types = dataset.get('hull_points')
+        if hull_points_with_types is None or len(hull_points_with_types) < 4:
+            logger.warning(f"Skipping segments for {dataset_name}: hull not computed or too small.")
+            return False
 
         try:
-            # Extract the hull boundary (excluding the closing point)
-            hull_boundary = dataset['hull_points'][:-1]
-            hull_size = len(hull_boundary)
+            # PER-SURFACE length from the table (fallback handled inside helper)
+            target_length = float(self._get_seg_target_length_for_dataset(dataset_index))
+            if target_length <= 1e-6:
+                logger.warning("Target Feature Size is too small, using default (1.0).")
+                target_length = 1.0
+                
+            class TempHullLine:
+                def __init__(self, points_with_types):
+                    self.points = []
+                    for p in points_with_types:
+                        self.points.append(Vector3D(p[0], p[1], p[2], point_type=p[3]))
+
+            hull_line = TempHullLine(hull_points_with_types)
+
+            refined_hull_points_vec = refine_intersection_line_by_length(hull_line, target_length)
             
-            logger.info(f"Processing hull with {hull_size} vertices for segmentation of '{dataset_name}'")
-            
-            # Performance optimization: Limit the number of segments per edge to prevent excessive calculations
-            MAX_SEGMENTS_PER_EDGE = 20
-            
-            # Calculate total perimeter along the complex hull boundary
-            total_perimeter = 0
-            for i in range(hull_size):
-                p1 = hull_boundary[i]
-                p2 = hull_boundary[(i + 1) % hull_size]
-                total_perimeter += np.linalg.norm(p2 - p1)
-            
-            # For complex hulls, we need to be more adaptive with segment sizing
-            if hull_size > 20:  # Complex hull detected
-                # Use a more conservative approach for complex hulls
-                avg_edge_length = total_perimeter / hull_size
-                min_segment_length = avg_edge_length * 0.5  # Allow smaller segments for complex shapes
-            else:
-                # Simple hull - use original logic
-                avg_edge_length = total_perimeter / hull_size
-                min_segment_length = avg_edge_length / MAX_SEGMENTS_PER_EDGE
-            
-            # Use the larger of calculated min_segment_length and effective_segment_length
-            effective_segment_length = max(effective_segment_length, min_segment_length)
-            
-            # Pre-allocate segments list with reasonable capacity
-            estimated_segments = int(total_perimeter / effective_segment_length) + hull_size
             segments = []
-            
-            # Generate segments along the hull boundary with uniform distribution
-            # For complex hulls, we process the entire boundary as a continuous path
-            # instead of segmenting each individual edge
-            
-            if hull_size > 20:  # Complex hull - use continuous path approach
-                logger.info(f"Using continuous path segmentation for complex hull with {hull_size} vertices")
+            if len(refined_hull_points_vec) >= 2:
+                num_points_for_segments = len(refined_hull_points_vec)
+                if (refined_hull_points_vec[0] - refined_hull_points_vec[-1]).length_squared() < 1e-24:
+                    num_points_for_segments -= 1
                 
-                # Calculate cumulative distances along the hull boundary
-                cumulative_distances = [0.0]
-                for i in range(hull_size):
-                    p1 = hull_boundary[i]
-                    p2 = hull_boundary[(i + 1) % hull_size]
-                    dist = np.linalg.norm(p2 - p1)
-                    cumulative_distances.append(cumulative_distances[-1] + dist)
-                
-                # Create uniform segments along the entire perimeter
-                num_total_segments = max(4, int(np.ceil(total_perimeter / effective_segment_length)))
-                segment_spacing = total_perimeter / num_total_segments
-                
-                # Optimized segment creation - pre-allocate and compute in batch
-                segments = []
-                for seg_idx in range(num_total_segments):
-                    # Calculate start and end positions along the perimeter
-                    start_dist = seg_idx * segment_spacing
-                    end_dist = ((seg_idx + 1) * segment_spacing) % total_perimeter
-                    
-                    # Find start and end points (optimized version)
-                    start_point = self._find_point_at_distance_fast(hull_boundary, cumulative_distances, start_dist)
-                    end_point = self._find_point_at_distance_fast(hull_boundary, cumulative_distances, end_dist)
-                    
-                    if start_point is not None and end_point is not None:
-                        segments.append([start_point, end_point])
-                
-            else:  # Simple hull - use original edge-by-edge approach
-                logger.info(f"Using edge-by-edge segmentation for simple hull with {hull_size} vertices")
-                
-                for i in range(hull_size):
-                    p1 = hull_boundary[i]
-                    p2 = hull_boundary[(i + 1) % hull_size]
-                    
-                    # Compute edge length
-                    dist = np.linalg.norm(p2 - p1)
-                    
-                    # Skip very short edges to avoid over-segmentation
-                    if dist < effective_segment_length * 0.1:
-                        continue
-                    
-                    # Limit number of segments per edge
-                    num_segments = min(max(1, int(np.ceil(dist / effective_segment_length))), MAX_SEGMENTS_PER_EDGE)
-                    
-                    # Create segments for this edge
-                    if num_segments == 1:
-                        # Single segment for this edge
-                        segments.append([p1, p2])
-                    else:
-                        # Multiple segments for this edge
-                        t_values = np.linspace(0, 1, num_segments + 1)
-                        for j in range(num_segments):
-                            t1, t2 = t_values[j], t_values[j+1]
-                            segment_start = p1 + t1 * (p2 - p1)
-                            segment_end = p1 + t2 * (p2 - p1)
-                            segments.append([segment_start, segment_end])
-            
-            # Store the segments in the dataset - using a normal list for better performance
-            dataset['segments'] = segments
-            
-            # Log success information (reduced logging for performance)
-            logger.info(f"Successfully created {len(segments)} segments for dataset '{dataset_name}'")
-            
-            # Clear any previous results from later steps for this dataset
-            dataset.pop('triangulation_result', None)
+                for i in range(num_points_for_segments):
+                    p1 = refined_hull_points_vec[i]
+                    p2 = refined_hull_points_vec[(i + 1) % len(refined_hull_points_vec)]
+                    segments.append([p1.to_numpy(), p2.to_numpy()])
 
-            return True # Indicate success
+            dataset['segments'] = segments
+            dataset.pop('triangulation_result', None)
+            logger.info(f"Successfully created {len(segments)} segments for '{dataset_name}' using RefineByLength (per-surface={target_length}).")
+            return True
 
         except Exception as e:
-            logger.error(f"Error computing segments for {dataset_name}: {str(e)}")
-            return False # Indicate error
-
+            logger.error(f"Error computing segments for '{dataset_name}': {e}", exc_info=True)
+            return False
     def compute_segments(self):
         """Compute the segmentation of the convex hull for the *active* dataset (primarily for context menu)"""
         # Check if we have an active dataset
+        self._sync_seg_lengths_from_table()
         if self.current_dataset_index < 0 or self.current_dataset_index >= len(self.datasets):
             self.statusBar().showMessage("Error: No active dataset selected")
             QMessageBox.critical(self, "Error", "No active dataset selected")
@@ -4656,22 +7036,129 @@ segmentation, triangulation, and visualization.
             self._update_visualization() # Ensure other dependent views are updated/cleared
             self.notebook.setCurrentIndex(2)  # Switch to segment tab
             self.statusBar().showMessage(f"Computed segments for {dataset_name}")
+            self._refresh_seg_view_if_active()
         else:
             self.statusBar().showMessage("Failed to compute segments")
             QMessageBox.warning(self, "Error", "Failed to compute segments")
 
     def compute_all_segments(self):
         """Compute segmentation for all datasets that have hulls using a worker thread."""
+        self._sync_seg_lengths_from_table()
         datasets_with_hulls_indices = [i for i, d in enumerate(self.datasets) if d.get('hull_points') is not None]
         if not datasets_with_hulls_indices:
             QMessageBox.information(self, "No Hulls", "No datasets have computed hulls. Please compute hulls first.")
             return
         self._run_batch_computation("segments", len(datasets_with_hulls_indices))
-    
-    
+    def _refresh_seg_view_if_active(self):
+        """If Segmentation tab is active, force a fresh 3D redraw from current dataset['segments']."""
+        try:
+            if self.notebook.widget(self.notebook.currentIndex()) == self.segment_tab:
+                self._clear_segment_plot()
+                # Prefer 3D always when available
+                self.view_3d_enabled = HAVE_PYVISTA
+                self._visualize_all_segments()
+        except Exception:
+            pass
+    def _alpha_shape_outer_boundary(points_xy: np.ndarray, base_size: float) -> Optional[np.ndarray]:
+        import numpy as np
+        from scipy.spatial import Delaunay, cKDTree
+
+        if points_xy is None or len(points_xy) < 4:
+            return None
+
+        # Adaptive radius from density and GUI size
+        tree = cKDTree(points_xy)
+        dists, _ = tree.query(points_xy, k=min(8, len(points_xy)))
+        nn_med = float(np.median(dists[:, 1])) if dists.shape[1] > 1 else float(np.median(dists))
+        R = max(1.0 * nn_med, 0.75 * max(base_size, 1e-6))  # radius
+        alpha = 1.0 / max(R, 1e-12)
+
+        tri = Delaunay(points_xy)
+        simplices = tri.simplices
+        if len(simplices) == 0:
+            return None
+
+        pts = points_xy
+        kept = []
+        for tri_idx in simplices:
+            ia, ib, ic = tri_idx
+            pa, pb, pc = pts[ia], pts[ib], pts[ic]
+            a = np.linalg.norm(pb - pc)
+            b = np.linalg.norm(pa - pc)
+            c = np.linalg.norm(pa - pb)
+            s2 = max((a + b + c) * (b + c - a) * (a + c - b) * (a + b - c), 0.0)
+            if s2 == 0.0:
+                continue
+            area = 0.25 * np.sqrt(s2)
+            if area <= 1e-12:
+                continue
+            Rcirc = (a * b * c) / (4.0 * area)
+            if Rcirc < 1.0 / alpha:  # keep small-radius triangles
+                kept.append((ia, ib, ic))
+
+        if not kept:
+            return None
+
+        # Boundary edges = edges used by exactly one kept triangle
+        from collections import Counter, defaultdict
+        edge_counter = Counter()
+        for ia, ib, ic in kept:
+            for e in ((ia, ib), (ib, ic), (ic, ia)):
+                edge = tuple(sorted(e))
+                edge_counter[edge] += 1
+
+        boundary_edges = [e for e, cnt in edge_counter.items() if cnt == 1]
+        if len(boundary_edges) < 3:
+            return None
+
+        # Build adjacency and trace outer ring
+        adj = defaultdict(list)
+        for i, j in boundary_edges:
+            adj[i].append(j)
+            adj[j].append(i)
+
+        # Pick start on the extreme (leftmost) boundary vertex
+        start = min(adj.keys(), key=lambda idx: (pts[idx][0], pts[idx][1]))
+        ring = [start]
+        prev = None
+        cur = start
+        for _ in range(len(boundary_edges) + 5):
+            nbrs = adj[cur]
+            # choose neighbor with smallest left turn to keep turning consistently
+            if prev is None:
+                nxt = nbrs[0]
+            else:
+                v_prev = pts[cur] - pts[prev]
+                best = None
+                best_angle = +1e9
+                for nb in nbrs:
+                    if nb == prev:
+                        continue
+                    v_nb = pts[nb] - pts[cur]
+                    # prefer smallest rightward angle to continue around boundary
+                    cross = v_prev[0] * v_nb[1] - v_prev[1] * v_nb[0]
+                    dot = np.dot(v_prev, v_nb)
+                    angle = -np.arctan2(cross, dot)  # negative to bias consistent turn
+                    if angle < best_angle:
+                        best_angle = angle
+                        best = nb
+                nxt = best if best is not None else (nbrs[0] if len(nbrs) > 0 else None)
+            if nxt is None:
+                break
+            if nxt == ring[0]:
+                ring.append(nxt)
+                break
+            ring.append(nxt)
+            prev, cur = cur, nxt
+
+        if len(ring) < 4 or ring[0] != ring[-1]:
+            return None
+
+        # Ensure uniqueness and return XY polyline (closed)
+        coords = pts[np.array(ring[:-1], dtype=int)]
+        return coords
     def _run_triangulation_for_dataset(self, dataset_index):
         """Run triangulation for a specific dataset index. Returns True on success, False on error."""
-        # Check index validity
         if not (0 <= dataset_index < len(self.datasets)):
             logger.error(f"Invalid dataset index {dataset_index} for triangulation.")
             return False
@@ -4684,370 +7171,264 @@ segmentation, triangulation, and visualization.
             logger.warning(f"Skipping triangulation for {dataset_name}: segments not computed.")
             return False
 
-        # Get triangulation parameters from GUI
         gradient = self.gradient_input.value()
         min_angle = self.min_angle_input.value()
         uniform = self.uniform_checkbox.isChecked()
+        interp_label = self.interp_combo.currentText() if hasattr(self, "interp_combo") else "Thin Plate Spline (TPS)"
+        smoothing = float(self.interp_smoothing_input.value()) if hasattr(self, "interp_smoothing_input") else 0.0
 
-        # --- START EDIT: Get base_size from the unified control ---
         try:
-            base_size = float(self.target_feature_size_input.value())
-            if base_size <= 1e-6:
-                logger.warning("Target Feature Size (used as base_size) is too small, using default (1.0).")
+            import numpy as np
+            from scipy.spatial import Delaunay, cKDTree
+            from scipy.interpolate import RBFInterpolator, CloughTocher2DInterpolator
+            from meshit.triangle_direct import DirectTriangleWrapper
+
+            # Common rotation basis (C++ rotate-by-normal)
+            all_pts = np.asarray(dataset['points'], dtype=float)
+            centred = all_pts - all_pts.mean(axis=0, keepdims=True)
+            _, _, vh = np.linalg.svd(centred, full_matrices=False)
+            normal = vh[-1];  normal = -normal if normal[2] < 0.0 else normal
+            z_axis = np.array([0.0, 0.0, 1.0], dtype=float)
+
+            def build_rot(n, onto_z=True):
+                axis = np.cross(n, z_axis) if onto_z else np.cross(z_axis, n)
+                c = float(np.dot(z_axis, n)) if onto_z else float(np.dot(n, z_axis))
+                an = np.linalg.norm(axis)
+                if 1.0 - abs(c) < 1e-12 or an < 1e-15:
+                    return np.eye(3)
+                axis = axis / an; s = np.sqrt(1.0 - c*c); C = 1.0 - c
+                r1 = np.array([axis[0]*axis[0]*C + c,        axis[0]*axis[1]*C - axis[2]*s, axis[0]*axis[2]*C + axis[1]*s])
+                r2 = np.array([axis[1]*axis[0]*C + axis[2]*s, axis[1]*axis[1]*C + c,        axis[1]*axis[2]*C - axis[0]*s])
+                r3 = np.array([axis[2]*axis[0]*C - axis[1]*s, axis[2]*axis[1]*C + axis[0]*s, axis[2]*axis[2]*C + c       ])
+                return np.vstack([r1, r2, r3])
+
+            R = build_rot(normal, onto_z=True); R_inv = build_rot(normal, onto_z=False)
+            all_pts_rot = (R @ all_pts.T).T
+
+            # Build boundary points/segments from provided segments_data
+            unique_points_list, point_to_index, segment_indices = [], {}, []
+            cur = 0
+            for seg in segments_data:
+                p0, p1 = np.asarray(seg[0], float), np.asarray(seg[1], float)
+                t0, t1 = tuple(np.round(p0, 12)), tuple(np.round(p1, 12))
+                if t0 not in point_to_index: point_to_index[t0]=cur; unique_points_list.append(p0); i0=cur; cur+=1
+                else: i0 = point_to_index[t0]
+                if t1 not in point_to_index: point_to_index[t1]=cur; unique_points_list.append(p1); i1=cur; cur+=1
+                else: i1 = point_to_index[t1]
+                segment_indices.append([i0, i1])
+            boundary_xyz = np.asarray(unique_points_list, float)
+            boundary_segs = np.asarray(segment_indices, int)
+
+            boundary_rot = (R @ boundary_xyz.T).T
+            provided_xy = boundary_rot[:, :2]
+
+            try:
+                base_size = float(self._get_seg_target_length_for_dataset(dataset_index))
+                if base_size <= 1e-6: base_size = 1.0
+            except Exception:
                 base_size = 1.0
-        except ValueError:
-            logger.warning("Invalid Target Feature Size (used as base_size), using default (1.0).")
-            base_size = 1.0
-        # Remove old target_edge_length reading
-        # target_edge_length = self.target_edge_length_input.value()
-        # base_size = max(1e-9, target_edge_length)
-        # --- END EDIT ---
 
-        try:
-            start_time = time.time()
+            # Triangulation (no hull snapping for non-legacy)
+            triangulator = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=base_size)
+            tri_res = triangulator.triangulate(points=provided_xy, segments=boundary_segs, uniform=uniform, create_transition=True)
+            if tri_res is None or 'vertices' not in tri_res or 'triangles' not in tri_res:
+                raise ValueError("Triangulation failed.")
+            vertices_xy = tri_res['vertices']; triangles = tri_res['triangles']
 
-            # Extract unique points and segment indices from segments
-            segment_points = []
-            for segment in segments_data:
-                segment_points.append(segment[0])
-                segment_points.append(segment[1])
+            # Prepare interpolation data
+            sample_xy = all_pts_rot[:, :2]; sample_z = all_pts_rot[:, 2]
 
-            unique_points_list = []
-            point_to_index = {}
-            segment_indices = []
+            # Legacy branch keeps hull+snap
+            if "Legacy" in interp_label:
+                tree = cKDTree(sample_xy)
+                k = min(64, len(sample_xy))
+                dists, idxs = tree.query(vertices_xy, k=k)
+                if k == 1: dists = dists[:, None]; idxs = idxs[:, None]
 
-            current_index = 0
-            for segment in segments_data:
-                start_pt, end_pt = segment[0], segment[1]
-                start_tuple = tuple(start_pt)
-                end_tuple = tuple(end_pt)
+                def key_xy(xy): return (round(float(xy[0]), 9), round(float(xy[1]), 9))
+                boundary_map = {key_xy(p[:2]): float(p[2]) for p in boundary_rot}
 
-                if start_tuple not in point_to_index:
-                    point_to_index[start_tuple] = current_index
-                    unique_points_list.append(start_pt)
-                    start_idx = current_index
-                    current_index += 1
-                else:
-                    start_idx = point_to_index[start_tuple]
+                final_vertices_rot3d = np.zeros((len(vertices_xy), 3), float)
+                final_vertices_rot3d[:, :2] = vertices_xy
+                for i in range(len(vertices_xy)):
+                    kxy = key_xy(vertices_xy[i])
+                    if kxy in boundary_map:
+                        final_vertices_rot3d[i, 2] = boundary_map[kxy]; continue
+                    di = dists[i]; ii = idxs[i]
+                    r2 = np.maximum(di*di, 1e-24); w = 1.0 / (r2 * r2); wsum = float(np.sum(w))
+                    final_vertices_rot3d[i, 2] = float(np.sum(w * sample_z[ii]) / wsum) if wsum > 0 else float(np.mean(sample_z))
 
-                if end_tuple not in point_to_index:
-                    point_to_index[end_tuple] = current_index
-                    unique_points_list.append(end_pt)
-                    end_idx = current_index
-                    current_index += 1
-                else:
-                    end_idx = point_to_index[end_tuple]
+                final_vertices_3d = (R_inv @ final_vertices_rot3d.T).T
+                dataset['triangulation_result'] = {'vertices': final_vertices_3d, 'triangles': triangles}
+                logger.info(f"Triangulation for {dataset_name} (Legacy) completed. V={len(final_vertices_3d)}, T={len(triangles)}")
+                return True
 
-                segment_indices.append([start_idx, end_idx])
+            # Other methods: interpolation only, no hull/snap
+            def interp_linear(q):
+                dela = Delaunay(sample_xy); out = np.empty(len(q), float); out[:] = np.nan
+                s = dela.find_simplex(q); inside = s >= 0
+                if np.any(inside):
+                    T = dela.transform[s[inside]]; r = q[inside] - T[:, 2]
+                    bary = np.einsum('ijk,ik->ij', T[:, :2, :], r)
+                    w0 = 1.0 - bary.sum(axis=1); w1 = bary[:, 0]; w2 = bary[:, 1]
+                    inds = dela.simplices[s[inside]]
+                    out[inside] = w0*sample_z[inds[:, 0]] + w1*sample_z[inds[:, 1]] + w2*sample_z[inds[:, 2]]
+                if np.any(~inside):
+                    tree = cKDTree(sample_xy); k = min(12, len(sample_xy))
+                    d, idx = tree.query(q[~inside], k=k)
+                    if k==1: d=d[:,None]; idx=idx[:,None]
+                    P = sample_xy[idx]; Z = sample_z[idx]
+                    A = np.concatenate([P, np.ones((P.shape[0],P.shape[1],1))], axis=2); At = np.transpose(A,(0,2,1))
+                    coef = np.linalg.solve(At@A, At@Z[...,None]); a=coef[:,0,0]; b=coef[:,1,0]; c=coef[:,2,0]
+                    uv = q[~inside]; out[~inside] = a*uv[:,0] + b*uv[:,1] + c
+                return out
 
-            all_boundary_points = np.array(unique_points_list)
-            boundary_segments_indices = np.array(segment_indices)
-            logger.info(f"Using {len(all_boundary_points)} unique points and {len(boundary_segments_indices)} segments from segmentation step for triangulation.")
+            def interp_idw(q, power=4):
+                tree = cKDTree(sample_xy); k = min(64, len(sample_xy))
+                d, idx = tree.query(q, k=k)
+                if k==1: d=d[:,None]; idx=idx[:,None]
+                r2 = np.maximum(d*d, 1e-24); w = 1.0/(r2**(power/2.0)); wsum = np.sum(w, axis=1)
+                return np.sum(w * sample_z[idx], axis=1) / wsum
 
-            # Projection and reconstruction logic
-            all_dataset_points = np.array(dataset['points'])
-            plane_normal = None
-            projected_boundary_points = all_boundary_points.copy()
+            def interp_plane(q):
+                tree = cKDTree(sample_xy); k = min(12, len(sample_xy))
+                d, idx = tree.query(q, k=k)
+                if k==1: d=d[:,None]; idx=idx[:,None]
+                P = sample_xy[idx]; Z = sample_z[idx]
+                A = np.concatenate([P, np.ones((P.shape[0],P.shape[1],1))], axis=2); At = np.transpose(A,(0,2,1))
+                coef = np.linalg.solve(At@A, At@Z[...,None]); a=coef[:,0,0]; b=coef[:,1,0]; c=coef[:,2,0]
+                return a*q[:,0] + b*q[:,1] + c
 
-            if all_dataset_points.shape[1] > 2:
-                logger.info(f"Projecting ALL 3D points to best-fit plane for triangulation for {dataset_name}")
-                
-                # Find best-fitting plane using ALL points
-                centroid = np.mean(all_dataset_points, axis=0)
-                centered_all_points = all_dataset_points - centroid
-                u, s, vh = np.linalg.svd(centered_all_points, full_matrices=False)
-                projection_basis = vh[:2]
-                plane_normal = vh[2]
-                
-                # Project ALL points to 2D
-                all_points_2d = np.dot(centered_all_points, projection_basis.T)
-                
-                # Project boundary points using the same projection
-                centered_boundary = all_boundary_points - centroid
-                boundary_points_2d = np.dot(centered_boundary, projection_basis.T)
-                
-                # For complex hulls with many vertices, use intelligent subsampling
-                # instead of all original dataset points for interpolation efficiency
-                hull_size = len(dataset.get('hull_points', []))
-                if hull_size > 100:  # Complex hull detected
-                    # Use intelligent subsampling to maintain accuracy while improving performance
-                    max_interpolation_points = 500  # Balance between accuracy and performance
-                    if len(all_dataset_points) > max_interpolation_points:
-                        logger.info(f"Using intelligent subsampling ({max_interpolation_points}) from {len(all_dataset_points)} dataset points for efficient interpolation")
-                        
-                        # Subsample the dataset points intelligently
-                        # Always include boundary points + interior sampling
-                        step_size = max(1, len(all_dataset_points) // max_interpolation_points)
-                        subsampled_indices = list(range(0, len(all_dataset_points), step_size))
-                        
-                        # Ensure we don't exceed our limit
-                        if len(subsampled_indices) > max_interpolation_points:
-                            subsampled_indices = subsampled_indices[:max_interpolation_points]
-                        
-                        sampled_3d_points = all_dataset_points[subsampled_indices]
-                        sampled_2d_points = all_points_2d[subsampled_indices]
-                        
-                        dataset['original_points_3d'] = sampled_3d_points
-                        dataset['projected_points_2d'] = sampled_2d_points
-                        projection_reference_points = sampled_3d_points
-                        projection_reference_2d = sampled_2d_points
-                    else:
-                        logger.info(f"Using all dataset points ({len(all_dataset_points)}) for interpolation (within limit)")
-                        # Use all dataset points as they're within our limit
-                        dataset['original_points_3d'] = all_dataset_points.copy()
-                        dataset['projected_points_2d'] = all_points_2d
-                        projection_reference_points = all_dataset_points.copy()
-                        projection_reference_2d = all_points_2d
-                else:
-                    # For simple hulls, use all dataset points as before
-                    dataset['original_points_3d'] = all_dataset_points.copy()
-                    dataset['projected_points_2d'] = all_points_2d
-                    projection_reference_points = all_dataset_points.copy()
-                    projection_reference_2d = all_points_2d
-                
-                projected_boundary_points = boundary_points_2d
-                
-                dataset['projection_params'] = {
-                    'centroid': centroid,
-                    'basis': projection_basis,
-                    'normal': plane_normal,
-                    'original_points': all_boundary_points.copy(),
-                    'all_original_points': projection_reference_points
-                }
-            else:
-                projected_boundary_points = all_boundary_points
-                dataset['projection_params'] = None
+            def interp_tps(q):
+                try:
+                    from scipy.interpolate import RBFInterpolator
+                    # Use all points, but limit neighbors for speed (like moving window in C++)
+                    # neighbors=50 is a good tradeoff; adjust as needed
+                    rbf = RBFInterpolator(
+                        sample_xy, sample_z,
+                        kernel='thin_plate_spline',
+                        smoothing=float(smoothing)
+                    )
+                    return rbf(q)
+                except Exception:
+                    return interp_linear(q)
+            # choose method
+            if "Thin Plate" in interp_label: 
+                z_out = interp_tps(vertices_xy)
+            elif "Linear" in interp_label:  
+                z_out = interp_linear(vertices_xy)
+            elif "IDW" in interp_label:     
+                z_out = interp_idw(vertices_xy)
+            else:                            
+                z_out = interp_plane(vertices_xy)
 
-            # Run triangulation
-            if not HAVE_DIRECT_WRAPPER:
-                logger.error("DirectTriangleWrapper not available!")
-                raise ImportError("DirectTriangleWrapper failed to import.")
+            final_vertices_rot3d = np.zeros((len(vertices_xy), 3), float)
+            final_vertices_rot3d[:, :2] = vertices_xy
+            final_vertices_rot3d[:, 2] = z_out
 
-            logger.info(f"Triangulating {dataset_name} with Target Edge Length = {base_size:.4f}")
-
-            # Initialize triangulator with mesh quality parameters
-            triangulator = DirectTriangleWrapper(
-                gradient=gradient,
-                min_angle=min_angle,
-                base_size=base_size
-            )
-
-            # Set up triangulation with enhanced transition feature points
-            triangulation_result = triangulator.triangulate(
-                points=projected_boundary_points,
-                segments=boundary_segments_indices,
-                uniform=uniform,
-                create_transition=True  # Enable enhanced transition point generation
-            )
-
-            if triangulation_result is None or 'vertices' not in triangulation_result or 'triangles' not in triangulation_result:
-                raise ValueError("Triangulation failed to produce valid output.")
-
-            vertices_2d = triangulation_result['vertices']
-            triangles = triangulation_result['triangles']
-
-            # Reconstruction logic
-            if dataset['projection_params'] is not None:
-                projection_params = dataset['projection_params']
-                centroid = projection_params['centroid']
-                basis = projection_params['basis']
-                normal = projection_params.get('normal')
-                original_boundary_points = projection_params['original_points']
-                all_original_points = projection_params.get('all_original_points')
-                all_projected_points = dataset.get('projected_points_2d')
-
-                can_calculate_planar_z = normal is not None and abs(normal[2]) > 1e-9
-                final_vertices_3d = np.zeros((len(vertices_2d), 3))
-                
-                # Performance optimization for complex hulls
-                dataset_name = dataset.get('name', 'Unknown')
-                
-                # Use segments data to determine complexity, not original hull points
-                segments_data = dataset.get('segments', [])
-                segment_count = len(segments_data)
-                is_complex_dataset = segment_count > 100  # Based on number of segments, not hull vertices
-                
-                if is_complex_dataset:
-                    logger.info(f"Processing {len(vertices_2d)} vertices for complex dataset ({segment_count} segments)")
-                else:
-                    # For simple datasets, also check original hull size for logging consistency
-                    hull_size = len(dataset.get('hull_points', []))
-                    logger.info(f"FAST processing {len(vertices_2d)} vertices for simple dataset ({hull_size} hull vertices, {segment_count} segments)")
-                
-                # PERFORMANCE OPTIMIZATION: Build spatial indices for O(log N) lookups instead of O(N²)
-                # This provides ~100x speedup for the vertex processing step that was taking minutes
-                logger.info(f"Building spatial indices for {len(all_projected_points) if all_projected_points is not None else 0} projected points...")
-                
-                # Build KDTree for all projected points for fast nearest neighbor lookup
-                all_projected_kdtree = None
-                boundary_projected_kdtree = None
-                
-                if all_projected_points is not None and len(all_projected_points) > 0:
-                    from scipy.spatial import cKDTree
-                    all_projected_kdtree = cKDTree(all_projected_points)
-                    
-                if projected_boundary_points is not None and len(projected_boundary_points) > 0:
-                    from scipy.spatial import cKDTree  
-                    boundary_projected_kdtree = cKDTree(projected_boundary_points)
-                
-                # Process vertices using fast spatial lookup instead of nested loops
-                tolerance = 1e-10
-                for i, vertex_2d in enumerate(vertices_2d):
-                    # Progress logging for complex datasets only
-                    if is_complex_dataset and i > 0 and i % 100 == 0:
-                        logger.info(f"Processed {i}/{len(vertices_2d)} vertices for {dataset_name}")
-                        
-                    is_matched_point = False
-                    
-                    # FAST: Use KDTree for O(log N) lookup instead of O(N) linear search
-                    if all_projected_kdtree is not None:
-                        distances, indices = all_projected_kdtree.query(vertex_2d, k=1)
-                        if distances < tolerance and indices < len(all_original_points):
-                            final_vertices_3d[i] = all_original_points[indices]
-                            is_matched_point = True
-                    
-                    # Try boundary points if no match found (also with fast lookup)
-                    if not is_matched_point and boundary_projected_kdtree is not None:
-                        distances, indices = boundary_projected_kdtree.query(vertex_2d, k=1)
-                        if distances < tolerance and indices < len(original_boundary_points):
-                            final_vertices_3d[i] = original_boundary_points[indices]
-                            is_matched_point = True
-                
-                # PERFORMANCE OPTIMIZATION: Pre-compute interpolation setup for batch processing
-                original_3d = projection_params.get('all_original_points')
-                projected_2d = dataset.get('projected_points_2d')
-                has_interpolation_data = False
-                
-                if original_3d is not None and projected_2d is not None and len(original_3d) > 0:
-                    # Pre-compute interpolator for better performance
-                    original_z = original_3d[:, 2]
-                    has_interpolation_data = True
-                    
-                # Collect unmatched vertices for batch interpolation (much faster)
-                unmatched_indices = []
-                unmatched_vertices_2d = []
-                
-                # Process vertices using fast spatial lookup
-                tolerance = 1e-10
-                for i, vertex_2d in enumerate(vertices_2d):
-                    # Progress logging for complex datasets only
-                    if is_complex_dataset and i > 0 and i % 100 == 0:
-                        logger.info(f"Processed {i}/{len(vertices_2d)} vertices for {dataset_name}")
-                        
-                    is_matched_point = False
-                    
-                    # FAST: Use KDTree for O(log N) lookup instead of O(N) linear search
-                    if all_projected_kdtree is not None:
-                        distances, indices = all_projected_kdtree.query(vertex_2d, k=1)
-                        if distances < tolerance and indices < len(all_original_points):
-                            final_vertices_3d[i] = all_original_points[indices]
-                            is_matched_point = True
-                    
-                    # Try boundary points if no match found (also with fast lookup)
-                    if not is_matched_point and boundary_projected_kdtree is not None:
-                        distances, indices = boundary_projected_kdtree.query(vertex_2d, k=1)
-                        if distances < tolerance and indices < len(original_boundary_points):
-                            final_vertices_3d[i] = original_boundary_points[indices]
-                            is_matched_point = True
-                    
-                    # Collect unmatched vertices for batch interpolation
-                    if not is_matched_point:
-                        unmatched_indices.append(i)
-                        unmatched_vertices_2d.append(vertex_2d)
-                
-                # PERFORMANCE: Batch interpolation for all unmatched vertices
-                if unmatched_indices and has_interpolation_data:
-                    logger.info(f"Batch interpolating Z values for {len(unmatched_indices)} unmatched vertices")
-                    
-                    # Batch interpolation - much faster than individual calls
-                    unmatched_array = np.array(unmatched_vertices_2d)
-                    interpolated_z_values = griddata(projected_2d, original_z, unmatched_array, method='linear')
-                    
-                    # Handle NaN values with nearest neighbor fallback
-                    nan_mask = np.isnan(interpolated_z_values)
-                    if np.any(nan_mask):
-                        interpolated_z_values[nan_mask] = griddata(projected_2d, original_z, unmatched_array[nan_mask], method='nearest')
-                    
-                    # Apply interpolated Z values to final vertices
-                    for idx, vertex_idx in enumerate(unmatched_indices):
-                        vertex_2d = unmatched_vertices_2d[idx]
-                        interpolated_z = interpolated_z_values[idx]
-                        
-                        # Handle remaining NaN values
-                        if np.isnan(interpolated_z):
-                            interpolated_z = centroid[2]  # Fallback to centroid Z
-                            
-                        # Reconstruct 3D point
-                        vertex_3d_reconstructed = centroid.copy()
-                        vertex_3d_reconstructed += vertex_2d[0] * basis[0]
-                        vertex_3d_reconstructed += vertex_2d[1] * basis[1]
-                        vertex_3d_reconstructed[2] = float(interpolated_z)
-                        
-                        final_vertices_3d[vertex_idx] = vertex_3d_reconstructed
-                        
-                elif unmatched_indices:
-                    # Fallback for vertices without interpolation data
-                    logger.info(f"Using planar projection for {len(unmatched_indices)} unmatched vertices")
-                    for vertex_idx in unmatched_indices:
-                        vertex_2d = vertices_2d[vertex_idx]
-                        vertex_3d_on_plane = centroid.copy()
-                        vertex_3d_on_plane += vertex_2d[0] * basis[0]
-                        vertex_3d_on_plane += vertex_2d[1] * basis[1]
-                        if can_calculate_planar_z:
-                            z_planar = centroid[2] - (normal[0]*(vertex_3d_on_plane[0] - centroid[0]) + 
-                                                    normal[1]*(vertex_3d_on_plane[1] - centroid[1])) / normal[2]
-                            vertex_3d_on_plane[2] = z_planar
-                        else:
-                            vertex_3d_on_plane[2] = centroid[2]
-                        final_vertices_3d[vertex_idx] = vertex_3d_on_plane
-                
-                final_vertices = final_vertices_3d
-            else:
-                if vertices_2d.shape[1] == 2:
-                    final_vertices = np.zeros((len(vertices_2d), 3))
-                    final_vertices[:, :2] = vertices_2d
-                else:
-                    final_vertices = vertices_2d
-
-            # Store results
-            dataset['triangulation_result'] = {
-                'vertices': final_vertices,
-                'triangles': triangles,
-                'uniform': uniform,
-                'gradient': gradient,
-                'min_angle': min_angle,
-                'target_edge_length': base_size,
-            }
-            logger.info(f"Triangulation for {dataset_name} completed. Vertices: {len(final_vertices)}, Triangles: {len(triangles)}")
+            final_vertices_3d = (R_inv @ final_vertices_rot3d.T).T
+            dataset['triangulation_result'] = {'vertices': final_vertices_3d, 'triangles': triangles}
+            logger.info(f"Triangulation for {dataset_name} completed. V={len(final_vertices_3d)}, T={len(triangles)}")
             return True
 
         except Exception as e:
-            logger.error(f"Error triangulating {dataset_name}: {str(e)}")
-            import traceback
-            logger.debug(f"Triangulation error traceback: {traceback.format_exc()}")
+            logger.error(f"Error during triangulation for '{dataset_name}': {e}", exc_info=True)
             return False
 
+    def _attach_vtu_constraints_to_all_datasets(self) -> None:
+        """
+        Parse VTU 'CON' style constraints and attach to each dataset as:
+        dataset['constraints'] = [
+            { 'type': 'SEGMENTS'|'HOLES', 'points': (M,3) float array },
+            ...
+        ]
+        If no constraints found, leaves dataset unchanged.
+        """
+        import numpy as np
+        import pyvista as pv
+
+        updated = 0
+        for idx, ds in enumerate(self.datasets):
+            path = ds.get('file_path')
+            if not path or not str(path).lower().endswith('.vtu'):
+                continue
+
+            try:
+                mesh = pv.read(path)
+                # Ensure PolyData
+                if not isinstance(mesh, pv.PolyData):
+                    mesh = mesh.extract_surface()
+
+                # We look for line cells (polylines) that carry matType per-cell info
+                # Common names seen in C++: matType, matR, matG, matB
+                matType = None
+                for key in list(mesh.cell_data.keys()):
+                    if key.lower() == 'mattype':
+                        matType = np.asarray(mesh.cell_data[key]).astype(int)
+                        break
+
+                constraints = []
+                if mesh.n_cells > 0 and mesh.lines.size > 0:
+                    lines = mesh.lines.ravel()
+                    pts = np.asarray(mesh.points, dtype=float)
+                    i = 0
+                    cell_id = 0
+                    while i < len(lines):
+                        n = int(lines[i]); i += 1
+                        ids = lines[i:i + n]; i += n
+                        if n >= 2:
+                            ring_pts = pts[ids].astype(float)
+                            # Treat as closed if endpoints coincide
+                            if np.linalg.norm(ring_pts[0] - ring_pts[-1]) > 1e-12:
+                                ring_pts = np.vstack([ring_pts, ring_pts[0]])
+
+                            ctype = 'SEGMENTS'
+                            if matType is not None and 0 <= cell_id < len(matType):
+                                if matType[cell_id] == 2:
+                                    ctype = 'HOLES'
+                                elif matType[cell_id] == 1:
+                                    ctype = 'UNDEFINED'
+                                else:
+                                    ctype = 'SEGMENTS'
+
+                            constraints.append({
+                                'type': ctype,
+                                'points': ring_pts
+                            })
+                        cell_id += 1
+
+                if constraints:
+                    ds['constraints'] = constraints
+                    updated += 1
+            except Exception as e:
+                logger.warning(f"[VTU-CON] Failed to attach constraints for {ds.get('name', idx)}: {e}")
+
+        if updated:
+            self.statusBar().showMessage(f"Attached VTU constraints for {updated} dataset(s)")
     def run_triangulation(self):
-        """Run triangulation on the segments and points of the *active* dataset (primarily for context menu)"""
-        # Check if we have an active dataset
+        # Refresh VTU boundary segments before triangulating the active dataset
+        self._rebuild_segments_from_vtu_boundaries()
+        self._attach_vtu_constraints_to_all_datasets()
+
         if self.current_dataset_index < 0 or self.current_dataset_index >= len(self.datasets):
             self.statusBar().showMessage("Error: No active dataset selected")
             QMessageBox.critical(self, "Error", "No active dataset selected")
             return
-
-        self.statusBar().showMessage(f"Running triangulation for {self.datasets[self.current_dataset_index]['name']}...") # Add status message here for single run
+        self.statusBar().showMessage(f"Running triangulation for {self.datasets[self.current_dataset_index]['name']}...")
         success = self._run_triangulation_for_dataset(self.current_dataset_index)
-
         if success:
-            # Update statistics and visualization after computing for the active one
             self._update_statistics()
             self._visualize_all_triangulations()
-            self._update_visualization() # Ensure other dependent views are updated/cleared
-            self.notebook.setCurrentIndex(3)  # Switch to triangulation tab
+            self._update_visualization()
+            self.notebook.setCurrentIndex(3)
             self.statusBar().showMessage(f"Completed triangulation for {self.datasets[self.current_dataset_index]['name']}") # Add success message here
 
     def run_all_triangulations(self):
-        """Run triangulation for all datasets that have segments using a worker thread."""
+        # Ensure VTU datasets have true boundary rings as segments
+        self._rebuild_segments_from_vtu_boundaries()
+        self._attach_vtu_constraints_to_all_datasets()
+
+
         datasets_with_segments_indices = [i for i, d in enumerate(self.datasets) if d.get('segments') is not None]
         if not datasets_with_segments_indices:
             QMessageBox.information(self, "No Segments", "No datasets have computed segments. Please compute segments first.")
@@ -5733,6 +8114,12 @@ segmentation, triangulation, and visualization.
         # Update surface visibility checkboxes if the widget exists
         if hasattr(self, 'surface_checkboxes_layout'):
             self._populate_surface_checkboxes()
+
+        # NEW: keep per‑surface refinement tables in sync with dataset list
+        if hasattr(self, '_refresh_seg_refine_table'):
+            self._refresh_seg_refine_table()
+        if hasattr(self, '_refresh_mesh_refine_table'):
+            self._refresh_mesh_refine_table()
     
     def _rename_dataset(self, dataset_index):
         """Rename a dataset"""
@@ -5964,7 +8351,7 @@ segmentation, triangulation, and visualization.
             self,
             "Select a point data file",
             "",
-            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;All files (*.*)"
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
         )
         
         if not file_path:
@@ -6013,40 +8400,27 @@ segmentation, triangulation, and visualization.
     def load_multiple_files(self):
         """Load multiple data files"""
         self.statusBar().showMessage("Loading multiple files...")
-        
-        # Open file dialog
         file_paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Select point data files",
-            "",
-            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;All files (*.*)"
+            self, "Select point data files", "",
+            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
         )
-        
         if not file_paths:
             self.statusBar().showMessage("File loading canceled")
             return
-        
+
         successful_loads = 0
-        
         for file_path in file_paths:
+            filename = os.path.basename(file_path)
             try:
-                # Update status with file path
-                filename = os.path.basename(file_path)
-                self.statusBar().showMessage(f"Loading file: {filename}...")
-                
-                # Try to read the file
                 points = self._read_point_file(file_path)
-                
                 if points is not None and len(points) > 0:
-                    # Create a new dataset
                     dataset = {
                         'name': filename,
+                        'type': 'SURFACE',   # mark as SURFACE
                         'points': points,
                         'visible': True,
                         'color': self._get_next_color()
                     }
-                    
-                    # Add to datasets
                     self.datasets.append(dataset)
                     self.current_dataset_index = len(self.datasets) - 1
                     successful_loads += 1
@@ -6054,13 +8428,11 @@ segmentation, triangulation, and visualization.
                     logger.warning(f"No valid points found in file: {filename}")
             except Exception as e:
                 logger.error(f"Error loading file {filename}: {str(e)}")
-        
+
         if successful_loads > 0:
-            # Update UI
             self._update_dataset_list()
             self._update_statistics()
             self._visualize_all_points()
-            
             self.statusBar().showMessage(f"Successfully loaded {successful_loads} out of {len(file_paths)} files")
         else:
             self.statusBar().showMessage("Error: No valid points found in any file")
@@ -6097,73 +8469,61 @@ segmentation, triangulation, and visualization.
 
     def _visualize_all_points(self):
         """Visualize all visible datasets' points"""
-        # Get visible datasets
         visible_datasets = [d for d in self.datasets if d.get('visible', True)]
-        
         if not visible_datasets:
             self._clear_hull_plot()
             return
-        
-        # Clear existing visualization
+
         while self.file_viz_layout.count():
             item = self.file_viz_layout.takeAt(0)
             widget = item.widget()
             if widget:
                 widget.deleteLater()
-        
-        # Calculate global bounds for all visible datasets
-        all_points = np.vstack([d['points'] for d in visible_datasets if d['points'] is not None])
+
+        all_points = np.vstack([d['points'] for d in visible_datasets if d.get('points') is not None])
         if len(all_points) == 0:
             return
-            
-        # Calculate bounds, correctly handling 3D coordinates
+
         min_coords = np.min(all_points, axis=0)
         max_coords = np.max(all_points, axis=0)
         min_x, min_y = min_coords[0], min_coords[1]
         max_x, max_y = max_coords[0], max_coords[1]
-        
-        # Use 3D visualization if enabled
+
         if self.view_3d_enabled:
-            # Create 3D visualization
+            # Keep existing 3D path (no change here)
             self._create_multi_dataset_3d_visualization(
-                self.file_viz_frame,
-                visible_datasets,
-                "Points Visualization",
-                view_type="points"
+                self.file_viz_frame, visible_datasets, "Points Visualization", view_type="points"
             )
         else:
-            # Fall back to matplotlib if PyVista is not available
             fig = Figure(figsize=(6, 4), dpi=100)
             ax = fig.add_subplot(111)
-            
-            # Plot each dataset with its color
             for dataset in visible_datasets:
-                points = dataset['points']
-                if points is not None and len(points) > 0:
-                    color = dataset.get('color', 'blue')
-                    name = dataset.get('name', 'Unnamed')
+                points = dataset.get('points')
+                if points is None or len(points) == 0:
+                    continue
+                color = dataset.get('color', 'blue')
+                name = dataset.get('name', 'Unnamed')
+                if dataset.get('type') == 'WELL' and len(points) >= 2:
+                    # Draw well polyline as connected line
+                    ax.plot(points[:, 0], points[:, 1], '-', c=color, alpha=0.9, lw=1.5, label=f"{name} (well)")
+                    # Also scatter endpoints lightly
+                    ax.scatter([points[0, 0], points[-1, 0]], [points[0, 1], points[-1, 1]],
+                            s=12, c=color, alpha=0.9, zorder=3)
+                else:
                     ax.scatter(points[:, 0], points[:, 1], s=5, c=color, alpha=0.7, label=name)
-            
+
             ax.set_aspect('equal')
-            ax.set_title("Point Clouds")
+            ax.set_title("Point Clouds (Wells drawn as polylines)")
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
             ax.legend()
-            
-            # Add grid and set limits with some padding
             ax.grid(True, linestyle='--', alpha=0.6)
             padding = max((max_x - min_x), (max_y - min_y)) * 0.05
             ax.set_xlim(min_x - padding, max_x + padding)
             ax.set_ylim(min_y - padding, max_y + padding)
-            
-            # Create canvas
+
             canvas = FigureCanvas(fig)
             self.file_viz_layout.addWidget(canvas)
-            
-            # Add toolbar
-            toolbar = NavigationToolbar(canvas, self.file_viz_frame)
-            self.file_viz_layout.addWidget(toolbar)
-    
     def _visualize_all_hulls(self):
         """Visualize all visible hulls"""
         # Get datasets with hulls
@@ -6250,120 +8610,86 @@ segmentation, triangulation, and visualization.
         # Add toolbar
         toolbar = NavigationToolbar(canvas, self.hull_viz_frame)
         self.hull_viz_layout.addWidget(toolbar)
-    
+    def _sync_seg_lengths_from_table(self):
+        """Snapshot the Segmentation table into seg_length_by_surface before computing."""
+        if not hasattr(self, 'seg_refine_table') or self.seg_refine_table is None:
+            return
+        from PyQt5.QtCore import Qt
+        if not hasattr(self, 'seg_length_by_surface') or self.seg_length_by_surface is None:
+            self.seg_length_by_surface = {}
+        rows = self.seg_refine_table.rowCount()
+        for r in range(rows):
+            item_name = self.seg_refine_table.item(r, 0)
+            item_val  = self.seg_refine_table.item(r, 1)
+            if not item_name or not item_val:
+                continue
+            ds_idx = item_name.data(Qt.UserRole)
+            if ds_idx is None:
+                continue
+            try:
+                v = float(item_val.text())
+                if v > 1e-9:
+                    self.seg_length_by_surface[int(ds_idx)] = v
+            except Exception:
+                continue
     def _visualize_all_segments(self):
-        """Visualize all visible datasets' segments"""
-        # Get visible datasets with segments
+        """Visualize all visible datasets' segments (prefer 3D PyVista; fallback to 2D only if PyVista unavailable)."""
         visible_datasets = [d for d in self.datasets if d.get('visible', True) and d.get('segments') is not None]
-        
         if not visible_datasets:
             self._clear_segment_plot()
             return
-        
-        # Mark that segmentation is being visualized in this tab
-        self._mark_segmentation_visualized("segmentation")
-        
+
         # Clear existing visualization
         while self.segment_viz_layout.count():
             item = self.segment_viz_layout.takeAt(0)
             widget = item.widget()
             if widget:
                 widget.deleteLater()
-        
-        # Calculate global bounds for all visible datasets
-        all_points = np.vstack([d['points'] for d in visible_datasets if d['points'] is not None])
-        if len(all_points) == 0:
-            return
-            
-        # Handle 3D coordinates properly
-        min_coords = np.min(all_points, axis=0)
-        max_coords = np.max(all_points, axis=0)
-        min_x, min_y = min_coords[0], min_coords[1]
-        max_x, max_y = max_coords[0], max_coords[1]
-        
-        # Use 3D visualization if enabled
-        if self.view_3d_enabled:
-            # Create 3D visualization - pass segments to be drawn as lines
+
+        # Prefer 3D if PyVista is available
+        if HAVE_PYVISTA:
+            # Force 3D and use the existing 3D helper
+            self.view_3d_enabled = True
             self._create_multi_dataset_3d_visualization(
                 self.segment_viz_frame,
                 visible_datasets,
                 "Segmentation Visualization",
-                view_type="segments" # This already handles plotting segments
+                view_type="segments"
             )
-        else:
-            # Fall back to matplotlib if PyVista is not available
-            fig = Figure(figsize=(6, 4), dpi=100)
-            ax = fig.add_subplot(111)
-            
-            # Plot each dataset with its color
-            for dataset in visible_datasets:
-                points = dataset['points']
-                segments = dataset['segments']
-                
-                if points is not None and len(points) > 0 and segments is not None and len(segments) > 0:
-                    color = dataset.get('color', 'blue')
-                    name = dataset.get('name', 'Unnamed')
-                    
-                    # Plot points (smaller and more transparent for context)
-                    ax.scatter(points[:, 0], points[:, 1], s=3, c=color, alpha=0.2, label=f"{name} Original")
-                    
-                    # Collect all segment endpoints
-                    segment_endpoints = []
-                    segment_count = 0
-                    for segment in segments:
-                        # Add both endpoints of each segment
-                        if hasattr(segment[0], 'shape'):  # NumPy array format
-                            segment_endpoints.append(segment[0])
-                            segment_endpoints.append(segment[1])
-                        else:  # List format
-                            segment_endpoints.append(np.array(segment[0]))
-                            segment_endpoints.append(np.array(segment[1]))
-                    
-                    # Remove duplicates by converting to tuples and back
-                    unique_endpoints = []
-                    seen = set()
-                    for point in segment_endpoints:
-                        point_tuple = tuple(point[:2])  # Only use x,y for comparison
-                        if point_tuple not in seen:
-                            seen.add(point_tuple)
-                            unique_endpoints.append(point)
-                    
-                    # Convert to numpy array for plotting
-                    if unique_endpoints:
-                        unique_endpoints_array = np.array(unique_endpoints)
-                        # Plot segment endpoints as more prominent red points
-                        ax.scatter(unique_endpoints_array[:, 0], unique_endpoints_array[:, 1], 
-                                s=50, c='red', edgecolor='black', linewidth=1.5, alpha=1.0,
-                                marker='o', label=f"{name} Segment Points", zorder=5)
+            return
 
-                    # Plot segments - make them slightly more prominent
-                    for segment in segments:
-                        ax.plot([segment[0][0], segment[1][0]], [segment[0][1], segment[1][1]], 
-                              color=color, linewidth=2.0, alpha=0.9)
-                        segment_count += 1
-                    
-                    logger.info(f"Plotted {segment_count} segments and {len(unique_endpoints)} unique segment points for '{name}'")
-            
-            ax.set_aspect('equal')
-            ax.set_title("Segmentations (Boundary Defined by Segments)") # Updated title
-            # ... rest of matplotlib setup (labels, legend, grid, limits) ...
-            ax.set_xlabel("X")
-            ax.set_ylabel("Y")
-            ax.legend()
-            
-            # Add grid and set limits with some padding
-            ax.grid(True, linestyle='--', alpha=0.6)
-            padding = max((max_x - min_x), (max_y - min_y)) * 0.05
-            ax.set_xlim(min_x - padding, max_x + padding)
-            ax.set_ylim(min_y - padding, max_y + padding)
-            
-            # Create canvas
-            canvas = FigureCanvas(fig)
-            self.segment_viz_layout.addWidget(canvas)
-            
-            # Add toolbar
-            toolbar = NavigationToolbar(canvas, self.segment_viz_frame)
-            self.segment_viz_layout.addWidget(toolbar)
+        # Fallback: 2D Matplotlib (unchanged)
+        all_points = np.vstack([d['points'] for d in visible_datasets if d['points'] is not None])
+        if len(all_points) == 0:
+            return
+        min_coords = np.min(all_points, axis=0); max_coords = np.max(all_points, axis=0)
+        min_x, min_y = min_coords[0], min_coords[1]; max_x, max_y = max_coords[0], max_coords[1]
+
+        fig = Figure(figsize=(6, 4), dpi=100)
+        ax = fig.add_subplot(111)
+        for dataset in visible_datasets:
+            points = dataset['points']; segments = dataset['segments']
+            if points is not None and len(points) > 0 and segments is not None and len(segments) > 0:
+                color = dataset.get('color', 'blue'); name = dataset.get('name', 'Unnamed')
+                ax.scatter(points[:, 0], points[:, 1], s=3, c=color, alpha=0.2, label=f"{name} Original")
+                segment_endpoints = []
+                for segment in segments:
+                    p0 = np.asarray(segment[0]); p1 = np.asarray(segment[1])
+                    segment_endpoints.append(p0); segment_endpoints.append(p1)
+                    ax.plot([p0[0], p1[0]], [p0[1], p1[1]], color=color, linewidth=2.0, alpha=0.9)
+                if segment_endpoints:
+                    ue = np.unique(np.array(segment_endpoints)[:, :2], axis=0)
+                    ax.scatter(ue[:, 0], ue[:, 1], s=50, c='red', edgecolor='black', linewidth=1.5, alpha=1.0, marker='o', label=f"{name} Segment Points", zorder=5)
+
+        ax.set_aspect('equal')
+        ax.set_title("Segmentations (Boundary Defined by Segments)")
+        ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.legend()
+        ax.grid(True, linestyle='--', alpha=0.6)
+        pad = max((max_x - min_x), (max_y - min_y)) * 0.05
+        ax.set_xlim(min_x - pad, max_x + pad); ax.set_ylim(min_y - pad, max_y + pad)
+
+        canvas = FigureCanvas(fig); self.segment_viz_layout.addWidget(canvas)
+        toolbar = NavigationToolbar(canvas, self.segment_viz_frame); self.segment_viz_layout.addWidget(toolbar)
         
         # Update the segments legend (remains the same)
         # ... existing legend update code ...
@@ -6481,32 +8807,19 @@ segmentation, triangulation, and visualization.
     
     def _visualize_refined_intersections(self):
         """Visualize refined intersections with enhanced special point visualization."""
-        # Get plotter
-        plotter = None
-        if hasattr(self, 'refine_mesh_plotter') and self.refine_mesh_plotter:
-            plotter = self.refine_mesh_plotter
-        elif hasattr(self, 'plotters') and 'refine_mesh' in self.plotters and self.plotters['refine_mesh']:
-            plotter = self.plotters['refine_mesh']
-            self.refine_mesh_plotter = plotter
+        # Get the current active plotter from the tab system
+        plotter = self._get_current_refine_plotter()
+        if not plotter:
+            # Fallback to old method for backward compatibility
+            if hasattr(self, 'refine_mesh_plotter') and self.refine_mesh_plotter:
+                plotter = self.refine_mesh_plotter
+            elif hasattr(self, 'plotters') and 'refine_mesh' in self.plotters and self.plotters['refine_mesh']:
+                plotter = self.plotters['refine_mesh']
+                self.refine_mesh_plotter = plotter
         
         if not plotter:
             logger.warning("Refine/Mesh plotter not available for visualization.")
-            if HAVE_PYVISTA and hasattr(self, 'refine_mesh_viz_frame') and self.refine_mesh_viz_frame:
-                try:
-                    from pyvistaqt import QtInteractor
-                    new_plotter = QtInteractor(self.refine_mesh_viz_frame)
-                    self.refine_mesh_plot_layout.addWidget(new_plotter.interactor)
-                    new_plotter.set_background([0.318, 0.341, 0.431])
-                    plotter = new_plotter
-                    self.refine_mesh_plotter = plotter
-                    if hasattr(self, 'plotters'):
-                        self.plotters['refine_mesh'] = plotter
-                    logger.info("Successfully recreated refine_mesh_plotter")
-                except Exception as e:
-                    logger.error(f"Error recreating Refine/Mesh plotter: {e}")
-                    return
-            else:
-                return
+            return
 
         plotter.clear()
         plotter.set_background([0.2, 0.2, 0.25])
@@ -6517,6 +8830,20 @@ segmentation, triangulation, and visualization.
             return
 
         logger.info("Visualizing refined intersections...")
+
+        # Get selected surface from dropdown for filtering
+        selected_surface = "All Surfaces"
+        if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
+            selected_surface = self.refine_surface_selector.currentText()
+
+        # Helper function to check if a surface should be shown
+        def should_show_surface(dataset_idx):
+            if selected_surface == "All Surfaces":
+                return True
+            if dataset_idx < len(self.datasets):
+                dataset_name = self.datasets[dataset_idx].get("name", f"Surface_{dataset_idx}")
+                return dataset_name == selected_surface
+            return False
 
         # Initialize constraint points collection (consolidated)
         constraint_points = []  # All constraint points for triangulation
@@ -6558,6 +8885,13 @@ segmentation, triangulation, and visualization.
                     # Track involved datasets
                     dataset_id1 = intersection_data.get('dataset_id1', -1)
                     dataset_id2 = intersection_data.get('dataset_id2', -1)
+                    
+                    # Apply surface filter - only show intersections involving the selected surface
+                    if selected_surface != "All Surfaces":
+                        surface_involved = (should_show_surface(dataset_id1) or should_show_surface(dataset_id2))
+                        if not surface_involved:
+                            continue  # Skip this intersection if neither dataset matches the filter
+                    
                     involved_dataset_indices.add(dataset_id1)
                     involved_dataset_indices.add(dataset_id2)
                     
@@ -6701,8 +9035,6 @@ segmentation, triangulation, and visualization.
                 points_np = np.array(unique_constraints)
                 plotter.add_mesh(points_np, color='red', point_size=10,
                             render_points_as_spheres=True, name="Constraint_Points")
-                plotter.add_point_labels(points_np, [f"C{i}" for i in range(len(points_np))],
-                                    point_size=5, text_color='black')
                 plotter_has_content = True
                 logger.info(f"Added {len(unique_constraints)} constraint points (consolidated)")
             except Exception as e:
@@ -6711,8 +9043,6 @@ segmentation, triangulation, and visualization.
         # Add comprehensive legend and statistics
         if plotter_has_content:
             # Statistics text
-           # Clean statistics text
-            # Clean statistics text
             stats_text = "MeshIt Constraint Points (All Types):\n"
             if constraint_points:
                 unique_constraints = []
@@ -6730,18 +9060,21 @@ segmentation, triangulation, and visualization.
 
             stats_text += f"\nIntersection Lines: {len(refined_intersection_lines)}"
             stats_text += f"\nDatasets Involved: {len(involved_dataset_indices)}"
+            
+            # Add surface filter information
+            if selected_surface != "All Surfaces":
+                stats_text += f"\nSurface Filter: {selected_surface}"
 
             # Simple legend
             legend_text = "Constraint Points for Triangulation:\n"
             legend_text += "C = Constraint Point (all special types)\n"
             legend_text += "Red = Ready for triangulation\n"
             
-            stats_text += f"\nIntersection Lines: {len(refined_intersection_lines)}"
-            stats_text += f"\nDatasets Involved: {len(involved_dataset_indices)}"
+            # Add filter info to legend if active
+            if selected_surface != "All Surfaces":
+                legend_text += f"\nFiltered for: {selected_surface}"
             
             plotter.add_text(stats_text, position='lower_left', font_size=10, color='white')
-            
-          
             plotter.add_text(legend_text, position='upper_right', font_size=9, color='white')
             
             plotter.add_axes()
@@ -6753,11 +9086,16 @@ segmentation, triangulation, and visualization.
             plotter.add_text("No valid data to display in refined view.", position='upper_edge', color='white')
             plotter.reset_camera()
     def _clear_refine_mesh_plot(self):
-            """Clear the embedded Refine & Mesh PyVista plotter."""
+        """Clear all refine mesh tab plotters"""
+        try:
+            # Clear all individual tab plotters
+            self._clear_refine_tab_plotters()
+            
+            # Legacy compatibility: Clear the main plotter if it exists
             plotter = None
             if hasattr(self, 'refine_mesh_plotter') and self.refine_mesh_plotter:
                 plotter = self.refine_mesh_plotter
-            elif 'refine_mesh' in self.plotters and self.plotters['refine_mesh']:
+            elif 'refine_mesh' in getattr(self, 'plotters', {}) and self.plotters['refine_mesh']:
                 plotter = self.plotters['refine_mesh']
                 self.refine_mesh_plotter = plotter
             
@@ -6765,25 +9103,237 @@ segmentation, triangulation, and visualization.
                 plotter.clear()
                 plotter.add_text("Refine intersections to visualize or load data.", position='upper_edge', color='white')
                 plotter.reset_camera()
-            elif hasattr(self, 'refine_mesh_plot_layout'): # Fallback if plotter is None but layout exists
-                for i in reversed(range(self.refine_mesh_plot_layout.count())):
-                    widget = self.refine_mesh_plot_layout.itemAt(i).widget()
-                    if widget:
-                        if hasattr(self, 'refine_mesh_plotter') and self.refine_mesh_plotter and widget == self.refine_mesh_plotter.interactor:
-                            continue
-                        widget.setParent(None)
-                        widget.deleteLater()
-                if not hasattr(self, 'refine_mesh_plotter') or not self.refine_mesh_plotter:
-                    placeholder = QLabel("PyVista required or plot cleared.")
-                    placeholder.setAlignment(Qt.AlignCenter)
-                    self.refine_mesh_plot_layout.addWidget(placeholder)
-    
+                
+            logger.info("Cleared all refine mesh visualizations")
+        except Exception as e:
+            logger.warning(f"Error in _clear_refine_mesh_plot: {e}")
+    def _debug_segments_widget_tree(self, where: str = ""):
+        try:
+            frame = getattr(self, 'segments_viz_frame', None)
+            layout = getattr(self, 'segments_plot_layout', None)
+            plotter = getattr(self, 'segments_plotter', None)
+            interactor = getattr(plotter, 'interactor', None) if plotter else None
+
+            logger.info(f"[SEGMENTS][DBG]{' ' + where if where else ''} "
+                        f"frame={type(frame).__name__ if frame else None} "
+                        f"layout={'OK' if layout else 'None'} "
+                        f"plotter={'OK' if plotter else 'None'} "
+                        f"interactor={'OK' if interactor else 'None'}")
+
+            if layout and interactor:
+                idx = layout.indexOf(interactor)
+                parent_ok = (interactor.parent() is frame)
+                vis = interactor.isVisible() if hasattr(interactor, 'isVisible') else None
+                size = interactor.size() if hasattr(interactor, 'size') else None
+                logger.info(f"[SEGMENTS][DBG]{' ' + where if where else ''} "
+                            f"layout_index={idx}, parent_ok={parent_ok}, visible={vis}, size={size}")
+
+                # Self-heal: if not in layout or wrong parent, reattach
+                if idx == -1 or not parent_ok:
+                    try:
+                        interactor.setParent(frame)
+                        layout.addWidget(interactor)
+                        interactor.show()
+                        logger.info(f"[SEGMENTS][DBG]{' ' + where if where else ''} reattached interactor to layout")
+                    except Exception as e:
+                        logger.error(f"[SEGMENTS][DBG] reattach failed: {e}", exc_info=True)
+            elif frame and not layout:
+                try:
+                    self.segments_plot_layout = QVBoxLayout(self.segments_viz_frame)
+                    self.segments_plot_layout.setContentsMargins(0, 0, 0, 0)
+                    logger.info(f"[SEGMENTS][DBG]{' ' + where if where else ''} created missing segments_plot_layout")
+                    if interactor:
+                        self.segments_plot_layout.addWidget(interactor)
+                        interactor.show()
+                except Exception as e:
+                    logger.error(f"[SEGMENTS][DBG] create layout failed: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"[SEGMENTS][DBG] exception: {e}", exc_info=True)
     # ======================================================================
         # ======================================================================
     #  REFINED-MESH TAB : 3-D view updater  (Intersections / Mesh / Segments)
     # ======================================================================
         # ======================================================================
     #  REFINED-MESH TAB : 3-D view updater  (Intersections / Mesh / Segments)
+    def _refresh_segment_map_from_tree(self):
+        """
+        Mirror refine_constraint_tree states into _refine_segment_map for drawing.
+        Keeps 'selected' and 'is_hole' in sync with the table (source of truth).
+        """
+        seg_map = getattr(self, "_refine_segment_map", {}) or {}
+        tree = getattr(self, "refine_constraint_tree", None)
+        if not tree or not seg_map:
+            return
+
+        def walk(item):
+            data = item.data(0, Qt.UserRole)
+            if data and data.get("type") == "constraint":
+                surf_idx = data.get("surface_idx")
+                seg_uid = data.get("seg_uid")
+                key = (surf_idx, seg_uid)
+                if key in seg_map:
+                    seg_map[key]["selected"] = (item.checkState(0) == Qt.Checked)
+                    # Column 4 is the holes checkbox
+                    seg_map[key]["is_hole"] = (item.checkState(4) == Qt.Checked)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(tree.topLevelItemCount()):
+            walk(tree.topLevelItem(i))
+    def _draw_segments_batched_fast(
+        self,
+        plotter,
+        surface_is_visible_fn,
+        show_hull_constraints: bool,
+        show_intersection_constraints: bool,
+        selected_only_mode: bool,
+    ):
+        """
+        Extremely fast Segments renderer: batches into at most 3 actors
+        - selected NORMAL constraints  (green, thick)
+        - selected HOLE constraints    (red,   thick)
+        - unselected constraints       (grey,  thin)
+
+        Includes fallback: if no HULL segments exist in _refine_segment_map
+        for a visible surface, draw its hull from dataset['hull_points'].
+        """
+        import numpy as np
+        import pyvista as pv
+
+        # NEW: ensure the map mirrors the table before drawing (synchronization respected)
+        try:
+            self._refresh_segment_map_from_tree()
+        except Exception:
+            pass
+
+        seg_map = getattr(self, "_refine_segment_map", {}) or {}
+
+        cats = {
+            "sel_norm": {"pts": [], "lines": [], "idx": 0},
+            "sel_hole": {"pts": [], "lines": [], "idx": 0},
+            "unsel":    {"pts": [], "lines": [], "idx": 0},
+        }
+
+        def add_segment(cat_key, p1, p2):
+            if p1 == p2:
+                return
+            cat = cats[cat_key]
+            i0 = cat["idx"]
+            cat["pts"].append(p1); cat["pts"].append(p2)
+            cat["lines"].extend([2, i0, i0 + 1])
+            cat["idx"] += 2
+
+        def to_xyz(p):
+            # Accept list/tuple, numpy rows (including dtype=object), or objects with x,y,z
+            try:
+                if isinstance(p, np.ndarray):
+                    if p.size >= 3:
+                        return float(p[0]), float(p[1]), float(p[2])
+                    return None
+                if isinstance(p, (list, tuple)) and len(p) >= 3:
+                    return float(p[0]), float(p[1]), float(p[2])
+                if hasattr(p, "x") and hasattr(p, "y") and hasattr(p, "z"):
+                    return float(p.x), float(p.y), float(p.z)
+            except Exception:
+                return None
+            return None
+
+        built = 0
+        saw_hull_for_surface = set()
+
+        # 1) Use map data when present
+        for (surf_idx, seg_uid), seg_info in seg_map.items():
+            if not surface_is_visible_fn(surf_idx):
+                continue
+
+            seg_type = str(seg_info.get("type", seg_info.get("ctype", ""))).lower()
+            if seg_type == "hull":
+                saw_hull_for_surface.add(surf_idx)
+                if not show_hull_constraints:
+                    continue
+            elif seg_type in ("int", "intersection"):
+                if not show_intersection_constraints:
+                    continue
+
+            is_selected = bool(seg_info.get("selected", True))
+            is_hole     = bool(seg_info.get("is_hole", False))
+            if selected_only_mode and not is_selected:
+                continue
+
+            pts = seg_info.get("points", [])
+            if not pts or len(pts) < 2:
+                continue
+
+            cat_key = "sel_hole" if (is_selected and is_hole) else ("sel_norm" if is_selected else "unsel")
+
+            if len(pts) == 2:
+                p1 = to_xyz(pts[0]); p2 = to_xyz(pts[1])
+                if p1 is not None and p2 is not None and p1 != p2:
+                    add_segment(cat_key, p1, p2)
+                    built += 1
+            else:
+                local_pairs = 0
+                for j in range(len(pts) - 1):
+                    p1 = to_xyz(pts[j]); p2 = to_xyz(pts[j + 1])
+                    if p1 is None or p2 is None or p1 == p2:
+                        continue
+                    add_segment(cat_key, p1, p2)
+                    local_pairs += 1
+                if local_pairs > 0:
+                    built += 1
+
+        # 2) Fallback for missing HULL segments: draw from dataset['hull_points']
+        if show_hull_constraints:
+            for s_idx, ds in enumerate(getattr(self, "datasets", [])):
+                if not surface_is_visible_fn(s_idx):
+                    continue
+                if s_idx in saw_hull_for_surface:
+                    continue  # already emitted from map
+                hull = ds.get("hull_points")
+                if hull is None or len(hull) < 2:
+                    continue
+
+                points = []
+                for hp in hull:
+                    xyz = to_xyz(hp)
+                    if xyz is not None:
+                        points.append(xyz)
+                if len(points) < 2:
+                    continue
+
+                n = len(points)
+                closed = (np.linalg.norm(np.array(points[0]) - np.array(points[-1])) < 1e-12)
+                last = n - 1  # wrap manually
+
+                local_pairs = 0
+                for i in range(last):
+                    p1 = points[i]
+                    p2 = points[(i + 1) % n] if closed or i + 1 < n else points[i + 1]
+                    if p1 != p2:
+                        add_segment("sel_norm", p1, p2)
+                        local_pairs += 1
+                if local_pairs > 0:
+                    built += 1
+
+        # build up to three actors
+        def emit(cat_key, color, lw):
+            cat = cats[cat_key]
+            if cat["idx"] == 0:
+                return
+            pts = np.asarray(cat["pts"], dtype=float)
+            lines = np.asarray(cat["lines"], dtype=np.int64)
+            poly = pv.PolyData(pts); poly.lines = lines
+            plotter.add_mesh(poly, color=color, line_width=lw,
+                            render_lines_as_tubes=True, pickable=False, smooth_shading=False)
+
+        # Clear per-segment refs in batched mode
+        self.constraint_segment_actor_refs = {}
+
+        emit("sel_norm", (0.0, 1.0, 0.0), 4)
+        emit("sel_hole", (1.0, 0.0, 0.0), 4)
+        emit("unsel",    (0.53, 0.53, 0.53), 2)
+
+        return built
     # ======================================================================
     def _update_refined_visualization(self):
         """
@@ -6793,107 +9343,238 @@ segmentation, triangulation, and visualization.
             view 1 – conforming surface meshes    (faces, 70 % opa)
             view 2 – constraint segments          (green ↔ dotted grey)
 
-        The routine is now robust against points that include an extra
-        string label in position 3 (e.g. “… CONVEXHULL_POINT_START_POINT”).
+        Restores reliable per-segment actors keyed by (surf_idx, seg_uid) and
+        guarantees the Segments plotter is cleared and repopulated each time.
         """
-        import pyvista as pv
         import numpy as np
+        import pyvista as pv
 
-        # ── helper ─────────────────────────────────────────────────────────
         def _to_xyz(pt):
-            """
-            Return [x, y, z] as floats or None if *pt* cannot be parsed.
-            Accepts plain lists / numpy rows / small objects that expose
-            .x . y . z attributes.
-            """
+            # Accept [x,y,z], numpy rows, or objects with x,y,z
             try:
                 if isinstance(pt, (list, tuple, np.ndarray)) and len(pt) >= 3:
-                    return [float(pt[0]), float(pt[1]), float(pt[2])]
+                    return float(pt[0]), float(pt[1]), float(pt[2])
                 if hasattr(pt, "x") and hasattr(pt, "y") and hasattr(pt, "z"):
-                    return [float(pt.x), float(pt.y), float(pt.z)]
+                    return float(pt.x), float(pt.y), float(pt.z)
             except Exception:
                 pass
             return None
-        # ───────────────────────────────────────────────────────────────────
-
-        plotter = self.plotters.get("refine_mesh")
-        if not plotter:              # first call arrives before plotter exists
-            return
-
-        # fresh canvas + actor caches
-        plotter.clear()
-        self.intersection_actor_refs       = []
-        self.conforming_mesh_actor_refs    = []
-        self.constraint_segment_actor_refs = {}
 
         view = getattr(self, "current_refine_view", 0)
 
-        # ------------------------------------------------ 0 : intersections
-        if view == 0 and hasattr(self, "refined_intersections_for_visualization"):
-            for surf_idx, inters in self.refined_intersections_for_visualization.items():
-                for inter_d in inters:
-                    coords = [_to_xyz(p) for p in inter_d.get("points", [])]
-                    coords = [c for c in coords if c is not None]
-                    if len(coords) < 2:
-                        continue
-                    self.intersection_actor_refs.append(
-                        plotter.add_mesh(
-                            pv.lines_from_points(np.asarray(coords, float)),
-                            color="red", line_width=4,
-                        )
-                    )
+        # --- 0: Intersections ---
+        if view == 0:
+            self.intersection_actor_refs = []
+            self.conforming_mesh_actor_refs = []
+            if not hasattr(self, 'constraint_segment_actor_refs'):
+                self.constraint_segment_actor_refs = {}
+            self._visualize_refined_intersections()
+            self._add_wells_to_intersection_plotter()
+            return
 
-        # ------------------------------------------------ 1 : conforming mesh
-        elif view == 1:
+        # --- 1: Meshes ---
+        if view == 1:
+            plotter = getattr(self, "meshes_plotter", None)
+            if not plotter:
+                return
+            plotter.clear()
+            self.intersection_actor_refs = []
+            self.conforming_mesh_actor_refs = []
+            if not hasattr(self, 'constraint_segment_actor_refs'):
+                self.constraint_segment_actor_refs = {}
+
             for ds in self.datasets:
                 cm = ds.get("conforming_mesh")
                 if not cm:
                     continue
-                verts, faces = cm["vertices"], cm["triangles"]
+                verts, faces = cm.get("vertices"), cm.get("triangles")
                 if verts is None or faces is None or len(verts) == 0:
                     continue
                 mesh = pv.PolyData(
                     verts,
-                    np.hstack([np.full((len(faces), 1), 3), faces])
+                    np.hstack([np.full((len(faces), 1), 3, dtype=np.int64), faces])
                 )
-                self.conforming_mesh_actor_refs.append(
-                    plotter.add_mesh(
-                        mesh,
-                        color   = ds.get("color", "#CCCCCC"),
-                        opacity = 0.7,
-                        show_edges = True,
-                        edge_color = "black",
-                    )
+                actor = plotter.add_mesh(
+                    mesh,
+                    color=ds.get("color", "#CCCCCC"),
+                    opacity=0.7,
+                    show_edges=True,
+                    edge_color="black",
                 )
+                self.conforming_mesh_actor_refs.append(actor)
 
-        # ------------------------------------------------ 2 : constraint segments
-        else:   # view == 2
-            for (surf_idx, seg_uid), seg_info in getattr(self, "_refine_segment_map", {}).items():
-                if len(seg_info.get("points", [])) < 2:
+            plotter.add_axes()
+            plotter.reset_camera()
+            plotter.render()
+            return
+
+        # --- 2: Segments ---
+        plotter = getattr(self, "segments_plotter", None)
+        logger.info("[SEGMENTS] Enter segments view redraw")
+        self._debug_segments_widget_tree("redraw")
+        if not plotter:
+            return
+
+        # Fully reset the Segments viewport so it never stays white
+        plotter.clear()
+        plotter.set_background([0.318, 0.341, 0.431])
+
+        # UI filters
+        selected_surface_name = "All Surfaces"
+        if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
+            selected_surface_name = self.refine_surface_selector.currentText()
+
+        show_hull = getattr(self, 'show_hull_constraints_checkbox', None)
+        show_intersections = getattr(self, 'show_intersection_constraints_checkbox', None)
+        show_selected_only = getattr(self, 'show_selected_only_checkbox', None)
+
+        show_hull_constraints = show_hull.isChecked() if show_hull else True
+        show_intersection_constraints = show_intersections.isChecked() if show_intersections else True
+        selected_only_mode = show_selected_only.isChecked() if show_selected_only else False
+
+        def surface_name(idx):
+            if 0 <= idx < len(self.datasets):
+                return self.datasets[idx].get("name", f"Surface_{idx}")
+            return f"Surface_{idx}"
+
+        def surface_is_visible(idx):
+            if selected_surface_name == "All Surfaces":
+                return True
+            return surface_name(idx) == selected_surface_name
+
+        # Decide rendering mode: batched for speed when mouse selection is OFF
+        mouse_sel_on = bool(getattr(self, 'mouse_selection_enabled_btn', None) and self.mouse_selection_enabled_btn.isChecked())
+        self._segments_batched_mode = not mouse_sel_on
+
+        # Ensure the segment map is available
+        if not hasattr(self, "_refine_segment_map") or not self._refine_segment_map:
+            try:
+                self._populate_refine_constraint_tree()
+            except Exception:
+                pass
+
+        if self._segments_batched_mode:
+            # FAST path: draw everything in 1–3 actors
+            built = self._draw_segments_batched_fast(
+                plotter,
+                surface_is_visible_fn=surface_is_visible,
+                show_hull_constraints=show_hull_constraints,
+                show_intersection_constraints=show_intersection_constraints,
+                selected_only_mode=selected_only_mode,
+            )
+        else:
+            # PRECISE path (picking): one actor per segment (original behavior)
+            if not hasattr(self, 'constraint_segment_actor_refs'):
+                self.constraint_segment_actor_refs = {}
+            else:
+                for actor in list(self.constraint_segment_actor_refs.values()):
+                    try:
+                        plotter.remove_actor(actor)
+                    except Exception:
+                        pass
+                self.constraint_segment_actor_refs = {}
+
+            # initialize picking maps
+            self._actor_id_to_segment_map = {}
+            self._mesh_geometry_map = {}
+            self._mesh_geometry_map_reduced = {}
+
+            seg_map = getattr(self, "_refine_segment_map", {}) or {}
+            built = 0
+
+            for (surf_idx, seg_uid), seg_info in seg_map.items():
+                if not surface_is_visible(surf_idx):
                     continue
-                p1 = _to_xyz(seg_info["points"][0])
-                p2 = _to_xyz(seg_info["points"][-1])
+
+                seg_type = str(seg_info.get("type", seg_info.get("ctype", ""))).lower()
+                if seg_type == "hull" and not show_hull_constraints:
+                    continue
+                if seg_type in ("int", "intersection") and not show_intersection_constraints:
+                    continue
+                if selected_only_mode and not seg_info.get("selected", True):
+                    continue
+
+                pts = seg_info.get("points", [])
+                if not pts or len(pts) < 2:
+                    continue
+
+                def to_xyz(p):
+                    if isinstance(p, (list, tuple)) and len(p) >= 3:
+                        return float(p[0]), float(p[1]), float(p[2])
+                    if hasattr(p, "x") and hasattr(p, "y") and hasattr(p, "z"):
+                        return float(p.x), float(p.y), float(p.z)
+                    try:
+                        import numpy as np
+                        if isinstance(p, np.ndarray) and p.size >= 3:
+                            return float(p[0]), float(p[1]), float(p[2])
+                    except Exception:
+                        pass
+                    return None
+
+                p1 = to_xyz(pts[0]); p2 = to_xyz(pts[-1])
                 if p1 is None or p2 is None:
                     continue
 
+                import numpy as np, pyvista as pv
+                poly = pv.PolyData(np.array([p1, p2], dtype=float))
+                poly.lines = np.array([2, 0, 1], dtype=np.int64)
+
                 rgb, lw, pattern = self._segment_vis_props(surf_idx, seg_uid)
                 actor = plotter.add_mesh(
-                    pv.lines_from_points(np.array([p1, p2], float)),
-                    color=rgb, line_width=lw,
+                    poly, color=rgb, line_width=lw, pickable=True,
+                    render_lines_as_tubes=True, smooth_shading=False,
                 )
-                # dotted grey for un-selected segments (works on VTK ≥ 9.1)
                 try:
                     prop = actor.GetProperty()
-                    prop.SetLineStipplePattern(pattern)
-                    prop.SetLineStippleRepeatFactor(1)
+                    try:
+                        prop.SetLineStipplePattern(pattern)
+                        prop.SetLineStippleRepeatFactor(1)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
+                # store refs and build picking maps
                 self.constraint_segment_actor_refs[(surf_idx, seg_uid)] = actor
+                actor_id = id(actor)
+                self._actor_id_to_segment_map[actor_id] = (surf_idx, seg_uid)
+                try:
+                    sig = self._create_mesh_signature(poly)
+                    if sig is not None:
+                        self._mesh_geometry_map[sig] = (surf_idx, seg_uid)
+                    rsig = self._create_reduced_precision_signature(poly)
+                    if rsig is not None:
+                        if not hasattr(self, '_mesh_geometry_map_reduced') or self._mesh_geometry_map_reduced is None:
+                            self._mesh_geometry_map_reduced = {}
+                        self._mesh_geometry_map_reduced[rsig] = (surf_idx, seg_uid)
+                except Exception:
+                    pass
 
+                built += 1
+
+            # flag for mouse toggler
+            self._constraint_actors_built = built > 0
+
+        # Empty-state text if nothing passed the filters
+        if built == 0:
+            msg = "No segments to display."
+            details = []
+            if selected_surface_name != "All Surfaces":
+                details.append(f"Surface={selected_surface_name}")
+            if not show_hull_constraints:
+                details.append("Hull hidden")
+            if not show_intersection_constraints:
+                details.append("Intersections hidden")
+            if selected_only_mode:
+                details.append("Selected only")
+            if details:
+                msg += " (" + ", ".join(details) + ")"
+            plotter.add_text(msg, position='upper_edge', color='white')
+
+        plotter.add_axes()
         plotter.reset_camera()
         plotter.render()
-    # =====================================
+        # =====================================
 
     # ======================================================================
     #  SEGMENT selection → drawing helpers
@@ -6925,15 +9606,28 @@ segmentation, triangulation, and visualization.
     def _segment_vis_props(self, surf_idx: int, seg_uid: int):
         """
         Return a tuple   (rgb-tuple , line-width , stipple-pattern)
-        • If the segment is selected  →  thick solid green
-        • If not selected            →  thin  dotted grey
+        • If the segment is selected and is a hole  →  thick solid red
+        • If the segment is selected               →  thick solid green
+        • If not selected                         →  thin  dotted grey
         """
         checked = self._segment_checked(surf_idx, seg_uid)
+        is_hole = self._segment_is_hole(surf_idx, seg_uid)
+        
         if checked:
-            return ((0.00, 1.00, 0.00), 4, 0xFFFF)      # solid green
+            if is_hole:
+                return ((1.00, 0.00, 0.00), 4, 0xFFFF)      # solid red for holes
+            else:
+                return ((0.00, 1.00, 0.00), 4, 0xFFFF)      # solid green for normal constraints
         else:
             # 0xAAAA = dot-dot pattern; renders solid on old VTK builds
             return ((0.53, 0.53, 0.53), 2, 0xAAAA)
+        
+    def _segment_is_hole(self, surf_idx: int, seg_uid: int) -> bool:
+        """Check if a segment is marked as a hole."""
+        seg_data = self._refine_segment_map.get((surf_idx, seg_uid))
+        if seg_data:
+            return seg_data.get("is_hole", False)
+        return False
         # ======================================================================
     #  SEGMENT-TREE → 3-D SYNC
     # ======================================================================
@@ -6942,6 +9636,10 @@ segmentation, triangulation, and visualization.
     #  Update ONE segment actor when its checkbox changes
     # ======================================================================
     def _apply_segment_state(self, surf_idx: int, seg_uid: int, checked: bool):
+        """
+        Update ONE segment actor when its checkbox changes.
+        Optimized for fast individual updates during mouse clicks.
+        """
         actor = self.constraint_segment_actor_refs.get((surf_idx, seg_uid))
         if not actor:
             return
@@ -6962,29 +9660,59 @@ segmentation, triangulation, and visualization.
                 pass
 
         actor.SetVisibility(True)      # always draw – style encodes selection
+        
+        # Immediate render for instant feedback (only if in segments view)
+        if (getattr(self, "current_refine_view", 0) == 2):
+            current_plotter = self._get_current_refine_plotter()
+            if current_plotter:
+                current_plotter.render()
+            elif self.plotters.get("refine_mesh"):
+                self.plotters["refine_mesh"].render()
 
     def _update_all_segment_actors(self):
-            """Refresh colours / styles of EVERY segment actor after any tick change"""
-            if getattr(self, "current_refine_view", 0) != 2:
-                return
+        """
+        Refresh colours/styles after any tree tick change.
+        - If batched mode is ON (mouse selection OFF), just rebuild once.
+        - If per-segment mode (mouse selection ON), update actors in place.
+        """
+        if getattr(self, "current_refine_view", 0) != 2:
+            return
 
-            tree = self.refine_constraint_tree
-            if not tree:
-                return
+        if getattr(self, "_segments_batched_mode", False):
+            # Rebuild the batched view in a single pass
+            self._update_refined_visualization()
+            return
 
-            def walk(item):
-                data = item.data(0, Qt.UserRole)
-                if data and data.get("type") == "constraint":
-                    s_idx = data["surface_idx"]
-                    uid   = data["seg_uid"]
-                    self._apply_segment_state(s_idx, uid, item.checkState(0) == Qt.Checked)
-                for i in range(item.childCount()):
-                    walk(item.child(i))
+        # Per-segment path (original behavior)
+        needs_render = False
+        for (s_idx, uid), actor in getattr(self, 'constraint_segment_actor_refs', {}).items():
+            if not actor:
+                continue
+            is_checked = self._segment_checked(s_idx, uid)
+            is_hole = self._segment_is_hole(s_idx, uid)
+            if (s_idx, uid) in getattr(self, '_refine_segment_map', {}):
+                self._refine_segment_map[(s_idx, uid)]["selected"] = is_checked
+                self._refine_segment_map[(s_idx, uid)]["is_hole"] = is_hole
+            rgb, lw, pattern = self._segment_vis_props(s_idx, uid)
+            try:
+                prop = actor.GetProperty()
+                if (prop.GetColor() != rgb) or (prop.GetLineWidth() != lw):
+                    prop.SetColor(*rgb)
+                    prop.SetLineWidth(lw)
+                    needs_render = True
+                try:
+                    prop.SetLineStipplePattern(pattern)
+                    prop.SetLineStippleRepeatFactor(1)
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
-            for i in range(tree.topLevelItemCount()):
-                walk(tree.topLevelItem(i))
-
-            if self.plotters.get("refine_mesh"):
+        if needs_render:
+            current_plotter = self._get_current_refine_plotter()
+            if current_plotter:
+                current_plotter.render()
+            elif self.plotters.get("refine_mesh"):
                 self.plotters["refine_mesh"].render()
 
     # ----------------------------------------------------------------------
@@ -6994,20 +9722,128 @@ segmentation, triangulation, and visualization.
         1) Propagate parent->children or child->parent states.
         2) Update visibility/colour of the corresponding 3-D actor(s).
         3) Synchronize intersection line selections across surfaces.
+        4) Handle hole checkbox changes (column 4).
         """
-        if self._refine_updating_constraint_tree or column != 0:
+        if self._refine_updating_constraint_tree:
             return
 
         self._refine_updating_constraint_tree = True
         try:
+            # Handle hole checkbox changes (column 4)
+            if column == 4:
+                data = item.data(0, Qt.UserRole)
+                if data and data.get("type") == "constraint":
+                    surface_idx = data["surface_idx"]
+                    seg_uid = data["seg_uid"]
+                    is_hole = (item.checkState(4) == Qt.Checked)
+                    # Update the segment map
+                    if (surface_idx, seg_uid) in self._refine_segment_map:
+                        self._refine_segment_map[(surface_idx, seg_uid)]["is_hole"] = is_hole
+                        logger.info(f"Updated segment {seg_uid} hole status: {is_hole}")
+                        
+                    # Synchronize hole marking across surfaces for shared intersection lines
+                    self._sync_hole_selection_across_surfaces(item)
+                        
+                    # Update visualization to show hole segments differently
+                    self._update_all_segment_actors()
+                
+                # Handle hole checkbox changes for group items (intersection_group or hull_group)
+                elif data and data.get("type") in ["intersection_group", "hull_group"]:
+                    is_hole = (item.checkState(4) == Qt.Checked)
+                    group_type = data.get("type")
+                    surface_idx = data.get("surface_idx")
+                    
+                    logger.info(f"Group {group_type} hole state changed to {is_hole} for surface {surface_idx}")
+                    
+                    # Propagate hole state to all children segments
+                    def set_all_children_hole_state(parent, state):
+                        for i in range(parent.childCount()):
+                            child = parent.child(i)
+                            child_data = child.data(0, Qt.UserRole)
+                            if child_data and child_data.get("type") == "constraint":
+                                child.setCheckState(4, state)
+                                # Update segment map
+                                child_surface_idx = child_data["surface_idx"]
+                                child_seg_uid = child_data["seg_uid"]
+                                if (child_surface_idx, child_seg_uid) in self._refine_segment_map:
+                                    self._refine_segment_map[(child_surface_idx, child_seg_uid)]["is_hole"] = (state == Qt.Checked)
+                                    logger.debug(f"Updated segment {child_seg_uid} hole status: {state == Qt.Checked}")
+                            set_all_children_hole_state(child, state)
+                    
+                    set_all_children_hole_state(item, Qt.Checked if is_hole else Qt.Unchecked)
+                    
+                    # Synchronize across surfaces if it's an intersection group
+                    if data.get("type") == "intersection_group":
+                        logger.info(f"Synchronizing intersection group hole state across surfaces...")
+                        self._sync_hole_selection_across_surfaces(item)
+                    
+                    # Update visualization
+                    self._update_all_segment_actors()
+                
+                # Handle parent state updates when children change
+                def update_parent_hole_state(child):
+                    parent = child.parent()
+                    if not parent:
+                        return
+                    
+                    parent_data = parent.data(0, Qt.UserRole)
+                    if parent_data and parent_data.get("type") in ["intersection_group", "hull_group"]:
+                        # Check if all children have the same hole state
+                        all_hole = True
+                        any_hole = False
+                        for i in range(parent.childCount()):
+                            child_item = parent.child(i)
+                            child_item_data = child_item.data(0, Qt.UserRole)
+                            if child_item_data and child_item_data.get("type") == "constraint":
+                                child_is_hole = (child_item.checkState(4) == Qt.Checked)
+                                if child_is_hole:
+                                    any_hole = True
+                                else:
+                                    all_hole = False
+                        
+                        # Set parent state: checked if all children are holes, unchecked if none, partially checked if mixed
+                        if all_hole and any_hole:
+                            parent.setCheckState(4, Qt.Checked)
+                        elif any_hole:
+                            parent.setCheckState(4, Qt.PartiallyChecked)
+                        else:
+                            parent.setCheckState(4, Qt.Unchecked)
+                        
+                        update_parent_hole_state(parent)
+                
+                # Update parent state if this was a constraint item
+                if data and data.get("type") == "constraint":
+                    update_parent_hole_state(item)
+                
+                return
+
+            # Handle selection checkbox changes (column 0)
+            if column != 0:
+                return
+
             # -------- propagate state downwards (parent → children) ----------
             def set_all_children_state(parent, state):
                 for i in range(parent.childCount()):
                     child = parent.child(i)
                     child.setCheckState(0, state)
+                    # Update segment map for constraint items
+                    child_data = child.data(0, Qt.UserRole)
+                    if child_data and child_data.get("type") == "constraint":
+                        surface_idx = child_data["surface_idx"]
+                        seg_uid = child_data["seg_uid"]
+                        if (surface_idx, seg_uid) in self._refine_segment_map:
+                            self._refine_segment_map[(surface_idx, seg_uid)]["selected"] = (state == Qt.Checked)
                     set_all_children_state(child, state)
 
             set_all_children_state(item, item.checkState(0))
+            
+            # Also update the current item if it's a constraint
+            data = item.data(0, Qt.UserRole)
+            if data and data.get("type") == "constraint":
+                surface_idx = data["surface_idx"]
+                seg_uid = data["seg_uid"]
+                if (surface_idx, seg_uid) in self._refine_segment_map:
+                    self._refine_segment_map[(surface_idx, seg_uid)]["selected"] = (item.checkState(0) == Qt.Checked)
 
             # -------- propagate upwards (any unchecked → parent unchecked) ----
             def update_parent_state(child):
@@ -7040,8 +9876,10 @@ segmentation, triangulation, and visualization.
         finally:
             self._refine_updating_constraint_tree = False
 
-        # -------- refresh 3-D actors -----------------------------------------
-        self._update_all_segment_actors()
+        # -------- refresh 3-D actors (only for non-mouse triggered changes) ----
+        # Skip batch update if this was triggered by mouse selection (already handled individually)
+        if not getattr(self, '_mouse_triggered_change', False):
+            self._update_all_segment_actors()
     def consolidate_points_for_triangulation(self):
         """
         Consolidate all refined points following C++ MeshIt logic for tetrahedral meshing:
@@ -7185,385 +10023,174 @@ segmentation, triangulation, and visualization.
                 if widget:
                     widget.deleteLater()
 
-            # Ensure parent_frame has a layout
             if parent_frame.layout() is None:
                 parent_frame.setLayout(QVBoxLayout())
 
-            # Create a message if PyVista is not available
-            msg_widget = QWidget()
-            msg_layout = QVBoxLayout(msg_widget)
             msg = QLabel("PyVista not installed.\nPlease install PyVista for 3D visualization.")
             msg.setAlignment(Qt.AlignCenter)
-            msg_layout.addWidget(msg)
-            parent_frame.layout().addWidget(msg_widget)
-            return msg_widget
+            parent_frame.layout().addWidget(msg)
+            return
 
-        # Close previous plotter if it exists
-        if hasattr(self, 'current_plotter') and self.current_plotter is not None:
-            try:
-                self.current_plotter.close()
-            except Exception as e:
-                logger.warning(f"Error closing previous plotter: {e}")
-            self.current_plotter = None
-
-        # Clear previous content from parent frame layout first
+        # Close and clean up any previous plotter in this frame
+        if hasattr(self, f'{view_type}_plotter'):
+            old_plotter = getattr(self, f'{view_type}_plotter')
+            if old_plotter:
+                try:
+                    old_plotter.close()
+                except Exception as e:
+                    logger.warning(f"Error closing old plotter for {view_type}: {e}")
+        
         parent_layout = parent_frame.layout()
         if parent_layout is None:
             parent_layout = QVBoxLayout(parent_frame)
-            parent_layout.setContentsMargins(0,0,0,0)
+            parent_layout.setContentsMargins(0, 0, 0, 0)
 
         while parent_layout.count():
             item = parent_layout.takeAt(0)
             widget = item.widget()
             if widget:
-                if isinstance(widget, QFrame) and hasattr(widget, 'interactor'):
-                    try:
-                        widget.interactor.close()
-                    except Exception as e:
-                        logger.debug(f"Minor issue closing interactor: {e}")
                 widget.deleteLater()
 
-        # Create a container widget for the entire visualization area
-        vis_container_widget = QWidget()
-        vis_container_layout = QVBoxLayout(vis_container_widget)
-        vis_container_layout.setContentsMargins(0, 0, 0, 0)
+        from pyvistaqt import QtInteractor
+        import pyvista as pv
+        import numpy as np
+                
+        plotter = QtInteractor(parent=parent_frame)
+        setattr(self, f'{view_type}_plotter', plotter) # Store reference to the new plotter
+        parent_layout.addWidget(plotter.interactor)
+        
+        plotter.set_background("#383F51")
+        plotter.disable() # Disable rendering for performance during setup
 
-        # Add visualization info header based on view_type
-        if view_type == "points":
-            info_title = "Point Cloud Visualization"
-        elif view_type == "hulls":
-            info_title = "Convex Hull Visualization"
-        elif view_type == "segments":
-            info_title = "Segmentation Visualization"
-        elif view_type == "triangulation":
-            info_title = "Triangulation Visualization"
-        else:
-            info_title = title
-
-        info_label = QLabel(info_title)
-        info_label.setAlignment(Qt.AlignCenter)
-        vis_container_layout.addWidget(info_label)
-
-        # Create legend with colored boxes for each dataset
-        legend_widget = QWidget()
-        legend_layout = QHBoxLayout(legend_widget)
-        legend_layout.setContentsMargins(5, 2, 5, 2)
-
-        visible_datasets_in_list = [d for d in datasets if d.get('visible', True)]
-        for dataset in visible_datasets_in_list:
+        plotter_has_geometry = False
+        for i, dataset in enumerate(datasets):
+            if not dataset.get('visible', True):
+                continue
+                
+            points = dataset.get('points')
             color = dataset.get('color', '#000000')
             name = dataset.get('name', 'Unnamed')
             
-            legend_item = QWidget()
-            legend_item_layout = QHBoxLayout(legend_item)
-            legend_item_layout.setContentsMargins(0, 0, 5, 0)
-            
-            # Color box
-            color_box = QLabel("■")
-            color_box.setStyleSheet(f"color: {color}; font-size: 16px;")
-            legend_item_layout.addWidget(color_box)
-            
-            # Dataset name
-            name_label = QLabel(name)
-            legend_item_layout.addWidget(name_label)
-            
-            legend_layout.addWidget(legend_item)
+            if points is None or len(points) == 0:
+                continue
 
-        legend_layout.addStretch()
-        vis_container_layout.addWidget(legend_widget)
+            if points.shape[1] >= 3:
+                points_3d = points[:, 0:3].copy()
+            else:
+                points_3d = np.zeros((len(points), 3))
+                points_3d[:, :points.shape[1]] = points
 
-        try:
-            # Create PyVista plotter widget using QtInteractor
-            from pyvistaqt import QtInteractor
-            import pyvista as pv
-            import numpy as np
-            
-            self.current_plotter = QtInteractor(parent=vis_container_widget)
-            vis_container_layout.addWidget(self.current_plotter)
-            
-            # Set background color
-            self.current_plotter.set_background("#383F51")
-            
-            # Process datasets based on visualization type
-            plotter_has_geometry = False
-            for i, dataset in enumerate(datasets):
-                if not dataset.get('visible', True):
-                    continue
-                    
-                # Get dataset properties
-                points = dataset.get('points')
-                color = dataset.get('color', '#000000')
-                name = dataset.get('name', 'Unnamed')
-                
-                if points is None or len(points) == 0:
-                    continue
-                
-                # Convert 2D points to 3D with height variation
-                if points.shape[1] == 2:
-                    points_3d = np.zeros((len(points), 3))
-                    points_3d[:, 0] = points[:, 0]
-                    points_3d[:, 1] = points[:, 1]
-                    # Z coordinate is left as 0 for 2D points
-                elif points.shape[1] >= 3:
-                    # Use actual Z coordinates from the data
-                    points_3d = points.copy()[:, 0:3]
-                else:
-                    logger.warning(f"Dataset '{name}' has unexpected point dimensions: {points.shape[1]}. Skipping.")
-                    continue
+            max_points_for_viz = 5000
+            if len(points_3d) > max_points_for_viz:
+                step = len(points_3d) // max_points_for_viz
+                points_3d_viz = points_3d[::step]
+            else:
+                points_3d_viz = points_3d
 
-                # Add visualization based on type
-                if view_type == "points":
-                    point_cloud = pv.PolyData(points_3d)
-                    self.current_plotter.add_mesh(point_cloud, color=color, render_points_as_spheres=True, 
-                                        point_size=8, label=name)
-                    plotter_has_geometry = True
-                
-                elif view_type == "hulls":
-                    hull_points = dataset.get('hull_points')
-                    if hull_points is not None and len(hull_points) > 3:
-                        try:
-                            # Ensure hull points are properly formatted as 3D coordinates
-                            hull_3d = np.array(hull_points)
-                            
-                            # Validate dimensions
-                            if len(hull_3d.shape) < 2:
-                                logger.warning(f"Invalid hull shape for {name}: {hull_3d.shape}")
-                                continue
-                                
-                            # Ensure each point has exactly 3 coordinates
-                            if hull_3d.shape[1] < 3:
-                                # Pad with zeros if less than 3D
-                                padding = np.zeros((hull_3d.shape[0], 3 - hull_3d.shape[1]))
-                                hull_3d = np.hstack([hull_3d, padding])
-                            elif hull_3d.shape[1] > 3:
-                                # Take only first 3 coordinates if more than 3D
-                                hull_3d = hull_3d[:, :3]
-                            
-                            # Create lines for the hull with proper validation
-                            for j in range(len(hull_3d)-1):
+            if view_type == "points":
+                point_cloud = pv.PolyData(points_3d_viz)
+                plotter.add_mesh(point_cloud, color=color, render_points_as_spheres=True, point_size=8, label=name)
+                plotter_has_geometry = True
+            
+            elif view_type == "hulls":
+                hull_points = dataset.get('hull_points')
+                if hull_points is not None and len(hull_points) > 3:
+                    try:
+                        # *** FIX START ***
+                        # The hull_points array has dtype=object because of the type string.
+                        # We must explicitly extract the numeric coordinates into a new, purely numeric array.
+                        hull_vertices_numeric = []
+                        for p in hull_points:
+                            if len(p) >= 3:
                                 try:
-                                    # Convert to proper 3D coordinate lists
-                                    point_a = hull_3d[j].tolist() if hasattr(hull_3d[j], 'tolist') else list(hull_3d[j])
-                                    point_b = hull_3d[j+1].tolist() if hasattr(hull_3d[j+1], 'tolist') else list(hull_3d[j+1])
-                                    
-                                    # Ensure exactly 3 coordinates and valid floats
-                                    if (len(point_a) >= 3 and len(point_b) >= 3 and
-                                        all(isinstance(x, (int, float)) for x in point_a[:3]) and
-                                        all(isinstance(x, (int, float)) for x in point_b[:3])):
-                                        
-                                        hull_line = pv.Line([float(point_a[0]), float(point_a[1]), float(point_a[2])],
-                                                        [float(point_b[0]), float(point_b[1]), float(point_b[2])])
-                                        self.current_plotter.add_mesh(hull_line, color=color, line_width=3)
-                                    else:
-                                        logger.warning(f"Skipping invalid hull line {j} for {name}")
-                                except Exception as e:
-                                    logger.warning(f"Error creating hull line {j} for {name}: {e}")
-                                    continue
-                                    
-                            # Add the original points with reduced opacity for context
-                            point_cloud = pv.PolyData(points_3d)
-                            self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.3, 
-                                            render_points_as_spheres=True, point_size=5)
-                            plotter_has_geometry = True
-                            
-                        except Exception as e:
-                            logger.error(f"Error processing hull points for {name}: {e}")
-                            # Fallback to just showing points
-                            point_cloud = pv.PolyData(points_3d)
-                            self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.7, 
-                                            render_points_as_spheres=True, point_size=5)
-                            plotter_has_geometry = True
-
-                elif view_type == "segments":
-                    segments = dataset.get('segments')
-                    if segments is not None and len(segments) > 0:
-                        logger.info(f"Visualizing {len(segments)} segments for dataset '{name}'")
+                                    # Extract and convert the first 3 elements (x,y,z)
+                                    xyz = [float(p[0]), float(p[1]), float(p[2])]
+                                    hull_vertices_numeric.append(xyz)
+                                except (ValueError, TypeError):
+                                    continue # Skip if conversion fails
                         
-                        # Add original points for context (smaller and more transparent)
-                        point_cloud = pv.PolyData(points_3d)
-                        self.current_plotter.add_mesh(point_cloud, color=color, opacity=0.2, render_points_as_spheres=True,
-                                        point_size=3, label=f"{name} Original Points")
+                        if not hull_vertices_numeric:
+                            continue # Skip if no valid points were extracted
 
-                        # OPTIMIZED: Batch process all segments into single line mesh
-                        if segments:
-                            # Pre-allocate arrays for all line points and connectivity
-                            total_lines = len(segments)
-                            line_points = np.zeros((total_lines * 2, 3))  # 2 points per line
-                            line_connectivity = np.zeros(total_lines * 3, dtype=int)  # [2, p1_idx, p2_idx] per line
+                        hull_3d = np.array(hull_vertices_numeric, dtype=np.float64)
+                        # *** FIX END ***
+
+                        # This logic now works correctly with the clean `hull_3d` array
+                        num_hull_points = len(hull_3d)
+                        if num_hull_points >= 2:
+                            # Create a single PolyData object for the entire hull outline
+                            line_segments = np.array([[2, i, (i + 1) % num_hull_points] for i in range(num_hull_points)], dtype=np.int32).ravel()
+                            hull_mesh = pv.PolyData(hull_3d)
+                            hull_mesh.lines = line_segments
+
+                            plotter.add_mesh(hull_mesh, color=color, line_width=3.0, label=f"{name} Hull")
                             
-                            valid_lines = 0
-                            segment_endpoints_set = set()  # Use set for fast deduplication
-                            
-                            for i, segment in enumerate(segments):
-                                try:
-                                    # Ensure segment points are 3D NumPy arrays
-                                    p1 = np.array(segment[0], dtype=float)
-                                    p2 = np.array(segment[1], dtype=float)
-                                    
-                                    # Pad with zeros if dimension is less than 3
-                                    if len(p1) == 2: 
-                                        p1 = np.append(p1, 0.0)
-                                    if len(p2) == 2: 
-                                        p2 = np.append(p2, 0.0)
-
-                                    # Validate coordinates
-                                    if (len(p1) >= 3 and len(p2) >= 3 and
-                                        np.all(np.isfinite(p1[:3])) and np.all(np.isfinite(p2[:3]))):
-                                        
-                                        # Add to batch arrays
-                                        point_idx = valid_lines * 2
-                                        line_points[point_idx] = p1[:3]
-                                        line_points[point_idx + 1] = p2[:3]
-                                        
-                                        # Line connectivity: [2, point1_index, point2_index]
-                                        conn_idx = valid_lines * 3
-                                        line_connectivity[conn_idx] = 2
-                                        line_connectivity[conn_idx + 1] = point_idx
-                                        line_connectivity[conn_idx + 2] = point_idx + 1
-                                        
-                                        # Collect endpoints for markers (use tuples for set)
-                                        segment_endpoints_set.add(tuple(p1[:3]))
-                                        segment_endpoints_set.add(tuple(p2[:3]))
-                                        
-                                        valid_lines += 1
-                                        
-                                except Exception as e:
-                                    logger.warning(f"Error processing segment {i} for {name}: {e}")
-                                    continue
-
-                            # Create single mesh for all segments if we have valid lines
-                            if valid_lines > 0:
-                                # Trim arrays to actual size
-                                line_points = line_points[:valid_lines * 2]
-                                line_connectivity = line_connectivity[:valid_lines * 3]
+                            point_cloud = pv.PolyData(points_3d_viz)
+                            plotter.add_mesh(point_cloud, color=color, opacity=0.3, render_points_as_spheres=True, point_size=5)
+                            plotter_has_geometry = True
                                 
-                                # Create PolyData with all segments at once
-                                segments_mesh = pv.PolyData(line_points, lines=line_connectivity)
-                                self.current_plotter.add_mesh(segments_mesh, color=color, line_width=3.0, 
-                                                            opacity=0.9, label=f"{name} Segments")
-                                
-                                # Add segment endpoints as visible points (batch processed)
-                                if segment_endpoints_set:
-                                    unique_endpoints = np.array(list(segment_endpoints_set))
-                                    segment_points = pv.PolyData(unique_endpoints)
-                                    
-                                    # Make segment points more visible
-                                    segment_point_color = '#FF0000' if color != '#FF0000' else '#00FF00'
-                                    self.current_plotter.add_mesh(segment_points, color=segment_point_color, 
-                                                                render_points_as_spheres=True, point_size=8, 
-                                                                opacity=1.0, label=f"{name} Segment Points")
-                                    
-                                    logger.info(f"Added {len(unique_endpoints)} segment endpoint markers for dataset '{name}'")
-
-                                logger.info(f"Successfully visualized {valid_lines}/{len(segments)} segments for dataset '{name}'")
-                        
+                    except Exception as e:
+                        logger.error(f"Error processing hull points for {name}: {e}")
+                        point_cloud = pv.PolyData(points_3d_viz)
+                        plotter.add_mesh(point_cloud, color=color, opacity=0.7, render_points_as_spheres=True, point_size=5)
                         plotter_has_geometry = True
 
-                elif view_type == "triangulation":
-                    triangulation_result = dataset.get('triangulation_result')
-                    if triangulation_result is not None:
-                        vertices = triangulation_result.get('vertices')
-                        triangles = triangulation_result.get('triangles')
+            elif view_type == "segments":
+                segments = dataset.get('segments')
+                if segments is not None and len(segments) > 0:
+                    point_cloud = pv.PolyData(points_3d_viz)
+                    plotter.add_mesh(point_cloud, color=color, opacity=0.2, render_points_as_spheres=True, point_size=3)
+
+                    segment_points_list = []
+                    for seg in segments:
+                        segment_points_list.append(seg[0])
+                        segment_points_list.append(seg[1])
+                    
+                    if segment_points_list:
+                        all_line_points = np.array(segment_points_list)
+                        # Create line connectivity array
+                        lines = np.arange(len(all_line_points)).reshape(-1, 2)
+                        lines = np.hstack((np.full((len(lines), 1), 2), lines))
                         
-                        if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
-                            # Convert vertices to 3D, respecting Z coordinates 
-                            if vertices.shape[1] == 2:
-                                vertices_3d = np.zeros((len(vertices), 3))
-                                vertices_3d[:, 0:2] = vertices
-                                
-                                # Try to map Z values from original points
-                                for j in range(len(vertices)):
-                                    vertex_2d = vertices[j]
-                                    # Find closest point in original dataset for Z value
-                                    distances = np.sum((points_3d[:, 0:2] - vertex_2d)**2, axis=1)
-                                    closest_idx = np.argmin(distances)
-                                    vertices_3d[j, 2] = points_3d[closest_idx, 2]
-                            else:
-                                # Use Z values if they're already present
-                                vertices_3d = vertices.copy()[:, 0:3]
-                            
-                            cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
-                            mesh = pv.PolyData(vertices_3d, cells)
-                            
-                            self.current_plotter.add_mesh(mesh, color=color, opacity=0.7, 
-                                                    show_edges=True, edge_color=color, 
-                                                    line_width=1, specular=0.5, label=name)
-                            plotter_has_geometry = True
+                        segments_mesh = pv.PolyData(all_line_points, lines=lines.ravel())
+                        plotter.add_mesh(segments_mesh, color=color, line_width=3.0, label=f"{name} Segments")
+                        
+                        # Add endpoint markers
+                        unique_endpoints = np.unique(all_line_points, axis=0)
+                        plotter.add_points(unique_endpoints, color='red', point_size=8, render_points_as_spheres=True)
+                        plotter_has_geometry = True
 
-            # Add axes and reset camera only if something was plotted
-            if plotter_has_geometry:
-                self.current_plotter.add_axes()
-                self.current_plotter.reset_camera()
-                
-                # Force a render to ensure the visualization is updated
-                try:
-                    self.current_plotter.render()
-                    logger.info("3D visualization rendered successfully")
-                except Exception as e:
-                    logger.warning(f"Error forcing render: {e}")
-            else:
-                logger.warning("No geometry added to the plotter for the current view.")
-            
-            # Add controls for adjustment
-            controls_widget = QWidget()
-            controls_layout = QHBoxLayout(controls_widget)
-            controls_layout.setContentsMargins(5, 2, 5, 2)
-            
-            # Add segment controls for segment view
-            if view_type == "segments":
-                # Toggle for showing segment distances
-                show_distances_cb = QCheckBox("Show Distances")
-                show_distances_cb.setChecked(False)
-                show_distances_cb.stateChanged.connect(lambda state: self._toggle_segment_distance_labels(state == 2))
-                controls_layout.addWidget(show_distances_cb)
-                controls_layout.addWidget(QLabel("|"))
-            
-            # Height adjustment slider - for Z axis exaggeration
-            controls_layout.addWidget(QLabel("Z Exaggeration:"))
-            height_slider = QSlider(Qt.Horizontal)
-            height_slider.setMinimum(1)
-            height_slider.setMaximum(100)
-            height_slider.setValue(int(self.height_factor * 20))
-            height_slider.valueChanged.connect(lambda v: self._set_height_factor_and_update(v / 20.0))
-            controls_layout.addWidget(height_slider)
-            
-            # Add zoom controls
-            controls_layout.addStretch(1)
-            controls_layout.addWidget(QLabel("Zoom:"))
-            zoom_in_btn = QPushButton("+")
-            zoom_in_btn.setMaximumWidth(30)
-            zoom_in_btn.clicked.connect(lambda: self.current_plotter.camera.zoom(1.2))
-            controls_layout.addWidget(zoom_in_btn)
-            
-            zoom_out_btn = QPushButton("-")
-            zoom_out_btn.setMaximumWidth(30)
-            zoom_out_btn.clicked.connect(lambda: self.current_plotter.camera.zoom(1/1.2))
-            controls_layout.addWidget(zoom_out_btn)
-            
-            # Reset view button
-            reset_btn = QPushButton("Reset View")
-            reset_btn.clicked.connect(lambda: self.current_plotter.reset_camera())
-            controls_layout.addWidget(reset_btn)
-            
-            vis_container_layout.addWidget(controls_widget)
+            elif view_type == "triangulation":
+                tri_result = dataset.get('triangulation_result')
+                if tri_result:
+                    vertices = tri_result.get('vertices')
+                    triangles = tri_result.get('triangles')
+                    
+                    if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
+                        vertices_3d = np.zeros((len(vertices), 3))
+                        if vertices.shape[1] >= 3:
+                            vertices_3d = vertices[:, :3].copy()
+                        else:
+                            vertices_3d[:, :vertices.shape[1]] = vertices
+                        
+                        # Apply height factor for visualization
+                        vertices_3d[:, 2] *= self.height_factor
 
-        except ImportError:
-            logger.error("PyVistaQt import failed unexpectedly.")
-            error_msg = QLabel("Error: Failed to load PyVistaQt.")
-            error_msg.setAlignment(Qt.AlignCenter)
-            vis_container_layout.addWidget(error_msg)
-        except Exception as e:
-            error_msg_text = f"Error creating 3D view: {str(e)}\nCheck logs for details."
-            error_msg = QLabel(error_msg_text)
-            error_msg.setAlignment(Qt.AlignCenter)
-            error_msg.setWordWrap(True)
-            vis_container_layout.addWidget(error_msg)
-            logger.exception(f"Error creating multi-dataset 3D view:")
+                        cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
+                        mesh = pv.PolyData(vertices_3d, cells)
+                        
+                        plotter.add_mesh(mesh, color=color, opacity=0.8, show_edges=True, edge_color='black', line_width=0.5, label=name)
+                        plotter_has_geometry = True
 
-        # Add the visualization container widget to the parent frame provided
-        parent_layout.addWidget(vis_container_widget)
-
-        return vis_container_widget
+        if plotter_has_geometry:
+            plotter.add_axes()
+            plotter.add_legend()
+            plotter.reset_camera()
+        else:
+            plotter.add_text(f"No valid data to display for '{view_type}' view.", position='upper_edge', color='white')
+            
+        plotter.enable()
+        plotter.render()
 
     def _set_height_factor_and_update(self, height_factor):
         """Sets the height factor and triggers a visualization update."""
@@ -7580,63 +10207,61 @@ segmentation, triangulation, and visualization.
         if not self.datasets:
             logger.debug("No datasets loaded, clearing visualizations.")
             self._clear_visualizations() # Clears all known plots
-            # Explicitly clear the current tab's specific plot if it has one and _clear_visualizations doesn't cover it
-            if current_tab_widget == self.file_tab: pass # Covered
+            if current_tab_widget == self.file_tab: pass
             elif current_tab_widget == self.hull_tab: self._clear_hull_plot()
             elif current_tab_widget == self.segment_tab: self._clear_segment_plot()
             elif current_tab_widget == self.triangulation_tab: self._clear_triangulation_plot()
             elif current_tab_widget == self.intersection_tab: self._clear_intersection_plot()
-            elif current_tab_widget == self.refine_mesh_tab: self._clear_refine_mesh_plot() # Add this
-            elif current_tab_widget == self.pre_tetramesh_tab: self._clear_pre_tetramesh_plot() # Add this
-            elif hasattr(self, 'tetra_mesh_tab') and current_tab_widget == self.tetra_mesh_tab: self._clear_tetra_mesh_plot() # Add this
+            elif current_tab_widget == self.refine_mesh_tab: self._clear_refine_mesh_plot()
+            elif hasattr(self, 'tetra_mesh_tab') and current_tab_widget == self.tetra_mesh_tab: self._clear_tetra_mesh_plot()
             return
 
-        if current_tab_widget == self.file_tab:  # File tab
+        # NEW: ensure tables are populated whenever user views any tab
+        if hasattr(self, '_refresh_seg_refine_table'):
+            self._refresh_seg_refine_table()
+        if hasattr(self, '_refresh_mesh_refine_table'):
+            self._refresh_mesh_refine_table()
+
+        if current_tab_widget == self.file_tab:
             self._visualize_all_points()
-        elif current_tab_widget == self.hull_tab:  # Hull tab
+        elif current_tab_widget == self.hull_tab:
             needs_update = any(d.get('visible', True) and d.get('hull_points') is not None for d in self.datasets)
             if needs_update: self._visualize_all_hulls()
             else: self._clear_hull_plot(); self.statusBar().showMessage("No visible hulls computed.")
-        elif current_tab_widget == self.segment_tab:  # Segment tab
+        elif current_tab_widget == self.segment_tab:
             needs_update = any(d.get('visible', True) and d.get('segments') is not None for d in self.datasets)
-            if needs_update: 
-                # Clear flag before visualizing in segmentation tab
+            if needs_update:
                 self._clear_segmentation_visualization_flag()
                 self._visualize_all_segments()
-            else: self._clear_segment_plot(); self.statusBar().showMessage("No visible segments computed.")
-        elif current_tab_widget == self.triangulation_tab:  # Triangulation tab
+            else:
+                self._clear_segment_plot(); self.statusBar().showMessage("No visible segments computed.")
+        elif current_tab_widget == self.triangulation_tab:
             needs_update = any(d.get('visible', True) and d.get('triangulation_result') is not None for d in self.datasets)
-            if needs_update: 
-                # Only visualize triangulation, skip segments if already visualized
+            if needs_update:
                 self._visualize_all_triangulations()
-            else: self._clear_triangulation_plot(); self.statusBar().showMessage("No visible triangulations computed.")
-        elif current_tab_widget == self.intersection_tab:  # Intersection tab
+            else:
+                self._clear_triangulation_plot(); self.statusBar().showMessage("No visible triangulations computed.")
+        elif current_tab_widget == self.intersection_tab:
             has_intersections = hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections)
             if has_intersections: self._visualize_intersections()
             else: self._clear_intersection_plot(); self.statusBar().showMessage("No intersections computed yet.")
-        elif current_tab_widget == self.refine_mesh_tab: # Refine & Mesh tab - Add this block
-            has_refined_intersections = hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections) # Check if any intersections exist (refined or not)
+        elif current_tab_widget == self.refine_mesh_tab:
+            has_refined_intersections = hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections)
             if has_refined_intersections:
-                self._visualize_refined_intersections() # This will show current state of intersections
+                self._visualize_refined_intersections()
             else:
-                self._clear_refine_mesh_plot()
-                self.statusBar().showMessage("No intersections to refine or display.")
-        elif current_tab_widget == self.pre_tetramesh_tab: # Pre-Tetramesh tab - Add this block
+                self._clear_refine_mesh_plot(); self.statusBar().showMessage("No intersections to refine or display.")
+        elif current_tab_widget == self.pre_tetramesh_tab:
             if any(d.get('constrained_triangulation_result') for d in self.datasets):
                 self._visualize_constrained_meshes()
             else:
-                self._clear_pre_tetramesh_plot()
-                self.statusBar().showMessage("No constrained surface meshes computed yet.")
-        elif hasattr(self, 'tetra_mesh_tab') and current_tab_widget == self.tetra_mesh_tab: # Tetra Mesh tab
-            # Update tetra tab when switching to it
+                self._clear_pre_tetramesh_plot(); self.statusBar().showMessage("No constrained surface meshes computed yet.")
+        elif hasattr(self, 'tetra_mesh_tab') and current_tab_widget == self.tetra_mesh_tab:
             if hasattr(self, 'tetrahedral_mesh') and self.tetrahedral_mesh:
-                # Show existing tetrahedral mesh
                 self._visualize_tetrahedral_mesh_in_tetra_tab()
             elif hasattr(self, 'tetra_selected_surfaces') and self.tetra_selected_surfaces:
-                # Show loaded constrained surfaces
                 self._visualize_loaded_surfaces()
             else:
-                # Clear and show ready message
                 if hasattr(self, 'tetra_plotter') and self.tetra_plotter:
                     self.tetra_plotter.clear()
                     self.tetra_plotter.add_text("Load surfaces from Pre-Tetra tab to begin", position='upper_edge', color='white')
@@ -7842,6 +10467,9 @@ segmentation, triangulation, and visualization.
             logger.info(f"{task_name} finished. Success: {success_count}/{total_eligible}. Time: {elapsed_time:.2f}s")
             self.statusBar().showMessage(f"Batch finished: {success_count}/{total_eligible} succeeded in {elapsed_time:.2f}s.", 10000)
 
+        if any(d.get('segments') is not None for d in self.datasets):
+            self._refresh_seg_view_if_active()
+
         # Close progress dialog if it exists
         if hasattr(self, 'progress_dialog') and self.progress_dialog:
             # If it was the global intersection task, set value to max to show completion
@@ -7850,7 +10478,7 @@ segmentation, triangulation, and visualization.
             self.progress_dialog.close()
             self.progress_dialog = None
             logger.debug("Progress dialog closed.")
-
+        
         # Thread cleanup (moved thread check inside)
         if hasattr(self, 'thread') and self.thread and self.thread.isRunning():
             logger.info("Signaling worker thread to stop and quit.")
@@ -8053,162 +10681,162 @@ segmentation, triangulation, and visualization.
         """
         Compute intersections globally for all datasets with triangulation data.
         This method is called by the worker thread.
-        
+
         Returns:
             bool: True if successful, False otherwise
         """
         logger.info("Starting global intersection computation...")
         try:
             from meshit.intersection_utils import (
-                Vector3D, Triangle, Intersection, TriplePoint, 
+                Vector3D, Triangle, Intersection, TriplePoint,
                 run_intersection_workflow
             )
         except ImportError as e:
             logger.error(f"Failed to import intersection utilities: {e}")
             QMessageBox.critical(self, "Import Error", f"Failed to import intersection utilities: {e}\nPlease ensure meshit.intersection_utils is available.")
             return False
-        
-        # Check if there are any datasets with triangulation
-        eligible_dataset_indices = [i for i, d in enumerate(self.datasets) if d.get('triangulation_result') is not None]
-        
-        if len(eligible_dataset_indices) < 2:
-            logger.warning("Need at least two triangulated datasets to compute intersections.")
-            QMessageBox.warning(self, "Not Enough Data", "Need at least two triangulated datasets to compute intersections.")
-            return False
-        
-        logger.info(f"Found {len(eligible_dataset_indices)} eligible datasets for intersection.")
 
-        # Create a structure similar to MeshItModel to store all eligible datasets
+        # Eligible surfaces require triangulations
+        eligible_surface_indices = [i for i, d in enumerate(self.datasets) if d.get('type') != 'WELL' and d.get('triangulation_result') is not None]
+        if len(eligible_surface_indices) < 1:
+            logger.warning("Need at least one triangulated surface to compute intersections.")
+            QMessageBox.warning(self, "Not Enough Data", "Need at least one triangulated surface to compute intersections.")
+            return False
+
+        # Collect wells (polylines) regardless of triangulation
+        well_indices = [i for i, d in enumerate(self.datasets) if d.get('type') == 'WELL' and d.get('points') is not None and len(d.get('points')) >= 2]
+        logger.info(f"Found {len(eligible_surface_indices)} triangulated surfaces and {len(well_indices)} wells for intersection.")
+
+        if len(eligible_surface_indices) + len(well_indices) < 2:
+            logger.warning("Need at least two objects (surfaces and/or wells) to compute intersections.")
+            QMessageBox.warning(self, "Not Enough Data", "Need at least two objects (surfaces and/or wells) to compute intersections.")
+            return False
+
+        # Model wrapper compatible with intersection_utils
         class ModelWrapper:
             def __init__(self):
                 self.surfaces = []
-                self.model_polylines = [] # Future extension: Add polylines if needed
+                self.model_polylines = []
                 self.intersections = []
                 self.triple_points = []
-                self.original_indices = {} # Map model surface index back to original dataset index
-                self.is_polyline = {} # Map surface index to whether it's a polyline (False for all surfaces)
-        
+                # Maps: model indices -> original dataset indices
+                self.original_surface_indices = {}
+                self.original_polyline_indices = {}
+
         model = ModelWrapper()
-        
-        # Populate model with surfaces from eligible datasets
-        for original_index in eligible_dataset_indices:
+
+        # Populate surfaces
+        for original_index in eligible_surface_indices:
             dataset = self.datasets[original_index]
-            
-            # Create a surface object for this dataset
+
             class SurfaceWrapper:
                 def __init__(self, dataset, index):
                     self.name = dataset.get('name', f"Dataset {index+1}")
-                    self.vertices = [] # Vertices corresponding to the triangulation
-                    self.triangles = [] # Triangle indices referencing self.vertices
+                    self.vertices = []
+                    self.triangles = []
                     self.convex_hull = []
                     self.bounds = [Vector3D(), Vector3D()]
                     self.type = "Surface"
-                    
+
                     tri_result = dataset.get('triangulation_result')
                     if not tri_result or 'vertices' not in tri_result or 'triangles' not in tri_result:
-                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: Missing valid triangulation result (vertices or triangles).")
-                        return # Skip if no valid triangulation result
-                        
-                    # --- CORRECTED: Use vertices from triangulation result --- 
+                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: Missing triangulation result.")
+                        return
+
                     tri_vertices = tri_result['vertices']
                     self.triangles = tri_result['triangles']
-                    
                     if tri_vertices is None or len(tri_vertices) == 0 or self.triangles is None:
-                         logger.warning(f"Skipping SurfaceWrapper for dataset {index}: Empty vertices or triangles in triangulation result.")
-                         return
-                         
-                    # Convert triangulation vertices to Vector3D
+                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: Empty vertices or triangles.")
+                        return
+
                     for point in tri_vertices:
-                         # Ensure points are 3D
-                         if len(point) >= 3:
-                             self.vertices.append(Vector3D(point[0], point[1], point[2]))
-                         elif len(point) == 2:
-                             self.vertices.append(Vector3D(point[0], point[1], 0.0)) # Assume Z=0 for 2D
-                         else:
-                             logger.warning(f"Skipping invalid vertex in triangulation result for dataset {index}: {point}")
-                    
+                        if len(point) >= 3:
+                            self.vertices.append(Vector3D(point[0], point[1], point[2]))
+                        elif len(point) == 2:
+                            self.vertices.append(Vector3D(point[0], point[1], 0.0))
+                        else:
+                            logger.warning(f"Skipping invalid vertex in triangulation result for dataset {index}: {point}")
+
                     if not self.vertices:
-                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: No valid Vector3D vertices created from triangulation result.")
-                        return # Skip if no valid vertices could be created
-                        
-                    # Ensure triangle indices are valid for the created vertices list
+                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: No valid vertices.")
+                        return
+
                     max_vertex_index = len(self.vertices) - 1
                     valid_triangles = []
                     for tri in self.triangles:
                         if all(0 <= idx <= max_vertex_index for idx in tri):
                             valid_triangles.append(tri)
-                        else:
-                            logger.warning(f"Skipping invalid triangle in dataset {index} (indices out of bounds): {tri}")
                     self.triangles = valid_triangles
-                    
                     if not self.triangles:
-                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: No valid triangles remain after index check.")
+                        logger.warning(f"Skipping SurfaceWrapper for dataset {index}: No valid triangles remain.")
                         return
-                    # --- END CORRECTION --- 
-                    
-                    # Add convex hull if available (optional for intersection but good practice)
+
                     hull_points_data = dataset.get('hull_points')
                     if hull_points_data is not None and len(hull_points_data) > 0:
                         self.convex_hull = [Vector3D(p[0], p[1], p[2]) for p in hull_points_data if len(p) >= 3]
-                    
-                    # Calculate bounds for early rejection test using the triangulation vertices
+
                     if self.vertices:
-                        min_x = min(v.x for v in self.vertices)
-                        min_y = min(v.y for v in self.vertices)
-                        min_z = min(v.z for v in self.vertices)
-                        max_x = max(v.x for v in self.vertices)
-                        max_y = max(v.y for v in self.vertices)
-                        max_z = max(v.z for v in self.vertices)
-                        
+                        min_x = min(v.x for v in self.vertices); min_y = min(v.y for v in self.vertices); min_z = min(v.z for v in self.vertices)
+                        max_x = max(v.x for v in self.vertices); max_y = max(v.y for v in self.vertices); max_z = max(v.z for v in self.vertices)
                         self.bounds[0] = Vector3D(min_x, min_y, min_z)
                         self.bounds[1] = Vector3D(max_x, max_y, max_z)
-            
-            # Add surface to model if valid
+
             surface = SurfaceWrapper(dataset, original_index)
-            # --- START CORRECTED BLOCK ---
-            # Check the validity of the surface before adding
-            # Use explicit length checks for lists/arrays to avoid ValueError
             vertices_valid = hasattr(surface, 'vertices') and surface.vertices is not None and len(surface.vertices) > 0
             triangles_valid = hasattr(surface, 'triangles') and surface.triangles is not None and len(surface.triangles) > 0
-
             if vertices_valid and triangles_valid:
-                # If checks pass, add the surface
-                model_surface_index = len(model.surfaces)
+                model_index = len(model.surfaces)
                 model.surfaces.append(surface)
-                model.original_indices[model_surface_index] = original_index # Store mapping
-                model.is_polyline[model_surface_index] = False # All surfaces are not polylines
-                logger.debug(f"Added dataset {original_index} as model surface {model_surface_index}")
+                model.original_surface_indices[model_index] = original_index
             else:
-                # Log if checks fail
-                logger.warning(f"Dataset {original_index} ('{dataset.get('name')}') could not be added to intersection model (missing valid vertices or triangles). Vertices valid: {vertices_valid}, Triangles valid: {triangles_valid}")
-            # --- END CORRECTED BLOCK ---
+                logger.warning(f"Dataset {original_index} ('{dataset.get('name')}') skipped as surface (missing valid vertices or triangles).")
 
-        # Check if we have enough valid surfaces in the model
-        if len(model.surfaces) < 2:
-            logger.warning("Need at least two valid surfaces in the model to compute intersections.")
-            QMessageBox.warning(self, "Not Enough Valid Data", "Need at least two valid triangulated datasets for intersection computation.")
+        if len(model.surfaces) < 1 and len(well_indices) < 2:
+            logger.warning("Insufficient surfaces and wells to compute intersections.")
+            QMessageBox.warning(self, "Not Enough Valid Data", "Insufficient triangulated surfaces and wells for intersections.")
             return False
 
-        logger.info(f"Prepared intersection model with {len(model.surfaces)} surfaces.")
+        # Populate polylines (wells)
+        for original_index in well_indices:
+            dataset = self.datasets[original_index]
+            points = dataset.get('points')
+            if points is None or len(points) < 2:
+                continue
 
-        # Initialize progress reporting function for intersection_utils
+            class PolylineWrapper:
+                def __init__(self, dataset, pts, index):
+                    self.name = dataset.get('name', f"Well_{index}")
+                    self.vertices = [Vector3D(float(p[0]), float(p[1]), float(p[2]) if len(p) > 2 else 0.0) for p in pts]
+                    # Consecutive segment pairs referencing self.vertices indices
+                    self.segments = [(i, i + 1) for i in range(len(self.vertices) - 1)]
+                    # Bounds
+                    xs = [v.x for v in self.vertices]; ys = [v.y for v in self.vertices]; zs = [v.z for v in self.vertices]
+                    self.bounds = [Vector3D(min(xs), min(ys), min(zs)), Vector3D(max(xs), max(ys), max(zs))]
+                    self.type = "Polyline"
+
+            polyline = PolylineWrapper(dataset, points, original_index)
+            if hasattr(polyline, 'vertices') and len(polyline.vertices) >= 2 and hasattr(polyline, 'segments') and len(polyline.segments) >= 1:
+                model_idx = len(model.model_polylines)
+                model.model_polylines.append(polyline)
+                model.original_polyline_indices[model_idx] = original_index
+
+        logger.info(f"Prepared intersection model with {len(model.surfaces)} surfaces and {len(model.model_polylines)} wells.")
+
+        # Run workflow
         def progress_callback(message):
-            # We can log this, but the main progress dialog is handled by batch_finished
             logger.debug(f"Intersection util progress: {message.strip()}")
-            QApplication.processEvents() # Keep UI responsive during internal steps
-        
-        # --- Run the intersection workflow --- 
+            QApplication.processEvents()
+
         try:
             logger.info("Calling run_intersection_workflow...")
-            # Configure constraint processing for intersection workflow with enhanced curved surface detection
             intersection_config = {
                 'use_constraint_processing': True,
                 'type_based_sizing': True,
                 'hierarchical_constraints': True,
                 'gradient': 2.0,
-                'use_enhanced_curved_detection': True,  # Enable enhanced curved surface detection
-                'adaptive_sampling': True,               # Enable adaptive sampling for curved surfaces
-                'max_subdivisions': 3                    # Maximum subdivision levels for adaptive sampling
+                'use_enhanced_curved_detection': True,
+                'adaptive_sampling': True,
+                'max_subdivisions': 3
             }
             model = run_intersection_workflow(model, progress_callback, config=intersection_config)
             logger.info("run_intersection_workflow finished.")
@@ -8217,71 +10845,63 @@ segmentation, triangulation, and visualization.
             logger.error(error_msg, exc_info=True)
             QMessageBox.critical(self, "Intersection Computation Error", error_msg)
             return False
-        
-        # --- Store the results --- 
-        # Clear previous results
-        self.datasets_intersections = {} # Store intersections per *original* dataset index
-        self.triple_points = [] # Store triple points globally
-        
+
+        # Store results
+        self.datasets_intersections = {}
+        self.triple_points = []
+
         logger.info(f"Processing {len(model.intersections)} raw intersections and {len(model.triple_points)} triple points from workflow.")
 
-        # Process intersections
         found_intersections_count = 0
         for intersection in model.intersections:
-            # Map model surface indices back to original dataset indices
-            original_id1 = model.original_indices.get(intersection.id1, -1)
-            original_id2 = model.original_indices.get(intersection.id2, -1)
-            
+            # Map back to original dataset indices
+            if getattr(intersection, 'is_polyline_mesh', False):
+                original_poly = model.original_polyline_indices.get(intersection.id1, -1)
+                original_surf = model.original_surface_indices.get(intersection.id2, -1)
+                original_id1, original_id2 = original_poly, original_surf
+            else:
+                original_id1 = model.original_surface_indices.get(intersection.id1, -1)
+                original_id2 = model.original_surface_indices.get(intersection.id2, -1)
+
             if original_id1 == -1 or original_id2 == -1:
-                logger.warning(f"Skipping intersection with invalid original index mapping (IDs: {intersection.id1}, {intersection.id2})")
-                continue # Skip invalid mappings
-            
-            # Convert points to regular lists for storage
+                logger.warning(f"Skipping intersection with invalid mapping (IDs: {intersection.id1}, {intersection.id2}, is_polyline={getattr(intersection, 'is_polyline_mesh', False)})")
+                continue
+
+            # Points to plain lists
             points = []
             for point in intersection.points:
                 points.append([point.x, point.y, point.z])
-            
-            # Create intersection info
+
             intersection_info = {
                 'dataset_id1': original_id1,
                 'dataset_id2': original_id2,
-                'is_polyline_mesh': intersection.is_polyline_mesh,
+                'is_polyline_mesh': getattr(intersection, 'is_polyline_mesh', False),
                 'points': points
             }
             found_intersections_count += 1
 
-            # Store only with the dataset having the lower ID
-            if original_id1 <= original_id2:
-                if original_id1 not in self.datasets_intersections:
-                    self.datasets_intersections[original_id1] = []
-                self.datasets_intersections[original_id1].append(intersection_info)
-            else:
-                if original_id2 not in self.datasets_intersections:
-                    self.datasets_intersections[original_id2] = []
-                self.datasets_intersections[original_id2].append(intersection_info)
-  
-        # Process triple points
+            # Store keyed by the lower dataset id (as before)
+            primary_key = min(original_id1, original_id2)
+            if primary_key not in self.datasets_intersections:
+                self.datasets_intersections[primary_key] = []
+            self.datasets_intersections[primary_key].append(intersection_info)
+
+        # Triple points
         for tp in model.triple_points:
             point = [tp.point.x, tp.point.y, tp.point.z]
-            # Note: intersection_ids in TriplePoint refer to the indices within model.intersections
-            # We might need to map these if we store intersections differently, but for now, store raw indices.
-            intersection_ids = tp.intersection_ids 
             self.triple_points.append({
                 'point': point,
-                'intersection_ids': intersection_ids
+                'intersection_ids': tp.intersection_ids
             })
-        
+
         logger.info(f"Stored {found_intersections_count} intersections across datasets and {len(self.triple_points)} triple points.")
 
-        # --- Update UI --- 
-        # Use QTimer.singleShot to ensure UI updates happen on the main thread
-        # after the worker thread finishes processing this method.
         QTimer.singleShot(0, self._update_statistics)
         QTimer.singleShot(0, self._update_intersection_list)
-        QTimer.singleShot(0, self._visualize_intersections) # Or visualize selected if preferred
-        
+        QTimer.singleShot(0, self._visualize_intersections)
+
         logger.info("Global intersection computation successful.")
-        return True # Indicate success
+        return True
     def _clear_intersection_results(self):
         """Clear all intersection results"""
         # Clear intersection data
@@ -8736,6 +11356,9 @@ segmentation, triangulation, and visualization.
                         logger.warning(f"Invalid triple points array shape or content: {points_array.shape}")
             except Exception as e:
                 logger.error(f"Error adding triple points in embedded view: {e}")
+
+        # Add Well datasets as polylines
+        self._add_wells_polyline_to_plotter(plotter)
 
         if plotter_has_content:
             # Use white text for legend on dark background
@@ -9203,7 +11826,7 @@ segmentation, triangulation, and visualization.
         # TetGen options
         tetgen_options_layout = QHBoxLayout()
         tetgen_options_layout.addWidget(QLabel("TetGen Switches:"))
-        self.tetgen_switches_input = QLineEdit("pq1.414aA")
+        self.tetgen_switches_input = QLineEdit("pq1.2AY")
         self.tetgen_switches_input.setToolTip("TetGen command line switches (e.g., pq1.414aA)")
         tetgen_options_layout.addWidget(self.tetgen_switches_input)
         generate_layout.addLayout(tetgen_options_layout)
@@ -9758,6 +12381,9 @@ segmentation, triangulation, and visualization.
              QMessageBox.critical(self, "Data Error", "No conforming mesh data is loaded in the Tetra Mesh tab.")
              return
         
+        # Collect hole information from constraint tree
+        holes = self._collect_holes_from_constraint_tree()
+        
         self.tetra_mesh_generator = TetrahedralMeshGenerator(
             datasets=self.datasets,
             selected_surfaces=self.tetra_selected_surfaces,
@@ -9765,7 +12391,8 @@ segmentation, triangulation, and visualization.
             unit_surface_indices=unit_indices,
             fault_surface_indices=fault_indices,
             materials=self.tetra_materials,
-            surface_data=self.tetra_surface_data  # <-- PASS THE CORRECT DATA
+            surface_data=self.tetra_surface_data,  # <-- PASS THE CORRECT DATA
+            holes=holes  # <-- PASS HOLE INFORMATION
         )
 
         self.statusBar().showMessage("Generating 3D tetrahedral mesh... This may take a while.")
@@ -9811,6 +12438,123 @@ segmentation, triangulation, and visualization.
             QMessageBox.critical(self, "TetGen Failure", "Failed to generate tetrahedral mesh. Check the logs and the exported debug_plc.vtm file for details.")
 
         self.statusBar().showMessage("Tetrahedral meshing complete.")
+
+    def _collect_holes_from_constraint_tree(self):
+        """
+        Collect hole points from the constraint tree where users have marked intersections as holes.
+        Returns a list of (x, y, z) hole center points.
+        """
+        holes = []
+        processed_intersections = set()  # Avoid duplicate holes from same intersection
+        
+        # Try to get the constraint tree from Refine & Mesh tab
+        constraint_tree = None
+        if hasattr(self, 'refine_constraint_tree') and self.refine_constraint_tree:
+            constraint_tree = self.refine_constraint_tree
+            logger.info("Using constraint tree from Refine & Mesh tab for hole collection")
+        else:
+            logger.info("No constraint tree available for hole collection")
+            return holes
+            
+        tree = constraint_tree
+        
+        # Iterate through all surfaces in the constraint tree
+        for i in range(tree.topLevelItemCount()):
+            surface_item = tree.topLevelItem(i)
+            surface_data = surface_item.data(0, Qt.UserRole)
+            
+            if not surface_data or surface_data.get('type') != 'surface':
+                continue
+                
+            surface_idx = surface_data.get('surface_idx')
+            if surface_idx is None:
+                continue
+                
+            # Iterate through intersection groups in this surface
+            for j in range(surface_item.childCount()):
+                group_item = surface_item.child(j)
+                group_data = group_item.data(0, Qt.UserRole)
+                
+                if not group_data or group_data.get('type') != 'intersection_group':
+                    continue
+                
+                # Check if this intersection group is marked as a hole (column 4)
+                if group_item.checkState(4) == Qt.Checked:
+                    # Extract intersection index from text (e.g., "Intersection 2")
+                    item_text = group_item.text(0)
+                    try:
+                        intersection_idx = int(item_text.split(" ")[-1])
+                    except (ValueError, IndexError):
+                        continue
+                        
+                    # Get intersection data
+                    if (hasattr(self, 'refined_intersections_for_visualization') and 
+                        surface_idx in self.refined_intersections_for_visualization and 
+                        intersection_idx < len(self.refined_intersections_for_visualization[surface_idx])):
+                        
+                        intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+                        dataset_id1 = intersection_data.get('dataset_id1')
+                        dataset_id2 = intersection_data.get('dataset_id2')
+                        
+                        # Create unique key for this intersection to avoid duplicates
+                        intersection_key = tuple(sorted([dataset_id1, dataset_id2]))
+                        if intersection_key in processed_intersections:
+                            continue
+                            
+                        processed_intersections.add(intersection_key)
+                        
+                        # Calculate hole center from intersection segments
+                        hole_center = self._calculate_intersection_hole_center(surface_idx, intersection_idx)
+                        if hole_center:
+                            holes.append(hole_center)
+                            surface_name = self.datasets[surface_idx].get("name", f"Surface_{surface_idx}")
+                            logger.info(f"Collected hole from constraint tree: '{surface_name}' intersection {intersection_idx} at ({hole_center[0]:.3f}, {hole_center[1]:.3f}, {hole_center[2]:.3f})")
+        
+        if holes:
+            logger.info(f"✓ Collected {len(holes)} holes from constraint tree")
+        else:
+            logger.info("No holes marked in constraint tree")
+            
+        return holes
+    
+    def _calculate_intersection_hole_center(self, surface_idx, intersection_idx):
+        """
+        Calculate the center point of a hole from intersection segments.
+        """
+        try:
+            if (not hasattr(self, 'refined_intersections_for_visualization') or
+                surface_idx not in self.refined_intersections_for_visualization or 
+                intersection_idx >= len(self.refined_intersections_for_visualization[surface_idx])):
+                return None
+                
+            intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+            segments = intersection_data.get('segments', [])
+            
+            if not segments:
+                return None
+            
+            # Collect all points from all segments
+            all_points = []
+            for segment in segments:
+                points = segment.get('points', [])
+                for point in points:
+                    if hasattr(point, 'x'):  # Vector3D-like object
+                        all_points.append([point.x, point.y, point.z])
+                    elif isinstance(point, (list, tuple)) and len(point) >= 3:
+                        all_points.append([point[0], point[1], point[2]])
+            
+            if not all_points:
+                return None
+                
+            # Calculate centroid
+            import numpy as np
+            coords_array = np.array(all_points)
+            center = np.mean(coords_array, axis=0)
+            return [float(center[0]), float(center[1]), float(center[2])]
+            
+        except Exception as e:
+            logger.warning(f"Failed to calculate intersection hole center: {e}")
+            return None
 
     def _get_surface_indices_from_list(self, list_widget):
         """Extract surface indices from a list widget containing classified surfaces"""
@@ -12997,9 +15741,11 @@ segmentation, triangulation, and visualization.
             Surface
                 Hull segments →  Seg 0, Seg 1, …
                 Intersection n → Seg 0, Seg 1, …
-        Every Seg-item represents one two-point constraint segment.
+        Every Seg-item represents ONE selectable block:
+        - For intersections: between TRIPLE_POINTs and endpoints (or wrapping for closed loops)
+        - For hull: per-edge as before
         """
-        from meshit.intersection_utils import split_line_at_special_points
+        from meshit.intersection_utils import Vector3D
 
         if not hasattr(self, "refine_constraint_tree"):
             return
@@ -13008,9 +15754,95 @@ segmentation, triangulation, and visualization.
         tree.clear()
         tree.blockSignals(True)
 
-        # (surface_idx , seg_uid)  →  {'points':[...], 'ctype':'HULL'|'INT'}
+        # (surface_idx , seg_uid)  →  {'points':[...], 'type':'HULL'|'INTERSECTION', 'ctype':'HULL'|'INT'}
         self._refine_segment_map: Dict[Tuple[int, int], Dict] = {}
         seg_uid = 0
+
+        def get_type(p):
+            # Works for Vector3D or [x, y, z, type]
+            if hasattr(p, "point_type") and p.point_type is not None:
+                return p.point_type
+            if hasattr(p, "type") and p.type is not None:
+                return p.type
+            if isinstance(p, (list, tuple)) and len(p) > 3:
+                return p[3]
+            return "DEFAULT"
+
+        def is_closed_loop(pts):
+            if len(pts) < 3:
+                return False
+            # Use distance and loop markers
+            def as_xyz(q):
+                if hasattr(q, "x"):
+                    return (float(q.x), float(q.y), float(q.z))
+                return (float(q[0]), float(q[1]), float(q[2]))
+            x1, y1, z1 = as_xyz(pts[0])
+            x2, y2, z2 = as_xyz(pts[-1])
+            d = ((x1 - x2)**2 + (y1 - y2)**2 + (z1 - z2)**2) ** 0.5
+            if d < 1e-4:
+                return True
+            last_t = get_type(pts[-1])
+            if ("LOOP_END" in last_t) or ("CIRCULAR" in last_t):
+                return True
+            # Optional: if any point marked CIRCULAR
+            for q in pts:
+                if "CIRCULAR" in get_type(q):
+                    return True
+            return False
+
+        def segment_by_triples(pts):
+            """
+            Return list of segments (each a list of points), split only at TRIPLE_POINTs,
+            and at endpoints. For closed loops, wrap between last and first triple.
+            """
+            if len(pts) < 2:
+                return []
+            n = len(pts)
+            triples = [i for i, q in enumerate(pts) if get_type(q) == "TRIPLE_POINT"]
+
+            closed = is_closed_loop(pts)
+            segments = []
+
+            # No triple points
+            if not triples:
+                # One segment: whole polyline (or loop)
+                seg = pts[:]
+                if closed and seg[0] != seg[-1]:
+                    seg = seg + [seg[0]]  # re-close the loop
+                segments.append(seg)
+                return segments
+
+            # At least one triple
+            if closed:
+                tri = sorted(set(triples))
+                if len(tri) == 1:
+                    # Special case: only one triple in a closed loop
+                    segments.append(pts[:])  # entire loop as one block
+                else:
+                    for a, b in zip(tri, tri[1:] + tri[:1]):
+                        if a <= b:
+                            seg = pts[a:b+1]
+                        else:
+                            seg = pts[a:] + pts[:b+1]
+                        if len(seg) >= 2:
+                            segments.append(seg)
+
+            else:
+                # Open polyline: endpoints are split points too
+                splits = [0] + sorted(triples) + [n - 1]
+                # Remove immediate duplicates (e.g., triple at index 0)
+                dedup_splits = []
+                for s in splits:
+                    if not dedup_splits or dedup_splits[-1] != s:
+                        dedup_splits.append(s)
+                # Build segments between consecutive split indices
+                for a, b in zip(dedup_splits[:-1], dedup_splits[1:]):
+                    if b - a >= 1:
+                        seg = pts[a:b+1]
+                        if len(seg) >= 2:
+                            segments.append(seg)
+
+            return segments
 
         for s_idx, ds in enumerate(self.datasets):
             if ds.get("type") == "polyline":
@@ -13029,24 +15861,34 @@ segmentation, triangulation, and visualization.
                 hull_item.setText(0, "Hull segments")
                 hull_item.setFlags(hull_item.flags() | Qt.ItemIsUserCheckable)
                 hull_item.setCheckState(0, Qt.Checked)
-                hull_item.setData(0, Qt.UserRole,
-                                {"type": "hull_group", "surface_idx": s_idx})
+                # Add hole checkbox for hull group
+                hull_item.setCheckState(4, Qt.Unchecked)
+                hull_item.setData(0, Qt.UserRole, {"type": "hull_group", "surface_idx": s_idx})
 
                 for i in range(len(hull)):
                     p1, p2 = hull[i], hull[(i + 1) % len(hull)]
                     seg_item = QTreeWidgetItem(hull_item)
                     seg_item.setText(0, f"Seg {i}")
+                    seg_item.setText(1, "HULL")  # Set type column
                     seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
                     seg_item.setCheckState(0, Qt.Checked)
-                    seg_item.setData(0, Qt.UserRole,
-                                    {"type": "constraint",
-                                    "surface_idx": s_idx,
-                                    "seg_uid": seg_uid})
+                    # Add hole checkbox in column 4
+                    seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
+                    seg_item.setCheckState(4, Qt.Unchecked)  # Default: not a hole
+                    seg_item.setData(0, Qt.UserRole, {
+                        "type": "constraint",
+                        "surface_idx": s_idx,
+                        "seg_uid": seg_uid
+                    })
                     self._refine_segment_map[(s_idx, seg_uid)] = {
                         "points": [p1, p2],
-                        "ctype": "HULL",
+                        "type": "HULL",     # normalized
+                        "ctype": "HULL",    # keep for compatibility
+                        "is_hole": False,
+                        "selected": True,
                     }
                     seg_uid += 1
+
             # ------------------ intersection lines ------------------------------
             inters = getattr(self, "refined_intersections_for_visualization", {}).get(s_idx, [])
             for line_id, inter_d in enumerate(inters):
@@ -13054,13 +15896,8 @@ segmentation, triangulation, and visualization.
                 if len(raw_pts) < 2:
                     continue
 
-                # NEW ───────────────────────────────────────────────────────────
-                # remove duplicates BUT keep the best special-point flag
-                deduped = self._dedupe_preserve_special(raw_pts)
-                # ───────────────────────────────────────────────────────────────
-
-                # split at every special point
-                seg_lists = split_line_at_special_points(deduped, default_size=1.0)
+                # DIRECTLY use raw_pts; no deduplication
+                seg_lists = segment_by_triples(raw_pts)
                 if not seg_lists:
                     continue
 
@@ -13068,31 +15905,38 @@ segmentation, triangulation, and visualization.
                 line_item.setText(0, f"Intersection {line_id}")
                 line_item.setFlags(line_item.flags() | Qt.ItemIsUserCheckable)
                 line_item.setCheckState(0, Qt.Checked)
-                line_item.setData(0, Qt.UserRole,
-                                  {"type": "intersection_group", "surface_idx": s_idx})
+                # Add hole checkbox for intersection group
+                line_item.setCheckState(4, Qt.Unchecked)
+                line_item.setData(0, Qt.UserRole, {"type": "intersection_group", "surface_idx": s_idx})
 
                 for k, seg_pts in enumerate(seg_lists):
-                    for e in range(len(seg_pts) - 1):
-                        p1, p2 = seg_pts[e], seg_pts[e + 1]
+                    seg_item = QTreeWidgetItem(line_item)
+                    seg_item.setText(0, f"Seg {k}")
+                    seg_item.setText(1, "INTERSECTION")  # Set type column
+                    seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
+                    seg_item.setCheckState(0, Qt.Checked)
+                    # Add hole checkbox in column 4
+                    seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
+                    seg_item.setCheckState(4, Qt.Unchecked)  # Default: not a hole
+                    seg_item.setData(0, Qt.UserRole, {
+                        "type": "constraint",
+                        "surface_idx": s_idx,
+                        "seg_uid": seg_uid
+                    })
 
-                        seg_item = QTreeWidgetItem(line_item)
-                        seg_item.setText(0, f"Seg {k}.{e}")
-                        seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
-                        seg_item.setCheckState(0, Qt.Checked)
-                        seg_item.setData(0, Qt.UserRole,
-                                         {"type": "constraint",
-                                          "surface_idx": s_idx,
-                                          "seg_uid": seg_uid})
+                    self._refine_segment_map[(s_idx, seg_uid)] = {
+                        "points": seg_pts,           # full block (not pairwise)
+                        "type": "INTERSECTION",      # normalized
+                        "ctype": "INT",              # keep for compatibility
+                        "is_hole": False,
+                        "selected": True,
+                        "line_id": line_id,
+                    }
+                    seg_uid += 1
 
-                        self._refine_segment_map[(s_idx, seg_uid)] = {
-                            "points": [p1, p2],
-                            "ctype": "INT",
-                        }
-                        seg_uid += 1
         tree.expandAll()
         tree.blockSignals(False)
-        logger.info("Segment-level constraint tree populated.")
-        
+        logger.info("Segment-level constraint tree populated (intersection segments between TRIPLE_POINTs and endpoints, no dedup).")
     def _collect_selected_refine_segments(self, surface_idx: int) -> List[List]:
         """Return list of point-pairs [p1, p2] for all checked segments."""
         if not hasattr(self, "refine_constraint_tree"):
@@ -13114,6 +15958,347 @@ segmentation, triangulation, and visualization.
             walk(self.refine_constraint_tree.topLevelItem(i))
 
         return selected
+    
+    def _collect_selected_hole_segments(self, surface_idx: int) -> List[List]:
+        """Return list of point-pairs [p1, p2] for all segments marked as holes."""
+        if not hasattr(self, "refine_constraint_tree"):
+            return []
+
+        hole_segments = []
+
+        def walk(item: QTreeWidgetItem):
+            data = item.data(0, Qt.UserRole)
+            if data and data.get("type") == "constraint":
+                # Only check if it's marked as hole and for the correct surface
+                # Don't require it to be selected for meshing (column 0) 
+                # because holes are exclusion regions
+                if (item.checkState(4) == Qt.Checked  # Hole checkbox is checked
+                        and data["surface_idx"] == surface_idx):
+                    seg_uid = data["seg_uid"]
+                    if (surface_idx, seg_uid) in self._refine_segment_map:
+                        hole_segments.append(self._refine_segment_map[(surface_idx, seg_uid)]["points"])
+                        logger.debug(f"Collected hole segment {seg_uid} for surface {surface_idx}")
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        for i in range(self.refine_constraint_tree.topLevelItemCount()):
+            walk(self.refine_constraint_tree.topLevelItem(i))
+
+        if hole_segments:
+            logger.info(f"Collected {len(hole_segments)} hole segments for surface {surface_idx}")
+        else:
+            logger.debug(f"No hole segments found for surface {surface_idx}")
+
+        return hole_segments
+    
+    def _sync_hole_selection_across_surfaces(self, item):
+        """Synchronize hole selection for intersection lines across all surfaces that share them."""
+        if self._refine_updating_constraint_tree:
+            return
+            
+        if not hasattr(self, "refined_intersections_for_visualization") or not hasattr(self, "refine_constraint_tree"):
+            return
+            
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+            
+        hole_state = item.checkState(4)
+        
+        # Handle intersection group synchronization
+        if data.get("type") == "intersection_group":
+            surface_idx = data.get('surface_idx')
+            
+            # Extract the intersection index from the text (e.g., "Intersection 2")
+            item_text = item.text(0)
+            try:
+                intersection_idx = int(item_text.split(" ")[-1])
+            except (ValueError, IndexError):
+                return
+                
+            # Get the intersection data for this surface and index
+            if surface_idx not in self.refined_intersections_for_visualization:
+                return
+                
+            if intersection_idx >= len(self.refined_intersections_for_visualization[surface_idx]):
+                return
+                
+            # Get the intersection data
+            intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+            
+            # Find all surfaces involved in this intersection
+            dataset_id1 = intersection_data.get('dataset_id1')
+            dataset_id2 = intersection_data.get('dataset_id2')
+            
+            logger.info(f"Synchronizing intersection hole state: surface {surface_idx}, intersection {intersection_idx}, datasets {dataset_id1}-{dataset_id2}, hole={hole_state == Qt.Checked}")
+            
+            # Update both surfaces (except the current one)
+            if dataset_id1 is not None and dataset_id1 != surface_idx:
+                self._update_matching_intersection_hole_state(dataset_id1, intersection_data, hole_state)
+                logger.info(f"Updated hole state for surface {dataset_id1}")
+                
+            if dataset_id2 is not None and dataset_id2 != surface_idx:
+                self._update_matching_intersection_hole_state(dataset_id2, intersection_data, hole_state)
+                logger.info(f"Updated hole state for surface {dataset_id2}")
+        
+        # Handle individual constraint synchronization  
+        elif data.get("type") == "constraint":
+            # Find the parent intersection group
+            parent = item.parent()
+            if parent:
+                parent_data = parent.data(0, Qt.UserRole)
+                if parent_data and parent_data.get("type") == "intersection_group":
+                    surface_idx = parent_data.get('surface_idx')
+                    
+                    # Extract the intersection index from the parent text
+                    item_text = parent.text(0)
+                    try:
+                        intersection_idx = int(item_text.split(" ")[-1])
+                    except (ValueError, IndexError):
+                        return
+                        
+                    # Get the intersection data
+                    if surface_idx not in self.refined_intersections_for_visualization:
+                        return
+                        
+                    if intersection_idx >= len(self.refined_intersections_for_visualization[surface_idx]):
+                        return
+                        
+                    intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+                    
+                    # Get the segment data
+                    segment_uid = data.get("seg_uid")
+                    segment_points = self._refine_segment_map.get((surface_idx, segment_uid), {}).get("points", [])
+                    
+                    # Find all surfaces involved in this intersection
+                    dataset_id1 = intersection_data.get('dataset_id1')
+                    dataset_id2 = intersection_data.get('dataset_id2')
+                    
+                    # Update both surfaces (except the current one)
+                    if dataset_id1 is not None and dataset_id1 != surface_idx:
+                        self._update_matching_segment_hole_state(dataset_id1, intersection_idx, segment_points, hole_state)
+                        
+                    if dataset_id2 is not None and dataset_id2 != surface_idx:
+                        self._update_matching_segment_hole_state(dataset_id2, intersection_idx, segment_points, hole_state)
+                        
+                    intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+                    
+                    # Get the segment data
+                    seg_uid = data.get('seg_uid')
+                    if (surface_idx, seg_uid) not in self._refine_segment_map:
+                        return
+                        
+                    segment_data = self._refine_segment_map[(surface_idx, seg_uid)]
+                    segment_points = segment_data.get('points', [])
+                    
+                    # Find all surfaces involved in this intersection
+                    dataset_id1 = intersection_data.get('dataset_id1')
+                    dataset_id2 = intersection_data.get('dataset_id2')
+                    
+                    # Update segments in all related surfaces (except the current one)
+                    if dataset_id1 is not None and dataset_id1 != surface_idx:
+                        for i in range(len(self.refined_intersections_for_visualization.get(dataset_id1, []))):
+                            self._update_matching_segment_hole_state(dataset_id1, i, segment_points, hole_state)
+                        
+                    if dataset_id2 is not None and dataset_id2 != surface_idx:
+                        for i in range(len(self.refined_intersections_for_visualization.get(dataset_id2, []))):
+                            self._update_matching_segment_hole_state(dataset_id2, i, segment_points, hole_state)
+    
+    def _update_matching_intersection_hole_state(self, target_surface_idx, intersection_data, hole_state):
+        """Update hole state for matching intersection groups in target surface."""
+        # Find the matching intersection in the target surface
+        tree = self.refine_constraint_tree
+        
+        for i in range(tree.topLevelItemCount()):
+            surface_item = tree.topLevelItem(i)
+            surface_data = surface_item.data(0, Qt.UserRole)
+            if surface_data and surface_data.get("surface_idx") == target_surface_idx:
+                # Look through intersection groups
+                for j in range(surface_item.childCount()):
+                    group_item = surface_item.child(j)
+                    group_data = group_item.data(0, Qt.UserRole)
+                    if group_data and group_data.get("type") == "intersection_group":
+                        # Extract intersection index from text
+                        item_text = group_item.text(0)
+                        try:
+                            intersection_idx = int(item_text.split(" ")[-1])
+                        except (ValueError, IndexError):
+                            continue
+                            
+                        # Check if this intersection matches by comparing dataset IDs
+                        if (target_surface_idx in self.refined_intersections_for_visualization and 
+                            intersection_idx < len(self.refined_intersections_for_visualization[target_surface_idx])):
+                            
+                            other_intersection = self.refined_intersections_for_visualization[target_surface_idx][intersection_idx]
+                            
+                            # Check if this is the same intersection (by comparing the two surfaces involved)
+                            if ((other_intersection.get('dataset_id1') == intersection_data.get('dataset_id1') and 
+                                 other_intersection.get('dataset_id2') == intersection_data.get('dataset_id2')) or
+                                (other_intersection.get('dataset_id1') == intersection_data.get('dataset_id2') and 
+                                 other_intersection.get('dataset_id2') == intersection_data.get('dataset_id1'))):
+                                
+                                # This is the matching intersection, update its hole state (column 4)
+                                if group_item.checkState(4) != hole_state:
+                                    group_item.setCheckState(4, hole_state)
+                                    
+                                    # Also update all child segments
+                                    for k in range(group_item.childCount()):
+                                        child_item = group_item.child(k)
+                                        child_data = child_item.data(0, Qt.UserRole)
+                                        if child_data and child_data.get("type") == "constraint":
+                                            child_item.setCheckState(4, hole_state)
+                                            # Update segment map
+                                            child_surface_idx = child_data["surface_idx"]
+                                            child_seg_uid = child_data["seg_uid"]
+                                            if (child_surface_idx, child_seg_uid) in self._refine_segment_map:
+                                                self._refine_segment_map[(child_surface_idx, child_seg_uid)]["is_hole"] = (hole_state == Qt.Checked)
+                                    
+                                    logger.info(f"Synchronized intersection hole state across surface {target_surface_idx}")
+                                    break
+                break
+    
+    def _update_matching_segment_hole_state(self, target_surface_idx, intersection_idx, segment_points, hole_state):
+        """Update hole state for matching segments in target surface."""
+        tree = self.refine_constraint_tree
+        
+        for i in range(tree.topLevelItemCount()):
+            surface_item = tree.topLevelItem(i)
+            surface_data = surface_item.data(0, Qt.UserRole)
+            if surface_data and surface_data.get("surface_idx") == target_surface_idx:
+                # Look through intersection groups
+                for j in range(surface_item.childCount()):
+                    group_item = surface_item.child(j)
+                    group_data = group_item.data(0, Qt.UserRole)
+                    if group_data and group_data.get("type") == "intersection_group":
+                        # Check if this is the right intersection
+                        group_text = group_item.text(0)
+                        try:
+                            group_intersection_idx = int(group_text.split(" ")[-1])
+                            if group_intersection_idx == intersection_idx:
+                                # Look through segments in this group
+                                for k in range(group_item.childCount()):
+                                    child_item = group_item.child(k)
+                                    child_data = child_item.data(0, Qt.UserRole)
+                                    if child_data and child_data.get("type") == "constraint":
+                                        # Check if segment points match
+                                        child_seg_uid = child_data["seg_uid"]
+                                        if (target_surface_idx, child_seg_uid) in self._refine_segment_map:
+                                            child_segment_data = self._refine_segment_map[(target_surface_idx, child_seg_uid)]
+                                            child_points = child_segment_data.get('points', [])
+                                            if self._segments_match(segment_points, child_points):
+                                                child_item.setCheckState(4, hole_state)
+                                                child_segment_data["is_hole"] = (hole_state == Qt.Checked)
+                        except (ValueError, IndexError):
+                            continue
+                break
+    
+    def _intersections_match(self, surface_idx, intersection_idx, target_intersection_data):
+        """Check if intersections match based on their data."""
+        if surface_idx not in self.refined_intersections_for_visualization:
+            return False
+        if intersection_idx >= len(self.refined_intersections_for_visualization[surface_idx]):
+            return False
+            
+        intersection_data = self.refined_intersections_for_visualization[surface_idx][intersection_idx]
+        
+        # Compare dataset IDs
+        return (intersection_data.get('dataset_id1') == target_intersection_data.get('dataset_id1') and
+                intersection_data.get('dataset_id2') == target_intersection_data.get('dataset_id2')) or \
+               (intersection_data.get('dataset_id1') == target_intersection_data.get('dataset_id2') and
+                intersection_data.get('dataset_id2') == target_intersection_data.get('dataset_id1'))
+    
+    def _segments_match(self, points1, points2, tolerance=1e-6):
+        """Check if two segments match (same points)."""
+        if len(points1) != len(points2):
+            return False
+            
+        # Check if points match in order or reverse order
+        def points_equal(p1, p2):
+            if hasattr(p1, 'x'):
+                return (abs(p1.x - (p2.x if hasattr(p2, 'x') else p2[0])) < tolerance and
+                        abs(p1.y - (p2.y if hasattr(p2, 'y') else p2[1])) < tolerance and
+                        abs(p1.z - (p2.z if hasattr(p2, 'z') else p2[2])) < tolerance)
+            else:
+                return (abs(p1[0] - (p2.x if hasattr(p2, 'x') else p2[0])) < tolerance and
+                        abs(p1[1] - (p2.y if hasattr(p2, 'y') else p2[1])) < tolerance and
+                        abs(p1[2] - (p2.z if hasattr(p2, 'z') else p2[2])) < tolerance)
+        
+        # Check forward direction
+        forward_match = all(points_equal(points1[i], points2[i]) for i in range(len(points1)))
+        
+        # Check reverse direction
+        reverse_match = all(points_equal(points1[i], points2[-(i+1)]) for i in range(len(points1)))
+        
+        return forward_match or reverse_match
+    
+    def _mark_selected_segments_as_holes(self, surface_idx: int, is_hole: bool = True):
+        """Mark all selected segments for a surface as holes or not holes."""
+        if not hasattr(self, "refine_constraint_tree"):
+            return
+            
+        self._refine_updating_constraint_tree = True
+        try:
+            def walk(item: QTreeWidgetItem):
+                data = item.data(0, Qt.UserRole)
+                if data and data.get("type") == "constraint":
+                    if (item.checkState(0) == Qt.Checked
+                            and data["surface_idx"] == surface_idx):
+                        seg_uid = data["seg_uid"]
+                        # Update UI
+                        item.setCheckState(4, Qt.Checked if is_hole else Qt.Unchecked)
+                        # Update segment map
+                        if (surface_idx, seg_uid) in self._refine_segment_map:
+                            self._refine_segment_map[(surface_idx, seg_uid)]["is_hole"] = is_hole
+                for i in range(item.childCount()):
+                    walk(item.child(i))
+
+            for i in range(self.refine_constraint_tree.topLevelItemCount()):
+                walk(self.refine_constraint_tree.topLevelItem(i))
+        finally:
+            self._refine_updating_constraint_tree = False
+            
+        logger.info(f"Marked selected segments for surface {surface_idx} as {'holes' if is_hole else 'constraints'}")
+    
+    def _mark_selected_as_holes(self):
+        """Mark all selected segments as holes for the currently selected surface."""
+        # Get the currently selected surface from the tree
+        selected_surface_idx = self._get_currently_selected_surface_from_tree()
+        if selected_surface_idx is not None:
+            self._mark_selected_segments_as_holes(selected_surface_idx, True)
+        else:
+            # If no specific surface selected, apply to all surfaces
+            for s_idx in range(len(self.datasets)):
+                if self.datasets[s_idx].get("type") != "polyline":
+                    self._mark_selected_segments_as_holes(s_idx, True)
+    
+    def _unmark_selected_as_holes(self):
+        """Unmark all selected segments as holes for the currently selected surface."""
+        # Get the currently selected surface from the tree
+        selected_surface_idx = self._get_currently_selected_surface_from_tree()
+        if selected_surface_idx is not None:
+            self._mark_selected_segments_as_holes(selected_surface_idx, False)
+        else:
+            # If no specific surface selected, apply to all surfaces
+            for s_idx in range(len(self.datasets)):
+                if self.datasets[s_idx].get("type") != "polyline":
+                    self._mark_selected_segments_as_holes(s_idx, False)
+    
+    def _get_currently_selected_surface_from_tree(self):
+        """Get the surface index of the currently selected item in the constraint tree."""
+        if not hasattr(self, "refine_constraint_tree"):
+            return None
+            
+        current_item = self.refine_constraint_tree.currentItem()
+        if current_item:
+            # Walk up the tree to find the surface item
+            item = current_item
+            while item:
+                data = item.data(0, Qt.UserRole)
+                if data and data.get("type") == "surface":
+                    return data.get("surface_idx")
+                item = item.parent()
+        return None
+    
     def _get_selected_refine_constraints(self, surface_idx_to_check):
         """
         Checks the refine_constraint_tree to see if hull and intersection
@@ -13150,12 +16335,14 @@ segmentation, triangulation, and visualization.
         from meshit.intersection_utils import Vector3D
         import numpy as np
         seg_lists = self._collect_selected_refine_segments(surface_idx)
+        hole_segments = self._collect_selected_hole_segments(surface_idx)
         if not seg_lists:
             return [], np.empty((0, 2), dtype=int), []
 
         uniq: Dict[Tuple[float, float, float], int] = {}
         pts: List[Vector3D] = []
         seg_idx: List[List[int]] = []
+        hole_points: List[Vector3D] = []
 
         def add(v):
             if isinstance(v, Vector3D):
@@ -13182,7 +16369,44 @@ segmentation, triangulation, and visualization.
                 if i1 != i2:
                     seg_idx.append([i1, i2])
 
-        return pts, np.asarray(seg_idx, dtype=int), []
+        # Process hole segments - combine segments into closed loops and calculate centroids
+        logger.debug(f"Processing {len(hole_segments)} hole segments for surface {surface_idx}")
+        
+        if hole_segments:
+            # Combine all hole segments into a single continuous point list
+            all_hole_points = []
+            for hole_idx, hole_seg_pts in enumerate(hole_segments):
+                logger.debug(f"Hole segment {hole_idx}: {len(hole_seg_pts)} points")
+                if len(hole_seg_pts) >= 2:  # Each segment should have at least 2 points
+                    # For the first segment, add all points
+                    if hole_idx == 0:
+                        all_hole_points.extend(hole_seg_pts)
+                    else:
+                        # For subsequent segments, skip the first point to avoid duplication
+                        # (assuming segments are connected end-to-end)
+                        all_hole_points.extend(hole_seg_pts[1:])
+                else:
+                    logger.warning(f"Skipping hole segment with only {len(hole_seg_pts)} points")
+            
+            # Now calculate hole center from the combined point list
+            if len(all_hole_points) >= 3:  # Need at least 3 points for a valid hole
+                # Calculate centroid of all hole points
+                x_sum = sum(p.x if hasattr(p, 'x') else p[0] for p in all_hole_points)
+                y_sum = sum(p.y if hasattr(p, 'y') else p[1] for p in all_hole_points)
+                z_sum = sum(p.z if hasattr(p, 'z') else p[2] for p in all_hole_points)
+                n = len(all_hole_points)
+                hole_center = Vector3D(x_sum/n, y_sum/n, z_sum/n)
+                hole_points.append(hole_center)
+                logger.info(f"Added hole center at ({hole_center.x:.3f}, {hole_center.y:.3f}, {hole_center.z:.3f}) from {len(all_hole_points)} combined points")
+            else:
+                logger.warning(f"Combined hole points ({len(all_hole_points)}) insufficient for hole center calculation")
+
+        if hole_points:
+            logger.info(f"Built PLC with {len(pts)} constraint points, {len(seg_idx)} segments, and {len(hole_points)} holes")
+        else:
+            logger.info(f"Built PLC with {len(pts)} constraint points and {len(seg_idx)} segments (no holes)")
+
+        return pts, np.asarray(seg_idx, dtype=int), hole_points
     def _refine_select_intersection_constraints_only(self):
         """Select only intersection constraints in Tab 6, deselect hull constraints"""
         if not hasattr(self, 'refine_constraint_tree'):

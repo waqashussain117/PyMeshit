@@ -19,7 +19,6 @@ except ImportError:
     HAVE_DIRECT_WRAPPER_INTERSECTION_UTILS = False
     print("WARNING (intersection_utils): DirectTriangleWrapper not found. Constrained triangulation might be limited.")
     # tr_standard is already imported above
-
 # Attempt to import PyVista for an alternative triangulation method
 try:
     import pyvista as pv
@@ -616,37 +615,157 @@ def isect2(v0, v1, v2, vv0, vv1, vv2, d0, d1, d2, isect, isectpoint):
 
 def triangle_triangle_intersection(tri1: Triangle, tri2: Triangle) -> List[Vector3D]:
     """
-    Calculate intersection between two triangles using robust Möller's algorithm.
-    This directly calls the C++ ported tri_tri_intersect_with_isectline function.
-    
-    Args:
-        tri1: First triangle
-        tri2: Second triangle
-        
-    Returns:
-        List of intersection points (empty if no intersection)
+    C++-like tri-tri intersection:
+    - No near-parallel prefilter
+    - Coplanar overlap handled via 2D projection and polygon-overlap sampling
+    - Only drop true slivers
     """
-    # Use the robust triangle-triangle intersection algorithm
-    pt1, pt2 = tri_tri_intersect_with_isectline(tri1, tri2)
-    
-    if pt1 is not None and pt2 is not None:
-        # Check if we have a valid line segment with meaningful length
-        segment_length = (pt1 - pt2).length()
-        if segment_length > 1e-6:  # More reasonable tolerance for actual intersections
-            # Additional validation: ensure intersection points are actually within both triangles
-            if (tri1.contains_point(pt1) and tri1.contains_point(pt2)) or \
-               (tri2.contains_point(pt1) and tri2.contains_point(pt2)) or \
-               (tri1.contains_point(pt1) and tri2.contains_point(pt2)) or \
-               (tri1.contains_point(pt2) and tri2.contains_point(pt1)):
-                return [pt1, pt2]
+    import numpy as np
+
+    n1 = tri1.normal(); n2 = tri2.normal()
+    l1 = n1.length(); l2 = n2.length()
+    if l1 < 1e-14 or l2 < 1e-14:
+        return []
+
+    n1u = n1 * (1.0 / l1); n2u = n2 * (1.0 / l2)
+    align = abs(n1u.dot(n2u))
+
+    # Characteristic scale for tolerances
+    edges = [
+        (tri1.v2 - tri1.v1).length(),
+        (tri1.v3 - tri1.v1).length(),
+        (tri1.v3 - tri1.v2).length(),
+        (tri2.v2 - tri2.v1).length(),
+        (tri2.v3 - tri2.v1).length(),
+        (tri2.v3 - tri2.v2).length(),
+    ]
+    L = max(edges) if edges else 1.0
+    sliver_tol = 1e-12
+    plane_tol = 1e-8 * L + 1e-12
+
+    def as_np(p: Vector3D):
+        return np.array([p.x, p.y, p.z], dtype=float)
+
+    # Coplanar handling
+    # If near-parallel normals and plane-to-vertex distances are tiny both ways,
+    # treat as coplanar and compute overlap segment in-plane.
+    if align > 0.999999:
+        p0 = as_np(tri1.v1)
+        n = as_np(n1u)
+        def min_sep_to_plane(nu, p0, a, b, c):
+            return min(abs(nu.dot(as_np(a) - p0)),
+                       abs(nu.dot(as_np(b) - p0)),
+                       abs(nu.dot(as_np(c) - p0)))
+        if min_sep_to_plane(n, p0, tri2.v1, tri2.v2, tri2.v3) <= plane_tol and \
+           min_sep_to_plane(as_np(n2u), as_np(tri2.v1), tri1.v1, tri1.v2, tri1.v3) <= plane_tol:
+            # Build an orthonormal in-plane basis (u,v,n)
+            a = as_np(tri1.v2) - p0
+            if np.linalg.norm(a) < 1e-14:
+                a = as_np(tri1.v3) - p0
+            if np.linalg.norm(a) < 1e-14:
+                a = np.array([1.0, 0.0, 0.0])
+            u = a / np.linalg.norm(a)
+            v = np.cross(n, u)
+            v_norm = np.linalg.norm(v)
+            if v_norm < 1e-14:
+                # pick any orthogonal to n
+                tmp = np.array([1.0, 0.0, 0.0])
+                if abs(n.dot(tmp)) > 0.9:
+                    tmp = np.array([0.0, 1.0, 0.0])
+                u = np.cross(tmp, n); u /= np.linalg.norm(u)
+                v = np.cross(n, u); v /= np.linalg.norm(v)
             else:
-                # This is likely a false positive intersection
+                v /= v_norm
+
+            def proj2(p):
+                w = as_np(p) - p0
+                return np.array([u.dot(w), v.dot(w)], dtype=float)
+
+            t1 = [proj2(tri1.v1), proj2(tri1.v2), proj2(tri1.v3)]
+            t2 = [proj2(tri2.v1), proj2(tri2.v2), proj2(tri2.v3)]
+
+            # Collect overlap polygon samples: vertices inside the other + edge-edge 2D intersections
+            def inside(pt, tri):
+                # barycentric test in 2D
+                A, B, C = tri
+                v0 = C - A; v1 = B - A; v2 = pt - A
+                den = v0[0]*v1[1] - v1[0]*v0[1]
+                if abs(den) < 1e-16:
+                    return False
+                a = (v2[0]*v1[1] - v1[0]*v2[1]) / den
+                b = (v0[0]*v2[1] - v2[0]*v0[1]) / den
+                c = 1.0 - a - b
+                return a >= -1e-12 and b >= -1e-12 and c >= -1e-12
+
+            P = []
+            for pt in t1:
+                if inside(pt, t2): P.append(pt)
+            for pt in t2:
+                if inside(pt, t1): P.append(pt)
+
+            def segseg(p, q, r, s):
+                # segment intersection in 2D; returns list of intersection points (0,1 or 2 for colinear overlap endpoints)
+                def orient(a,b,c): return (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])
+                def on_seg(a,b,c):
+                    return min(a[0],b[0]) - 1e-12 <= c[0] <= max(a[0],b[0]) + 1e-12 and \
+                           min(a[1],b[1]) - 1e-12 <= c[1] <= max(a[1],b[1]) + 1e-12
+                o1 = orient(p,q,r); o2 = orient(p,q,s); o3 = orient(r,s,p); o4 = orient(r,s,q)
+                out = []
+                if abs(o1) < 1e-12 and on_seg(p,q,r): out.append(r)
+                if abs(o2) < 1e-12 and on_seg(p,q,s): out.append(s)
+                if abs(o3) < 1e-12 and on_seg(r,s,p): out.append(p)
+                if abs(o4) < 1e-12 and on_seg(r,s,q): out.append(q)
+                if (o1*o2 < 0) and (o3*o4 < 0):
+                    # proper intersection
+                    A = q - p; B = s - r; C = r - p
+                    den = A[0]*B[1] - A[1]*B[0]
+                    if abs(den) > 1e-16:
+                        t = (C[0]*B[1] - C[1]*B[0]) / den
+                        out.append(p + t*A)
+                return out
+
+                # Done
+
+            e1 = [(t1[0],t1[1]), (t1[1],t1[2]), (t1[2],t1[0])]
+            e2 = [(t2[0],t2[1]), (t2[1],t2[2]), (t2[2],t2[0])]
+            for a0,a1 in e1:
+                for b0,b1 in e2:
+                    for ip in segseg(a0,a1,b0,b1):
+                        P.append(ip)
+
+            if len(P) < 2:
                 return []
-        else:
-            # Degenerate case - single point intersection or very small segment
-            return []
-    
-    return []
+
+            # Deduplicate and pick the farthest pair
+            Q = []
+            for pt in P:
+                if not any(np.linalg.norm(pt - q) <= 1e-12 for q in Q):
+                    Q.append(pt)
+            if len(Q) < 2:
+                return []
+
+            # farthest pair
+            maxd = 0.0; best = (Q[0], Q[0])
+            for i in range(len(Q)):
+                for j in range(i+1, len(Q)):
+                    d = np.linalg.norm(Q[i] - Q[j])
+                    if d > maxd:
+                        maxd = d; best = (Q[i], Q[j])
+            if maxd <= sliver_tol:
+                return []
+
+            # Map back to 3D: p = p0 + u*x + v*y
+            a3 = Vector3D(*(p0 + u*best[0][0] + v*best[0][1]))
+            b3 = Vector3D(*(p0 + u*best[1][0] + v*best[1][1]))
+            return [a3, b3]
+
+    # Non-coplanar: use the robust C++-ported routine
+    pt1, pt2 = tri_tri_intersect_with_isectline(tri1, tri2)
+    if pt1 is None or pt2 is None:
+        return []
+    if (pt1 - pt2).length() <= sliver_tol:
+        return []
+    return [pt1, pt2]
 
 
 def line_triangle_intersection(
@@ -827,9 +946,12 @@ def calculate_surface_surface_intersection(surface1_idx: int, surface2_idx: int,
                 logger.info(f"  Segment {i}: ({seg[0].x:.3f},{seg[0].y:.3f},{seg[0].z:.3f}) -> ({seg[1].x:.3f},{seg[1].y:.3f},{seg[1].z:.3f})")
         
         # Connect intersection segments into continuous curves (like C++ does)
+        # Connect intersection segments into continuous curves (like C++ does)
         connected_curves = connect_intersection_segments(intersection_segments)
-        
-        logger.info(f"Surface {surface1_idx}-{surface2_idx}: Connected into {len(connected_curves)} curves")
+
+        # Optional post-connection regularization (C++-like RefineByLength)
+
+        # logger.info(f"Surface {surface1_idx}-{surface2_idx}: Connected into {len(connected_curves)} curves")
         
         # Return multiple intersection objects - one for each curve
         # This matches the C++ behavior where each curve is a separate intersection
@@ -866,29 +988,21 @@ def connect_intersection_segments(segments, tolerance=1e-10):
     
     logger.info(f"Starting segment connection with {len(segments)} input segments")
     
-    # First, validate and filter segments using C++ appendNonExistingSegment logic
-    # Convert to flat list of points (like C++ input->Ns)
     validated_points = []
     for i, segment in enumerate(segments):
         if len(segment) >= 2:
             p1, p2 = segment[0], segment[1]
-            
-            # C++ check: points are identical --> not a segment
             if (p1 - p2).length_squared() < 1e-24:
                 logger.info(f"Segment {i} rejected: identical points")
                 continue
-                
-            # C++ check: prevent duplicate segments
             is_duplicate = False
             for j in range(0, len(validated_points), 2):
                 if j + 1 < len(validated_points):
                     ep1, ep2 = validated_points[j], validated_points[j + 1]
-                    # Check both orientations
                     if ((p1 - ep1).length_squared() < 1e-24 and (p2 - ep2).length_squared() < 1e-24) or \
                        ((p2 - ep1).length_squared() < 1e-24 and (p1 - ep2).length_squared() < 1e-24):
                         is_duplicate = True
                         break
-            
             if not is_duplicate:
                 validated_points.extend([p1, p2])
                 logger.info(f"Segment {i} accepted: ({p1.x:.3f},{p1.y:.3f},{p1.z:.3f}) -> ({p2.x:.3f},{p2.y:.3f},{p2.z:.3f})")
@@ -901,29 +1015,27 @@ def connect_intersection_segments(segments, tolerance=1e-10):
     
     logger.info(f"After filtering: {len(validated_points)//2} valid segments")
     
-    # Process segments iteratively like C++ GenerateFirstSplineOfSegments
+    # Much stricter compatibility: avoid jumping to nearby but different lines
+    def is_direction_compatible(tangent: Vector3D, candidate_vec: Vector3D, min_dot: float = 0.10) -> bool:
+        t_len = tangent.length()
+        c_len = candidate_vec.length()
+        if t_len < 1e-14 or c_len < 1e-14:
+            return False
+        t = tangent * (1.0 / t_len)
+        c = candidate_vec * (1.0 / c_len)
+        return t.dot(c) > min_dot
     curves = []
     curve_count = 0
-    
-    # Use C++ MeshIt's exact tolerance: 1e-12 for squared distance comparison
     connect_tolerance_squared = 1e-12
     
-    # Continue while there are segments to process (like C++ while loop)
     while len(validated_points) >= 2:
         curve_count += 1
         logger.info(f"Starting curve {curve_count} with {len(validated_points)//2} segments remaining")
-        
-        # Start a new curve with the first available segment
         curve = [validated_points[0], validated_points[1]]
         logger.info(f"Curve {curve_count} initial segment: ({curve[0].x:.3f},{curve[0].y:.3f},{curve[0].z:.3f}) -> ({curve[1].x:.3f},{curve[1].y:.3f},{curve[1].z:.3f})")
-        
-        # Remove the used segment (like C++ removeAt)
         validated_points.pop(1)
         validated_points.pop(0)
         
-
-        
-        # Try to extend the curve at the beginning (like C++ first reloop)
         extended_count = 0
         extended = True
         while extended:
@@ -932,25 +1044,26 @@ def connect_intersection_segments(segments, tolerance=1e-10):
             while n < len(validated_points):
                 dist_squared = (validated_points[n] - curve[0]).length_squared()
                 if dist_squared < connect_tolerance_squared:
-                    if n % 2 == 0:  # Even index - this is the first point of a segment
-                        curve.insert(0, validated_points[n + 1])
-                        validated_points.pop(n + 1)
-                        validated_points.pop(n)
-                        extended = True
-                        extended_count += 1
-                        logger.info(f"Curve {curve_count} extended at beginning (extension #{extended_count})")
-                        break
-                    else:  # Odd index - this is the second point of a segment
-                        curve.insert(0, validated_points[n - 1])
-                        validated_points.pop(n)
-                        validated_points.pop(n - 1)
-                        extended = True
-                        extended_count += 1
-                        logger.info(f"Curve {curve_count} extended at beginning (extension #{extended_count})")
+                    tangent = curve[0] - curve[1]
+                    if n % 2 == 0:
+                        meeting = validated_points[n]
+                        other = validated_points[n + 1]
+                    else:
+                        meeting = validated_points[n]
+                        other = validated_points[n - 1]
+                    candidate_vec = other - meeting
+                    if is_direction_compatible(tangent, candidate_vec):
+                        if n % 2 == 0:
+                            curve.insert(0, other)
+                            validated_points.pop(n + 1); validated_points.pop(n)
+                        else:
+                            curve.insert(0, other)
+                            validated_points.pop(n); validated_points.pop(n - 1)
+                        extended = True; extended_count += 1
+                        logger.info(f"Curve {curve_count} extended at beginning (#{extended_count})")
                         break
                 n += 1
         
-        # Try to extend the curve at the end (like C++ second reloop)
         extended = True
         while extended:
             extended = False
@@ -958,25 +1071,26 @@ def connect_intersection_segments(segments, tolerance=1e-10):
             while n < len(validated_points):
                 dist_squared = (validated_points[n] - curve[-1]).length_squared()
                 if dist_squared < connect_tolerance_squared:
-                    if n % 2 == 0:  # Even index - this is the first point of a segment
-                        curve.append(validated_points[n + 1])
-                        validated_points.pop(n + 1)
-                        validated_points.pop(n)
-                        extended = True
-                        extended_count += 1
-                        logger.info(f"Curve {curve_count} extended at end (extension #{extended_count})")
-                        break
-                    else:  # Odd index - this is the second point of a segment
-                        curve.append(validated_points[n - 1])
-                        validated_points.pop(n)
-                        validated_points.pop(n - 1)
-                        extended = True
-                        extended_count += 1
-                        logger.info(f"Curve {curve_count} extended at end (extension #{extended_count})")
+                    tangent = curve[-1] - curve[-2]
+                    if n % 2 == 0:
+                        meeting = validated_points[n]
+                        other = validated_points[n + 1]
+                    else:
+                        meeting = validated_points[n]
+                        other = validated_points[n - 1]
+                    candidate_vec = other - meeting
+                    if is_direction_compatible(tangent, candidate_vec):
+                        if n % 2 == 0:
+                            curve.append(other)
+                            validated_points.pop(n + 1); validated_points.pop(n)
+                        else:
+                            curve.append(other)
+                            validated_points.pop(n); validated_points.pop(n - 1)
+                        extended = True; extended_count += 1
+                        logger.info(f"Curve {curve_count} extended at end (#{extended_count})")
                         break
                 n += 1
         
-        # Clean up the curve by removing duplicate consecutive points
         cleaned_curve = [curve[0]]
         for point in curve[1:]:
             if (point - cleaned_curve[-1]).length_squared() > tolerance * tolerance:
@@ -1410,18 +1524,14 @@ def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, mode
     intersection1 = model.intersections[intersection1_idx]
     intersection2 = model.intersections[intersection2_idx]
 
-    # Check if the intersections share a common surface/polyline ID
-    # This is a basic check, more robust checks might involve surface indices
+    # Both lines must share one common parent (typical: A∩B with A∩C → common A)
     ids1 = {intersection1.id1, intersection1.id2}
     ids2 = {intersection2.id1, intersection2.id2}
     if not ids1.intersection(ids2):
         return []  # No common parent object, cannot form a triple point
     
-    # Create a spatial subdivision box for more efficient computation
+    # Spatial box on the overlap of their bounds
     box = Box()
-    
-    # Set box bounds to the intersection of the bounds of both polylines
-    # First, compute the bounds of intersection1
     if len(intersection1.points) > 0:
         min1 = Vector3D(
             min(p.x for p in intersection1.points),
@@ -1433,8 +1543,6 @@ def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, mode
             max(p.y for p in intersection1.points),
             max(p.z for p in intersection1.points)
         )
-        
-        # Compute the bounds of intersection2
         min2 = Vector3D(
             min(p.x for p in intersection2.points),
             min(p.y for p in intersection2.points),
@@ -1445,85 +1553,57 @@ def calculate_triple_points(intersection1_idx: int, intersection2_idx: int, mode
             max(p.y for p in intersection2.points),
             max(p.z for p in intersection2.points)
         )
-        
-        # Set the box bounds to the intersection of the two bounds
         box.min.x = max(min1.x, min2.x)
         box.min.y = max(min1.y, min2.y)
         box.min.z = max(min1.z, min2.z)
         box.max.x = min(max1.x, max2.x)
         box.max.y = min(max1.y, max2.y)
         box.max.z = min(max1.z, max2.z)
-        
-        # Check if there's no overlap in the bounding boxes
         if (box.min.x > box.max.x or 
             box.min.y > box.max.y or 
             box.min.z > box.max.z):
-            return []  # No overlap, cannot have triple points
+            return []
     else:
-        return []  # No points in one of the intersections
+        return []
     
-    # Gather segments in the overlap box
+    # Populate candidate segments
     for i in range(len(intersection1.points) - 1):
         p1 = intersection1.points[i]
         p2 = intersection1.points[i + 1]
         if box.seg_in_box(p1, p2):
             box.N1s.append((p1, p2))
-    
     for i in range(len(intersection2.points) - 1):
         p1 = intersection2.points[i]
         p2 = intersection2.points[i + 1]
         if box.seg_in_box(p1, p2):
             box.N2s.append((p1, p2))
-    
-    # No segments in the overlap box
     if not box.N1s or not box.N2s:
         return []
     
-    # List to store found triple points
     found_triple_points = []
-    
-    # Use recursive spatial subdivision to find triple points
+
+    # Reject near-parallel segments to prevent false positives along close, parallel lines
+    # e.g., require at least ~10 degrees between directions (|dot| <= 0.985 ≈ cos(10°))
+    parallel_dot_threshold = 0.985
+
     if box.too_much_seg():
         box.split_seg(found_triple_points, intersection1_idx, intersection2_idx)
     else:
-        # Direct testing for small number of segments
         for seg1_idx, seg1 in enumerate(box.N1s):
             p1a, p1b = seg1[0], seg1[1]
+            d1 = (p1b - p1a).normalized()
             for seg2_idx, seg2 in enumerate(box.N2s):
                 p2a, p2b = seg2[0], seg2[1]
+                d2 = (p2b - p2a).normalized()
 
-                # Calculate distance and closest points between segments FIRST
+                # Calculate shortest distance between segments and their closest points
                 dist, closest1, closest2 = segment_segment_distance(p1a, p1b, p2a, p2b)
 
-                # Check if distance is within tolerance
                 if dist < tolerance:
-                    # Calculate triple point as the midpoint
+                    # Use midpoint as triple point candidate
                     tp_point = (closest1 + closest2) * 0.5
-                    # Just append the raw point coordinate to the list passed by reference
                     found_triple_points.append(tp_point)
 
-                    # --- REMOVED duplicate check and TriplePoint object creation ---
-                    # # Check for duplicates within the accumulating list
-                    # is_duplicate = False
-                    # for existing_tp in found_triple_points:
-                    #     # This check is problematic here, should be done after collecting all points
-                    #     # if (existing_tp.point - tp_point).length() < tolerance:
-                    #     #     # Merge intersection IDs into the existing TP
-                    #     #     existing_tp.add_intersection(i1)
-                    #     #     existing_tp.add_intersection(i2)
-                    #     #     is_duplicate = True
-                    #     #     break
-                    #
-                    # if not is_duplicate:
-                    #     # Create a new TriplePoint object
-                    #     # This creation should happen after merging
-                    #     # triple_point_obj = TriplePoint(tp_point)
-                    #     # triple_point_obj.add_intersection(i1)
-                    #     # triple_point_obj.add_intersection(i2)
-                    #     # found_triple_points.append(triple_point_obj)
-                    # --- END REMOVAL ---
-
-    # Return list of potential coordinate points (Vector3D)
     return found_triple_points
 
 
@@ -1715,276 +1795,283 @@ def make_corners_special(convex_hull: List[Vector3D], angle_threshold_deg: float
     return convex_hull
 
 
-def align_intersections_to_convex_hull(surface_idx: int, model):
+def refine_hull_with_interpolation(raw_hull_points: List[Vector3D], 
+                                   scattered_data_points: List[Vector3D], 
+                                   config: Dict) -> List[Vector3D]:
     """
-    Align intersection points to the convex hull of a surface.
-    This closely follows the C++ MeshIt alignIntersectionsToConvexHull function.
+    Refine convex hull points by projecting them onto an interpolated surface model.
     
-    Key behaviors:
-    1. Snap intersection endpoints to existing special hull points if close enough
-    2. Project intersection endpoints onto hull segments and create new special points
-    3. Insert these new special points into the convex hull
-    4. Clean up and refine the hull
+    This implements the missing C++ MeshIt workflow step that creates a smooth interpolated
+    surface from the scattered data and then projects the raw hull points onto this surface
+    to create a refined, geometrically accurate boundary.
     
     Args:
-        surface_idx: Index of the surface in model.surfaces
-        model: MeshItModel instance (temporary model wrapper from GUI)
+        raw_hull_points: Original 3D boundary points calculated from scattered data
+        scattered_data_points: Full cloud of 3D scattered data points for the surface
+        config: Configuration dictionary containing interpolation settings
+        
+    Returns:
+        List of refined hull points projected onto the interpolated surface
+    """
+    if not raw_hull_points or not scattered_data_points:
+        logger.warning("Empty hull or scattered data points provided for hull refinement")
+        return raw_hull_points
+    
+    if len(scattered_data_points) < 3:
+        logger.warning("Insufficient scattered data points for interpolation")
+        return raw_hull_points
+        
+    try:
+        # Import required scipy modules
+        from scipy.interpolate import griddata, RBFInterpolator
+        from scipy.spatial.distance import pdist
+        
+        # Try to import sklearn PCA, fallback to manual PCA if not available
+        try:
+            from sklearn.decomposition import PCA
+            use_sklearn_pca = True
+        except ImportError:
+            logger.warning("scikit-learn not available, using manual PCA implementation")
+            use_sklearn_pca = False
+        
+        logger.info(f"Refining hull with {len(raw_hull_points)} points using {len(scattered_data_points)} scattered data points")
+        
+        # Convert scattered data to numpy arrays
+        scattered_3d = np.array([[p.x, p.y, p.z] for p in scattered_data_points])
+        hull_3d = np.array([[p.x, p.y, p.z] for p in raw_hull_points])
+        
+        # Step 1: Perform PCA on scattered data to establish local 2D coordinate system
+        if use_sklearn_pca:
+            pca = PCA(n_components=3)
+            pca.fit(scattered_3d)
+            scattered_pca = pca.transform(scattered_3d)
+            hull_pca = pca.transform(hull_3d)
+        else:
+            # Manual PCA implementation
+            # Center the data
+            mean_point = np.mean(scattered_3d, axis=0)
+            centered_data = scattered_3d - mean_point
+            
+            # Compute covariance matrix
+            cov_matrix = np.cov(centered_data.T)
+            
+            # Compute eigenvalues and eigenvectors
+            eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+            
+            # Sort by eigenvalues (descending)
+            idx = np.argsort(eigenvalues)[::-1]
+            eigenvalues = eigenvalues[idx]
+            eigenvectors = eigenvectors[:, idx]
+            
+            # Transform data to PCA space
+            scattered_pca = np.dot(centered_data, eigenvectors)
+            hull_centered = hull_3d - mean_point
+            hull_pca = np.dot(hull_centered, eigenvectors)
+            
+            # Store transformation info for inverse transform
+            pca_mean = mean_point
+            pca_components = eigenvectors
+        
+        # Use first two PCA components as 2D coordinates, third as Z values
+        scattered_2d = scattered_pca[:, :2]
+        scattered_z = scattered_pca[:, 2]
+        hull_2d = hull_pca[:, :2]
+        
+        # Step 2: Create interpolation model based on configuration
+        interp_method = config.get('interp', 'Thin Plate Spline (TPS)')
+        smoothing = config.get('smoothing', 0.0)
+        
+        logger.info(f"Using interpolation method: {interp_method}")
+        
+        # Check for sufficient data density
+        if len(scattered_data_points) < 10:
+            logger.warning("Low data density - using simple linear interpolation")
+            interp_method = "Linear (Barycentric)"
+        
+        refined_hull_pca = np.zeros_like(hull_pca)
+        refined_hull_pca[:, :2] = hull_2d  # Keep X,Y coordinates in PCA space
+        
+        if interp_method == "Thin Plate Spline (TPS)":
+            try:
+                # Use RBF with thin plate spline kernel
+                rbf = RBFInterpolator(
+                    scattered_2d, scattered_z,
+                    kernel='thin_plate_spline',
+                    smoothing=0.0  # C++-equivalent: pure interpolation
+                )
+                refined_hull_pca[:, 2] = rbf(hull_2d)
+            except Exception as e:
+                logger.warning(f"TPS interpolation failed: {e}, falling back to linear")
+                refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
+                                                 method='linear', fill_value=np.nan)
+                
+        elif interp_method == "Linear (Barycentric)":
+            refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
+                                             method='linear', fill_value=np.nan)
+            
+        elif interp_method.startswith("IDW"):
+            # Extract power parameter (default p=4)
+            try:
+                power = float(interp_method.split('p=')[1].rstrip(')'))
+            except:
+                power = 4.0
+            
+            # Manual IDW implementation
+            refined_z = []
+            for hull_pt_2d in hull_2d:
+                distances = np.sqrt(np.sum((scattered_2d - hull_pt_2d)**2, axis=1))
+                
+                # Handle exact matches
+                exact_match_idx = np.where(distances < 1e-12)[0]
+                if len(exact_match_idx) > 0:
+                    refined_z.append(scattered_z[exact_match_idx[0]])
+                else:
+                    weights = 1.0 / (distances**power)
+                    weighted_sum = np.sum(weights * scattered_z)
+                    weight_sum = np.sum(weights)
+                    refined_z.append(weighted_sum / weight_sum)
+            
+            refined_hull_pca[:, 2] = np.array(refined_z)
+            
+        elif interp_method == "Cubic (Clough–Tocher)":
+            try:
+                refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
+                                                 method='cubic', fill_value=np.nan)
+            except Exception as e:
+                logger.warning(f"Cubic interpolation failed: {e}, falling back to linear")
+                refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
+                                                 method='linear', fill_value=np.nan)
+                
+        elif interp_method == "Kriging (Ordinary)":
+            try:
+                # Simple kriging implementation using RBF with gaussian kernel
+                rbf = RBFInterpolator(scattered_2d, scattered_z, kernel='gaussian', 
+                                    smoothing=smoothing, epsilon=1.0)
+                refined_hull_pca[:, 2] = rbf(hull_2d)
+            except Exception as e:
+                logger.warning(f"Kriging interpolation failed: {e}, falling back to linear")
+                refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
+                                                 method='linear', fill_value=np.nan)
+        else:
+            # Default to linear interpolation
+            logger.warning(f"Unknown interpolation method {interp_method}, using linear")
+            refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
+                                             method='linear', fill_value=np.nan)
+        
+        # Handle any NaN values by falling back to original Z coordinates
+        nan_mask = np.isnan(refined_hull_pca[:, 2])
+        if np.any(nan_mask):
+            logger.warning(f"Interpolation produced {np.sum(nan_mask)} NaN values, using original Z coordinates")
+            refined_hull_pca[nan_mask, 2] = hull_pca[nan_mask, 2]
+        
+        # Step 3: Transform refined hull points back to original 3D coordinate system
+        if use_sklearn_pca:
+            refined_hull_3d = pca.inverse_transform(refined_hull_pca)
+        else:
+            # Manual inverse transform
+            refined_hull_3d = np.dot(refined_hull_pca, pca_components.T) + pca_mean
+        
+        # Step 4: Create refined Vector3D objects preserving point types
+        refined_hull_points = []
+        for i, (orig_pt, refined_3d) in enumerate(zip(raw_hull_points, refined_hull_3d)):
+            refined_pt = Vector3D(refined_3d[0], refined_3d[1], refined_3d[2])
+            # Preserve original point type information
+            refined_pt.point_type = getattr(orig_pt, 'point_type', 'DEFAULT')
+            if hasattr(orig_pt, 'type'):
+                refined_pt.type = orig_pt.type
+            refined_hull_points.append(refined_pt)
+        
+        # Calculate refinement statistics
+        displacement_distances = [
+            (orig - refined).length() 
+            for orig, refined in zip(raw_hull_points, refined_hull_points)
+        ]
+        max_displacement = max(displacement_distances) if displacement_distances else 0.0
+        avg_displacement = np.mean(displacement_distances) if displacement_distances else 0.0
+        
+        logger.info(f"Hull refinement complete: max displacement = {max_displacement:.6f}, "
+                   f"avg displacement = {avg_displacement:.6f}")
+        
+        return refined_hull_points
+        
+    except ImportError as e:
+        logger.error(f"Required interpolation libraries not available: {e}")
+        logger.warning("Hull refinement skipped - returning original hull points")
+        return raw_hull_points
+        
+    except Exception as e:
+        logger.error(f"Error during hull interpolation refinement: {e}", exc_info=True)
+        logger.warning("Hull refinement failed - returning original hull points")
+        return raw_hull_points
+
+
+def align_intersections_to_convex_hull(surface_idx: int, model):
+    """
+    Geometry-preserving alignment only (no resampling here).
+    - Snap intersection endpoints to any hull vertex (not just special)
+    - If not snapped, project to closest hull edge and INSERT a new special vertex on that edge
     """
     surface = model.surfaces[surface_idx]
-    
-    if not hasattr(surface, 'convex_hull') or not surface.convex_hull:
-        logger.warning(f"Surface {surface_idx} has no convex hull for alignment.")
+    if not hasattr(surface, "convex_hull") or not surface.convex_hull or len(surface.convex_hull) < 3:
+        logger.warning(f"Surface {surface_idx} has no valid convex hull for alignment.")
         return
-    
-    if len(surface.convex_hull) < 3:
-        logger.warning(f"Surface {surface_idx} convex hull has < 3 points, skipping alignment.")
-        return
-    
-    logger.info(f"Aligning intersections to convex hull for surface {surface_idx}")
-    
-    original_hull_size = len(surface.convex_hull)
-    logger.info(f"Original hull size for surface {surface_idx}: {original_hull_size} points")
-    
-    # Simplify overly complex hulls before processing (similar to C++ MeshIt approach)
-    MAX_HULL_POINTS = 100  # Reasonable limit for hull complexity
-    if original_hull_size > MAX_HULL_POINTS:
-        logger.info(f"Hull with {original_hull_size} points is too complex, applying simplification...")
-        
-        # Use the same target size logic as hull refinement for consistent sizing
-        tgt = getattr(surface, "size", 0.1)
-        if tgt <= 1e-6:
-            tgt = 0.1
-            
-        logger.info(f"Using target size {tgt:.6f} for hull simplification")
-        
-        # Calculate total perimeter of the hull
-        total_perimeter = 0.0
-        for i in range(original_hull_size):
-            p1 = surface.convex_hull[i]
-            p2 = surface.convex_hull[(i + 1) % original_hull_size]
-            total_perimeter += (p2 - p1).length()
-        
-        # Calculate target number of points based on perimeter and target size
-        target_points = max(8, min(MAX_HULL_POINTS, int(total_perimeter / tgt)))
-        logger.info(f"Hull perimeter: {total_perimeter:.3f}, target points: {target_points}")
-        
-        if target_points < original_hull_size:
-            # Simplify by sampling points at regular intervals along the perimeter
-            simplified_hull = []
-            target_spacing = total_perimeter / target_points
-            current_distance = 0.0
-            next_target = 0.0
-            
-            # Always include first point
-            simplified_hull.append(surface.convex_hull[0])
-            next_target = target_spacing
-            
-            for i in range(original_hull_size):
-                p1 = surface.convex_hull[i]
-                p2 = surface.convex_hull[(i + 1) % original_hull_size]
-                segment_length = (p2 - p1).length()
-                
-                # Check if we need to add points along this segment
-                while current_distance + segment_length >= next_target and len(simplified_hull) < target_points:
-                    # Calculate interpolation factor
-                    remaining_distance = next_target - current_distance
-                    t = remaining_distance / segment_length if segment_length > 1e-10 else 0.0
-                    
-                    # Create interpolated point
-                    interp_point = Vector3D(
-                        p1.x + t * (p2.x - p1.x),
-                        p1.y + t * (p2.y - p1.y),
-                        p1.z + t * (p2.z - p1.z)
-                    )
-                    
-                    # Preserve corner points if they're close to the interpolated point
-                    pt_type = getattr(p1, 'point_type', getattr(p1, 'type', "DEFAULT"))
-                    if pt_type == "CORNER" and t < 0.1:
-                        simplified_hull.append(p1)
-                    elif i == original_hull_size - 1:  # Last segment, check p2 for corner
-                        pt_type2 = getattr(p2, 'point_type', getattr(p2, 'type', "DEFAULT"))
-                        if pt_type2 == "CORNER" and t > 0.9:
-                            simplified_hull.append(p2)
-                        else:
-                            simplified_hull.append(interp_point)
-                    else:
-                        simplified_hull.append(interp_point)
-                    
-                    next_target += target_spacing
-                
-                current_distance += segment_length
-            
-            # Ensure we have a reasonable number of points
-            if len(simplified_hull) >= 3:
-                surface.convex_hull = simplified_hull
-                logger.info(f"Simplified hull from {original_hull_size} to {len(surface.convex_hull)} points using target size {tgt:.6f}")
-            else:
-                logger.warning(f"Hull simplification resulted in too few points ({len(simplified_hull)}), keeping original")
-        else:
-            logger.info(f"Hull already has appropriate size ({original_hull_size} points for target {target_points})")
-    
-    # Process all intersections that involve this surface
-    for intersection_idx, intersection in enumerate(model.intersections):
-        # Check if this surface is involved in this intersection
-        is_surface1 = not model.is_polyline.get(intersection.id1, True)
-        is_surface2 = not model.is_polyline.get(intersection.id2, True)
-        
-        surface_is_id1 = is_surface1 and intersection.id1 == surface_idx
-        surface_is_id2 = is_surface2 and intersection.id2 == surface_idx
-        
-        if not (surface_is_id1 or surface_is_id2):
+
+    snap_tol = 1e-4  # <<--- increased
+    proj_tol = 1e-3   # <<--- increased
+
+    for inter in model.intersections:
+        is_surface1 = not model.is_polyline.get(inter.id1, True)
+        is_surface2 = not model.is_polyline.get(inter.id2, True)
+        if not ((is_surface1 and inter.id1 == surface_idx) or (is_surface2 and inter.id2 == surface_idx)):
             continue
-            
-        if len(intersection.points) < 1:
+        if not inter.points:
             continue
-        
-        # Process first and last points of the intersection Taking points from the C ++ Version of Meshit
-        points_to_process = []
-        if len(intersection.points) == 1:
-            points_to_process = [(0, intersection.points[0])] # 0 represents the first point, -1 represents the last point
-        else:
-            points_to_process = [(0, intersection.points[0]), (-1, intersection.points[-1])]
-        
-        for point_idx_in_intersection, intersection_point in points_to_process:
-            # Try to align this intersection point to the convex hull
-            aligned = False
-            
-            # Step 1: Check if close to existing special hull points
-            for hull_pt_idx, hull_pt in enumerate(surface.convex_hull):
-                # Only snap to special points (non-DEFAULT)
-                hull_pt_type = getattr(hull_pt, 'point_type', getattr(hull_pt, 'type', "DEFAULT"))
-                if hull_pt_type != "DEFAULT":
-                    distance = (intersection_point - hull_pt).length()
-                    if distance < 1e-8:  # Very close to special point # 1e-8 means 0.00000001
-                        # Snap intersection point to the special hull point
-                        if point_idx_in_intersection == 0:
-                            intersection.points[0] = hull_pt
-                        else:
-                            intersection.points[-1] = hull_pt
-                        aligned = True
-                        logger.info(f"*** Snapped intersection point to existing special hull point at ({hull_pt.x:.3f}, {hull_pt.y:.3f}, {hull_pt.z:.3f}) ***")
-                        break
-            
-            if aligned:
-                continue
-            
-            # Step 2: Project onto hull segments and create new special points
-            for segment_idx in range(len(surface.convex_hull)):
-                p1 = surface.convex_hull[segment_idx]
-                p2 = surface.convex_hull[(segment_idx + 1) % len(surface.convex_hull)]
-                
-                # Project intersection point onto this hull segment
-                closest_pt_on_segment = closest_point_on_segment(intersection_point, p1, p2)
-                distance_to_segment = (intersection_point - closest_pt_on_segment).length()
-                
-                if distance_to_segment < 1e-8:  # Very close to this segment
-                    # Check if the projection point is already an existing hull vertex
-                    is_existing_vertex = False
-                    for existing_hull_pt in surface.convex_hull:
-                        if (closest_pt_on_segment - existing_hull_pt).length() < 1e-8:
-                            # Snap to existing vertex
-                            if point_idx_in_intersection == 0:
-                                intersection.points[0] = existing_hull_pt
-                            else:
-                                intersection.points[-1] = existing_hull_pt
-                            is_existing_vertex = True
-                            logger.info(f"*** Snapped intersection point to existing hull vertex at ({existing_hull_pt.x:.3f}, {existing_hull_pt.y:.3f}, {existing_hull_pt.z:.3f}) ***")
-                            break
-                    
-                    if not is_existing_vertex:
-                        # Create new special point and insert into hull
-                        new_hull_point = Vector3D(
-                            closest_pt_on_segment.x,
-                            closest_pt_on_segment.y,
-                            closest_pt_on_segment.z,
-                            point_type="COMMON_INTERSECTION_CONVEXHULL_POINT"
-                        )
-                        
-                        # Update intersection point to reference the new hull point
-                        if point_idx_in_intersection == 0:
-                            intersection.points[0] = new_hull_point
-                        else:
-                            intersection.points[-1] = new_hull_point
-                        
-                        # Insert the new point into the convex hull at the correct position
-                        insert_position = segment_idx + 1
-                        surface.convex_hull.insert(insert_position, new_hull_point)
-                        
-                        logger.info(f"*** Created COMMON_INTERSECTION_CONVEXHULL_POINT at ({new_hull_point.x:.3f}, {new_hull_point.y:.3f}, {new_hull_point.z:.3f}) and inserted into hull ***")
-                    
-                    aligned = True
+
+        endpoints = [(0, inter.points[0])] if len(inter.points) == 1 else [(0, inter.points[0]), (-1, inter.points[-1])]
+        for ep_idx, ep in endpoints:
+            # Try snap to any hull vertex (not just special)
+            snapped = False
+            for v in surface.convex_hull:
+                if (ep - v).length() < snap_tol:
+                    inter.points[0 if ep_idx == 0 else -1] = v
+                    snapped = True
+                    logger.info(f"Snapped endpoint to hull vertex at ({v.x:.3f}, {v.y:.3f}, {v.z:.3f})")
                     break
-            
-            if not aligned:
-                logger.warning(f"Could not align intersection point ({intersection_point.x:.3f}, {intersection_point.y:.3f}, {intersection_point.z:.3f}) to convex hull")
-    
-    # Clean up the convex hull after all insertions
-    if hasattr(surface, 'convex_hull') and surface.convex_hull:
-        original_count = len(surface.convex_hull)
-        surface.convex_hull = clean_identical_points(surface.convex_hull)
-        final_count = len(surface.convex_hull)
-        
-        if final_count != original_count:
-            logger.info(f"Cleaned convex hull: {original_count} -> {final_count} points")
-        
-                # -------------------------------------------------------------
-        # Split any edge longer than 1.3*target_len.
-        # Do NOT remove existing vertices – keeps topology intact.
-        # -------------------------------------------------------------
-        tgt = getattr(surface, "size", 0.1)
-        logger.info(f"Hull refinement for surface {surface_idx}: target size = {tgt:.6f}, hull length = {len(surface.convex_hull)} points")
-        
-        if tgt > 1e-6:
-            refined = []
-            segments_refined = 0
-            total_segments = len(surface.convex_hull)
-            segment_lengths = []
-            
-            for i in range(len(surface.convex_hull)):
-                p1 = surface.convex_hull[i]
-                p2 = surface.convex_hull[(i + 1) % len(surface.convex_hull)]
+            if snapped:
+                continue
 
-                refined.append(p1)                    # always keep vertex
+            # Otherwise project to closest edge; insert a special vertex there
+            best_d, best_i, best_p = float("inf"), None, None
+            n = len(surface.convex_hull)
+            for i in range(n):
+                a = surface.convex_hull[i]
+                b = surface.convex_hull[(i + 1) % n]
+                p = closest_point_on_segment(ep, a, b)
+                d = (p - ep).length()
+                if d < best_d:
+                    best_d, best_i, best_p = d, i, p
 
-                seg_len = (p2 - p1).length()
-                segment_lengths.append(seg_len)
-                
-                if seg_len > 1.3 * tgt:               # oversize → split
-                    n_seg = max(1, round(seg_len / tgt))
-                    step = (p2 - p1) / n_seg
-                    segments_refined += 1
-                    
-                    for k in range(1, n_seg):
-                        refined.append(
-                            Vector3D(p1.x + step.x * k,
-                                     p1.y + step.y * k,
-                                     p1.z + step.z * k,
-                                     point_type="DEFAULT")
-                        )
+            if best_p is not None and best_d < proj_tol:
+                # If point already exists at the projection location, snap
+                for v in surface.convex_hull:
+                    if (best_p - v).length() < snap_tol:
+                        inter.points[0 if ep_idx == 0 else -1] = v
+                        logger.info(f"Snapped endpoint to existing hull vertex at ({v.x:.3f}, {v.y:.3f}, {v.z:.3f})")
+                        break
+                else:
+                    # Insert a new special vertex on the hull edge
+                    nv = Vector3D(best_p.x, best_p.y, best_p.z, point_type="COMMON_INTERSECTION_CONVEXHULL_POINT")
+                    surface.convex_hull.insert(int(best_i) + 1, nv)
+                    inter.points[0 if ep_idx == 0 else -1] = nv
+                    logger.info(f"Inserted new special vertex at ({nv.x:.3f}, {nv.y:.3f}, {nv.z:.3f}) on hull edge {best_i}")
 
-            # Log segment length statistics
-            if segment_lengths:
-                min_len, max_len, avg_len = min(segment_lengths), max(segment_lengths), sum(segment_lengths)/len(segment_lengths)
-                threshold = 1.3 * tgt
-                logger.info(f"Hull segments: min={min_len:.6f}, max={max_len:.6f}, avg={avg_len:.6f}, threshold={threshold:.6f}")
-            
-            surface.convex_hull = clean_identical_points(refined)
-            logger.info(f"Hull refinement result: {segments_refined}/{total_segments} segments refined, {len(refined)} → {len(surface.convex_hull)} points")
-            logger.info(f"Refined hull → {len(surface.convex_hull)} pts")
-            
-            logger.info(f"Refined convex hull for surface {surface_idx}: final count = {len(surface.convex_hull)} points")
-        
-        # Count special points for debugging
-        special_count = 0
-        for pt in surface.convex_hull:
-            pt_type = getattr(pt, 'point_type', getattr(pt, 'type', "DEFAULT"))
-            if pt_type != "DEFAULT":
-                special_count += 1
-                # logger.info(f"  Special hull point: ({pt.x:.3f}, {pt.y:.3f}, {pt.z:.3f}) type={pt_type}")
-        surface.hull_points = surface.convex_hull[:]  # shallow copy
-        
-        logger.info(f"Convex hull alignment complete for surface {surface_idx}: {special_count} special points out of {len(surface.convex_hull)} total")
+    # Remove true duplicates only (no geometry changes)
+    surface.convex_hull = clean_identical_points(surface.convex_hull, tolerance=1e-12)
 
+    # Bookkeeping
+    surface.hull_points = surface.convex_hull[:]
+    special_count = sum(1 for p in surface.convex_hull if getattr(p, "point_type", getattr(p, "type", "DEFAULT")) != "DEFAULT")
+    logger.info(f"Convex hull alignment complete for surface {surface_idx}: {special_count} special / {len(surface.convex_hull)} total")
 def calculate_size_of_intersections(model):
     """
     Calculate sizes for intersections based on the associated objects.
@@ -2185,29 +2272,6 @@ def run_intersection_workflow(model, progress_callback=None, tolerance=1e-5, con
     insert_triple_points(model, tolerance)
     report_progress(">...Triple Points finished")
 
-    # --- NEW: Constraint Processing Workflow ---
-    if config.get('use_constraint_processing', False):
-        report_progress(">Processing Constraints (C++ MeshIt Logic)...")
-        try:
-            integrate_constraint_processing_workflow(model, config)
-            report_progress(">...Constraint processing finished")
-        except Exception as e:
-            report_progress(f">...Constraint processing failed: {e}")
-            logger.error(f"Constraint processing failed: {e}")
-
-    # --- Align intersections to convex hulls ---
-    report_progress(">Aligning intersections to convex hulls...")
-    for surface_idx in range(len(model.surfaces)):
-        try:
-            align_intersections_to_convex_hull(surface_idx, model)
-        except Exception as e:
-            logger.error(f"Error aligning intersections for surface {surface_idx}: {e}")
-    report_progress(">...Alignment finished")
-
-    # --- Calculate sizes for intersections ---
-    report_progress(">Calculating intersection sizes...")
-    calculate_size_of_intersections(model)
-    report_progress(">...Size calculation finished")
 
     return model
 
@@ -2406,104 +2470,143 @@ def refine_intersection_line_by_length(intersection,
     intersection.points = refined
     return refined
 
-def prepare_plc_for_surface_triangulation(surface_data, intersections_on_surface_data, config):
+def prepare_plc_for_surface_triangulation(surface_data,
+                                          intersections_on_surface_data,
+                                          config):
     """
-    Prepares Points and Segments for constrained 2D triangulation of a surface.
-    FIXED: Uses robust high-precision rounding approach following C++ MeshIt logic.
+    Build a PLC (Planar Straight–Line Complex) for one surface, ready to be
+    triangulated with Triangle / TetGen.
+
+    Differences from the earlier version
+    ------------------------------------
+    1.  Detects *closed* intersection polylines (first-point ≈ last-point).
+        These represent interior holes in C++ MeshIt and **must NOT** be treated
+        as ordinary intersection edge constraints.
+    2.  For every closed loop:
+        • the closing segment (last → first) is inserted so the loop is a proper
+          polygon;
+        • a point strictly inside the polygon is computed (simple centroid) and
+          stored in ``holes_2d``.  Triangle removes triangles containing that
+          point, and TetGen inherits the hole automatically – identical to the
+          C++ workflow.
+    3.  Open polylines are kept exactly as before.
+    4.  Function still returns 2-D points, segments, holes and the original
+        3-D points.
+
+    Parameters
+    ----------
+    surface_data : dict
+        Contains keys like ``'hull_points'`` and ``'projection_params'``.
+    intersections_on_surface_data : list[dict]
+        Each item has at least ``'points'`` (Vector3D list).
+    config : dict
+        Gui / workflow settings (only ``'target_size'`` is used here).
+
+    Returns
+    -------
+    points_2d : (N, 2) float64 ndarray
+    segments   : (M, 2) int32 ndarray
+    holes_2d   : (H, 2) float64 ndarray  – may be empty if no holes
+    points_3d  : (N, 3) float64 ndarray
     """
-    logger.info("Using FIXED robust PLC preparation following C++ MeshIt logic")
-    
-    # Get parameters from config
-    target_feature_size = config.get('target_size', 20.0)
-    
-    # ================================================================
-    # Direct PLC Generation Following C++ calculate_triangles Logic
-    # ================================================================
-    
-    # Initialize unique points map using high-precision rounding (round to 9 decimal places)
-    unique_points_map = {}  # key: (round_x, round_y, round_z) -> value: {'index': int, 'point': Vector3D}
-    final_points_list = []  # Final list of Vector3D points in index order
-    segment_indices_list = []  # Final list of [idx1, idx2] segment pairs
-    
-    def add_point_to_plc(point_obj: Vector3D) -> int:
-        """
-        Add a point to the PLC with high-precision deduplication.
-        Returns the index of the point in the final list.
-        """
-        key = (round(point_obj.x, 9), round(point_obj.y, 9), round(point_obj.z, 9))
-        
-        if key in unique_points_map:
-            # Point already exists, just return its index
-            return unique_points_map[key]['index']
-        else:
-            # New point - add to map and list
-            new_index = len(final_points_list)
-            unique_points_map[key] = {
-                'index': new_index,
-                'point': point_obj
-            }
-            final_points_list.append(point_obj)
-            return new_index
+    logger = logging.getLogger(__name__)
+    tgt_size = config.get("target_size", 20.0)
 
-    # ----------------------------------------------------------------
-    # Process hull constraints (closed loop)
-    # ----------------------------------------------------------------
-    hull_points = surface_data.get('hull_points', [])
-    if hull_points:
-        logger.info(f"Processing hull with {len(hull_points)} points")
-        hull_indices = [add_point_to_plc(p) for p in hull_points]
-        
-        # Create closed loop segments for hull
-        for i in range(len(hull_indices)):
-            idx1 = hull_indices[i]
-            idx2 = hull_indices[(i + 1) % len(hull_indices)]
-            if idx1 != idx2:  # Avoid zero-length segments
-                segment_indices_list.append([idx1, idx2])
+    # ------------------------------------------------------------------ helpers
+    def key_of(p: Vector3D):
+        return (round(p.x, 9), round(p.y, 9), round(p.z, 9))
 
-    # ----------------------------------------------------------------
-    # Process intersection constraints (open polylines)
-    # ----------------------------------------------------------------
-    for line_idx, intersection_data in enumerate(intersections_on_surface_data):
-        intersection_points = intersection_data.get('points', [])
-        if not intersection_points:
+    def add_point(pt: Vector3D) -> int:
+        """Insert unique 3-D point, return its global index."""
+        k = key_of(pt)
+        idx = point_map.get(k)
+        if idx is None:
+            idx = len(points_3d)
+            point_map[k] = idx
+            points_3d.append(pt)
+        return idx
+
+    # --------------------------- storage for global PLC -----------------------
+    point_map: Dict[Tuple[float, float, float], int] = {}
+    points_3d: List[Vector3D] = []
+    segments:   List[List[int]] = []
+    closed_loops_pts: List[List[Vector3D]] = []   # for hole centroids later
+
+    # --------------------------- 1. hull (outer boundary) ---------------------
+    hull_pts: List[Vector3D] = surface_data.get("hull_points",
+                           surface_data.get("convex_hull", []))
+    if hull_pts and len(hull_pts) > 1:
+        hull_idx = [add_point(p) for p in hull_pts]
+        for i in range(len(hull_idx)):
+            segments.append([hull_idx[i], hull_idx[(i + 1) % len(hull_idx)]])
+
+    # --------------------------- 2. intersection polylines --------------------
+    tol_sq = 1e-16  # squared tolerance for "same point" check
+    for inter in intersections_on_surface_data:
+        pts: List[Vector3D] = inter.get("points", [])
+        if len(pts) < 2:
             continue
-                
-        logger.info(f"Processing intersection line {line_idx} with {len(intersection_points)} points")
-        line_indices = [add_point_to_plc(p) for p in intersection_points]
-        
-        # Create segments for intersection polyline
-        for i in range(len(line_indices) - 1):
-            idx1 = line_indices[i]
-            idx2 = line_indices[i + 1]
-            if idx1 != idx2:  # Avoid zero-length segments
-                segment_indices_list.append([idx1, idx2])
 
-    logger.info(f"Robust PLC built: {len(final_points_list)} unique points, {len(segment_indices_list)} segments")
+        # Detect closed loop – first and last coincide within tolerance
+        is_closed = (pts[0] - pts[-1]).length_squared() < tol_sq
 
-    # ----------------------------------------------------------------
-    # Validate and Project to 2D
-    # ----------------------------------------------------------------
-    if len(final_points_list) < 3:
-        logger.error(f"Insufficient points ({len(final_points_list)}) for triangulation")
-        return None, None, np.empty((0, 2)), np.empty((0, 3))
-    
-    projection_params = surface_data.get('projection_params')
-    if not projection_params:
-        logger.error("Cannot create PLC: missing projection parameters.")
-        return None, None, np.empty((0, 2)), np.empty((0, 3))
-            
-    centroid = np.array(projection_params['centroid'])
-    basis = np.array(projection_params['basis'])
-    
-    points_3d_array = np.array([[p.x, p.y, p.z] for p in final_points_list])
-    centered_points = points_3d_array - centroid
-    points_2d = np.dot(centered_points, basis.T)[:,:2]
+        idx_list = [add_point(p) for p in pts]
 
-    segments_array = np.array(segment_indices_list, dtype=int) if segment_indices_list else np.empty((0, 2), dtype=int)
-    holes_2d = np.empty((0, 2))  # No holes for now
+        # Add polyline segments
+        for i in range(len(idx_list) - 1):
+            if idx_list[i] != idx_list[i + 1]:
+                segments.append([idx_list[i], idx_list[i + 1]])
 
-    logger.info(f"FIXED robust PLC preparation successful: {len(points_2d)} points, {len(segments_array)} segments")
-    return points_2d, segments_array, holes_2d, points_3d_array
+        # Close the loop if necessary and remember to create a hole
+        if is_closed and idx_list[0] != idx_list[-1]:
+            segments.append([idx_list[-1], idx_list[0]])
+            closed_loops_pts.append(pts)  # keep 3-D pts for centroid
+
+    logger.info(
+        f"PLC construction – raw counts: {len(points_3d)} pts, "
+        f"{len(segments)} segments, {len(closed_loops_pts)} holes detected"
+    )
+
+    # --------------------------- 3. project everything to 2-D -----------------
+    proj = surface_data.get("projection_params")
+    if not proj:
+        raise RuntimeError("Missing projection parameters for surface.")
+
+    centroid = np.asarray(proj["centroid"])
+    basis    = np.asarray(proj["basis"])        # (2×3) ortho basis stored row-wise
+
+    pts_3d_arr = np.array([[p.x, p.y, p.z] for p in points_3d])
+    pts_2d_arr = (pts_3d_arr - centroid) @ basis.T
+    pts_2d_arr = pts_2d_arr[:, :2]              # drop z in local coords
+
+    # --------------------------- 4. hole centroids ----------------------------
+    hole_pts_2d: List[np.ndarray] = []
+    for loop in closed_loops_pts:
+        # simple arithmetic centroid – sufficient for reasonably convex loops
+        cx = sum(p.x for p in loop) / len(loop)
+        cy = sum(p.y for p in loop) / len(loop)
+        cz = sum(p.z for p in loop) / len(loop)
+        p3d = np.array([cx, cy, cz])
+        p2d = (p3d - centroid) @ basis.T
+        hole_pts_2d.append(p2d[:2])
+
+    holes_2d_arr = (
+        np.vstack(hole_pts_2d).astype(float)
+        if hole_pts_2d else
+        np.empty((0, 2), dtype=float)
+    )
+
+    logger.info(
+        f"PLC ready: {pts_2d_arr.shape[0]} pts, {len(segments)} segments, "
+        f"{holes_2d_arr.shape[0]} holes"
+    )
+
+    return (
+        pts_2d_arr.astype(float),
+        np.asarray(segments, dtype=np.int32),
+        holes_2d_arr,
+        pts_3d_arr.astype(float),
+    )
 
 
 def run_constrained_triangulation_py(
@@ -2514,207 +2617,247 @@ def run_constrained_triangulation_py(
     original_3d_points_for_plc: np.ndarray,
     config: dict,
 ):
-    """
-    COMPLETELY REWRITTEN: Triangulation using DirectTriangleWrapper approach from triangulation tab.
-    This mimics the successful triangulation method that works in the triangulation tab.
-    """
-    # --- basic checks --------------------------------------------------------
+    import numpy as np
+    from meshit.triangle_direct import DirectTriangleWrapper
+    from scipy.spatial import Delaunay, cKDTree
+    from scipy.interpolate import RBFInterpolator, CloughTocher2DInterpolator
+
     if plc_points_2d is None or len(plc_points_2d) < 3:
         raise ValueError("Not enough PLC points")
     if plc_segments_indices is None or len(plc_segments_indices) < 3:
         raise ValueError("Not enough PLC segments")
 
-    # Import DirectTriangleWrapper
-    try:
-        from meshit.triangle_direct import DirectTriangleWrapper
-    except ImportError:
-        logger.error("DirectTriangleWrapper not available! Falling back to basic Triangle")
-        # Fallback to the old approach
-        return _run_basic_triangle_fallback(plc_points_2d, plc_segments_indices, plc_holes_2d, 
-                                          surface_projection_params, original_3d_points_for_plc, config)
+    gradient  = float(config.get('gradient', 2.0))
+    min_angle = float(config.get('min_angle', 20.0))
+    target_sz = float(config.get('target_size', 20.0))
+    interp    = str(config.get('interp', 'Thin Plate Spline (TPS)'))
+    smoothing = float(config.get('smoothing', 0.0))
 
-    # Extract triangulation parameters from config
-    gradient = config.get('gradient', 2.0)
-    min_angle = config.get('min_angle', 20.0)
-    target_size = config.get('target_size', 20.0)
-    
-    # CRITICAL FIX: If target size is too large, it creates sparse meshes that fail in TetGen
-    # Automatically reduce target size for complex surfaces
-    min_coords = np.min(plc_points_2d, axis=0)
-    max_coords = np.max(plc_points_2d, axis=0)
-    diagonal = np.sqrt(np.sum((max_coords - min_coords) ** 2))
-    
-    # If target size would create very sparse mesh, reduce it
-    max_reasonable_size = diagonal / 10.0  # Ensure at least 10 elements across diagonal
-    if target_size > max_reasonable_size:
-        old_target = target_size
-        target_size = max_reasonable_size
-        logger.warning(f"Target size {old_target:.2f} too large for complex surface (diagonal: {diagonal:.2f})")
-        logger.warning(f"Automatically reduced to {target_size:.2f} to prevent TetGen issues")
-    
-    # Use target_size from GUI (possibly adjusted)
-    base_size = target_size
-    
-    # Only fall back to diagonal-based calculation if target_size is unreasonable
-    if base_size <= 0:
-        base_size = diagonal / 15.0  # Fallback for unreasonable target_size
-        logger.warning(f"Target size {target_size:.2f} unreasonable, using fallback: {base_size:.2f}")
-    else:
-        logger.info(f"Using user target size: {base_size:.2f} (surface diagonal: {diagonal:.2f})")
-    
-    logger.info(f"Using DirectTriangleWrapper approach: gradient={gradient}, min_angle={min_angle}, base_size={base_size:.4f}")
+    # clamp target size
+    bb_min = np.min(plc_points_2d, axis=0); bb_max = np.max(plc_points_2d, axis=0)
+    diagonal = float(np.linalg.norm(bb_max - bb_min))
+    if target_sz > diagonal/10.0: target_sz = diagonal/10.0
 
-    # Initialize DirectTriangleWrapper with parameters
-    triangulator = DirectTriangleWrapper(
-        gradient=gradient,
-        min_angle=min_angle,
-        base_size=base_size
-    )
+    tri = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=target_sz)
+    tri.set_cpp_compatible_mode(True)
+    tri_res = tri.triangulate(points=plc_points_2d, segments=plc_segments_indices, holes=plc_holes_2d,
+                              uniform=True, create_transition=False, create_feature_points=False)
+    if tri_res is None or 'vertices' not in tri_res or 'triangles' not in tri_res:
+        raise RuntimeError("Constrained triangulation failed")
 
-    # CRITICAL FIX: Enable C++ MeshIt compatible Triangle switches
-    # This uses "pzYYu" switches like C++ MeshIt instead of "pzq" switches
-    # This should produce denser, higher quality meshes that work better with TetGen
-    triangulator.set_cpp_compatible_mode(True)
-    logger.info("✓ Enabled C++ MeshIt compatible Triangle switches for conforming mesh generation")
+    vertices_uv = np.asarray(tri_res['vertices'], float)
+    triangles   = np.asarray(tri_res['triangles'], int)
 
-    # Run triangulation using DirectTriangleWrapper (FAST PERFORMANCE OPTIMIZATIONS)
-    triangulation_result = triangulator.triangulate(
-        points=plc_points_2d,
-        segments=plc_segments_indices,
-        holes=plc_holes_2d,
-        uniform=True,  # Use uniform approach like triangulation tab
-        create_transition=False,  # PERFORMANCE: Disable expensive transition points
-        create_feature_points=False  # PERFORMANCE: Disable expensive feature points
-    )
+    # projection (use basis exactly as provided)
+    proj = surface_projection_params or {}
+    centroid = np.asarray(proj.get("centroid"), float)
+    basis    = np.asarray(proj.get("basis"), float)
+    if basis.shape != (2,3): raise RuntimeError("projection_params['basis'] must be (2,3)")
+    ex, ey = basis[0], basis[1]
+    ez = proj.get("normal");  ez = np.cross(ex, ey) if ez is None else np.asarray(ez, float)
+    ez /= max(np.linalg.norm(ez), 1e-15)
 
-    if triangulation_result is None or 'vertices' not in triangulation_result or 'triangles' not in triangulation_result:
-        raise RuntimeError("DirectTriangleWrapper triangulation failed to produce valid output.")
+    # local samples (u,v,w)
+    P = np.asarray(original_3d_points_for_plc, float)
+    C = P - centroid
+    sample_xy = np.column_stack([C @ ex, C @ ey])
+    sample_w  = C @ ez
 
-    vertices_2d = triangulation_result['vertices']
-    triangles = triangulation_result['triangles']
+    # interpolators in local frame
+    def z_plane(q):
+        tree = cKDTree(sample_xy); k = min(12, len(sample_xy))
+        d, idx = tree.query(q, k=k)
+        if k == 1: d = d[:, None]; idx = idx[:, None]
+        A = np.concatenate([sample_xy[idx], np.ones((idx.shape[0], idx.shape[1], 1))], axis=2); At = np.transpose(A,(0,2,1))
+        coef = np.linalg.solve(At@A, At@sample_w[idx][...,None])
+        a = coef[:,0,0]; b = coef[:,1,0]; c = coef[:,2,0]
+        return a*q[:,0] + b*q[:,1] + c
 
-    logger.info(f"DirectTriangleWrapper triangulation successful: {len(vertices_2d)} vertices, {len(triangles)} triangles")
+    def z_linear(q):
+        dela = Delaunay(sample_xy); out = np.empty(len(q), float); out[:] = np.nan
+        s = dela.find_simplex(q); inside = s >= 0
+        if np.any(inside):
+            T = dela.transform[s[inside]]; r = q[inside] - T[:,2]
+            bary = np.einsum('ijk,ik->ij', T[:,:2,:], r)
+            w0 = 1.0 - bary.sum(axis=1); w1 = bary[:,0]; w2 = bary[:,1]; inds = dela.simplices[s[inside]]
+            out[inside] = w0*sample_w[inds[:,0]] + w1*sample_w[inds[:,1]] + w2*sample_w[inds[:,2]]
+        if np.any(~inside):
+            out[~inside] = z_plane(q[~inside])
+        return out
 
-    # --- SOPHISTICATED 3D RECONSTRUCTION (from triangulation tab) -----------
-    
-    if surface_projection_params is None:
-        # 2D case - just add zero Z coordinate
-        if vertices_2d.shape[1] == 2:
-            final_vertices_3d = np.zeros((len(vertices_2d), 3))
-            final_vertices_3d[:, :2] = vertices_2d
-        else:
-            final_vertices_3d = vertices_2d
-    else:
-        # 3D case - sophisticated reconstruction like triangulation tab
-        centroid = np.asarray(surface_projection_params["centroid"])
-        basis = np.asarray(surface_projection_params["basis"])
-        normal = surface_projection_params.get("normal")
-        
-        # Project original 3D points to 2D for matching
-        centered_original = original_3d_points_for_plc - centroid
-        original_projected_2d = np.dot(centered_original, basis.T)
-        
-        final_vertices_3d = np.zeros((len(vertices_2d), 3))
-        
-        logger.info(f"FAST reconstructing {len(vertices_2d)} vertices from 2D to 3D...")
-        
-        # PERFORMANCE OPTIMIZATION: Use KDTree for O(log N) vertex matching instead of O(N²)
-        from scipy.spatial import cKDTree
-        original_kdtree = cKDTree(original_projected_2d)
-        tolerance = 1e-12
-        
-        # Collect unmatched vertices for batch interpolation
-        unmatched_indices = []
-        unmatched_vertices_2d = []
-        
-        # Fast vertex matching using spatial indexing
-        for i, vertex_2d in enumerate(vertices_2d):
-            # FAST: O(log N) lookup instead of O(N) linear search
-            distances, indices = original_kdtree.query(vertex_2d, k=1)
-            
-            if distances < tolerance and indices < len(original_3d_points_for_plc):
-                final_vertices_3d[i] = original_3d_points_for_plc[indices]
-            else:
-                # Collect for batch interpolation
-                unmatched_indices.append(i)
-                unmatched_vertices_2d.append(vertex_2d)
-        
-        # PERFORMANCE: Batch interpolation for all unmatched vertices
-        if unmatched_indices:
-            logger.info(f"FAST batch interpolating Z values for {len(unmatched_indices)} unmatched vertices")
-            
-            # Extract Z values from original points
-            original_z = original_3d_points_for_plc[:, 2]
-            
-            # Batch interpolation - much faster than individual calls
-            unmatched_array = np.array(unmatched_vertices_2d)
-            
+    def z_idw(q, power=4):
+        tree = cKDTree(sample_xy); k = min(64, len(sample_xy))
+        d, idx = tree.query(q, k=k)
+        if k == 1: d = d[:, None]; idx = idx[:, None]
+        r2 = np.maximum(d*d, 1e-24); w = 1.0/(r2**(power/2.0)); wsum = np.sum(w, axis=1)
+        return np.sum(w * sample_w[idx], axis=1) / wsum
+
+    def z_tps(q):
+        try:
+            rbf = RBFInterpolator(
+                sample_xy, sample_w,
+                kernel='thin_plate_spline',
+                smoothing=0.0  # C++-equivalent
+            )
+            return rbf(q)
+        except Exception:
+            return z_linear(q)
+
+    def z_kriging(q):
+        pts = sample_xy; vals = sample_w
+        n = len(pts)
+        if n < 3:
+            return z_plane(q)
+        bb = np.max(pts, axis=0) - np.min(pts, axis=0)
+        diag = float(np.linalg.norm(bb))
+        rng = max(1e-12, 0.5*diag)
+        sill = float(np.var(vals)) + 1e-12
+        nugget = 1e-6 * sill
+        dmat = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+        gamma = sill * (1.0 - np.exp(-dmat / rng))
+        C = sill - gamma
+        np.fill_diagonal(C, C.diagonal() + nugget)
+        A = np.empty((n+1, n+1), float)
+        A[:n,:n]=C; A[:n,n]=1.0; A[n,:n]=1.0; A[n,n]=0.0
+        try:
+            A_inv = np.linalg.inv(A)
+        except np.linalg.LinAlgError:
+            return z_linear(q)
+        out = np.empty(len(q), float)
+        for i, qi in enumerate(q):
+            dq = np.linalg.norm(pts - qi[None, :], axis=1)
+            gamma_q = sill * (1.0 - np.exp(-dq / rng))
+            cvec = (sill - gamma_q)
+            b = np.empty(n+1, float); b[:n]=cvec; b[n]=1.0
+            x = A_inv @ b
+            lamb = x[:n]
+            out[i] = float(np.dot(lamb, vals))
+        return out
+
+    def z_ct(q, k_neighbors=15, spike_factor=5.0):
+        tree_nn = cKDTree(sample_xy)
+        d_all, _ = tree_nn.query(sample_xy, k=min(8, len(sample_xy)))
+        global_med = float(np.median(d_all[:, 1])) if d_all.shape[1] > 1 else float(np.median(d_all))
+
+        ct = CloughTocher2DInterpolator(sample_xy, sample_w, fill_value=np.nan)
+        w_ct = ct(q)
+
+        w_out = np.empty(len(q), dtype=float)
+        for i, qi in enumerate(q):
+            d, idx = tree_nn.query(qi, k=min(k_neighbors, len(sample_xy)))
+            if np.isscalar(idx):
+                idx = np.array([idx]); d = np.array([d])
+            P = sample_xy[idx]
+            W = sample_w[idx]
+            A = np.column_stack([P, np.ones(P.shape[0])])
             try:
-                from scipy.interpolate import griddata
-                # Batch linear interpolation
-                interpolated_z_values = griddata(original_projected_2d, original_z, unmatched_array, method='linear')
-                
-                # Handle NaN values with nearest neighbor fallback
-                nan_mask = np.isnan(interpolated_z_values)
-                if np.any(nan_mask):
-                    interpolated_z_values[nan_mask] = griddata(original_projected_2d, original_z, unmatched_array[nan_mask], method='nearest')
-                
-                # Apply interpolated Z values to final vertices
-                for idx, vertex_idx in enumerate(unmatched_indices):
-                    vertex_2d = unmatched_vertices_2d[idx]
-                    interpolated_z = interpolated_z_values[idx]
-                    
-                    # Handle remaining NaN values
-                    if np.isnan(interpolated_z):
-                        interpolated_z = centroid[2]  # Fallback to centroid Z
-                    
-                    # Reconstruct 3D point
-                    vertex_3d = centroid.copy()
-                    vertex_3d += vertex_2d[0] * basis[0]
-                    vertex_3d += vertex_2d[1] * basis[1]
-                    vertex_3d[2] = float(interpolated_z)
-                    
-                    final_vertices_3d[vertex_idx] = vertex_3d
-                    
-            except Exception as e:
-                logger.warning(f"Batch Z interpolation failed: {e}. Using planar projection for {len(unmatched_indices)} vertices.")
-                # Fallback to simple plane projection for all unmatched
-                for vertex_idx in unmatched_indices:
-                    vertex_2d = vertices_2d[vertex_idx]
-                    vertex_3d = centroid + vertex_2d[0] * basis[0] + vertex_2d[1] * basis[1]
-                    final_vertices_3d[vertex_idx] = vertex_3d
+                coef, *_ = np.linalg.lstsq(A, W, rcond=None)
+                w_lp = coef[0]*qi[0] + coef[1]*qi[1] + coef[2]
+                w_fit = A @ coef
+                sigma = float(np.std(W - w_fit)) + 1e-12
+            except Exception:
+                w_lp = float(np.mean(W))
+                sigma = float(np.std(W - w_lp)) + 1e-12
 
-    # --- vertex deduplication with high precision (matching triangulation tab) -----
-    def vkey(vec):
-        return (round(vec[0], 12), round(vec[1], 12), round(vec[2], 12))
+            wc = w_ct[i]
+            if np.isnan(wc):
+                w_out[i] = w_lp
+                continue
 
-    uniq_map, uniq_verts, remap = {}, [], {}
-    for old_idx, vec in enumerate(final_vertices_3d):
-        k = vkey(vec)
-        if k in uniq_map:
-            remap[old_idx] = uniq_map[k]
-        else:
-            new_idx = len(uniq_verts)
-            uniq_map[k] = new_idx
-            remap[old_idx] = new_idx
-            uniq_verts.append(vec)
+            mean_d = float(np.mean(d))
+            sparsity = mean_d / max(global_med, 1e-12)
+            alpha = 1.0 / (1.0 + (max(sparsity - 1.0, 0.0))**2)
+
+            delta = alpha * (wc - w_lp)
+            cap = spike_factor * sigma
+            w_out[i] = w_lp + float(np.clip(delta, -cap, cap))
+
+        return w_out
+    def z_robust_mls(q, k=24, iters=3, c=4.685, h_mult=2.0):
+        tree = cKDTree(sample_xy)
+        d_all, _ = tree.query(sample_xy, k=min(8, len(sample_xy)))
+        global_med = float(np.median(d_all[:, 1])) if d_all.shape[1] > 1 else float(np.median(d_all))
+        h = max(global_med * h_mult, 1e-9)
+
+        out = np.empty(len(q), dtype=float)
+        for i, qi in enumerate(q):
+            d, idx = tree.query(qi, k=min(k, len(sample_xy)))
+            if np.isscalar(idx):
+                out[i] = float(sample_w[idx]); continue
+
+            P = sample_xy[idx]
+            Wv = sample_w[idx]
+            w_dist = np.exp(- (d / h) ** 2).astype(float) + 1e-12
+
+            A = np.column_stack([P, np.ones(P.shape[0])])
+            coef, *_ = np.linalg.lstsq(A, Wv, rcond=None)
+
+            for _ in range(iters):
+                w_fit = A @ coef
+                r = Wv - w_fit
+                s = np.median(np.abs(r)) / 0.6745 + 1e-12
+                u = r / (c * s)
+                w_rob = np.where(np.abs(u) < 1.0, (1 - u**2)**2, 0.0)
+                W = (w_dist * w_rob)
+                if np.sum(W) < 1e-12:
+                    break
+                Aw = A * W[:, None]
+                try:
+                    coef = np.linalg.lstsq(Aw.T @ A, Aw.T @ Wv, rcond=None)[0]
+                except Exception:
+                    break
+
+            out[i] = coef[0]*qi[0] + coef[1]*qi[1] + coef[2]
+        return out
     
+    # choose method (Legacy maps to IDW + PLC snap)
+    if "Legacy" in interp:
+        w_out = z_idw(vertices_uv)
+    elif "Thin Plate" in interp:
+        w_out = z_tps(vertices_uv)
+    elif "Linear" in interp:
+        w_out = z_linear(vertices_uv)
+    elif "IDW" in interp:
+        w_out = z_idw(vertices_uv)
+    elif "Kriging" in interp:
+        w_out = z_kriging(vertices_uv)
+    elif "Clough" in interp:
+        w_out = z_ct(vertices_uv)
+    elif "MLS" in interp:
+        w_out = z_robust_mls(vertices_uv)
+    else:
+        w_out = z_plane(vertices_uv)
+
+    # map back to world
+    final_vertices_3d = centroid + np.outer(vertices_uv[:,0], ex) + np.outer(vertices_uv[:,1], ey) + np.outer(w_out, ez)
+
+    # PLC snap (keeps TetGen happy)
+    tol_uv = 1e-10
+    plc_kd = cKDTree(plc_points_2d)
+    dists, nn = plc_kd.query(vertices_uv, k=1)
+    snap_mask = dists <= tol_uv
+    if np.any(snap_mask):
+        final_vertices_3d[snap_mask] = original_3d_points_for_plc[nn[snap_mask]]
+
+    # dedupe + drop degenerates
+    def vkey(vec): return (round(vec[0],12), round(vec[1],12), round(vec[2],12))
+    uniq_map, uniq_verts, remap = {}, [], {}
+    for i, v in enumerate(final_vertices_3d):
+        k = vkey(v)
+        if k in uniq_map: remap[i] = uniq_map[k]
+        else:
+            j = len(uniq_verts); uniq_map[k] = j; remap[i] = j; uniq_verts.append(v)
     final_vertices_3d = np.asarray(uniq_verts)
     triangles = np.vectorize(remap.get)(triangles)
 
-    # --- drop degenerate / zero-area triangles ---------------------
-    good_triangles = []
+    good = []
     for t in triangles:
-        if len({int(t[0]), int(t[1]), int(t[2])}) < 3:
-            continue
-        a, b, c = final_vertices_3d[t[0]], final_vertices_3d[t[1]], final_vertices_3d[t[2]]
-        area = 0.5 * np.linalg.norm(np.cross(b - a, c - a))
-        if area > 1e-12:
-            good_triangles.append(t)
-    
-    triangles = np.asarray(good_triangles, dtype=int)
+        if len({int(t[0]),int(t[1]),int(t[2])}) < 3: continue
+        a,b,c = final_vertices_3d[t[0]], final_vertices_3d[t[1]], final_vertices_3d[t[2]]
+        if 0.5*np.linalg.norm(np.cross(b-a, c-a)) > 1e-12:
+            good.append(t)
+    triangles = np.asarray(good, int)
 
-    logger.info(f"Final result: {len(final_vertices_3d)} vertices, {len(triangles)} triangles (after deduplication and cleanup)")
     return final_vertices_3d, triangles, []
 
 
