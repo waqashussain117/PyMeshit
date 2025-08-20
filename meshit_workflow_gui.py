@@ -7301,7 +7301,14 @@ segmentation, triangulation, and visualization.
 
             def interp_tps(q):
                 try:
-                    rbf = RBFInterpolator(sample_xy, sample_z, kernel='thin_plate_spline', smoothing=float(smoothing))
+                    from scipy.interpolate import RBFInterpolator
+                    # Use all points, but limit neighbors for speed (like moving window in C++)
+                    # neighbors=50 is a good tradeoff; adjust as needed
+                    rbf = RBFInterpolator(
+                        sample_xy, sample_z,
+                        kernel='thin_plate_spline',
+                        smoothing=float(smoothing)
+                    )
                     return rbf(q)
                 except Exception:
                     return interp_linear(q)

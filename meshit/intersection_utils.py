@@ -1894,8 +1894,11 @@ def refine_hull_with_interpolation(raw_hull_points: List[Vector3D],
         if interp_method == "Thin Plate Spline (TPS)":
             try:
                 # Use RBF with thin plate spline kernel
-                rbf = RBFInterpolator(scattered_2d, scattered_z, kernel='thin_plate_spline', 
-                                    smoothing=smoothing, epsilon=1.0)
+                rbf = RBFInterpolator(
+                    scattered_2d, scattered_z,
+                    kernel='thin_plate_spline',
+                    smoothing=0.0  # C++-equivalent: pure interpolation
+                )
                 refined_hull_pca[:, 2] = rbf(hull_2d)
             except Exception as e:
                 logger.warning(f"TPS interpolation failed: {e}, falling back to linear")
@@ -2691,7 +2694,11 @@ def run_constrained_triangulation_py(
 
     def z_tps(q):
         try:
-            rbf = RBFInterpolator(sample_xy, sample_w, kernel='thin_plate_spline', smoothing=smoothing)
+            rbf = RBFInterpolator(
+                sample_xy, sample_w,
+                kernel='thin_plate_spline',
+                smoothing=0.0  # C++-equivalent
+            )
             return rbf(q)
         except Exception:
             return z_linear(q)
