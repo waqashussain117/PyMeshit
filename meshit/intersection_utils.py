@@ -642,6 +642,18 @@ def triangle_triangle_intersection(tri1: Triangle, tri2: Triangle) -> List[Vecto
     L = max(edges) if edges else 1.0
     sliver_tol = 1e-12
     plane_tol = 1e-8 * L + 1e-12
+    if align > 0.95:
+        # Calculate minimum distance between triangle planes
+        plane_dist1 = abs(n1u.dot(tri2.v1 - tri1.v1))
+        plane_dist2 = abs(n1u.dot(tri2.v2 - tri1.v1)) 
+        plane_dist3 = abs(n1u.dot(tri2.v3 - tri1.v1))
+        min_plane_dist = min(plane_dist1, plane_dist2, plane_dist3)
+        
+        # If surfaces are parallel and separated by more than a small multiple of characteristic length,
+        # reject intersection to prevent ghost lines
+        separation_threshold = max(L * 1e-6, 1e-10)  # Adaptive threshold based on triangle size
+        if min_plane_dist > separation_threshold:
+            return []
 
     def as_np(p: Vector3D):
         return np.array([p.x, p.y, p.z], dtype=float)
