@@ -31,9 +31,7 @@ pip install numpy scipy matplotlib pyqt5 pyvista pyvistaqt
 # optional: tetgen, pybind11, cython, triangle wrappers, scikit-learn, pandas
 ```
 
-Notes:
-- PyVista is optional — if not present the GUI will run but 3D visualization features are disabled.
-- Some C++ acceleration (triangle/tetgen) is optional and requires a C++ toolchain (Visual Studio on Windows) and pybind11/CMake to build native wrappers.
+
 
 ## Quick start (GUI)
 
@@ -52,23 +50,6 @@ Typical workflow:
 6. Refine intersection lines and generate conforming meshes (Refine & Mesh tab).
 7. Select conforming surfaces and validate for TetGen (Pre‑Tetramesh tab).
 8. Generate and visualize tetrahedral mesh (Tetra Mesh tab) and export.
-
-## CLI / Scripting usage
-
-The MeshIt core functions are exposed in the python package (see meshit.*). The GUI is a convenient workflow wrapper but core utilities (triangulation, intersection utilities, tetra mesh helpers) can be used programmatically for automated pipelines.
-
-## Export & Interchange
-
-- Surface triangulations can be exported to OBJ / PLY / STL / CSV.
-- Conforming meshes produced in the refiner are stored in-memory and may be exported for TetGen input.
-- VTU boundary segments are parsed and may be re-built if triangulation is re-run.
-
-## Troubleshooting
-
-- If 3D view buttons are disabled, install PyVista and pyvistaqt:
-  pip install pyvista pyvistaqt
-- For native speedups (triangle / tetgen wrappers), ensure a working C++ toolchain and build the wrappers using CMake and pybind11.
-- Long batch operations use a background thread; cancel via the progress dialog if necessary.
 
 ## Contributing
 
