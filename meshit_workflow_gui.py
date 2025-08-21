@@ -244,7 +244,7 @@ class MeshItWorkflowGUI(QMainWindow):
         super().__init__()
         
         # Set window properties
-        self.setWindowTitle("MeshIt Workflow GUI")
+        self.setWindowTitle("PyMeshIt")
         self.setGeometry(100, 100, 1400, 900) # Increased default size
         # Add color cycle for surface visualization
         self.color_cycle = [
