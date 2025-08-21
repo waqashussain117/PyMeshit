@@ -1,109 +1,79 @@
 # MeshIt
 
-A Python library for mesh generation and manipulation with C++ backend.
+MeshIt is a Python library and Qt-based GUI for mesh generation and manipulation with a C++ backend. The repository contains both library code and a full featured workflow GUI to process point clouds / polylines into conforming surface meshes and tetrahedral meshes.
+
+## Highlights (GUI-driven workflow)
+
+The included GUI (meshit_workflow_gui.py) implements a full MeshIt workflow with the following main tabs:
+
+- 1. Load Data — load points, wells (polylines) or VTU/Poly formats; manage multiple datasets and colors.
+- 2. Convex Hull — compute dataset boundaries (convex or rim for/quasi-planar sheets) with corner detection.
+- 3. Segmentation — refine hulls by target feature size and per-surface length tables (RefineByLength).
+- 4. Triangulation — generate surface triangulations with gradient, min-angle, interpolation and uniform options.
+- 5. Intersections — compute & visualize global surface–surface and polyline–surface intersections; triple point detection.
+- 6. Refine & Mesh — refine intersection/hull lines, generate conforming surface meshes, constraint selection UI, per-surface mesh density table.
+- 7. Pre‑Tetramesh — select conforming surfaces, validate for TetGen, manage selection tree for tetrahedralization.
+- 8. Tetra Mesh — generate and visualize tetrahedral meshes, assign materials, export results.
+
+Other GUI features:
+- Optional 3D interactive rendering via PyVista / pyvistaqt (gracefully disabled if PyVista is missing).
+- Background worker thread support for batch hull/segment/triangulation/intersection processing with progress dialog and cancel.
+- Per-surface refinement tables and automatic propagation of shared intersection constraints.
+- Material seeds editor for tetrahedral material assignment with coordinate editors and auto-placement.
+- Export options: OBJ/PLY/STL/CSV for triangulations and related export helpers included.
 
 ## Installation
 
+Recommended minimal Python dependencies:
+
 ```bash
-pip install meshit
+pip install numpy scipy matplotlib pyqt5 pyvista pyvistaqt
+# optional: tetgen, pybind11, cython, triangle wrappers, scikit-learn, pandas
 ```
 
-## Features
+Notes:
+- PyVista is optional — if not present the GUI will run but 3D visualization features are disabled.
+- Some C++ acceleration (triangle/tetgen) is optional and requires a C++ toolchain (Visual Studio on Windows) and pybind11/CMake to build native wrappers.
 
-- Generate meshes from polylines and boundaries
-- Support for different mesh algorithms (Delaunay, advancing front)
-- Custom triangle refinement with gradient control
-- Export to VTU format for visualization
-- Vector operations and geometry utilities
+## Quick start (GUI)
 
-## Quick Start
+Run the GUI from the repository root:
 
-```python
-import meshit
-
-# Create a model
-model = meshit.MeshItModel()
-
-# Add a simple triangle
-points = [
-    [0, 0, 0],
-    [1, 0, 0],
-    [0.5, 1, 0],
-    [0, 0, 0]  # Close the loop
-]
-model.add_polyline(points)
-
-# Generate mesh
-model.set_mesh_algorithm("delaunay")
-model.set_mesh_quality(1.2)
-model.mesh()
-
-# Export result
-model.export_vtu("triangle_mesh.vtu")
+```bash
+python meshit_workflow_gui.py
 ```
 
-## Advanced Features
+Typical workflow:
+1. Load one or more point or VTU files (File → Load).
+2. Compute hulls (Convex Hull tab).
+3. Compute segmentation (Segmentation tab) — set "Target Feature Size" or per-surface values.
+4. Run triangulation (Triangulation tab), choose interpolation and quality settings.
+5. Compute intersections (Intersections tab) to extract shared constraints and triple points.
+6. Refine intersection lines and generate conforming meshes (Refine & Mesh tab).
+7. Select conforming surfaces and validate for TetGen (Pre‑Tetramesh tab).
+8. Generate and visualize tetrahedral mesh (Tetra Mesh tab) and export.
 
-### Custom Triangle Refinement
+## CLI / Scripting usage
 
-MeshIt includes a custom triangle refinement algorithm that mimics the behavior of the C++ `triunsuitable` function. This allows for precise control over mesh density based on features in the model.
+The MeshIt core functions are exposed in the python package (see meshit.*). The GUI is a convenient workflow wrapper but core utilities (triangulation, intersection utilities, tetra mesh helpers) can be used programmatically for automated pipelines.
 
-```python
-from meshit import extensions
-from meshit.core import Surface, Vector3D
+## Export & Interchange
 
-# Create a surface
-surface = Surface()
-for point in points:
-    v = Vector3D(point[0], point[1], point[2])
-    surface.add_vertex(v)
-
-# Triangulate with gradient control
-# Higher gradient values allow more variation in triangle size
-# Lower values create more uniform meshes
-gradient = 2.0
-vertices, triangles = extensions.triangulate_with_triangle(surface, gradient=gradient)
-
-# The result will have a higher density of triangles near important features
-# and fewer triangles in areas of less detail
-```
-
-### GradientControl
-
-The `GradientControl` class lets you specify feature points and their associated sizes to control mesh refinement:
-
-```python
-from meshit.core import GradientControl
-
-# Get the gradient control instance
-gc = GradientControl.get_instance()
-
-# Update with gradient parameters
-# gradient: How quickly triangle size increases with distance (default: 1.0)
-# base_size: Base size for the triangulation
-# feature_points: Points where finer triangulation is needed
-# feature_sizes: Size parameters for each feature point
-gc.update(gradient, base_size, num_feature_points, feature_point, feature_size)
-```
+- Surface triangulations can be exported to OBJ / PLY / STL / CSV.
+- Conforming meshes produced in the refiner are stored in-memory and may be exported for TetGen input.
+- VTU boundary segments are parsed and may be re-built if triangulation is re-run.
 
 ## Troubleshooting
 
-If you encounter issues with the installation, make sure you have the required dependencies:
-
-```bash
-pip install numpy scipy triangle matplotlib
-```
-
-For more complex builds with C++ components, you'll need:
-
-- C++ compiler (Visual Studio on Windows, GCC on Linux)
-- CMake
-- pybind11
+- If 3D view buttons are disabled, install PyVista and pyvistaqt:
+  pip install pyvista pyvistaqt
+- For native speedups (triangle / tetgen wrappers), ensure a working C++ toolchain and build the wrappers using CMake and pybind11.
+- Long batch operations use a background thread; cancel via the progress dialog if necessary.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome. Please open an issue for discussion and submit PRs for fixes and features. Keep GUI behavior consistent with the tab-based workflow.
 
 ## License
 
-This project is licensed under the terms of the GNU Affero General Public License v3.0.
+This project is licensed under the GNU Affero General Public
