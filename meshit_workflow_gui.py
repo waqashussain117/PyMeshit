@@ -468,9 +468,7 @@ class MeshItWorkflowGUI(QMainWindow):
             if ds.get('type') in ('WELL', 'polyline'):
                 continue
             name = ds.get('name', f"Surface_{idx}")
-            # default from unified if available
-            default_len = float(getattr(self.target_feature_size_input, "value", lambda: 15.0)())
-            value = float(self.seg_length_by_surface.get(idx, default_len))
+            value = float(self.seg_length_by_surface.get(idx, 15.0))
             row = self.seg_refine_table.rowCount()
             self.seg_refine_table.insertRow(row)
 
@@ -1298,19 +1296,6 @@ class MeshItWorkflowGUI(QMainWindow):
         # density_layout.addWidget(self.segment_density_slider)
         # segment_layout.addLayout(density_layout)
 
-        # Add new Target Feature Size control
-        target_size_layout = QFormLayout()
-        self.target_feature_size_input = QDoubleSpinBox()
-        self.target_feature_size_input.setRange(0.1, 500.0) # Adjust range as needed
-        self.target_feature_size_input.setValue(15.0)    # Example default size
-        self.target_feature_size_input.setSingleStep(0.5)
-        self.target_feature_size_input.setToolTip(
-            "Specify the desired approximate size for features (e.g., segment length).\n"
-            "This value also influences the base size for triangulation.\n"
-            "Smaller values result in denser segmentation and meshes."
-        )
-        target_size_layout.addRow("Target Feature Size:", self.target_feature_size_input)
-        segment_layout.addLayout(target_size_layout)
         # --- END EDIT ---
         # Per-surface refinement (segmentation)
         self.seg_length_by_surface = {}
