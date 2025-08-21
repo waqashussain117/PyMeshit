@@ -958,15 +958,6 @@ class MeshItWorkflowGUI(QMainWindow):
         # --- File Menu ---
         file_menu = menu_bar.addMenu("&File")
 
-        load_action = QAction("&Load File...", self)
-        load_action.setStatusTip("Load a single point data file")
-        load_action.triggered.connect(self.load_file)
-        file_menu.addAction(load_action)
-
-        load_multiple_action = QAction("Load &Multiple Files...", self)
-        load_multiple_action.setStatusTip("Load multiple point data files as separate datasets")
-        load_multiple_action.triggered.connect(self.load_multiple_files)
-        file_menu.addAction(load_multiple_action)
 
         # Add Well loaders
         load_well_action = QAction("Load &Well File...", self)
@@ -1135,12 +1126,6 @@ class MeshItWorkflowGUI(QMainWindow):
         # -- File Loading Controls --
         file_group = QGroupBox("Load Data")
         file_layout = QVBoxLayout(file_group)
-        
-        # Buttons for loading files
-        load_btn = QPushButton("Load Single File...")
-        load_btn.setToolTip("Load points from a single file (.txt, .csv, .dat, .vtu)")
-        load_btn.clicked.connect(self.load_file)
-        file_layout.addWidget(load_btn)
         
         # Button for loading multiple files
         load_multiple_btn = QPushButton("Load Multiple Files...")
@@ -6131,43 +6116,6 @@ class MeshItWorkflowGUI(QMainWindow):
         except Exception as e:
             logger.error(f"Error adding intersection lines to visualization: {e}")
 
-    def load_file(self):
-        """Load a single data file"""
-        self.statusBar().showMessage("Loading file...")
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select a point data file", "",
-            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
-        )
-        if not file_path:
-            self.statusBar().showMessage("File loading canceled")
-            return
-
-        try:
-            points = self._read_point_file(file_path)
-            if points is not None and len(points) > 0:
-                filename = os.path.basename(file_path)
-                dataset = {
-                    'name': filename,
-                    'type': 'SURFACE',   # mark as SURFACE
-                    'points': points,
-                    'visible': True,
-                    'color': self._get_next_color()
-                }
-                self.datasets.append(dataset)
-                self.current_dataset_index = len(self.datasets) - 1
-                self._clear_segmentation_visualization_flag()
-                self._update_dataset_list()
-                self._update_statistics()
-                self._visualize_all_points()
-                self.statusBar().showMessage(f"Successfully loaded {len(points)} points from {filename}")
-            else:
-                self.statusBar().showMessage("Error: No valid points found in file")
-                QMessageBox.critical(self, "Error", "No valid points found in file")
-        except Exception as e:
-            self.statusBar().showMessage(f"Error loading file: {str(e)}")
-            logger.error(f"Error loading file: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Error loading file: {str(e)}")
-
     
     def _read_point_file(self, file_path):
         """Read points from a file, handling various delimiters and formats."""
@@ -8342,67 +8290,13 @@ segmentation, triangulation, and visualization.
         if intersections_exist:
             self._visualize_intersections()
     
-    def load_file(self):
-        """Load a single data file"""
-        self.statusBar().showMessage("Loading file...")
-        
-        # Open file dialog
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select a point data file",
-            "",
-            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
-        )
-        
-        if not file_path:
-            self.statusBar().showMessage("File loading canceled")
-            return
-            
-        # Update status with file path
-        self.statusBar().showMessage(f"Loading file: {os.path.basename(file_path)}...")
-        
-        try:
-            # Try to read the file
-            points = self._read_point_file(file_path)
-            
-            if points is not None and len(points) > 0:
-                # Create a new dataset
-                filename = os.path.basename(file_path)
-                dataset = {
-                    'name': filename,
-                    'points': points,
-                    'visible': True,
-                    'color': self._get_next_color()
-                }
-                
-                # Add to datasets
-                self.datasets.append(dataset)
-                self.current_dataset_index = len(self.datasets) - 1
-                
-                # Clear visualization flags when new data is loaded
-                self._clear_segmentation_visualization_flag()
-                
-                # Update UI
-                self._update_dataset_list()
-                self._update_statistics()
-                self._visualize_all_points()
-                
-                self.statusBar().showMessage(f"Successfully loaded {len(points)} points from {filename}")
-            else:
-                self.statusBar().showMessage("Error: No valid points found in file")
-                QMessageBox.critical(self, "Error", "No valid points found in file")
-        
-        except Exception as e:
-            self.statusBar().showMessage(f"Error loading file: {str(e)}")
-            logger.error(f"Error loading file: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Error loading file: {str(e)}")
-    
     def load_multiple_files(self):
         """Load multiple data files"""
         self.statusBar().showMessage("Loading multiple files...")
+        # Let user select multiple files (not directories)
         file_paths, _ = QFileDialog.getOpenFileNames(
             self, "Select point data files", "",
-            "Text files (*.txt);;Data files (*.dat);;CSV files (*.csv);;VTU files (*.vtu);;All files (*.*)"
+            "Supported files (*.txt *.dat *.csv *.vtu);;All files (*.*)"
         )
         if not file_paths:
             self.statusBar().showMessage("File loading canceled")
@@ -8437,7 +8331,6 @@ segmentation, triangulation, and visualization.
         else:
             self.statusBar().showMessage("Error: No valid points found in any file")
             QMessageBox.critical(self, "Error", "No valid points found in any file")
-            
     def _get_next_color(self):
         """Get next color from palette for a new dataset"""
         if not self.datasets:
