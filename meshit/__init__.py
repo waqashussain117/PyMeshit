@@ -1,7 +1,7 @@
 """
 MeshIt - Python bindings for the MeshIt C++ library
 """
-
+import sys
 try:
     from .core._meshit import (
         MeshItModel,
