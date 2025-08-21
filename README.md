@@ -1,10 +1,10 @@
-# MeshIt
+# PyMeshIt
 
 MeshIt is a Python library and Qt-based GUI for mesh generation and manipulation with a C++ backend. The repository contains both library code and a full featured workflow GUI to process point clouds / polylines into conforming surface meshes and tetrahedral meshes.
 
 ## Highlights (GUI-driven workflow)
 
-The included GUI (meshit_workflow_gui.py) implements a full MeshIt workflow with the following main tabs:
+The included GUI (main.py) implements a full MeshIt workflow with the following main tabs:
 
 - 1. Load Data — load points, wells (polylines) or VTU/Poly formats; manage multiple datasets and colors.
 - 2. Convex Hull — compute dataset boundaries (convex or rim for/quasi-planar sheets) with corner detection.
