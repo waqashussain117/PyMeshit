@@ -1675,7 +1675,7 @@ class MeshItWorkflowGUI(QMainWindow):
         self.refine_selected_constraint_segments = {}        # {surface_idx: {...}}
         self._refine_updating_constraint_tree = False
         self.refine_intersections_btn = QPushButton("Refine Intersection Lines")
-        self.refine_intersections_btn.clicked.connect(self._refine_intersection_lines_action)
+        self.refine_intersections_btn.clicked.connect(lambda: [self._refine_intersection_lines_action(), self._refine_intersection_lines_action()])
         ag.addWidget(self.refine_intersections_btn)
 
         self.generate_conforming_meshes_btn = QPushButton("Generate Conforming Surface Meshes")
@@ -7212,12 +7212,13 @@ segmentation, triangulation, and visualization.
                     uv = q[~inside]; out[~inside] = a*uv[:,0] + b*uv[:,1] + c
                 return out
 
-            def interp_idw(q, power=4):
+            def interp_idw(q, power=2):
                 tree = cKDTree(sample_xy); k = min(64, len(sample_xy))
                 d, idx = tree.query(q, k=k)
                 if k==1: d=d[:,None]; idx=idx[:,None]
-                r2 = np.maximum(d*d, 1e-24); w = 1.0/(r2**(power/2.0)); wsum = np.sum(w, axis=1)
+                r2 = np.maximum(d*d, 1e-24); w = 1.0/(r2**power); wsum = np.sum(w, axis=1)
                 return np.sum(w * sample_z[idx], axis=1) / wsum
+
 
             def interp_plane(q):
                 tree = cKDTree(sample_xy); k = min(12, len(sample_xy))

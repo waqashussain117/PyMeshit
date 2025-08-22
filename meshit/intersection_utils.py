@@ -2029,7 +2029,7 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
         return
 
     snap_tol = 1e-4  # <<--- increased
-    proj_tol = 1e-3   # <<--- increased
+    proj_tol = 1e-2   # <<--- increased
 
     for inter in model.intersections:
         is_surface1 = not model.is_polyline.get(inter.id1, True)
@@ -2697,11 +2697,13 @@ def run_constrained_triangulation_py(
             out[~inside] = z_plane(q[~inside])
         return out
 
-    def z_idw(q, power=4):
+    def z_idw(q, power=2):
         tree = cKDTree(sample_xy); k = min(64, len(sample_xy))
         d, idx = tree.query(q, k=k)
         if k == 1: d = d[:, None]; idx = idx[:, None]
-        r2 = np.maximum(d*d, 1e-24); w = 1.0/(r2**(power/2.0)); wsum = np.sum(w, axis=1)
+        r2 = np.maximum(d*d, 1e-24)
+        w = 1.0 / (r2**power)   # same as interp_idw
+        wsum = np.sum(w, axis=1)
         return np.sum(w * sample_w[idx], axis=1) / wsum
 
     def z_tps(q):
