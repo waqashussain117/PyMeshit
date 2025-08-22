@@ -1533,10 +1533,6 @@ class MeshItWorkflowGUI(QMainWindow):
         self.compute_intersections_btn.clicked.connect(self.compute_intersections)
         controls_layout.addWidget(self.compute_intersections_btn)
         
-        self.compute_all_intersections_btn = QPushButton("Compute All")
-        self.compute_all_intersections_btn.setIcon(QIcon.fromTheme("system-run", QIcon()))
-        self.compute_all_intersections_btn.clicked.connect(self.compute_all_intersections)
-        controls_layout.addWidget(self.compute_all_intersections_btn)
         
         self.clear_intersections_btn = QPushButton("Clear Results")
         self.clear_intersections_btn.setIcon(QIcon.fromTheme("edit-clear", QIcon()))
@@ -10457,9 +10453,7 @@ segmentation, triangulation, and visualization.
         if hasattr(self, 'compute_intersections_btn'):
             self.compute_intersections_btn.setEnabled(False)
         
-        # Also disable compute all button for intersections if it exists
-        if hasattr(self, 'compute_all_intersections_btn'):
-            self.compute_all_intersections_btn.setEnabled(False)
+    
 
 
     def _enable_compute_buttons(self):
@@ -10483,10 +10477,8 @@ segmentation, triangulation, and visualization.
         # Handle intersection buttons directly
         if hasattr(self, 'compute_intersections_btn'):
             self.compute_intersections_btn.setEnabled(True)
+            
         
-        # Also enable compute all button for intersections if it exists
-        if hasattr(self, 'compute_all_intersections_btn'):
-            self.compute_all_intersections_btn.setEnabled(True)
 
 
     def closeEvent(self, event):
@@ -10548,12 +10540,6 @@ segmentation, triangulation, and visualization.
         # Run the single global computation task in a worker thread
         # total_items is 1 because it's one global task
         self._run_batch_computation("intersections", 1)
-
-    def compute_all_intersections(self):
-        """Compute intersections globally (this button now does the same as Compute Intersections)."""
-        # This button becomes redundant with the global approach, but we keep the UI
-        # and just call the same logic.
-        self.compute_intersections()
 
     def _compute_global_intersections(self):
         """
