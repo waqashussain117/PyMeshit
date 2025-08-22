@@ -16,7 +16,7 @@ def main():
 
     app = QApplication(sys.argv)
     # set application icon if available
-    icon_path = os.path.join(os.path.dirname(__file__), 'resources', 'images', 'meshitlogo.png')
+    icon_path = os.path.join(os.path.dirname(__file__), 'resources', 'images', 'app_logo_small.png')
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
