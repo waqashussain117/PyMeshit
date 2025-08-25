@@ -15,12 +15,6 @@ The included GUI (main.py) implements a full MeshIt workflow with the following 
 - 7. Pre‑Tetramesh — select conforming surfaces, validate for TetGen, manage selection tree for tetrahedralization.
 - 8. Tetra Mesh — generate and visualize tetrahedral meshes, assign materials, export results.
 
-Other GUI features:
-- Optional 3D interactive rendering via PyVista / pyvistaqt (gracefully disabled if PyVista is missing).
-- Background worker thread support for batch hull/segment/triangulation/intersection processing with progress dialog and cancel.
-- Per-surface refinement tables and automatic propagation of shared intersection constraints.
-- Material seeds editor for tetrahedral material assignment with coordinate editors and auto-placement.
-- Export options: OBJ/PLY/STL/CSV for triangulations and related export helpers included.
 
 ## Installation
 
