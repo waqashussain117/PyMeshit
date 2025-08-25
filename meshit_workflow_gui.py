@@ -1397,13 +1397,8 @@ class MeshItWorkflowGUI(QMainWindow):
         self.interp_combo = QComboBox()
         self.interp_combo.addItems([
             "Thin Plate Spline (TPS)",
-            "Linear (Barycentric)",
             "IDW (p=4)",
-            "Local Plane",
-            "Kriging (Ordinary)",
-            "Cubic (Clough–Tocher)",
-            "Legacy (Hull + IDW + Boundary Snap)",
-            "MLS (Robust Moving Least Squares)"
+            "Legacy (Hull + IDW + Boundary Snap)"
         ])
         self.interp_combo.setCurrentIndex(0)
         self.interp_smoothing_input = QDoubleSpinBox()
@@ -1699,9 +1694,8 @@ class MeshItWorkflowGUI(QMainWindow):
 
         self.mesh_interp_combo = QComboBox()
         self.mesh_interp_combo.addItems([
-            "Thin Plate Spline (TPS)", "Linear (Barycentric)", "IDW (p=4)",
-            "Local Plane", "Kriging (Ordinary)", "Cubic (Clough–Tocher)",
-            "Legacy (Hull + IDW + Boundary Snap)", "MLS (Robust Moving Least Squares)"
+            "Thin Plate Spline (TPS)", "IDW (p=4)",
+            "Legacy (Hull + IDW + Boundary Snap)"
         ])
         self.mesh_interp_combo.setCurrentIndex(0)
         mg.addRow("Interpolation", self.mesh_interp_combo)
@@ -7182,24 +7176,7 @@ segmentation, triangulation, and visualization.
                 return True
 
             # Other methods: interpolation only, no hull/snap
-            def interp_linear(q):
-                dela = Delaunay(sample_xy); out = np.empty(len(q), float); out[:] = np.nan
-                s = dela.find_simplex(q); inside = s >= 0
-                if np.any(inside):
-                    T = dela.transform[s[inside]]; r = q[inside] - T[:, 2]
-                    bary = np.einsum('ijk,ik->ij', T[:, :2, :], r)
-                    w0 = 1.0 - bary.sum(axis=1); w1 = bary[:, 0]; w2 = bary[:, 1]
-                    inds = dela.simplices[s[inside]]
-                    out[inside] = w0*sample_z[inds[:, 0]] + w1*sample_z[inds[:, 1]] + w2*sample_z[inds[:, 2]]
-                if np.any(~inside):
-                    tree = cKDTree(sample_xy); k = min(12, len(sample_xy))
-                    d, idx = tree.query(q[~inside], k=k)
-                    if k==1: d=d[:,None]; idx=idx[:,None]
-                    P = sample_xy[idx]; Z = sample_z[idx]
-                    A = np.concatenate([P, np.ones((P.shape[0],P.shape[1],1))], axis=2); At = np.transpose(A,(0,2,1))
-                    coef = np.linalg.solve(At@A, At@Z[...,None]); a=coef[:,0,0]; b=coef[:,1,0]; c=coef[:,2,0]
-                    uv = q[~inside]; out[~inside] = a*uv[:,0] + b*uv[:,1] + c
-                return out
+
 
             def interp_idw(q, power=2):
                 tree = cKDTree(sample_xy); k = min(64, len(sample_xy))
@@ -7209,14 +7186,7 @@ segmentation, triangulation, and visualization.
                 return np.sum(w * sample_z[idx], axis=1) / wsum
 
 
-            def interp_plane(q):
-                tree = cKDTree(sample_xy); k = min(12, len(sample_xy))
-                d, idx = tree.query(q, k=k)
-                if k==1: d=d[:,None]; idx=idx[:,None]
-                P = sample_xy[idx]; Z = sample_z[idx]
-                A = np.concatenate([P, np.ones((P.shape[0],P.shape[1],1))], axis=2); At = np.transpose(A,(0,2,1))
-                coef = np.linalg.solve(At@A, At@Z[...,None]); a=coef[:,0,0]; b=coef[:,1,0]; c=coef[:,2,0]
-                return a*q[:,0] + b*q[:,1] + c
+
 
             def interp_tps(q):
                 try:
@@ -7230,16 +7200,15 @@ segmentation, triangulation, and visualization.
                     )
                     return rbf(q)
                 except Exception:
-                    return interp_linear(q)
+                    return interp_idw(q)
             # choose method
-            if "Thin Plate" in interp_label: 
+            if "Thin Plate" in interp_label:
                 z_out = interp_tps(vertices_xy)
-            elif "Linear" in interp_label:  
-                z_out = interp_linear(vertices_xy)
-            elif "IDW" in interp_label:     
+            elif "IDW" in interp_label:
                 z_out = interp_idw(vertices_xy)
-            else:                            
-                z_out = interp_plane(vertices_xy)
+            else:
+                # Default to IDW for any unrecognized method
+                z_out = interp_idw(vertices_xy)
 
             final_vertices_rot3d = np.zeros((len(vertices_xy), 3), float)
             final_vertices_rot3d[:, :2] = vertices_xy

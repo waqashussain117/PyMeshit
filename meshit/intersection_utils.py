@@ -1897,8 +1897,8 @@ def refine_hull_with_interpolation(raw_hull_points: List[Vector3D],
         
         # Check for sufficient data density
         if len(scattered_data_points) < 10:
-            logger.warning("Low data density - using simple linear interpolation")
-            interp_method = "Linear (Barycentric)"
+            logger.warning("Low data density - using IDW interpolation")
+            interp_method = "IDW (p=4)"
         
         refined_hull_pca = np.zeros_like(hull_pca)
         refined_hull_pca[:, :2] = hull_2d  # Keep X,Y coordinates in PCA space
@@ -1913,26 +1913,33 @@ def refine_hull_with_interpolation(raw_hull_points: List[Vector3D],
                 )
                 refined_hull_pca[:, 2] = rbf(hull_2d)
             except Exception as e:
-                logger.warning(f"TPS interpolation failed: {e}, falling back to linear")
-                refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
-                                                 method='linear', fill_value=np.nan)
+                logger.warning(f"TPS interpolation failed: {e}, falling back to IDW")
+                # IDW fallback implementation
+                refined_z = []
+                for hull_pt_2d in hull_2d:
+                    distances = np.sqrt(np.sum((scattered_2d - hull_pt_2d)**2, axis=1))
+                    exact_match_idx = np.where(distances < 1e-12)[0]
+                    if len(exact_match_idx) > 0:
+                        refined_z.append(scattered_z[exact_match_idx[0]])
+                    else:
+                        weights = 1.0 / (distances**4.0)  # Default power of 4
+                        weighted_sum = np.sum(weights * scattered_z)
+                        weight_sum = np.sum(weights)
+                        refined_z.append(weighted_sum / weight_sum)
+                refined_hull_pca[:, 2] = np.array(refined_z)
                 
-        elif interp_method == "Linear (Barycentric)":
-            refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
-                                             method='linear', fill_value=np.nan)
-            
         elif interp_method.startswith("IDW"):
             # Extract power parameter (default p=4)
             try:
                 power = float(interp_method.split('p=')[1].rstrip(')'))
             except:
                 power = 4.0
-            
+
             # Manual IDW implementation
             refined_z = []
             for hull_pt_2d in hull_2d:
                 distances = np.sqrt(np.sum((scattered_2d - hull_pt_2d)**2, axis=1))
-                
+
                 # Handle exact matches
                 exact_match_idx = np.where(distances < 1e-12)[0]
                 if len(exact_match_idx) > 0:
@@ -1942,33 +1949,24 @@ def refine_hull_with_interpolation(raw_hull_points: List[Vector3D],
                     weighted_sum = np.sum(weights * scattered_z)
                     weight_sum = np.sum(weights)
                     refined_z.append(weighted_sum / weight_sum)
-            
+
             refined_hull_pca[:, 2] = np.array(refined_z)
-            
-        elif interp_method == "Cubic (Clough–Tocher)":
-            try:
-                refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
-                                                 method='cubic', fill_value=np.nan)
-            except Exception as e:
-                logger.warning(f"Cubic interpolation failed: {e}, falling back to linear")
-                refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
-                                                 method='linear', fill_value=np.nan)
-                
-        elif interp_method == "Kriging (Ordinary)":
-            try:
-                # Simple kriging implementation using RBF with gaussian kernel
-                rbf = RBFInterpolator(scattered_2d, scattered_z, kernel='gaussian', 
-                                    smoothing=smoothing, epsilon=1.0)
-                refined_hull_pca[:, 2] = rbf(hull_2d)
-            except Exception as e:
-                logger.warning(f"Kriging interpolation failed: {e}, falling back to linear")
-                refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
-                                                 method='linear', fill_value=np.nan)
         else:
-            # Default to linear interpolation
-            logger.warning(f"Unknown interpolation method {interp_method}, using linear")
-            refined_hull_pca[:, 2] = griddata(scattered_2d, scattered_z, hull_2d, 
-                                             method='linear', fill_value=np.nan)
+            # Default to IDW for unrecognized methods
+            logger.warning(f"Unknown interpolation method {interp_method}, using IDW")
+            # IDW implementation
+            refined_z = []
+            for hull_pt_2d in hull_2d:
+                distances = np.sqrt(np.sum((scattered_2d - hull_pt_2d)**2, axis=1))
+                exact_match_idx = np.where(distances < 1e-12)[0]
+                if len(exact_match_idx) > 0:
+                    refined_z.append(scattered_z[exact_match_idx[0]])
+                else:
+                    weights = 1.0 / (distances**4.0)  # Default power of 4
+                    weighted_sum = np.sum(weights * scattered_z)
+                    weight_sum = np.sum(weights)
+                    refined_z.append(weighted_sum / weight_sum)
+            refined_hull_pca[:, 2] = np.array(refined_z)
         
         # Handle any NaN values by falling back to original Z coordinates
         nan_mask = np.isnan(refined_hull_pca[:, 2])
@@ -2676,26 +2674,8 @@ def run_constrained_triangulation_py(
     sample_w  = C @ ez
 
     # interpolators in local frame
-    def z_plane(q):
-        tree = cKDTree(sample_xy); k = min(12, len(sample_xy))
-        d, idx = tree.query(q, k=k)
-        if k == 1: d = d[:, None]; idx = idx[:, None]
-        A = np.concatenate([sample_xy[idx], np.ones((idx.shape[0], idx.shape[1], 1))], axis=2); At = np.transpose(A,(0,2,1))
-        coef = np.linalg.solve(At@A, At@sample_w[idx][...,None])
-        a = coef[:,0,0]; b = coef[:,1,0]; c = coef[:,2,0]
-        return a*q[:,0] + b*q[:,1] + c
 
-    def z_linear(q):
-        dela = Delaunay(sample_xy); out = np.empty(len(q), float); out[:] = np.nan
-        s = dela.find_simplex(q); inside = s >= 0
-        if np.any(inside):
-            T = dela.transform[s[inside]]; r = q[inside] - T[:,2]
-            bary = np.einsum('ijk,ik->ij', T[:,:2,:], r)
-            w0 = 1.0 - bary.sum(axis=1); w1 = bary[:,0]; w2 = bary[:,1]; inds = dela.simplices[s[inside]]
-            out[inside] = w0*sample_w[inds[:,0]] + w1*sample_w[inds[:,1]] + w2*sample_w[inds[:,2]]
-        if np.any(~inside):
-            out[~inside] = z_plane(q[~inside])
-        return out
+
 
     def z_idw(q, power=2):
         tree = cKDTree(sample_xy); k = min(64, len(sample_xy))
@@ -2715,132 +2695,23 @@ def run_constrained_triangulation_py(
             )
             return rbf(q)
         except Exception:
-            return z_linear(q)
+            return z_idw(q)
 
-    def z_kriging(q):
-        pts = sample_xy; vals = sample_w
-        n = len(pts)
-        if n < 3:
-            return z_plane(q)
-        bb = np.max(pts, axis=0) - np.min(pts, axis=0)
-        diag = float(np.linalg.norm(bb))
-        rng = max(1e-12, 0.5*diag)
-        sill = float(np.var(vals)) + 1e-12
-        nugget = 1e-6 * sill
-        dmat = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
-        gamma = sill * (1.0 - np.exp(-dmat / rng))
-        C = sill - gamma
-        np.fill_diagonal(C, C.diagonal() + nugget)
-        A = np.empty((n+1, n+1), float)
-        A[:n,:n]=C; A[:n,n]=1.0; A[n,:n]=1.0; A[n,n]=0.0
-        try:
-            A_inv = np.linalg.inv(A)
-        except np.linalg.LinAlgError:
-            return z_linear(q)
-        out = np.empty(len(q), float)
-        for i, qi in enumerate(q):
-            dq = np.linalg.norm(pts - qi[None, :], axis=1)
-            gamma_q = sill * (1.0 - np.exp(-dq / rng))
-            cvec = (sill - gamma_q)
-            b = np.empty(n+1, float); b[:n]=cvec; b[n]=1.0
-            x = A_inv @ b
-            lamb = x[:n]
-            out[i] = float(np.dot(lamb, vals))
-        return out
 
-    def z_ct(q, k_neighbors=15, spike_factor=5.0):
-        tree_nn = cKDTree(sample_xy)
-        d_all, _ = tree_nn.query(sample_xy, k=min(8, len(sample_xy)))
-        global_med = float(np.median(d_all[:, 1])) if d_all.shape[1] > 1 else float(np.median(d_all))
 
-        ct = CloughTocher2DInterpolator(sample_xy, sample_w, fill_value=np.nan)
-        w_ct = ct(q)
 
-        w_out = np.empty(len(q), dtype=float)
-        for i, qi in enumerate(q):
-            d, idx = tree_nn.query(qi, k=min(k_neighbors, len(sample_xy)))
-            if np.isscalar(idx):
-                idx = np.array([idx]); d = np.array([d])
-            P = sample_xy[idx]
-            W = sample_w[idx]
-            A = np.column_stack([P, np.ones(P.shape[0])])
-            try:
-                coef, *_ = np.linalg.lstsq(A, W, rcond=None)
-                w_lp = coef[0]*qi[0] + coef[1]*qi[1] + coef[2]
-                w_fit = A @ coef
-                sigma = float(np.std(W - w_fit)) + 1e-12
-            except Exception:
-                w_lp = float(np.mean(W))
-                sigma = float(np.std(W - w_lp)) + 1e-12
 
-            wc = w_ct[i]
-            if np.isnan(wc):
-                w_out[i] = w_lp
-                continue
-
-            mean_d = float(np.mean(d))
-            sparsity = mean_d / max(global_med, 1e-12)
-            alpha = 1.0 / (1.0 + (max(sparsity - 1.0, 0.0))**2)
-
-            delta = alpha * (wc - w_lp)
-            cap = spike_factor * sigma
-            w_out[i] = w_lp + float(np.clip(delta, -cap, cap))
-
-        return w_out
-    def z_robust_mls(q, k=24, iters=3, c=4.685, h_mult=2.0):
-        tree = cKDTree(sample_xy)
-        d_all, _ = tree.query(sample_xy, k=min(8, len(sample_xy)))
-        global_med = float(np.median(d_all[:, 1])) if d_all.shape[1] > 1 else float(np.median(d_all))
-        h = max(global_med * h_mult, 1e-9)
-
-        out = np.empty(len(q), dtype=float)
-        for i, qi in enumerate(q):
-            d, idx = tree.query(qi, k=min(k, len(sample_xy)))
-            if np.isscalar(idx):
-                out[i] = float(sample_w[idx]); continue
-
-            P = sample_xy[idx]
-            Wv = sample_w[idx]
-            w_dist = np.exp(- (d / h) ** 2).astype(float) + 1e-12
-
-            A = np.column_stack([P, np.ones(P.shape[0])])
-            coef, *_ = np.linalg.lstsq(A, Wv, rcond=None)
-
-            for _ in range(iters):
-                w_fit = A @ coef
-                r = Wv - w_fit
-                s = np.median(np.abs(r)) / 0.6745 + 1e-12
-                u = r / (c * s)
-                w_rob = np.where(np.abs(u) < 1.0, (1 - u**2)**2, 0.0)
-                W = (w_dist * w_rob)
-                if np.sum(W) < 1e-12:
-                    break
-                Aw = A * W[:, None]
-                try:
-                    coef = np.linalg.lstsq(Aw.T @ A, Aw.T @ Wv, rcond=None)[0]
-                except Exception:
-                    break
-
-            out[i] = coef[0]*qi[0] + coef[1]*qi[1] + coef[2]
-        return out
     
     # choose method (Legacy maps to IDW + PLC snap)
     if "Legacy" in interp:
         w_out = z_idw(vertices_uv)
     elif "Thin Plate" in interp:
         w_out = z_tps(vertices_uv)
-    elif "Linear" in interp:
-        w_out = z_linear(vertices_uv)
     elif "IDW" in interp:
         w_out = z_idw(vertices_uv)
-    elif "Kriging" in interp:
-        w_out = z_kriging(vertices_uv)
-    elif "Clough" in interp:
-        w_out = z_ct(vertices_uv)
-    elif "MLS" in interp:
-        w_out = z_robust_mls(vertices_uv)
     else:
-        w_out = z_plane(vertices_uv)
+        # Default to IDW for any unrecognized method
+        w_out = z_idw(vertices_uv)
 
     # map back to world
     final_vertices_3d = centroid + np.outer(vertices_uv[:,0], ex) + np.outer(vertices_uv[:,1], ey) + np.outer(w_out, ez)
