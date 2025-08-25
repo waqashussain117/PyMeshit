@@ -6,15 +6,10 @@ including file loading, convex hull computation, segmentation, triangulation, an
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
-from matplotlib.figure import Figure
 import logging
 import os
 import sys
 import time
-from matplotlib.colors import ListedColormap, to_rgba
 import re
 # import QToolButton
 from PyQt5.QtWidgets import QToolButton
@@ -53,15 +48,10 @@ from PyQt5.QtWidgets import (QDockWidget, QListWidget, QListWidgetItem,
                              QVBoxLayout, QHBoxLayout, QLabel, QSlider,
                              QDoubleSpinBox, QWidget, QGroupBox, QGridLayout)
 from PyQt5.QtCore import Qt, pyqtSlot
-# Import PyVista for 3D visualization
-try:
-    import pyvista as pv
-    from pyvista import examples
-    HAVE_PYVISTA = True
-    logging.info("Successfully imported PyVista for 3D visualization")
-except ImportError:
-    HAVE_PYVISTA = False
-    logging.warning("PyVista not available. 3D visualization disabled.")
+# Import PyVista for 3D visualization (required)
+import pyvista as pv
+from pyvista import examples
+logging.info("Successfully imported PyVista for 3D visualization")
 
 # Configure logging to show ALL messages at INFO level
 logging.basicConfig(level=logging.INFO, 
@@ -265,7 +255,7 @@ class MeshItWorkflowGUI(QMainWindow):
         self.active_view = "points" # To track which visualization is active
         
         # Initialize optional variables that could be used for 3D visualization
-        self.view_3d_enabled = HAVE_PYVISTA
+        self.view_3d_enabled = True  # PyVista is now mandatory
         self.height_factor = 1.0
         self.current_plotter = None
         self.pv_plotter = None
@@ -346,12 +336,6 @@ class MeshItWorkflowGUI(QMainWindow):
         self.statusBar().showMessage("MeshIt GUI Ready")
         
         # Initialize plot axes (will be properly set up in _setup_..._tab methods)
-        self.hull_ax = None
-        self.segment_ax = None
-        self.tri_ax = None
-        self.hull_canvas = None
-        self.segment_canvas = None
-        self.tri_canvas = None
         
         # For 3D view management
         self.plotter = None
@@ -1007,7 +991,7 @@ class MeshItWorkflowGUI(QMainWindow):
         view_3d_action = viz_menu.addAction("Show &3D View")
         view_3d_action.setStatusTip("Open a separate interactive 3D view (requires PyVista)")
         view_3d_action.triggered.connect(self.show_3d_view)
-        view_3d_action.setEnabled(HAVE_PYVISTA) # Disable if PyVista not available
+        view_3d_action.setEnabled(True)  # PyVista is now mandatory
     
         viz_menu.addSeparator()
         
@@ -1179,10 +1163,7 @@ class MeshItWorkflowGUI(QMainWindow):
         self.file_viz_layout = QVBoxLayout(self.file_viz_frame)
         
         # Initial visualization panel will show placeholder message
-        if HAVE_PYVISTA:
-            placeholder_text = "Load data to visualize points in 3D"
-        else:
-            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nLoad data to visualize points in 2D."
+        placeholder_text = "Load data to visualize points in 3D"
             
         self.file_viz_placeholder = QLabel(placeholder_text)
         self.file_viz_placeholder.setAlignment(Qt.AlignCenter)
@@ -1253,7 +1234,7 @@ class MeshItWorkflowGUI(QMainWindow):
         self.hull_viz_layout = QVBoxLayout(self.hull_viz_frame)
         
         # Initial visualization panel will show placeholder message
-        if HAVE_PYVISTA:
+        if True:
             placeholder_text = "Compute convex hull to visualize in 3D"
         else:
             placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nCompute convex hull to visualize in 2D."
@@ -1349,7 +1330,7 @@ class MeshItWorkflowGUI(QMainWindow):
         self.segment_viz_layout = QVBoxLayout(self.segment_viz_frame)
 
         # Initial visualization panel will show placeholder message
-        if HAVE_PYVISTA:
+        if True:
             placeholder_text = "Compute segmentation to visualize in 3D"
         else:
             placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\\nCompute segmentation to visualize in 2D."
@@ -1494,7 +1475,7 @@ class MeshItWorkflowGUI(QMainWindow):
         viz_layout = QVBoxLayout(viz_group) # Added for completeness
         self.tri_viz_frame = QWidget() # Added for completeness
         self.tri_viz_layout = QVBoxLayout(self.tri_viz_frame) # Added for completeness
-        if HAVE_PYVISTA: # Added for completeness
+        if True: # Added for completeness
             placeholder_text = "Run triangulation to visualize in 3D" # Added for completeness
         else: # Added for completeness
             placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nRun triangulation to visualize in 2D." # Added for completeness
@@ -1583,7 +1564,7 @@ class MeshItWorkflowGUI(QMainWindow):
         self.intersection_plot_layout = QVBoxLayout(self.intersection_view_frame)
         self.intersection_plot_layout.setContentsMargins(0, 0, 0, 0)
         
-        if HAVE_PYVISTA:
+        if True:
             from pyvistaqt import QtInteractor
             self.intersection_plotter = QtInteractor(self.intersection_view_frame)
             self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
@@ -1876,22 +1857,6 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _setup_refine_tab_plotters(self):
         """Initialize PyVista plotters for each sub-tab"""
-        if not HAVE_PYVISTA:
-            # Add placeholder labels for each tab if PyVista is not available
-            for viz_frame, tab_name in [
-                (self.intersections_viz_frame, "Intersections"),
-                (self.meshes_viz_frame, "Meshes"), 
-                (self.segments_viz_frame, "Segments")
-            ]:
-                placeholder = QLabel(f"PyVista is required for 3D {tab_name.lower()} visualization.")
-                placeholder.setAlignment(Qt.AlignCenter)
-                if tab_name == "Intersections":
-                    self.intersections_plot_layout.addWidget(placeholder)
-                elif tab_name == "Meshes":
-                    self.meshes_plot_layout.addWidget(placeholder)
-                else:  # Segments
-                    self.segments_plot_layout.addWidget(placeholder)
-            return
 
         try:
             from pyvistaqt import QtInteractor
@@ -2001,17 +1966,9 @@ class MeshItWorkflowGUI(QMainWindow):
     def _ensure_segments_plotter(self):
         """
         Lazily create/attach the Segments QtInteractor if missing.
-        Returns the plotter or None if PyVistaQt is unavailable.
+        Returns the plotter (PyVistaQt is now mandatory).
         """
-        try:
-            have_pv = bool(HAVE_PYVISTA)
-        except NameError:
-            have_pv = False
-        logger.info(f"[SEGMENTS] ensure plotter: HAVE_PYVISTA={have_pv}")
-
-        if not have_pv:
-            logger.warning("[SEGMENTS] PyVista not available; cannot create Segments plotter")
-            return None
+        logger.info("[SEGMENTS] Creating PyVista plotter (PyVista is now mandatory)")
 
         # Basic widget sanity
         try:
@@ -4205,7 +4162,7 @@ class MeshItWorkflowGUI(QMainWindow):
             self.pre_tetramesh_plot_layout = QVBoxLayout(self.pre_tetramesh_viz_frame)
             self.pre_tetramesh_plot_layout.setContentsMargins(0, 0, 0, 0)
 
-            if HAVE_PYVISTA:
+            if True:
                 from pyvistaqt import QtInteractor
                 plotter = QtInteractor(self.pre_tetramesh_viz_frame)
                 self.pre_tetramesh_plot_layout.addWidget(plotter.interactor)
@@ -6090,9 +6047,7 @@ class MeshItWorkflowGUI(QMainWindow):
             
             # Handle VTU files using PyVista (if available)
             if ext == '.vtu':
-                if not HAVE_PYVISTA:
-                    raise ValueError("PyVista is required to read VTU files. Please install PyVista.")
-                
+
                 logger.info(f"Reading VTU file using PyVista: {file_path}")
                 mesh = pv.read(file_path)
                 
@@ -6268,10 +6223,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 widget.deleteLater()
             
         # Reset placeholder
-        if HAVE_PYVISTA:
-            placeholder_text = "Compute convex hull to visualize in 3D"
-        else:
-            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nCompute convex hull to visualize in 2D."
+        placeholder_text = "Compute convex hull to visualize in 3D"
             
         self.hull_viz_placeholder = QLabel(placeholder_text)
         self.hull_viz_placeholder.setAlignment(Qt.AlignCenter)
@@ -6291,10 +6243,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 widget.deleteLater()
             
         # Reset placeholder
-        if HAVE_PYVISTA:
-            placeholder_text = "Compute segmentation to visualize in 3D"
-        else:
-            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nCompute segmentation to visualize in 2D."
+        placeholder_text = "Compute segmentation to visualize in 3D"
             
         self.segment_viz_placeholder = QLabel(placeholder_text)
         self.segment_viz_placeholder.setAlignment(Qt.AlignCenter)
@@ -6314,10 +6263,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 widget.deleteLater()
             
         # Reset placeholder
-        if HAVE_PYVISTA:
-            placeholder_text = "Run triangulation to visualize in 3D"
-        else:
-            placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nRun triangulation to visualize in 2D."
+        placeholder_text = "Run triangulation to visualize in 3D"
             
         self.tri_viz_placeholder = QLabel(placeholder_text)
         self.tri_viz_placeholder.setAlignment(Qt.AlignCenter)
@@ -6967,7 +6913,7 @@ segmentation, triangulation, and visualization.
             if self.notebook.widget(self.notebook.currentIndex()) == self.segment_tab:
                 self._clear_segment_plot()
                 # Prefer 3D always when available
-                self.view_3d_enabled = HAVE_PYVISTA
+                self.view_3d_enabled = True
                 self._visualize_all_segments()
         except Exception:
             pass
@@ -7372,13 +7318,13 @@ segmentation, triangulation, and visualization.
         
         dialog_layout.addWidget(format_group)
         
-        # 3D export options (enabled only if PyVista is available)
+        # 3D export options (PyVista is now mandatory)
         options_group = QGroupBox("3D Export Options")
         options_layout = QGridLayout(options_group)
         
         export_3d_checkbox = QCheckBox("Export as 3D Surface")
-        export_3d_checkbox.setChecked(HAVE_PYVISTA)
-        export_3d_checkbox.setEnabled(HAVE_PYVISTA)
+        export_3d_checkbox.setChecked(True)
+        export_3d_checkbox.setEnabled(True)
         options_layout.addWidget(export_3d_checkbox, 0, 0, 1, 2)
         
         options_layout.addWidget(QLabel("Height Scale:"), 1, 0)
@@ -7417,7 +7363,7 @@ segmentation, triangulation, and visualization.
                 export_format = "obj"  # Default
                 
             # Get 3D options
-            export_3d = export_3d_checkbox.isChecked() and HAVE_PYVISTA
+            export_3d = export_3d_checkbox.isChecked() and True
             height_scale = height_scale_slider.value() / 100.0
             
             # Create a file save dialog
@@ -7448,7 +7394,7 @@ segmentation, triangulation, and visualization.
                 triangles = dataset['triangulation_result']['triangles']
                 
                 # If 3D export is selected and PyVista is available
-                if export_3d and HAVE_PYVISTA:
+                if export_3d and True:
                     try:
                         # Create 3D vertices with Z-values
                         points_3d = np.zeros((len(vertices), 3))
@@ -8161,7 +8107,7 @@ segmentation, triangulation, and visualization.
                 widget.deleteLater()
         
         # Reset placeholder
-        if HAVE_PYVISTA:
+        if True:
             placeholder_text = "Load data to visualize points in 3D"
         else:
             placeholder_text = "PyVista not available. Install PyVista for 3D visualization.\nLoad data to visualize points in 2D."
@@ -8322,41 +8268,10 @@ segmentation, triangulation, and visualization.
         min_x, min_y = min_coords[0], min_coords[1]
         max_x, max_y = max_coords[0], max_coords[1]
 
-        if self.view_3d_enabled:
-            # Keep existing 3D path (no change here)
-            self._create_multi_dataset_3d_visualization(
-                self.file_viz_frame, visible_datasets, "Points Visualization", view_type="points"
-            )
-        else:
-            fig = Figure(figsize=(6, 4), dpi=100)
-            ax = fig.add_subplot(111)
-            for dataset in visible_datasets:
-                points = dataset.get('points')
-                if points is None or len(points) == 0:
-                    continue
-                color = dataset.get('color', 'blue')
-                name = dataset.get('name', 'Unnamed')
-                if dataset.get('type') == 'WELL' and len(points) >= 2:
-                    # Draw well polyline as connected line
-                    ax.plot(points[:, 0], points[:, 1], '-', c=color, alpha=0.9, lw=1.5, label=f"{name} (well)")
-                    # Also scatter endpoints lightly
-                    ax.scatter([points[0, 0], points[-1, 0]], [points[0, 1], points[-1, 1]],
-                            s=12, c=color, alpha=0.9, zorder=3)
-                else:
-                    ax.scatter(points[:, 0], points[:, 1], s=5, c=color, alpha=0.7, label=name)
-
-            ax.set_aspect('equal')
-            ax.set_title("Point Clouds (Wells drawn as polylines)")
-            ax.set_xlabel("X")
-            ax.set_ylabel("Y")
-            ax.legend()
-            ax.grid(True, linestyle='--', alpha=0.6)
-            padding = max((max_x - min_x), (max_y - min_y)) * 0.05
-            ax.set_xlim(min_x - padding, max_x + padding)
-            ax.set_ylim(min_y - padding, max_y + padding)
-
-            canvas = FigureCanvas(fig)
-            self.file_viz_layout.addWidget(canvas)
+        # Use 3D visualization with PyVista
+        self._create_multi_dataset_3d_visualization(
+            self.file_viz_frame, visible_datasets, "Points Visualization", view_type="points"
+        )
     def _visualize_all_hulls(self):
         """Visualize all visible hulls"""
         # Get datasets with hulls
@@ -8370,79 +8285,13 @@ segmentation, triangulation, and visualization.
             self._clear_hull_plot()
             return
             
-        # Use 3D visualization or PyVista
-        if self.view_3d_enabled:
-            self._create_multi_dataset_3d_visualization(
-                self.hull_viz_frame, 
-                datasets_with_hull,
-                "Convex Hull Visualization",
-                view_type="hulls"
-            )
-            return
-        
-        # Clear previous visualization
-        while self.hull_viz_layout.count():
-            item = self.hull_viz_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
-                
-        # Create a matplotlib visualization
-        fig = Figure(figsize=(6, 4), dpi=100)
-        ax = fig.add_subplot(111)
-        
-        # Find global limits for all datasets
-        all_points = []
-        for dataset in datasets_with_hull:
-            points = dataset.get('points')
-            if points is not None and len(points) > 0:
-                all_points.append(points)
-                
-        if not all_points:
-            return
-            
-        all_points_np = np.vstack(all_points)
-        min_x, min_y = np.min(all_points_np[:, 0:2], axis=0)
-        max_x, max_y = np.max(all_points_np[:, 0:2], axis=0)
-        
-        # Add some margin to the plot
-        margin_x = 0.1 * (max_x - min_x)
-        margin_y = 0.1 * (max_y - min_y)
-        
-        # Plot each dataset
-        for dataset in datasets_with_hull:
-            points = dataset.get('points')
-            hull_points = dataset.get('hull_points')
-            color = dataset.get('color', '#000000')
-            name = dataset.get('name', 'Unnamed')
-            
-            if points is None or len(points) == 0 or hull_points is None or len(hull_points) == 0:
-                continue
-            
-            # Plot points (with reduced alpha for better visualization)
-            ax.scatter(points[:, 0], points[:, 1], s=5, c=color, alpha=0.3)
-            
-            # Plot hull (using first 2 dimensions)
-            ax.plot(hull_points[:, 0], hull_points[:, 1], c=color, linewidth=2, label=name)
-            
-        ax.set_aspect('equal')
-        ax.set_title(f"Hull Visualization: {len(datasets_with_hull)} datasets")
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.grid(True, linestyle='--', alpha=0.6)
-        ax.legend(loc='best')
-        
-        # Set limits with margin
-        ax.set_xlim(min_x - margin_x, max_x + margin_x)
-        ax.set_ylim(min_y - margin_y, max_y + margin_y)
-        
-        # Create canvas
-        canvas = FigureCanvas(fig)
-        self.hull_viz_layout.addWidget(canvas)
-        
-        # Add toolbar
-        toolbar = NavigationToolbar(canvas, self.hull_viz_frame)
-        self.hull_viz_layout.addWidget(toolbar)
+        # Use 3D visualization with PyVista
+        self._create_multi_dataset_3d_visualization(
+            self.hull_viz_frame,
+            datasets_with_hull,
+            "Convex Hull Visualization",
+            view_type="hulls"
+        )
     def _sync_seg_lengths_from_table(self):
         """Snapshot the Segmentation table into seg_length_by_surface before computing."""
         if not hasattr(self, 'seg_refine_table') or self.seg_refine_table is None:
@@ -8466,7 +8315,7 @@ segmentation, triangulation, and visualization.
             except Exception:
                 continue
     def _visualize_all_segments(self):
-        """Visualize all visible datasets' segments (prefer 3D PyVista; fallback to 2D only if PyVista unavailable)."""
+        """Visualize all visible datasets' segments using 3D PyVista."""
         visible_datasets = [d for d in self.datasets if d.get('visible', True) and d.get('segments') is not None]
         if not visible_datasets:
             self._clear_segment_plot()
@@ -8479,53 +8328,14 @@ segmentation, triangulation, and visualization.
             if widget:
                 widget.deleteLater()
 
-        # Prefer 3D if PyVista is available
-        if HAVE_PYVISTA:
-            # Force 3D and use the existing 3D helper
-            self.view_3d_enabled = True
-            self._create_multi_dataset_3d_visualization(
-                self.segment_viz_frame,
-                visible_datasets,
-                "Segmentation Visualization",
-                view_type="segments"
-            )
-            return
-
-        # Fallback: 2D Matplotlib (unchanged)
-        all_points = np.vstack([d['points'] for d in visible_datasets if d['points'] is not None])
-        if len(all_points) == 0:
-            return
-        min_coords = np.min(all_points, axis=0); max_coords = np.max(all_points, axis=0)
-        min_x, min_y = min_coords[0], min_coords[1]; max_x, max_y = max_coords[0], max_coords[1]
-
-        fig = Figure(figsize=(6, 4), dpi=100)
-        ax = fig.add_subplot(111)
-        for dataset in visible_datasets:
-            points = dataset['points']; segments = dataset['segments']
-            if points is not None and len(points) > 0 and segments is not None and len(segments) > 0:
-                color = dataset.get('color', 'blue'); name = dataset.get('name', 'Unnamed')
-                ax.scatter(points[:, 0], points[:, 1], s=3, c=color, alpha=0.2, label=f"{name} Original")
-                segment_endpoints = []
-                for segment in segments:
-                    p0 = np.asarray(segment[0]); p1 = np.asarray(segment[1])
-                    segment_endpoints.append(p0); segment_endpoints.append(p1)
-                    ax.plot([p0[0], p1[0]], [p0[1], p1[1]], color=color, linewidth=2.0, alpha=0.9)
-                if segment_endpoints:
-                    ue = np.unique(np.array(segment_endpoints)[:, :2], axis=0)
-                    ax.scatter(ue[:, 0], ue[:, 1], s=50, c='red', edgecolor='black', linewidth=1.5, alpha=1.0, marker='o', label=f"{name} Segment Points", zorder=5)
-
-        ax.set_aspect('equal')
-        ax.set_title("Segmentations (Boundary Defined by Segments)")
-        ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.legend()
-        ax.grid(True, linestyle='--', alpha=0.6)
-        pad = max((max_x - min_x), (max_y - min_y)) * 0.05
-        ax.set_xlim(min_x - pad, max_x + pad); ax.set_ylim(min_y - pad, max_y + pad)
-
-        canvas = FigureCanvas(fig); self.segment_viz_layout.addWidget(canvas)
-        toolbar = NavigationToolbar(canvas, self.segment_viz_frame); self.segment_viz_layout.addWidget(toolbar)
-        
-        # Update the segments legend (remains the same)
-        # ... existing legend update code ...
+        # Use 3D visualization with PyVista
+        self.view_3d_enabled = True
+        self._create_multi_dataset_3d_visualization(
+            self.segment_viz_frame,
+            visible_datasets,
+            "Segmentation Visualization",
+            view_type="segments"
+        )
     
     def _visualize_all_triangulations(self):
         """Visualize all visible datasets' triangulations"""
@@ -8564,76 +8374,13 @@ segmentation, triangulation, and visualization.
         min_x, min_y = min_coords[0], min_coords[1]
         max_x, max_y = max_coords[0], max_coords[1]
         
-        # Use 3D visualization if enabled
-        if self.view_3d_enabled:
-            # In 3D, the mesh itself shows the boundary. We can optionally highlight edges.
-            # The existing _create_multi_dataset_3d_visualization already shows edges.
-            self._create_multi_dataset_3d_visualization(
-                self.tri_viz_frame,
-                visible_datasets,
-                "Triangulation Visualization",
-                view_type="triangulation"
-            )
-        else:
-            # Fall back to matplotlib if PyVista is not available
-            fig = Figure(figsize=(6, 4), dpi=100)
-            ax = fig.add_subplot(111)
-            
-            # Plot each dataset with its color
-            for dataset in visible_datasets:
-                triangulation_result = dataset['triangulation_result']
-                # hull_points = dataset.get('hull_points') # Don't use original hull
-                
-                if triangulation_result is not None:
-                    vertices = triangulation_result.get('vertices')
-                    triangles = triangulation_result.get('triangles')
-                    
-                    if vertices is not None and len(vertices) > 0 and triangles is not None and len(triangles) > 0:
-                        color = dataset.get('color', 'blue')
-                        name = dataset.get('name', 'Unnamed')
-                        
-                        # Plot triangulation using triplot
-                        from matplotlib.tri import Triangulation
-                        tri = Triangulation(vertices[:, 0], vertices[:, 1], triangles)
-                        ax.triplot(tri, color=color, lw=0.5, alpha=0.7, label=f"{name} Mesh")
-                        
-                        # --- Plot actual boundary edges ---
-                        boundary_edges_indices = self._get_boundary_edges(triangles)
-                        if boundary_edges_indices:
-                            boundary_lines = []
-                            for i1, i2 in boundary_edges_indices:
-                                p1 = vertices[i1]
-                                p2 = vertices[i2]
-                                ax.plot([p1[0], p2[0]], [p1[1], p2[1]], color=color, linewidth=1.5, label=f"{name} Boundary" if not ax.get_legend_handles_labels()[1] else "") # Only label once per dataset
-                        # --- End plot boundary edges ---
-
-                        # # Plot hull boundary if available - REMOVED
-                        # if hull_points is not None and len(hull_points) > 3:
-                        #     ax.plot(hull_points[:, 0], hull_points[:, 1], color=color, linewidth=1.5)
-            
-            ax.set_aspect('equal')
-            ax.set_title("Triangulations (Actual Boundary)") # Updated title
-            # ... rest of matplotlib setup (labels, legend, grid, limits) ...
-            ax.set_xlabel("X")
-            ax.set_ylabel("Y")
-             # Consolidate legend entries
-            handles, labels = ax.get_legend_handles_labels()
-            by_label = dict(zip(labels, handles)) # Remove duplicate labels
-            ax.legend(by_label.values(), by_label.keys())
-            
-            # Add grid and set limits with some padding
-            ax.grid(True, linestyle='--', alpha=0.6)
-            padding = max((max_x - min_x), (max_y - min_y)) * 0.05
-            ax.set_xlim(min_x - padding, max_x + padding)
-            ax.set_ylim(min_y - padding, max_y + padding)
-            
-            # Create canvas
-            canvas = FigureCanvas(fig)
-            self.tri_viz_layout.addWidget(canvas)
-            
-            # Add toolbar
-            toolbar = NavigationToolbar(canvas, self.tri_viz_frame)
-            self.tri_viz_layout.addWidget(toolbar)
+        # Use 3D visualization with PyVista
+        self._create_multi_dataset_3d_visualization(
+            self.tri_viz_frame,
+            visible_datasets,
+            "Triangulation Visualization",
+            view_type="triangulation"
+        )
         
         # Update the triangulation legend (remains the same)
         # ... existing legend update code ...
@@ -9848,21 +9595,6 @@ segmentation, triangulation, and visualization.
 
     def _create_multi_dataset_3d_visualization(self, parent_frame, datasets, title, view_type="points"):
         """Create a 3D visualization of multiple datasets with proper coordinate validation."""
-        if not HAVE_PYVISTA:
-            # Clear previous content if any
-            while parent_frame.layout() and parent_frame.layout().count():
-                item = parent_frame.layout().takeAt(0)
-                widget = item.widget()
-                if widget:
-                    widget.deleteLater()
-
-            if parent_frame.layout() is None:
-                parent_frame.setLayout(QVBoxLayout())
-
-            msg = QLabel("PyVista not installed.\nPlease install PyVista for 3D visualization.")
-            msg.setAlignment(Qt.AlignCenter)
-            parent_frame.layout().addWidget(msg)
-            return
 
         # Close and clean up any previous plotter in this frame
         if hasattr(self, f'{view_type}_plotter'):
@@ -10745,23 +10477,6 @@ segmentation, triangulation, and visualization.
             # Optionally add placeholder text back if desired
             # self.intersection_plotter.add_text("Compute intersections or select one from the list.", position='upper_edge')
             self.intersection_plotter.reset_camera()
-        else:
-            # Fallback for non-PyVista or error cases
-            if hasattr(self, 'intersection_plot_layout'):
-                 # Clear any potential old matplotlib widgets or placeholders
-                 for i in reversed(range(self.intersection_plot_layout.count())):
-                     widget = self.intersection_plot_layout.itemAt(i).widget()
-                     if widget:
-                         # Check if it's the plotter interactor itself before deleting
-                         if hasattr(self, 'intersection_plotter') and self.intersection_plotter and widget == self.intersection_plotter.interactor:
-                             continue # Don't delete the main interactor widget
-                         widget.setParent(None)
-                         widget.deleteLater()
-                 # Add text placeholder if plotter doesn't exist
-                 if not hasattr(self, 'intersection_plotter') or not self.intersection_plotter:
-                      placeholder = QLabel("PyVista required or plot cleared.")
-                      placeholder.setAlignment(Qt.AlignCenter)
-                      self.intersection_plot_layout.addWidget(placeholder)
 
     def _update_intersection_list(self):
         """Update the list of intersections in the UI"""
@@ -11328,9 +11043,7 @@ segmentation, triangulation, and visualization.
 
     def show_intersections_3d_view(self):
         """Show a 3D view of the datasets involved in intersections and the intersection lines/points."""
-        if not HAVE_PYVISTA:
-            QMessageBox.warning(self, "PyVista Needed", "PyVista is required for 3D visualization.")
-            return
+
         
         # Check if there are any intersections to show
         if not hasattr(self, 'datasets_intersections') or not self.datasets_intersections:
@@ -11820,7 +11533,7 @@ segmentation, triangulation, and visualization.
         viz_layout.addWidget(cutting_group)
         
         # 3D Viewer
-        if HAVE_PYVISTA:
+        if True:
             from pyvistaqt import QtInteractor
             
             self.tetra_plotter = QtInteractor(viz_panel)
@@ -15001,8 +14714,7 @@ segmentation, triangulation, and visualization.
     
     def _safe_create_pyvista_plotter(self, parent_widget, background_color='white'):
         """Safely create a PyVista plotter with proper error handling."""
-        if not HAVE_PYVISTA:
-            return None
+
             
         try:
             from pyvistaqt import QtInteractor
