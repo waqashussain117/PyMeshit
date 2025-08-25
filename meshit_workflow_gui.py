@@ -11,8 +11,7 @@ import os
 import sys
 import time
 import re
-# import QToolButton
-from PyQt5.QtWidgets import QToolButton
+
 # import List
 from typing import List, Dict, Tuple, Optional, Any
 # import QAbsractItemView
@@ -988,25 +987,8 @@ class MeshItWorkflowGUI(QMainWindow):
         # --- Visualization Menu ---
         viz_menu = menu_bar.addMenu("&Visualization")
 
-        view_3d_action = viz_menu.addAction("Show &3D View")
-        view_3d_action.setStatusTip("Open a separate interactive 3D view (requires PyVista)")
-        view_3d_action.triggered.connect(self.show_3d_view)
-        view_3d_action.setEnabled(True)  # PyVista is now mandatory
-    
-        viz_menu.addSeparator()
-        
-        # --- Height Factor Submenu ---
-        height_menu = viz_menu.addMenu("Height Factor (3D)")
-        height_group = QActionGroup(self) # Use QActionGroup for radio-button like behavior
 
-        height_factors = [0.1, 0.5, 1.0, 2.0, 5.0]
-        for factor in height_factors:
-            height_action = QAction(f"{factor:.1f}x", self, checkable=True)
-            height_action.setActionGroup(height_group)
-            height_action.triggered.connect(lambda checked, f=factor: self._set_height_factor_and_update(f) if checked else None)
-            if abs(factor - self.height_factor) < 1e-6: # Check if it's the current factor
-                 height_action.setChecked(True)
-            height_menu.addAction(height_action)
+
 
 
         # --- Help Menu ---
@@ -1398,34 +1380,6 @@ class MeshItWorkflowGUI(QMainWindow):
 
         tri_layout.addWidget(quality_group)
 
-        # Feature points controls (remain the same)
-        # ... (feature_group setup remains the same) ...
-        feature_group = QGroupBox("Feature Points") # Added for completeness
-        feature_layout = QFormLayout(feature_group) # Added for completeness
-        self.use_feature_points_checkbox = QCheckBox() # Added for completeness
-        feature_layout.addRow("Use Features:", self.use_feature_points_checkbox) # Added for completeness
-        self.num_features_input = QSpinBox() # Added for completeness
-        self.num_features_input.setRange(1, 10) # Added for completeness
-        self.num_features_input.setValue(3) # Added for completeness
-        feature_layout.addRow("Count:", self.num_features_input) # Added for completeness
-        self.feature_size_input = QDoubleSpinBox() # Added for completeness
-        self.feature_size_input.setRange(0.1, 3.0) # Added for completeness
-        self.feature_size_input.setValue(1.0) # Added for completeness
-        self.feature_size_input.setSingleStep(0.1) # Added for completeness
-        feature_layout.addRow("Size:", self.feature_size_input) # Added for completeness
-        tri_layout.addWidget(feature_group) # Added for completeness
-
-
-        # 3D visualization settings (remain the same)
-        # ... (viz3d_group setup remains the same) ...
-        viz3d_group = QGroupBox("3D Settings") # Added for completeness
-        viz3d_layout = QFormLayout(viz3d_group) # Added for completeness
-        self.height_factor_slider = QSlider(Qt.Horizontal) # Added for completeness
-        self.height_factor_slider.setMinimum(0) # Added for completeness
-        self.height_factor_slider.setMaximum(100) # Added for completeness
-        self.height_factor_slider.setValue(20)  # Added for completeness
-        viz3d_layout.addRow("Height Scale:", self.height_factor_slider) # Added for completeness
-        tri_layout.addWidget(viz3d_group) # Added for completeness
 
         # Run triangulation button
         run_btn = QPushButton("Run Triangulation (All Datasets)") # Update button text
@@ -2104,38 +2058,7 @@ class MeshItWorkflowGUI(QMainWindow):
             current_plotter.render()
         elif self.refine_mesh_plotter:  # Fallback
             self.refine_mesh_plotter.render()
-    def _handle_view_toggle(self, idx: int):
-        """Legacy method - now redirects to tab-based view switching"""
-        logger.info(f"Legacy _handle_view_toggle called with index {idx}, redirecting to tab system")
-        
-        # Update the tab widget to match the requested index
-        if hasattr(self, 'refine_view_tabs'):
-            self.refine_view_tabs.setCurrentIndex(idx)
-        else:
-            # Fallback to old behavior if tabs are not set up yet
-            old_view = getattr(self, 'current_refine_view', 0)
-            self.current_refine_view = idx
-            
-            # Only update visualization if view actually changed
-            if old_view != idx:
-                # Clear actors cache to force rebuild for the new view
-                if hasattr(self, '_constraint_actors_built'):
-                    self._constraint_actors_built = False
-                
-                # Disable mouse selection when leaving segments view
-                if old_view == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
-                    if self.mouse_selection_enabled_btn.isChecked():
-                        self.mouse_selection_enabled_btn.setChecked(False)
-                        
-                self._update_refined_visualization()
-                
-                # Re-enable mouse selection if returning to segments view and it was previously enabled
-                if idx == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
-                    # Enable the button but don't auto-check it - let user decide
-                    self.mouse_selection_enabled_btn.setEnabled(True)
-                elif hasattr(self, 'mouse_selection_enabled_btn'):
-                    # Disable mouse selection button for non-segments views
-                    self.mouse_selection_enabled_btn.setEnabled(idx == 2)
+
     
     def _on_refine_surface_selection_changed(self, surface_name):
         """
@@ -2416,7 +2339,6 @@ class MeshItWorkflowGUI(QMainWindow):
             else:
                 if hasattr(self, 'view_btn_grp'):
                     self.view_btn_grp.button(2).setChecked(True)
-                self._handle_view_toggle(2)
 
         plotter = self._get_current_refine_plotter() or self.plotters.get("refine_mesh")
         if not plotter:
@@ -6498,105 +6420,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
     
     
-    def show_3d_view(self):
-        """Show 3D view of all triangulations in a separate window"""
-        if not self.view_3d_enabled:
-            QMessageBox.information(self, "PyVista Not Available", 
-                                 "PyVista is not available. Please install PyVista for 3D visualization.")
-            return
-            
-        # Check if we have any triangulation results
-        visible_datasets = [d for d in self.datasets if d.get('visible', True) and d.get('triangulation_result') is not None]
-        
-        if not visible_datasets:
-            QMessageBox.information(self, "No Triangulation", 
-                                 "No triangulation results available. Please run triangulation first.")
-            return
-            
-        # Close previous plotter if it exists
-        if hasattr(self, 'pv_plotter') and self.pv_plotter is not None:
-            try:
-                self.pv_plotter.close()
-            except:
-                pass
-        
-        # Create a new plotter
-        self.pv_plotter = pv.Plotter(window_size=[800, 600], title="MeshIt 3D Visualization")
-        self.pv_plotter.set_background("#383F51")  # Dark blue background
-        
-        # Show each dataset
-        for dataset in visible_datasets:
-            color = dataset.get('color', '#000000')
-            name = dataset.get('name', 'Unnamed')
-            
-            triangulation_result = dataset['triangulation_result']
-            vertices = triangulation_result['vertices']
-            triangles = triangulation_result['triangles']
-            
-            # Ensure vertices are 3D
-            vertices_3d = np.zeros((len(vertices), 3))
-            if vertices.shape[1] == 2:
-                # If 2D vertices, try to get Z from original points
-                vertices_3d[:, 0:2] = vertices
-                
-                # If the dataset has 3D points, use them to set Z values based on XY proximity
-                original_points = dataset.get('points')
-                if original_points is not None and original_points.shape[1] >= 3:
-                    for i in range(len(vertices)):
-                        vertex_2d = vertices[i]
-                        # Find the closest original point
-                        distances = np.sum((original_points[:, 0:2] - vertex_2d)**2, axis=1)
-                        closest_idx = np.argmin(distances)
-                        vertices_3d[i, 2] = original_points[closest_idx, 2]
-            else:
-                # If vertices already have Z, use them directly
-                vertices_3d = vertices.copy()
-            
-            # Create a mesh
-            cells = np.hstack([np.full((len(triangles), 1), 3), triangles])
-            mesh = pv.PolyData(vertices_3d, cells)
-            
-            # Add mesh to plotter
-            self.pv_plotter.add_mesh(mesh, color=color, opacity=0.8, 
-                                  show_edges=True, edge_color=color, 
-                                  specular=0.5, smooth_shading=True,
-                                  name=name)  # Add name to identify in plotter
-        
-        # Add text with dataset information
-        text_lines = []
-        for i, dataset in enumerate(visible_datasets):
-            name = dataset.get('name', 'Unnamed')
-            num_vertices = len(dataset['triangulation_result']['vertices'])
-            num_triangles = len(dataset['triangulation_result']['triangles'])
-            text_lines.append(f"{i+1}. {name}: {num_vertices} vertices, {num_triangles} triangles")
-        
-        if text_lines:
-            info_text = '\n'.join(text_lines)
-            self.pv_plotter.add_text(info_text, font_size=10, position='upper_left')
-        
-        # Add UI controls for adjusting display
-        self.pv_plotter.add_checkbox_button_widget(
-            lambda state: [self.pv_plotter.add_axes() if state else self.pv_plotter.remove_axes()],
-            value=True,
-            position=(10, 180),
-            size=30,
-            border_size=1,
-            color_on='white',
-            color_off='grey',
-            background_color='darkblue'
-        )
-        self.pv_plotter.add_text("Axes", position=(50, 180), font_size=10, color='white')
-        
-        # Add scale slider for height
-        def update_height(value):
-            self._set_height_factor(value)
-            self.show_3d_view()  # Refresh the view
-            
-        # Add axes for reference
-        self.pv_plotter.add_axes()
-        
-        # Show the plotter in a separate window
-        self.pv_plotter.show()
+
     
     def _set_height_factor(self, height):
         """Set the height factor for 3D visualization"""
@@ -7401,7 +7225,7 @@ segmentation, triangulation, and visualization.
                         points_3d[:, 0] = vertices[:, 0]  # X remains the same
                         points_3d[:, 1] = vertices[:, 1]  # Y remains the same
                         
-                        # Calculate Z values (same as in show_3d_view)
+                        # Calculate Z values for 3D visualization
                         x_scale = 0.05
                         y_scale = 0.05
                         z_scale = 20.0 * height_scale
@@ -9757,12 +9581,7 @@ segmentation, triangulation, and visualization.
         plotter.enable()
         plotter.render()
 
-    def _set_height_factor_and_update(self, height_factor):
-        """Sets the height factor and triggers a visualization update."""
-        self.height_factor = height_factor
-        # Trigger update for the currently visible tab
-        current_index = self.notebook.currentIndex()
-        self._on_tab_changed(current_index)
+
     def _on_tab_changed(self, index):
         """Handle tab changes to update visualizations as needed"""
         logger.debug(f"Tab changed to index {index}")
