@@ -63,6 +63,7 @@ from scipy.spatial.distance import (braycurtis, canberra, chebyshev, cityblock,
                                     russellrao, seuclidean, sokalmichener,  # noqa: F401
                                     sokalsneath, sqeuclidean, yule)
 from scipy._lib._util import np_long, np_ulong
+from scipy.conftest import skip_xp_invalid_arg
 
 
 @pytest.fixture(params=_METRICS_NAMES, scope="session")
@@ -1370,6 +1371,7 @@ class TestPdist:
         right_y = 0.01492537
         assert_allclose(pdist_y, right_y, atol=eps, verbose=verbose > 2)
 
+    @skip_xp_invalid_arg
     def test_pdist_custom_notdouble(self):
         # tests that when using a custom metric the data type is not altered
         class myclass:
@@ -2106,7 +2108,7 @@ def test_Xdist_deprecated_args(metric):
         pdist(X1, metric, 2.)
 
     for arg in ["p", "V", "VI"]:
-        kwargs = {arg: "foo"}
+        kwargs = {arg: np.asarray(1.)}
 
         if ((arg == "V" and metric == "seuclidean")
                 or (arg == "VI" and metric == "mahalanobis")
@@ -2227,6 +2229,18 @@ def test_immutable_input(metric):
     x.setflags(write=False)
     with maybe_deprecated(metric):
         getattr(scipy.spatial.distance, metric)(x, x, w=x)
+
+
+def test_gh_23109():
+    a = np.array([0, 0, 1, 1])
+    b = np.array([0, 1, 1, 0])
+    w = np.asarray([1.5, 1.2, 0.7, 1.3])
+    expected = yule(a, b, w=w)
+    assert_allclose(expected, 1.1954022988505748)
+    actual = cdist(np.atleast_2d(a),
+                   np.atleast_2d(b),
+                   metric='yule', w=w)
+    assert_allclose(actual, expected)
 
 
 class TestJaccard:

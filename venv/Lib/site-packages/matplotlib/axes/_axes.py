@@ -2365,8 +2365,8 @@ class Axes(_AxesBase):
             facecolor = mcolors.to_rgba_array(facecolor)
         except ValueError as err:
             raise ValueError(
-                "'facecolor' or 'color' argument must be a valid color or"
-                    "sequence of colors."
+                "'facecolor' or 'color' argument must be a valid color or "
+                "sequence of colors."
             ) from err
 
         return facecolor, edgecolor
@@ -3171,6 +3171,9 @@ class Axes(_AxesBase):
         else:  # horizontal
             heads, locs = self._process_unit_info([("x", heads), ("y", locs)])
 
+        heads = cbook._check_1d(heads)
+        locs = cbook._check_1d(locs)
+
         # resolve line format
         if linefmt is None:
             linefmt = args[0] if len(args) > 0 else "C0-"
@@ -3780,7 +3783,7 @@ class Axes(_AxesBase):
                     'zorder', 'rasterized'):
             if key in kwargs:
                 eb_cap_style[key] = kwargs[key]
-        eb_cap_style['color'] = ecolor
+        eb_cap_style["markeredgecolor"] = ecolor
 
         barcols = []
         caplines = {'x': [], 'y': []}

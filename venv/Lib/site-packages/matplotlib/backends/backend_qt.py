@@ -169,9 +169,14 @@ def _allow_interrupt_qt(qapp_or_eventloop):
                 # be forgiving about reading an empty socket.
                 pass
 
-        return sn  # Actually keep the notifier alive.
+        # We return the QSocketNotifier so that the caller holds a reference, and we
+        # also explicitly clean it up in handle_sigint(). Without doing both, deletion
+        # of the socket notifier can happen prematurely or not at all.
+        return sn
 
-    def handle_sigint():
+    def handle_sigint(sn):
+        sn.deleteLater()
+        QtCore.QCoreApplication.sendPostedEvents(sn, QtCore.QEvent.Type.DeferredDelete)
         if hasattr(qapp_or_eventloop, 'closeAllWindows'):
             qapp_or_eventloop.closeAllWindows()
         qapp_or_eventloop.quit()
@@ -257,12 +262,21 @@ class FigureCanvasQT(FigureCanvasBase, QtWidgets.QWidget):
             screen.physicalDotsPerInchChanged.connect(self._update_pixel_ratio)
             screen.logicalDotsPerInchChanged.connect(self._update_pixel_ratio)
 
+    def eventFilter(self, source, event):
+        if event.type() == QtCore.QEvent.Type.DevicePixelRatioChange:
+            self._update_pixel_ratio()
+        return super().eventFilter(source, event)
+
     def showEvent(self, event):
         # Set up correct pixel ratio, and connect to any signal changes for it,
         # once the window is shown (and thus has these attributes).
         window = self.window().windowHandle()
-        window.screenChanged.connect(self._update_screen)
-        self._update_screen(window.screen())
+        current_version = tuple(int(x) for x in QtCore.qVersion().split('.', 2)[:2])
+        if current_version >= (6, 6):
+            window.installEventFilter(self)
+        else:
+            window.screenChanged.connect(self._update_screen)
+            self._update_screen(window.screen())
 
     def set_cursor(self, cursor):
         # docstring inherited

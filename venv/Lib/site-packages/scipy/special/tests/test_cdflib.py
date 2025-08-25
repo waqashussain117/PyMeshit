@@ -3,14 +3,12 @@ Test cdflib functions versus mpmath, if available.
 
 The following functions still need tests:
 
-- ncfdtri
 - ncfdtridfn
 - ncfdtridfd
 - ncfdtrinc
 - nbdtrik
 - nbdtrin
 - pdtrik
-- nctdtrit
 - nctdtridf
 - nctdtrinc
 
@@ -492,7 +490,7 @@ def test_bdtrik_nbdtrik_inf():
 
 
 @pytest.mark.parametrize(
-    "dfn,dfd,nc,f,expected",
+    "dfn,dfd,nc,f,expected_cdf",
     [[100.0, 0.1, 0.1, 100.0, 0.29787396410092676],
      [100.0, 100.0, 0.01, 0.1, 4.4344737598690424e-26],
      [100.0, 0.01, 0.1, 0.01, 0.002848616633080384],
@@ -506,7 +504,7 @@ def test_bdtrik_nbdtrik_inf():
      [100.0, 100.0, 0.1, 10.0, 1.0],
      [1.0, 0.1, 100.0, 10.0, 0.02926064279680897]]
 )
-def test_ncfdtr(dfn, dfd, nc, f, expected):
+def test_ncfdtr_ncfdtri(dfn, dfd, nc, f, expected_cdf):
     # Reference values computed with mpmath with the following script
     #
     # import numpy as np
@@ -549,10 +547,26 @@ def test_ncfdtr(dfn, dfd, nc, f, expected):
     # rng = np.random.default_rng(1234)
     # sample_idx = rng.choice(len(re), replace=False, size=12)
     # cases = np.array(cases)[sample_idx].tolist()
-    assert_allclose(sp.ncfdtr(dfn, dfd, nc, f), expected, rtol=1e-13, atol=0)
+    assert_allclose(sp.ncfdtr(dfn, dfd, nc, f), expected_cdf, rtol=1e-13, atol=0)
+    # testing tails where the CDF reaches 0 or 1 does not make sense for inverses
+    # of a CDF as they are not bijective in these regions
+    if 0 < expected_cdf < 1:
+        assert_allclose(sp.ncfdtri(dfn, dfd, nc, expected_cdf), f, rtol=5e-11)
 
+@pytest.mark.parametrize(
+    "args",
+    [(-1.0, 0.1, 0.1, 0.5),
+     (1, -1.0, 0.1, 0.5),
+     (1, 1, -1.0, 0.5),
+     (1, 1, 1, 100),
+     (1, 1, 1, -1)]
+)
+def test_ncfdtri_domain_error(args):
+    with sp.errstate(domain="raise"):
+        with pytest.raises(sp.SpecialFunctionError, match="domain"):
+            sp.ncfdtri(*args)
 
-class TestNctdtr:
+class TestNoncentralTFunctions:
 
     # Reference values computed with mpmath with the following script
     # Formula from:
@@ -592,7 +606,7 @@ class TestNctdtr:
     #         result = mp.one - f(df, -nc, x)
     #     return float(result)
 
-    @pytest.mark.parametrize("df, nc, x, expected", [
+    @pytest.mark.parametrize("df, nc, x, expected_cdf", [
         (0.98, -3.8, 0.0015, 0.9999279987514815),
         (0.98, -3.8, 0.15, 0.9999528361700505),
         (0.98, -3.8, 1.5, 0.9999908823016942),
@@ -660,13 +674,13 @@ class TestNctdtr:
                         reason="Bug in underlying Boost math implementation")),
         (980, 38, 15, 5.407535300713606e-105)
     ])
-    def test_gh19896(self, df, nc, x, expected):
+    def test_gh19896(self, df, nc, x, expected_cdf):
         # test that gh-19896 is resolved.
         # Originally this was a regression test that used the old Fortran results
         # as a reference. The Fortran results were not accurate, so the reference
         # values were recomputed with mpmath.
-        result = sp.nctdtr(df, nc, x)
-        assert_allclose(result, expected, rtol=1e-13, atol=1e-303)
+        nctdtr_result = sp.nctdtr(df, nc, x)
+        assert_allclose(nctdtr_result, expected_cdf, rtol=1e-13, atol=1e-303)
 
     def test_nctdtr_gh8344(self):
         # test that gh-8344 is resolved.
@@ -684,5 +698,15 @@ class TestNctdtr:
          [1., 1., -np.inf, 0.0, 0.0]
         ]
     )
-    def test_accuracy(self, df, nc, x, expected, rtol):
+    def test_nctdtr_accuracy(self, df, nc, x, expected, rtol):
         assert_allclose(sp.nctdtr(df, nc, x), expected, rtol=rtol)
+
+    @pytest.mark.parametrize("df, nc, x, expected_cdf", [
+        (0.98, 38, 1.5, 2.591995360483094e-97),
+        (3000, 3, 0.1, 0.0018657780826323328),
+        (0.98, -3.8, 15, 0.9999990264591945),
+        (9.8, 38, 15, 2.252076291604796e-09),
+
+    ])
+    def test_nctdtrit(self, df, nc, x, expected_cdf):
+        assert_allclose(sp.nctdtrit(df, nc, expected_cdf), x, rtol=1e-10)

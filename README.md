@@ -28,7 +28,7 @@ Recommended minimal Python dependencies:
 
 ```bash
 pip install numpy scipy matplotlib pyqt5 pyvista pyvistaqt
-# optional: tetgen, pybind11, cython, triangle wrappers, scikit-learn, pandas
+ optional: tetgen, pybind11, cython, triangle wrappers, scikit-learn, pandas
 ```
 
 

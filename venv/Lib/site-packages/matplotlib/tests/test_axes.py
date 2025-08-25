@@ -3293,6 +3293,20 @@ def test_stackplot_hatching(fig_ref, fig_test):
     ax_ref.set_ylim((0, 70))
 
 
+def test_stackplot_subfig_legend():
+    # Smoke test for https://github.com/matplotlib/matplotlib/issues/30158
+
+    fig = plt.figure()
+    subfigs = fig.subfigures(nrows=1, ncols=2)
+
+    for _fig in subfigs:
+        ax = _fig.subplots(nrows=1, ncols=1)
+        ax.stackplot([3, 4], [[1, 2]], labels=['a'])
+
+    fig.legend()
+    fig.draw_without_rendering()
+
+
 def _bxp_test_helper(
         stats_kwargs={}, transform_stats=lambda s: s, bxp_kwargs={}):
     np.random.seed(937)
@@ -4537,6 +4551,11 @@ def test_stem_args():
     _assert_equal(ax.stem(x, y, linefmt='r--', basefmt='b--'), expected=(x, y))
     _assert_equal(ax.stem(y, linefmt='r--'), expected=([0, 1, 2], y))
     _assert_equal(ax.stem(y, 'r--'), expected=([0, 1, 2], y))
+
+    with pytest.raises(ValueError):
+        ax.stem([[y]])
+    with pytest.raises(ValueError):
+        ax.stem([[x]], y)
 
 
 def test_stem_markerfmt():
@@ -9618,3 +9637,29 @@ def test_axes_set_position_external_bbox_unchanged(fig_test, fig_ref):
     ax_test.set_position([0.25, 0.25, 0.5, 0.5])
     assert (bbox.x0, bbox.y0, bbox.width, bbox.height) == (0.0, 0.0, 1.0, 1.0)
     ax_ref = fig_ref.add_axes([0.25, 0.25, 0.5, 0.5])
+
+
+def test_caps_color():
+    # Creates a simple plot with error bars and a specified ecolor
+    x = np.linspace(0, 10, 10)
+    mpl.rcParams['lines.markeredgecolor'] = 'green'
+    ecolor = 'red'
+
+    fig, ax = plt.subplots()
+    errorbars = ax.errorbar(x, np.sin(x), yerr=0.1, ecolor=ecolor)
+
+    # Tests if the caps have the specified color
+    for cap in errorbars[2]:
+        assert mcolors.same_color(cap.get_edgecolor(), ecolor)
+
+
+def test_caps_no_ecolor():
+    # Creates a simple plot with error bars without specifying ecolor
+    x = np.linspace(0, 10, 10)
+    mpl.rcParams['lines.markeredgecolor'] = 'green'
+    fig, ax = plt.subplots()
+    errorbars = ax.errorbar(x, np.sin(x), yerr=0.1)
+
+    # Tests if the caps have the default color (blue)
+    for cap in errorbars[2]:
+        assert mcolors.same_color(cap.get_edgecolor(), "blue")
