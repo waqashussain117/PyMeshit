@@ -101,96 +101,88 @@ class ComputationWorker(QObject):
         logger.debug("ComputationWorker stop requested.")
         self._is_running = False
 
-    def compute_hulls_batch(self):
-        """Worker method to compute hulls for all datasets."""
-        logger.info("Worker: Starting hull computation batch.")
-        if not self.gui.datasets:
-            self.error_occurred.emit("No datasets loaded.")
+    def run_batch_task(self, compute_type):
+        """Generic worker method to run batch computation for any compute type."""
+        logger.info(f"Worker: Starting {compute_type} computation batch.")
+
+        # Define eligibility criteria and method mappings for each compute type
+        config = {
+            'hulls': {
+                'eligibility_func': lambda d: d.get('type') != 'WELL',
+                'compute_method': '_compute_hull_for_dataset',
+                'error_msg': "No datasets loaded.",
+                'skip_msg': "No datasets loaded."
+            },
+            'segments': {
+                'eligibility_func': lambda d: d.get('type') != 'WELL' and d.get('hull_points') is not None,
+                'compute_method': '_compute_segments_for_dataset',
+                'error_msg': "No datasets have computed hulls.",
+                'skip_msg': "No eligible datasets."
+            },
+            'triangulations': {
+                'eligibility_func': lambda d: d.get('type') != 'WELL' and d.get('segments') is not None,
+                'compute_method': '_run_triangulation_for_dataset',
+                'error_msg': "No datasets have computed segments.",
+                'skip_msg': "No eligible datasets."
+            }
+        }
+
+        if compute_type not in config:
+            self.error_occurred.emit(f"Unknown compute type: {compute_type}")
             self.batch_finished.emit(0, 0, 0)
-            logger.info("Worker: Hull batch finished (no datasets).")
+            return
+
+        cfg = config[compute_type]
+        datasets = self.gui.datasets
+
+        if not datasets:
+            self.error_occurred.emit(cfg['error_msg'])
+            self.batch_finished.emit(0, 0, 0)
+            logger.info(f"Worker: {compute_type} batch finished ({cfg['skip_msg']})")
+            return
+
+        # Determine eligible datasets
+        if compute_type == 'hulls':
+            # For hulls, all non-WELL datasets are eligible
+            eligible = [i for i, d in enumerate(datasets) if cfg['eligibility_func'](d)]
+            total_eligible = len(eligible)
+        else:
+            # For segments and triangulations, filter by eligibility criteria
+            eligible = [i for i, d in enumerate(datasets) if cfg['eligibility_func'](d)]
+            total_eligible = len(eligible)
+
+        if not eligible:
+            self.error_occurred.emit(cfg['error_msg'])
+            self.batch_finished.emit(0, 0, 0)
+            logger.info(f"Worker: {compute_type} batch finished (no eligible datasets).")
             return
 
         success_count = 0
-        total_datasets = len(self.gui.datasets)
         start_time = time.time()
 
-        for i in range(total_datasets):
+        for i in eligible:
             if not self._is_running:
                 break
-            dataset = self.gui.datasets[i]
+            dataset = datasets[i]
             dataset_name = dataset.get('name', f"Dataset {i}")
-            # Skip wells
-            if dataset.get('type') == 'WELL':
+
+            # Special handling for hulls - skip wells but mark as successful
+            if compute_type == 'hulls' and dataset.get('type') == 'WELL':
                 self.dataset_finished.emit(i, dataset_name, True)
                 continue
-            success = self.gui._compute_hull_for_dataset(i)
+
+            # Call the appropriate computation method
+            compute_func = getattr(self.gui, cfg['compute_method'])
+            success = compute_func(i)
             self.dataset_finished.emit(i, dataset_name, success)
             if success:
                 success_count += 1
 
         elapsed = time.time() - start_time
-        logger.info(f"Worker: Hull batch finished. Success: {success_count}/{total_datasets}. Elapsed: {elapsed:.2f}s.")
-        self.batch_finished.emit(success_count, total_datasets, elapsed)
-
-        # self._is_running = False # Resetting here might be redundant if worker is deleted
-
-    def compute_segments_batch(self):
-        """Worker method to compute segments for all eligible datasets."""
-        logger.info("Worker: Starting segment computation batch.")
-        eligible = [i for i, d in enumerate(self.gui.datasets)
-                    if d.get('type') != 'WELL' and d.get('hull_points') is not None]
-        if not eligible:
-            self.error_occurred.emit("No datasets have computed hulls.")
-            self.batch_finished.emit(0, 0, 0)
-            logger.info("Worker: Segment batch finished (no eligible datasets).")
-            return
-
-        success_count = 0
-        total_eligible = len(eligible)
-        start_time = time.time()
-
-        for i in eligible:
-            if not self._is_running:
-                break
-            dataset_name = self.gui.datasets[i].get('name', f"Dataset {i}")
-            success = self.gui._compute_segments_for_dataset(i)
-            self.dataset_finished.emit(i, dataset_name, success)
-            if success:
-                success_count += 1
-
-        elapsed = time.time() - start_time
-        logger.info(f"Worker: Segment batch finished. Success: {success_count}/{total_eligible}. Elapsed: {elapsed:.2f}s.")
+        logger.info(f"Worker: {compute_type} batch finished. Success: {success_count}/{total_eligible}. Elapsed: {elapsed:.2f}s.")
         self.batch_finished.emit(success_count, total_eligible, elapsed)
 
 
-    def compute_triangulations_batch(self):
-        """Worker method to compute triangulations for all eligible datasets."""
-        logger.info("Worker: Starting triangulation computation batch.")
-        eligible = [i for i, d in enumerate(self.gui.datasets)
-                    if d.get('type') != 'WELL' and d.get('segments') is not None]
-        if not eligible:
-            self.error_occurred.emit("No datasets have computed segments.")
-            self.batch_finished.emit(0, 0, 0)
-            logger.info("Worker: Triangulation batch finished (no eligible datasets).")
-            return
-
-        success_count = 0
-        total_eligible = len(eligible)
-        start_time = time.time()
-
-        for i in eligible:
-            if not self._is_running:
-                break
-            dataset_name = self.gui.datasets[i].get('name', f"Dataset {i}")
-            success = self.gui._run_triangulation_for_dataset(i)
-            self.dataset_finished.emit(i, dataset_name, success)
-            if success:
-                success_count += 1
-
-        elapsed = time.time() - start_time
-        logger.info(f"Worker: Triangulation batch finished. Success: {success_count}/{total_eligible}. Elapsed: {elapsed:.2f}s.")
-        self.batch_finished.emit(success_count, total_eligible, elapsed)
-            # self._is_running = False
 
     def compute_global_intersections_task(self):
         """Worker task to trigger global intersection computation on the GUI instance."""
@@ -9804,7 +9796,7 @@ segmentation, triangulation, and visualization.
             self.worker.dataset_finished.connect(self.handle_dataset_finished)
             self.worker.batch_finished.connect(self.handle_batch_finished)
             self.worker.error_occurred.connect(self.handle_computation_error)
-            self.thread.started.connect(getattr(self.worker, f"compute_{compute_type}_batch")) # e.g., compute_hulls_batch
+            self.thread.started.connect(lambda: self.worker.run_batch_task(compute_type))
         
         # Common signals for thread management
         self.worker.batch_finished.connect(self.thread.quit) # Quit thread when batch finishes
