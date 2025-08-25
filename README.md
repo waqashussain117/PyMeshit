@@ -28,9 +28,17 @@ Recommended minimal Python dependencies:
 
 ```bash
 pip install numpy scipy matplotlib pyqt5 pyvista pyvistaqt
- optional: tetgen, pybind11, cython, triangle wrappers, scikit-learn, pandas
+ optional: tetgen, pybind11, cython, scikit-learn, pandas
 ```
+Or
 
+### Use venv enviornment
+.\venv\Scripts\Activate
+ 
+Or
+
+### Requirements
+pip install -r requirements.txt
 
 
 ## Quick start (GUI)
@@ -38,7 +46,7 @@ pip install numpy scipy matplotlib pyqt5 pyvista pyvistaqt
 Run the GUI from the repository root:
 
 ```bash
-python meshit_workflow_gui.py
+python main.py
 ```
 
 Typical workflow:
