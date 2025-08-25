@@ -2029,7 +2029,7 @@ def align_intersections_to_convex_hull(surface_idx: int, model):
         return
 
     snap_tol = 1e-4  # <<--- increased
-    proj_tol = 1e-2   # <<--- increased
+    proj_tol = 1e-1   # <<--- increased
 
     for inter in model.intersections:
         is_surface1 = not model.is_polyline.get(inter.id1, True)
