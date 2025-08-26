@@ -26,8 +26,8 @@ pip install numpy scipy matplotlib pyqt5 pyvista pyvistaqt
 ```
 Or
 
-### Use venv enviornment
-.\venv\Scripts\Activate
+### Use conda enviornment
+conda env create -f environment.yml
  
 Or
 
