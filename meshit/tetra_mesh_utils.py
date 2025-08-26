@@ -897,22 +897,3 @@ class TetrahedralMeshGenerator:
             stats['n_tetrahedra'] = mesh_data.n_cells
             stats['volume'] = float(mesh_data.volume) if hasattr(mesh_data, 'volume') else 0.0
         return stats
-
-
-# *** FIX: Move this function OUTSIDE the class definition ***
-def create_tetrahedral_mesh(datasets: List[Dict], selected_surfaces: set, 
-                           border_surface_indices: set, unit_surface_indices: set, 
-                           fault_surface_indices: set, materials: List[Dict] = None,
-                           tetgen_switches: str = "pq1.414aAY") -> Optional[Dict]:
-    """
-    Convenience function to create a tetrahedral mesh.
-    """
-    generator = TetrahedralMeshGenerator(
-        datasets=datasets,
-        selected_surfaces=selected_surfaces,
-        border_surface_indices=border_surface_indices,
-        unit_surface_indices=unit_surface_indices,
-        fault_surface_indices=fault_surface_indices,
-        materials=materials
-    )
-    return generator.generate_tetrahedral_mesh(tetgen_switches)

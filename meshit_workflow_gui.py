@@ -24,7 +24,7 @@ from meshit.intersection_utils import make_corners_special, Vector3D
 from meshit.pre_tetra_constraint_manager import PreTetraConstraintManager
 from PyQt5.QtWidgets import QMenu, QTreeWidgetItemIterator
 import tetgen
-from meshit.tetra_mesh_utils import TetrahedralMeshGenerator, create_tetrahedral_mesh
+from meshit.tetra_mesh_utils import TetrahedralMeshGenerator
 from PyQt5.QtWidgets import QMessageBox
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
                             QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QTabWidget,
