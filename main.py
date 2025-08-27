@@ -9,7 +9,7 @@ from PyQt5.QtCore import Qt
 
 def main():
     try:
-        from meshit_workflow_gui import MeshItWorkflowGUI
+        from Pymeshit_workflow_gui import MeshItWorkflowGUI
     except Exception as e:
         print("Failed to import GUI:", e, file=sys.stderr)
         raise

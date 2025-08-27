@@ -1,0 +1,30 @@
+include README.md
+include main.py
+include Pymeshit_workflow_gui.py
+recursive-include resources *
+recursive-include Pymeshit *.py
+
+exclude bin/*
+exclude debug_plc/*
+exclude doc/*
+exclude github/*
+exclude include/*
+exclude release/*
+exclude src/*
+exclude *.pyd
+exclude *.so
+exclude *.dll
+exclude *.exe
+exclude *.o
+exclude *.obj
+exclude *.lib
+exclude *.exp
+exclude *.cpp
+exclude *.c
+exclude *.h
+exclude *.cxx
+exclude *.rc
+exclude *.qrc
+exclude *.stl
+exclude _skipped.*
+exclude tetgen-tmpfile*

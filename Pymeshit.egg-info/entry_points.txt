@@ -1,0 +1,2 @@
+[console_scripts]
+meshit-gui = Pymeshit:main_wrapper

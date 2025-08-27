@@ -2,42 +2,51 @@
 requires = [
     "setuptools>=42",
     "wheel",
-    "pybind11>=2.5.0",
     "numpy>=1.20.0",
 ]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "meshit"
-version = "0.1.1"
+name = "Pymeshit"
+version = "0.1.6"
 authors = [
     {name = "Waqas Hussain", email = "waqas.hussain117@gmail.com"},
 ]
-description = "Python library for mesh generation and manipulation with C++ backend"
+description = "Complete mesh generation and manipulation package with GUI"
 readme = "README.md"
+license = {text = "GPL-3.0"}
 requires-python = ">=3.7"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.7",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
 ]
 dependencies = [
     "numpy>=1.20.0",
     "scipy>=1.7.0",
-    "triangle>=1.0.9",
+    "triangle",
     "matplotlib>=3.3.0",
-    "pybind11>=2.5.0",
+    "PyQt5>=5.15.0",
+    "pyvista>=0.30.0",
+    "tetgen>=0.6.0",
 ]
 
 [project.urls]
 "Homepage" = "https://github.com/waqashussain/meshit"
 "Bug Tracker" = "https://github.com/waqashussain/meshit/issues"
 
+[project.scripts]
+meshit-gui = "Pymeshit:main_wrapper"
+
 [tool.setuptools]
-packages = ["meshit"]
+packages = ["Pymeshit"]
 include-package-data = true
+py-modules = ["main", "Pymeshit_workflow_gui"]

@@ -1,3 +1,34 @@
+Metadata-Version: 2.4
+Name: Pymeshit
+Version: 0.1.6
+Summary: Complete mesh generation and manipulation package with GUI
+Author-email: Waqas Hussain <waqas.hussain117@gmail.com>
+License: GPL-3.0
+Project-URL: Homepage, https://github.com/waqashussain/meshit
+Project-URL: Bug Tracker, https://github.com/waqashussain/meshit/issues
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Scientific/Engineering
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: License :: OSI Approved :: GNU General Public License v3 (GPLv3)
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.20.0
+Requires-Dist: scipy>=1.7.0
+Requires-Dist: triangle
+Requires-Dist: matplotlib>=3.3.0
+Requires-Dist: PyQt5>=5.15.0
+Requires-Dist: pyvista>=0.30.0
+Requires-Dist: tetgen>=0.6.0
+Dynamic: license-file
+
 # PyMeshIt
 
 PyMeshIt is a complete Python package for mesh generation and manipulation with a full-featured Qt-based GUI. It provides a comprehensive workflow to process point clouds and polylines into conforming surface meshes and tetrahedral meshes.
