@@ -1,11 +1,11 @@
 # main.py
 import sys
-from PyQt5.QtWidgets import QApplication
-from PyQt5.QtGui import QIcon
+from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon
 import os
-from PyQt5.QtWidgets import QSplashScreen
-from PyQt5.QtGui import QPixmap
-from PyQt5.QtCore import Qt
+from PySide6.QtWidgets import QSplashScreen
+from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt
 
 def main():
     try:
@@ -41,7 +41,7 @@ def main():
     # finish splash and give focus to main window
     splash.finish(window)
 
-    # prefer exec() for modern PyQt, exec_() also works on PyQt5
+    # prefer exec() for modern PyQt, exec_() also works on PySide6
     sys.exit(app.exec())
 
 if __name__ == "__main__":

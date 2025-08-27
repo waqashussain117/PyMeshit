@@ -14,38 +14,35 @@ import re
 
 # import List
 from typing import List, Dict, Tuple, Optional, Any
-# import QAbsractItemView
-from PyQt5.QtWidgets import QAbstractItemView
+# Import PySide6
+from PySide6.QtWidgets import QAbstractItemView
 from Pymeshit.intersection_utils import align_intersections_to_convex_hull, Vector3D, Intersection, refine_intersection_line_by_length, insert_triple_points, refine_hull_with_interpolation
 from Pymeshit.intersection_utils import prepare_plc_for_surface_triangulation, run_constrained_triangulation_py, calculate_triple_points, TriplePoint
-# Import PyQt5
 from Pymeshit.intersection_utils import make_corners_special, Vector3D
-# import QMessageBox
-from PyQt5.QtWidgets import QMenu, QTreeWidgetItemIterator
+from PySide6.QtWidgets import QMenu, QTreeWidgetItemIterator
 import tetgen
 from Pymeshit.tetra_mesh_utils import TetrahedralMeshGenerator
-from PyQt5.QtWidgets import QMessageBox
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
                             QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QTabWidget,
                             QFileDialog, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox,
                             QCheckBox, QGroupBox, QRadioButton, QSlider, QLineEdit,
-                            QSplitter, QDialog, QFormLayout, QButtonGroup, QMenu, QAction,
+                            QSplitter, QDialog, QFormLayout, QButtonGroup, QMenu,
                             QListWidget, QColorDialog, QListWidgetItem, QProgressDialog,
-                            QActionGroup, QSpacerItem, QTableWidget, QTableWidgetItem,
+                            QSpacerItem, QTableWidget, QTableWidgetItem,
                             QTreeWidget, QTreeWidgetItem, QScrollArea)
-from PyQt5.QtCore import Qt, QSize, pyqtSignal, QObject, QThread, QTimer, QSettings # Add QTimer and QSettings
-from PyQt5.QtGui import QFont, QIcon, QColor, QPalette, QPixmap
+from PySide6.QtGui import QFont, QIcon, QColor, QPalette, QPixmap, QAction, QActionGroup
+from PySide6.QtCore import Qt, QSize, Signal, QObject, QThread, QTimer, QSettings
 # Add these imports at the top of meshit_workflow_gui.py
 from Pymeshit.intersection_utils import run_constrained_triangulation_py
 from scipy.spatial.distance import pdist, squareform
 import itertools
 import gc
 import atexit
-from PyQt5.QtWidgets import (QDockWidget, QListWidget, QListWidgetItem,
+from PySide6.QtWidgets import (QDockWidget, QListWidget, QListWidgetItem,
                              QTableWidget, QTableWidgetItem, QPushButton,
                              QVBoxLayout, QHBoxLayout, QLabel, QSlider,
                              QDoubleSpinBox, QWidget, QGroupBox, QGridLayout)
-from PyQt5.QtCore import Qt, pyqtSlot
+from PySide6.QtCore import Qt, Slot
 # Import PyVista for 3D visualization (required)
 import pyvista as pv
 from pyvista import examples
@@ -87,9 +84,9 @@ from scipy.interpolate import griddata
 
 # Worker class for background computations
 class ComputationWorker(QObject):
-    dataset_finished = pyqtSignal(int, str, bool) # index, name, success
-    batch_finished = pyqtSignal(int, int, float) # success_count, total_eligible, elapsed_time
-    error_occurred = pyqtSignal(str)
+    dataset_finished = Signal(int, str, bool) # index, name, success
+    batch_finished = Signal(int, int, float) # success_count, total_eligible, elapsed_time
+    error_occurred = Signal(str)
 
     def __init__(self, gui_instance):
         super().__init__()
@@ -413,7 +410,7 @@ class MeshItWorkflowGUI(QMainWindow):
     def _init_seg_refine_table(self):
         # Table for Segmentation per-surface RefineByLength
         # Uses dataset index as stable key; stores it in Qt.UserRole per row
-        from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem
+        from PySide6.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem
         if not hasattr(self, 'seg_length_by_surface'):
             self.seg_length_by_surface = {}
         self._seg_table_updating = False
@@ -424,7 +421,10 @@ class MeshItWorkflowGUI(QMainWindow):
         self.seg_refine_table.setHorizontalHeaderLabels(["Surface", "Length"])
         self.seg_refine_table.horizontalHeader().setStretchLastSection(True)
         self.seg_refine_table.verticalHeader().setVisible(False)
-        self.seg_refine_table.setEditTriggers(self.seg_refine_table.DoubleClicked | self.seg_refine_table.EditKeyPressed)
+        self.seg_refine_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked | 
+            QAbstractItemView.EditTrigger.EditKeyPressed
+        )
         self.seg_refine_table.cellChanged.connect(self._on_seg_refine_cell_changed)
         lay.addWidget(self.seg_refine_table)
 
@@ -432,8 +432,8 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _refresh_seg_refine_table(self):
         # Populate rows for all non-WELL datasets
-        from PyQt5.QtWidgets import QTableWidgetItem
-        from PyQt5.QtCore import Qt
+        from PySide6.QtWidgets import QTableWidgetItem
+        from PySide6.QtCore import Qt
         if not hasattr(self, 'seg_refine_table'):
             return
         self._seg_table_updating = True
@@ -457,7 +457,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _on_seg_refine_cell_changed(self, row, col):
         # Persist edits into self.seg_length_by_surface
-        from PyQt5.QtCore import Qt
+        from PySide6.QtCore import Qt
         if self._seg_table_updating or col != 1:
             return
         item_name = self.seg_refine_table.item(row, 0)
@@ -517,7 +517,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
             # Try to read from the table directly
             if hasattr(self, 'seg_refine_table') and self.seg_refine_table is not None:
-                from PyQt5.QtCore import Qt
+                from PySide6.QtCore import Qt
                 rows = self.seg_refine_table.rowCount()
                 for r in range(rows):
                     item_name = self.seg_refine_table.item(r, 0)
@@ -546,7 +546,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _init_mesh_refine_table(self):
         # Table for Refine & Mesh per-surface mesh target size
-        from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem
+        from PySide6.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem
         if not hasattr(self, 'mesh_length_by_surface'):
             self.mesh_length_by_surface = {}
         self._mesh_table_updating = False
@@ -557,7 +557,11 @@ class MeshItWorkflowGUI(QMainWindow):
         self.mesh_refine_table.setHorizontalHeaderLabels(["Surface", "Target Size"])
         self.mesh_refine_table.horizontalHeader().setStretchLastSection(True)
         self.mesh_refine_table.verticalHeader().setVisible(False)
-        self.mesh_refine_table.setEditTriggers(self.mesh_refine_table.DoubleClicked | self.mesh_refine_table.EditKeyPressed)
+        self.mesh_refine_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked |
+            QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+
         self.mesh_refine_table.cellChanged.connect(self._on_mesh_refine_cell_changed)
         lay.addWidget(self.mesh_refine_table)
 
@@ -565,8 +569,8 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _refresh_mesh_refine_table(self):
         # Populate rows for all non-WELL datasets
-        from PyQt5.QtWidgets import QTableWidgetItem
-        from PyQt5.QtCore import Qt
+        from PySide6.QtWidgets import QTableWidgetItem
+        from PySide6.QtCore import Qt
         if not hasattr(self, 'mesh_refine_table'):
             return
         self._mesh_table_updating = True
@@ -605,7 +609,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _on_mesh_refine_cell_changed(self, row, col):
         # Persist edits into self.mesh_length_by_surface
-        from PyQt5.QtCore import Qt
+        from PySide6.QtCore import Qt
         if self._mesh_table_updating or col != 1:
             return
         item_name = self.mesh_refine_table.item(row, 0)
@@ -803,11 +807,11 @@ class MeshItWorkflowGUI(QMainWindow):
 
         self._update_coordinate_editors()
         self._update_material_visualisation()
-    @pyqtSlot(int)
+    @Slot(int)
     def _on_material_selected(self,row:int)->None:
         self._refresh_material_list()
 
-    @pyqtSlot(int)
+    @Slot(int)
     def _on_location_selected(self,row:int)->None:
         self._update_coordinate_editors()
 
@@ -874,11 +878,11 @@ class MeshItWorkflowGUI(QMainWindow):
                 self.locX_slider,self.locY_slider,self.locZ_slider):
             w.blockSignals(False)
 
-    @pyqtSlot(float)
+    @Slot(float)
     def _coord_spin_changed(self,val:float)->None:
         axis=self.sender().property("axis"); self._apply_coord_change(axis,val)
 
-    @pyqtSlot(int)
+    @Slot(int)
     def _coord_slider_changed(self,val:int)->None:
         axis=self.sender().property("axis"); self._apply_coord_change(axis,val/256.0)
 
@@ -1545,7 +1549,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _init_mesh_refine_table(self):
         # Table for Refine & Mesh per-surface mesh target size
-        from PyQt5.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy
+        from PySide6.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy
         if not hasattr(self, 'mesh_length_by_surface'):
             self.mesh_length_by_surface = {}
 
@@ -1562,8 +1566,10 @@ class MeshItWorkflowGUI(QMainWindow):
         header.setStretchLastSection(True)
 
         self.mesh_refine_table.verticalHeader().setVisible(False)
-        self.mesh_refine_table.setEditTriggers(self.mesh_refine_table.DoubleClicked | self.mesh_refine_table.EditKeyPressed)
-
+        self.mesh_refine_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked |
+            QAbstractItemView.EditTrigger.EditKeyPressed
+        )
         # Professional sizing
         self.mesh_refine_table.setMinimumHeight(220)
         self.mesh_refine_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -1575,12 +1581,12 @@ class MeshItWorkflowGUI(QMainWindow):
         self._refresh_mesh_refine_table()
     def _setup_refine_mesh_tab(self):
         """Three-pane layout with Actions → Mesh Settings → Per‑Surface stacked on the left."""
-        from PyQt5.QtWidgets import (
+        from PySide6.QtWidgets import (
             QHBoxLayout, QVBoxLayout, QWidget, QGroupBox, QFormLayout, QLabel, QCheckBox, QComboBox,
             QDoubleSpinBox, QPushButton, QTreeWidget, QFrame, QTabWidget, QSplitter, QSizePolicy,
             QHeaderView
         )
-        from PyQt5.QtCore import Qt
+        from PySide6.QtCore import Qt
 
         tab_layout = QHBoxLayout(self.refine_mesh_tab)
 
@@ -4486,7 +4492,7 @@ class MeshItWorkflowGUI(QMainWindow):
         """
         import numpy as np
         import logging
-        from PyQt5.QtCore import Qt
+        from PySide6.QtCore import Qt
 
         logger = logging.getLogger("MeshIt-Workflow")
 
@@ -4880,7 +4886,7 @@ class MeshItWorkflowGUI(QMainWindow):
         try:
             per_surface_len = {}
             if hasattr(self, 'mesh_refine_table') and self.mesh_refine_table is not None:
-                from PyQt5.QtCore import Qt
+                from PySide6.QtCore import Qt
                 for r in range(self.mesh_refine_table.rowCount()):
                     item_name = self.mesh_refine_table.item(r, 0)
                     item_val = self.mesh_refine_table.item(r, 1)
@@ -7166,7 +7172,7 @@ segmentation, triangulation, and visualization.
         export_btn.clicked.connect(export_dialog.accept)
         
         # Show dialog and get result
-        result = export_dialog.exec_()
+        result = export_dialog.exec()
         
         if result == QDialog.Accepted:
             # Get selected format
@@ -7802,7 +7808,7 @@ segmentation, triangulation, and visualization.
         ok_btn.clicked.connect(dialog.accept)
         
         # Show dialog and get result
-        result = dialog.exec_()
+        result = dialog.exec()
         
         if result == QDialog.Accepted:
             new_name = name_input.text().strip()
@@ -8111,7 +8117,7 @@ segmentation, triangulation, and visualization.
         """Snapshot the Segmentation table into seg_length_by_surface before computing."""
         if not hasattr(self, 'seg_refine_table') or self.seg_refine_table is None:
             return
-        from PyQt5.QtCore import Qt
+        from PySide6.QtCore import Qt
         if not hasattr(self, 'seg_length_by_surface') or self.seg_length_by_surface is None:
             self.seg_length_by_surface = {}
         rows = self.seg_refine_table.rowCount()
@@ -13677,7 +13683,7 @@ segmentation, triangulation, and visualization.
     
     def _add_material(self):
         """Add a new material region."""
-        from PyQt5.QtWidgets import QInputDialog
+        from PySide6.QtWidgets import QInputDialog
         
         material_name, ok = QInputDialog.getText(
             self, 'Add Material', 'Enter material name:',
@@ -13705,7 +13711,7 @@ segmentation, triangulation, and visualization.
         """Remove the selected material."""
         current_row = self.material_list.currentRow()
         if current_row >= 0 and current_row < len(self.tetra_materials):
-            from PyQt5.QtWidgets import QMessageBox
+            from PySide6.QtWidgets import QMessageBox
             
             material_name = self.tetra_materials[current_row].get('name', f'Material_{current_row+1}')
             reply = QMessageBox.question(
@@ -14296,8 +14302,8 @@ segmentation, triangulation, and visualization.
 
     def _show_validation_results_dialog(self, validation_results):
         """Show validation results in a dialog."""
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel
-        from PyQt5.QtCore import Qt
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel
+        from PySide6.QtCore import Qt
         
         dialog = QDialog(self)
         dialog.setWindowTitle("Surface Validation Results")
@@ -14374,7 +14380,7 @@ segmentation, triangulation, and visualization.
         close_button.clicked.connect(dialog.accept)
         layout.addWidget(close_button)
         
-        dialog.exec_()
+        dialog.exec()
 
     def _cleanup_pyvista_plotters(self):
         """Comprehensive cleanup of all PyVista plotters and OpenGL contexts."""

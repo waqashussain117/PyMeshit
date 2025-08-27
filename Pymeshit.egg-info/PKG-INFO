@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: Pymeshit
-Version: 0.1.6
+Version: 0.2.3
 Summary: Complete mesh generation and manipulation package with GUI
 Author-email: Waqas Hussain <waqas.hussain117@gmail.com>
 License: GPL-3.0
@@ -24,7 +24,7 @@ Requires-Dist: numpy>=1.20.0
 Requires-Dist: scipy>=1.7.0
 Requires-Dist: triangle
 Requires-Dist: matplotlib>=3.3.0
-Requires-Dist: PyQt5>=5.15.0
+Requires-Dist: PySide6>=6.0.0
 Requires-Dist: pyvista>=0.30.0
 Requires-Dist: tetgen>=0.6.0
 Dynamic: license-file
@@ -74,10 +74,10 @@ The package will automatically install all required dependencies:
 - numpy
 - scipy
 - matplotlib
-- PyQt5
+- PySide6
 - pyvista
 - tetgen
-- triangle
+- triangle (optional)
 
 
 ## Quick start (GUI)
@@ -91,8 +91,8 @@ meshit-gui
 Or from Python:
 
 ```python
-import pymeshit
-pymeshit.main_wrapper()
+import Pymeshit
+Pymeshit.main_wrapper()
 ```
 
 Typical workflow:

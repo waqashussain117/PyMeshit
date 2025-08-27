@@ -43,10 +43,10 @@ The package will automatically install all required dependencies:
 - numpy
 - scipy
 - matplotlib
-- PyQt5
+- PySide6
 - pyvista
 - tetgen
-- triangle
+- triangle (optional)
 
 
 ## Quick start (GUI)
