@@ -60,8 +60,8 @@ meshit-gui
 Or from Python:
 
 ```python
-import pymeshit
-pymeshit.main_wrapper()
+import Pymeshit
+Pymeshit.main_wrapper()
 ```
 
 Typical workflow:
