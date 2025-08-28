@@ -9,51 +9,31 @@ import sys  # Import sys for error handling
 
 # Define main_wrapper early to ensure it's always available
 def main_wrapper():
-    """Entry point for the GUI application."""
-    try:
-        from PyQt5.QtWidgets import QApplication
-        from PyQt5.QtGui import QIcon
-        import os
-        from PyQt5.QtWidgets import QSplashScreen
-        from PyQt5.QtGui import QPixmap
-        from PyQt5.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QIcon
+    from PySide6.QtWidgets import QSplashScreen
+    from PySide6.QtGui import QPixmap
+    from PySide6.QtCore import Qt
+    import os, sys
 
-        # Import the GUI
-        from Pymeshit_workflow_gui import MeshItWorkflowGUI
+    app = QApplication(sys.argv)  # MUST be first
 
-        app = QApplication(sys.argv)
-        # set application icon if available
-        icon_path = os.path.join(os.path.dirname(__file__), '..', 'resources', 'images', 'app_logo_small.png')
-        if os.path.exists(icon_path):
-            app.setWindowIcon(QIcon(icon_path))
+    from Pymeshit_workflow_gui import MeshItWorkflowGUI  # import GUI after app
 
-        # show splash screen if image available
-        splash_path = os.path.join(os.path.dirname(__file__), '..', 'resources', 'images', 'app_logo.png')
-        if os.path.exists(splash_path):
-            pixmap = QPixmap(splash_path)
-            splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
-        else:
-            # fallback small transparent pixmap
-            pixmap = QPixmap(400, 300)
-            pixmap.fill(Qt.transparent)
-            splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
+    # optional: icon/splash
+    icon_path = os.path.join(os.path.dirname(__file__), '..', 'resources', 'images', 'app_logo_small.png')
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
 
-        splash.show()
-        app.processEvents()
+    splash_path = os.path.join(os.path.dirname(__file__), '..', 'resources', 'images', 'app_logo.png')
+    pixmap = QPixmap(splash_path) if os.path.exists(splash_path) else QPixmap(400, 300)
+    splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
+    splash.show(); app.processEvents()
 
-        # instantiate and show main window while splash is visible
-        window = MeshItWorkflowGUI()
-        window.show()
-
-        # finish splash and give focus to main window
-        splash.finish(window)
-
-        # prefer exec() for modern PyQt, exec_() also works on PyQt5
-        sys.exit(app.exec())
-
-    except Exception as e:
-        print(f"Failed to start GUI: {e}", file=sys.stderr)
-        raise
+    window = MeshItWorkflowGUI()
+    window.show()
+    splash.finish(window)
+    sys.exit(app.exec())
 
 # Import core components with fallback
 try:
@@ -133,7 +113,7 @@ except ImportError:
     HAS_DIRECT_TRIANGLE = False
 
 # Define version
-__version__ = '0.1.4'
+__version__ = '0.2.0'
 
 # Helper functions for adding geometries to a model
 def add_surface_to_model(model, surface):
