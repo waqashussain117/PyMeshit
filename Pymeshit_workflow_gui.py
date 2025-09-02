@@ -234,6 +234,7 @@ class MeshItWorkflowGUI(QMainWindow):
         self._color_index = 0 # For assigning colors to datasets
         
         self.plotters = {}
+        self._updating_coordinates = False  # Flag to prevent recursive updates during coordinate editing
         # Visualization placeholders and state
         self.points = None
         self.hull_points = None
@@ -391,12 +392,12 @@ class MeshItWorkflowGUI(QMainWindow):
         self.locY_val = QDoubleSpinBox(decimals=4); self.locY_val.setSuffix("  Y")
         self.locZ_val = QDoubleSpinBox(decimals=4); self.locZ_val.setSuffix("  Z")
         for w,lbl in [(self.locX_val,"X"),(self.locY_val,"Y"),(self.locZ_val,"Z")]:
-            w.setRange(-1e9,1e9); w.setSingleStep(0.1); w.setProperty("axis",lbl)
+            w.setRange(-1e9,1e9); w.setSingleStep(1.0); w.setDecimals(6); w.setProperty("axis",lbl)
             w.valueChanged.connect(self._coord_spin_changed)
 
         self.locX_slider = QSlider(Qt.Horizontal); self.locY_slider = QSlider(Qt.Horizontal); self.locZ_slider = QSlider(Qt.Horizontal)
         for s,lbl in [(self.locX_slider,"X"),(self.locY_slider,"Y"),(self.locZ_slider,"Z")]:
-            s.setRange(-100000,100000); s.setSingleStep(1); s.setProperty("axis",lbl)
+            s.setRange(-1000000,1000000); s.setSingleStep(500); s.setPageStep(5000); s.setProperty("axis",lbl)
             s.valueChanged.connect(self._coord_slider_changed)
 
         grid.addWidget(self.locX_val,0,0);  grid.addWidget(self.locX_slider,1,0)
@@ -776,7 +777,8 @@ class MeshItWorkflowGUI(QMainWindow):
         self.material_location_list.blockSignals(True)
 
         # remember what was selected
-        prev_sel = self.material_list.currentRow()
+        prev_mat_sel = self.material_list.currentRow()
+        prev_loc_sel = self.material_location_list.currentRow()
 
         # rebuild material list
         self.material_list.clear()
@@ -787,19 +789,26 @@ class MeshItWorkflowGUI(QMainWindow):
 
         # restore (or choose first) selection
         if self.material_list.count():
-            if prev_sel < 0 or prev_sel >= self.material_list.count():
-                prev_sel = 0
-            self.material_list.setCurrentRow(prev_sel)
+            if prev_mat_sel < 0 or prev_mat_sel >= self.material_list.count():
+                prev_mat_sel = 0
+            self.material_list.setCurrentRow(prev_mat_sel)
         else:
-            prev_sel = -1          # nothing selected
+            prev_mat_sel = -1          # nothing selected
 
         # rebuild location list for the selected material
         self.material_location_list.clear()
-        if 0 <= prev_sel < len(self.tetra_materials):
-            for i, xyz in enumerate(self.tetra_materials[prev_sel]["locations"]):
+        if 0 <= prev_mat_sel < len(self.tetra_materials):
+            for i, xyz in enumerate(self.tetra_materials[prev_mat_sel]["locations"]):
                 self.material_location_list.addItem(
                     f"Loc {i}: ({xyz[0]:.2f}, {xyz[1]:.2f}, {xyz[2]:.2f})"
                 )
+
+            # restore location selection if valid
+            if prev_loc_sel >= 0 and prev_loc_sel < len(self.tetra_materials[prev_mat_sel]["locations"]):
+                self.material_location_list.setCurrentRow(prev_loc_sel)
+            else:
+                # select first location if previous was invalid
+                self.material_location_list.setCurrentRow(0)
 
         # unblock signals and refresh the rest
         self.material_list.blockSignals(False)
@@ -862,41 +871,69 @@ class MeshItWorkflowGUI(QMainWindow):
     def _update_coordinate_editors(self)->None:
         m=self.material_list.currentRow(); l=self.material_location_list.currentRow()
         editing=(m>=0 and l>=0)
-        for w in (self.locX_val,self.locY_val,self.locZ_val,
-                self.locX_slider,self.locY_slider,self.locZ_slider):
-            w.blockSignals(True)
+
+        # Block all signals during programmatic updates
+        self.locX_val.blockSignals(True)
+        self.locY_val.blockSignals(True)
+        self.locZ_val.blockSignals(True)
+        self.locX_slider.blockSignals(True)
+        self.locY_slider.blockSignals(True)
+        self.locZ_slider.blockSignals(True)
 
         if editing:
             x,y,z=self.tetra_materials[m]["locations"][l]
+            # Convert numpy types to regular Python floats
+            x, y, z = float(x), float(y), float(z)
             self.locX_val.setValue(x); self.locY_val.setValue(y); self.locZ_val.setValue(z)
-            self.locX_slider.setValue(int(x*256)); self.locY_slider.setValue(int(y*256)); self.locZ_slider.setValue(int(z*256))
+            # Ensure slider values stay within range
+            slider_x = max(-1000000, min(1000000, int(x*1000)))
+            slider_y = max(-1000000, min(1000000, int(y*1000)))
+            slider_z = max(-1000000, min(1000000, int(z*1000)))
+            self.locX_slider.setValue(slider_x); self.locY_slider.setValue(slider_y); self.locZ_slider.setValue(slider_z)
         else:
-            for w in (self.locX_val,self.locY_val,self.locZ_val): w.setValue(0)
-            for s in (self.locX_slider,self.locY_slider,self.locZ_slider): s.setValue(0)
+            self.locX_val.setValue(0); self.locY_val.setValue(0); self.locZ_val.setValue(0)
+            self.locX_slider.setValue(0); self.locY_slider.setValue(0); self.locZ_slider.setValue(0)
 
-        for w in (self.locX_val,self.locY_val,self.locZ_val,
-                self.locX_slider,self.locY_slider,self.locZ_slider):
-            w.blockSignals(False)
+        # Unblock signals after programmatic updates
+        self.locX_val.blockSignals(False)
+        self.locY_val.blockSignals(False)
+        self.locZ_val.blockSignals(False)
+        self.locX_slider.blockSignals(False)
+        self.locY_slider.blockSignals(False)
+        self.locZ_slider.blockSignals(False)
 
     @Slot(float)
     def _coord_spin_changed(self,val:float)->None:
+        if self._updating_coordinates:
+            return
         axis=self.sender().property("axis"); self._apply_coord_change(axis,val)
 
     @Slot(int)
     def _coord_slider_changed(self,val:int)->None:
-        axis=self.sender().property("axis"); self._apply_coord_change(axis,val/256.0)
+        if self._updating_coordinates:
+            return
+        axis=self.sender().property("axis"); self._apply_coord_change(axis,val/1000.0)
 
     def _apply_coord_change(self,axis:str,value:float)->None:
         m=self.material_list.currentRow(); l=self.material_location_list.currentRow()
         if m<0 or l<0: return
-        xyz=list(self.tetra_materials[m]["locations"][l])
-        if axis=="X": xyz[0]=value
-        if axis=="Y": xyz[1]=value
-        if axis=="Z": xyz[2]=value
-        self.tetra_materials[m]["locations"][l]=xyz
-        self._update_coordinate_editors()
-        self._refresh_material_list()
-        self._update_material_visualisation()
+
+        # Prevent recursive updates during programmatic changes
+        self._updating_coordinates = True
+
+        try:
+            xyz=list(self.tetra_materials[m]["locations"][l])
+            # Convert numpy types to regular Python floats and update the specific axis
+            xyz = [float(coord) for coord in xyz]
+            if axis=="X": xyz[0]=value
+            if axis=="Y": xyz[1]=value
+            if axis=="Z": xyz[2]=value
+            self.tetra_materials[m]["locations"][l]=xyz
+            self._update_coordinate_editors()
+            self._refresh_material_list()
+            self._update_material_visualisation()
+        finally:
+            self._updating_coordinates = False
 
     def _update_material_visualisation(self) -> None:
         """
