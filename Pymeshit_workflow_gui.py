@@ -11678,22 +11678,26 @@ segmentation, triangulation, and visualization.
         """Refresh the tetrahedral mesh visualization with current settings"""
         if not self.tetra_plotter or not hasattr(self, 'full_tetra_mesh'):
             return
-            
+
         try:
             # Clear existing tetrahedral mesh actors
             actors_to_remove = []
             for name in list(self.tetra_plotter.actors.keys()):
                 if 'tetrahedral' in name:
                     actors_to_remove.append(name)
-            
+
             for name in actors_to_remove:
                 self.tetra_plotter.remove_actor(name)
-            
+
+            # Clear existing colorbars/scalar bars
+            if hasattr(self.tetra_plotter, 'clear_scalar_bars'):
+                self.tetra_plotter.clear_scalar_bars()
+
             # Re-add the visualization with current settings
             self._add_tetrahedral_mesh_visualization(self.full_tetra_mesh)
-            
+
             self.tetra_plotter.render()
-            
+
         except Exception as e:
             logger.error(f"Error refreshing tetrahedral visualization: {e}")
 
@@ -11987,9 +11991,11 @@ segmentation, triangulation, and visualization.
             # Update material dropdown with available materials
             self._update_material_dropdown()
             
-            # Add colorbar if using materials
-            if 'MaterialID' in mesh.cell_data:
-                self.tetra_plotter.add_scalar_bar(title='Material ID', interactive=True)
+            # Add colorbar if using materials and checkbox is enabled
+            show_materials = getattr(self, 'tetra_show_materials_check', None) and self.tetra_show_materials_check.isChecked()
+            if show_materials and 'MaterialID' in mesh.cell_data:
+                # Note: scalar bar is already handled in _add_tetrahedral_mesh_visualization
+                pass
             
             # Add coordinate axes
             self.tetra_plotter.add_axes(
@@ -12057,43 +12063,60 @@ segmentation, triangulation, and visualization.
     def _add_surface_visualization(self, mesh, show_materials, opacity, show_wireframe=False):
         """Add surface visualization (external boundary)"""
         import pyvista as pv
-        
+
         # Extract surface
         surface_mesh = mesh.extract_surface()
-        
-        # Configure scalars
+
+        # Configure scalars and colormap
         scalars = None
         cmap = None
+        clim = None
+        show_scalar_bar = False
+
         if show_materials and 'MaterialID' in mesh.cell_data:
-            # Map material IDs from cells to surface
+            # Map material IDs from cells to surface only when materials are enabled
             if hasattr(surface_mesh, 'cell_data') and 'MaterialID' in surface_mesh.cell_data:
                 scalars = 'MaterialID'
                 cmap = self._get_selected_colormap()  # Use user-selected colormap
-        
+                show_scalar_bar = True
+
         # Add surface mesh (external boundary)
         if show_wireframe:
-            # Wireframe mode: show edges only
+            # Wireframe mode: show edges only, no coloring
             self.tetra_plotter.add_mesh(
                 surface_mesh,
                 style='wireframe',
-                scalars=scalars,
-                cmap=cmap,
+                color='lightgray',  # Use consistent gray color when not showing materials
                 opacity=1.0,
                 line_width=1.5,
                 name='tetrahedral_surface'
             )
         else:
             # Solid mode: show faces with edges
-            self.tetra_plotter.add_mesh(
-                surface_mesh,
-                scalars=scalars,
-                cmap=cmap,
-                opacity=opacity,
-                show_edges=True,
-                edge_color='black',
-                line_width=0.5,
-                name='tetrahedral_surface'
-            )
+            if scalars is not None and show_scalar_bar:
+                # Show with material coloring and scalar bar
+                self.tetra_plotter.add_mesh(
+                    surface_mesh,
+                    scalars=scalars,
+                    cmap=cmap,
+                    opacity=opacity,
+                    show_edges=True,
+                    edge_color='black',
+                    line_width=0.5,
+                    scalar_bar_args={'title': 'Material ID'},
+                    name='tetrahedral_surface'
+                )
+            else:
+                # Show without material coloring
+                self.tetra_plotter.add_mesh(
+                    surface_mesh,
+                    color='lightgray',  # Use consistent gray color when not showing materials
+                    opacity=opacity,
+                    show_edges=True,
+                    edge_color='black',
+                    line_width=0.5,
+                    name='tetrahedral_surface'
+                )
 
     def _add_internal_structure_visualization(self, mesh, show_materials, opacity):
         """Add internal structure visualization like C++ version"""
@@ -12125,13 +12148,14 @@ segmentation, triangulation, and visualization.
                 
                 # Also add very transparent faces to show volume structure
                 if show_materials and 'MaterialID' in internal_cells.cell_data:
-                    # Show material colors on internal faces
+                    # Show material colors on internal faces (no scalar bar to avoid duplicates)
                     self.tetra_plotter.add_mesh(
                         internal_cells,
                         scalars='MaterialID',
                         cmap=self._get_selected_colormap(),  # Use user-selected colormap
                         opacity=0.12,  # Very transparent to see through
                         show_edges=False,
+                        show_scalar_bar=False,  # Prevent duplicate scalar bars
                         name='tetrahedral_internal_faces'
                     )
                 else:
