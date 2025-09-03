@@ -12207,12 +12207,26 @@ segmentation, triangulation, and visualization.
             self,
             "Export Tetrahedral Mesh",
             "tetrahedral_mesh.vtk",
-            "VTK files (*.vtk);;VTU files (*.vtu);;PLY files (*.ply);;STL files (*.stl)"
+            "VTK files (*.vtk);;VTU files (*.vtu);;PLY files (*.ply);;STL files (*.stl);;NetCDF files (*.nc);;EXODUS files (*.exo);;All files (*.*)"
         )
         
         if not file_path:
             return
-        
+
+        # Check if NetCDF export is requested but library is not available
+        file_ext = file_path.lower().split('.')[-1]
+        if file_ext in ['nc', 'exo']:
+            try:
+                from Pymeshit.tetra_mesh_utils import HAS_NETCDF
+                if not HAS_NETCDF:
+                    QMessageBox.warning(self, "NetCDF Not Available",
+                                      "NetCDF library is not installed. Please install netCDF4 to export to NetCDF format.")
+                    return
+            except ImportError:
+                QMessageBox.warning(self, "NetCDF Not Available",
+                                  "NetCDF library is not installed. Please install netCDF4 to export to NetCDF format.")
+                return
+
         try:
             success = self.tetra_mesh_generator.export_mesh(file_path, self.tetrahedral_mesh)
             if success:

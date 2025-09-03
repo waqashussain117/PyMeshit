@@ -6,7 +6,17 @@ import tetgen
 import pyvista as pv
 from typing import Dict, List, Tuple, Optional, Any, Union
 from Pymeshit.intersection_utils import Vector3D
+
 logger = logging.getLogger("MeshIt-Workflow")
+
+# Try to import netCDF4 for NetCDF export support
+try:
+    import netCDF4 as nc
+    HAS_NETCDF = True
+    logger.info("netCDF4 library available for NetCDF export")
+except ImportError:
+    HAS_NETCDF = False
+    logger.warning("netCDF4 library not available. NetCDF export will be disabled.")
 
 
 class TetrahedralMeshGenerator:
@@ -873,16 +883,154 @@ class TetrahedralMeshGenerator:
         except Exception as e:
             logger.error(f"Failed to export PLC debug files: {e}")
 
+    def _export_netcdf(self, file_path: str, mesh_data: pv.UnstructuredGrid) -> bool:
+        """
+        Export tetrahedral mesh to NetCDF/EXODUS format.
+
+        Args:
+            file_path: Path to save the NetCDF file
+            mesh_data: PyVista UnstructuredGrid containing the tetrahedral mesh
+
+        Returns:
+            bool: True if export successful, False otherwise
+        """
+        if not HAS_NETCDF:
+            logger.error("netCDF4 library not available. Cannot export to NetCDF format.")
+            return False
+
+        try:
+            # Get mesh data
+            points = mesh_data.points
+            cells = mesh_data.cells
+            cell_types = mesh_data.celltypes
+
+            # Filter tetrahedral cells (cell type 10 in VTK)
+            tetra_mask = cell_types == 10
+            if not np.any(tetra_mask):
+                logger.error("No tetrahedral cells found in mesh")
+                return False
+
+            # Extract tetrahedral cells only
+            tetra_indices = np.where(tetra_mask)[0]
+            tetra_cells = []
+            offset = 0
+
+            for i, cell_type in enumerate(cell_types):
+                if cell_type == 10:  # Tetrahedral cell
+                    n_points = cells[offset]
+                    cell_data = cells[offset:offset + n_points + 1]
+                    tetra_cells.append(cell_data)
+                offset += cells[offset] + 1
+
+            tetra_cells = np.array(tetra_cells)
+            n_tetrahedra = len(tetra_cells)
+
+            if n_tetrahedra == 0:
+                logger.error("No tetrahedral cells found after processing")
+                return False
+
+            # Extract connectivity for tetrahedra only (skip the first element which is the number of points)
+            connectivity = []
+            for tetra_cell in tetra_cells:
+                connectivity.extend(tetra_cell[1:])  # Skip the first element (number of points)
+
+            connectivity = np.array(connectivity, dtype=np.int32)
+
+            # Create NetCDF file
+            with nc.Dataset(file_path, 'w', format='NETCDF4') as rootgrp:
+                # Set global attributes
+                rootgrp.title = "MeshIt Tetrahedral Mesh Export"
+                rootgrp.api_version = "4.98"
+                rootgrp.version = "4.98"
+                rootgrp.floating_point_word_size = "8"
+                rootgrp.file_size = "0"
+
+                # Dimensions
+                rootgrp.createDimension("num_dim", 3)
+                rootgrp.createDimension("num_nodes", len(points))
+                rootgrp.createDimension("num_elem", n_tetrahedra)
+                rootgrp.createDimension("num_elem_blk", 1)  # One block for all tetrahedra
+                rootgrp.createDimension("num_node_sets", 0)
+                rootgrp.createDimension("num_side_sets", 0)
+                rootgrp.createDimension("len_string", 33)
+                rootgrp.createDimension("len_line", 81)
+                rootgrp.createDimension("four", 4)
+                rootgrp.createDimension("time_step", None)  # unlimited
+
+                # Coordinate variables
+                xcoor = rootgrp.createVariable("coordx", "f8", ("num_nodes",))
+                ycoor = rootgrp.createVariable("coordy", "f8", ("num_nodes",))
+                zcoor = rootgrp.createVariable("coordz", "f8", ("num_nodes",))
+
+                xcoor[:] = points[:, 0]
+                ycoor[:] = points[:, 1]
+                zcoor[:] = points[:, 2]
+
+                xcoor.units = "mesh units"
+                ycoor.units = "mesh units"
+                zcoor.units = "mesh units"
+
+                # Coordinate names
+                coord_names = rootgrp.createVariable("coor_names", "S1", ("num_dim", "len_string"))
+                coord_names[0, :] = b"xcoor"
+                coord_names[1, :] = b"ycoor"
+                coord_names[2, :] = b"zcoor"
+
+                # Element block info
+                eb_prop1 = rootgrp.createVariable("eb_prop1", "i4", ("num_elem_blk",))
+                eb_prop1[0] = 1  # Material ID
+
+                eb_names = rootgrp.createVariable("eb_names", "S1", ("num_elem_blk", "len_string"))
+                eb_names[0, :] = b"Tetrahedra"
+
+                # Connectivity
+                connect1 = rootgrp.createVariable("connect1", "i4", ("num_elem", "four"))
+                for i in range(n_tetrahedra):
+                    # Convert to 1-based indexing for EXODUS
+                    connect1[i, :] = connectivity[i*4:(i+1)*4] + 1
+
+                # Element map
+                elem_map = rootgrp.createVariable("elem_map", "i4", ("num_elem",))
+                elem_map[:] = np.arange(1, n_tetrahedra + 1, dtype=np.int32)
+
+                # QA records
+                qa_records = rootgrp.createVariable("qa_records", "S1", ("num_elem_blk", "four", "len_string"))
+                qa_records[0, 0, :] = b"MeshIt"
+                qa_records[0, 1, :] = b"1.0"
+                qa_records[0, 2, :] = b"2024-01-01"
+                qa_records[0, 3, :] = b"00:00:00"
+
+                # Info records
+                rootgrp.createDimension("num_info", 1)
+                info_records = rootgrp.createVariable("info_records", "S1", ("num_info", "len_line"))
+                info_records[0, :] = b"Tetrahedral mesh generated by MeshIt Python"
+
+            logger.info(f"Tetrahedral mesh exported to NetCDF/EXODUS format: {file_path}")
+            return True
+
+        except Exception as e:
+            logger.error(f"NetCDF export failed: {str(e)}")
+            return False
+
     def export_mesh(self, file_path: str, mesh_data: Optional[Dict] = None) -> bool:
         if mesh_data is None: mesh_data = self.tetrahedral_mesh
         if not mesh_data:
             logger.error("No tetrahedral mesh to export")
             return False
+
         try:
             if isinstance(mesh_data, pv.UnstructuredGrid):
-                mesh_data.save(file_path)
-                logger.info(f"Tetrahedral mesh exported to: {file_path}")
-                return True
+                # Check file extension to determine export format
+                file_ext = file_path.lower().split('.')[-1]
+
+                if file_ext in ['nc', 'nc4', 'cdf', 'exo']:
+                    # Use NetCDF/EXODUS export
+                    return self._export_netcdf(file_path, mesh_data)
+                else:
+                    # Use PyVista's built-in export for other formats
+                    mesh_data.save(file_path)
+                    logger.info(f"Tetrahedral mesh exported to: {file_path}")
+                    return True
         except Exception as e:
             logger.error(f"Export failed: {str(e)}")
             return False
