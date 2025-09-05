@@ -885,7 +885,7 @@ class TetrahedralMeshGenerator:
 
     def _export_netcdf(self, file_path: str, mesh_data: pv.UnstructuredGrid) -> bool:
         """
-        Export tetrahedral mesh to NetCDF/EXODUS format.
+        Export tetrahedral mesh to NetCDF/EXODUS format following C++ MeshIt approach.
 
         Args:
             file_path: Path to save the NetCDF file
@@ -936,20 +936,20 @@ class TetrahedralMeshGenerator:
 
             connectivity = np.array(connectivity, dtype=np.int32)
 
-            # Create NetCDF file
+            # Create NetCDF file following C++ EXODUS structure
             with nc.Dataset(file_path, 'w', format='NETCDF4') as rootgrp:
-                # Set global attributes
-                rootgrp.title = "MeshIt Tetrahedral Mesh Export"
+                # Set global attributes (matching C++ version)
+                rootgrp.title = "MeshIt export"
                 rootgrp.api_version = "4.98"
                 rootgrp.version = "4.98"
                 rootgrp.floating_point_word_size = "8"
                 rootgrp.file_size = "0"
 
-                # Dimensions
+                # Dimensions (matching C++ structure)
                 rootgrp.createDimension("num_dim", 3)
                 rootgrp.createDimension("num_nodes", len(points))
                 rootgrp.createDimension("num_elem", n_tetrahedra)
-                rootgrp.createDimension("num_elem_blk", 1)  # One block for all tetrahedra
+                rootgrp.createDimension("num_elem_blk", 1)  # Single block for now
                 rootgrp.createDimension("num_node_sets", 0)
                 rootgrp.createDimension("num_side_sets", 0)
                 rootgrp.createDimension("len_string", 33)
@@ -957,50 +957,54 @@ class TetrahedralMeshGenerator:
                 rootgrp.createDimension("four", 4)
                 rootgrp.createDimension("time_step", None)  # unlimited
 
-                # Coordinate variables
-                xcoor = rootgrp.createVariable("coordx", "f8", ("num_nodes",))
-                ycoor = rootgrp.createVariable("coordy", "f8", ("num_nodes",))
-                zcoor = rootgrp.createVariable("coordz", "f8", ("num_nodes",))
+                # Coordinate variables (matching C++ naming)
+                coordx = rootgrp.createVariable("coordx", "f8", ("num_nodes",))
+                coordy = rootgrp.createVariable("coordy", "f8", ("num_nodes",))
+                coordz = rootgrp.createVariable("coordz", "f8", ("num_nodes",))
 
-                xcoor[:] = points[:, 0]
-                ycoor[:] = points[:, 1]
-                zcoor[:] = points[:, 2]
+                coordx[:] = points[:, 0]
+                coordy[:] = points[:, 1]
+                coordz[:] = points[:, 2]
 
-                xcoor.units = "mesh units"
-                ycoor.units = "mesh units"
-                zcoor.units = "mesh units"
+                coordx.units = "mesh units"
+                coordy.units = "mesh units"
+                coordz.units = "mesh units"
 
-                # Coordinate names
-                coord_names = rootgrp.createVariable("coor_names", "S1", ("num_dim", "len_string"))
-                coord_names[0, :] = b"xcoor"
-                coord_names[1, :] = b"ycoor"
-                coord_names[2, :] = b"zcoor"
+                # Coordinate names (matching C++ const_cast<char**>(ex.coord_names))
+                coor_names = rootgrp.createVariable("coor_names", "S1", ("num_dim", "len_string"))
+                coor_names[0, :] = b"xcoor"
+                coor_names[1, :] = b"ycoor"
+                coor_names[2, :] = b"zcoor"
 
-                # Element block info
+                # Element block info (matching C++ ex.ebids)
                 eb_prop1 = rootgrp.createVariable("eb_prop1", "i4", ("num_elem_blk",))
-                eb_prop1[0] = 1  # Material ID
+                eb_prop1[0] = 1  # Default material ID
 
                 eb_names = rootgrp.createVariable("eb_names", "S1", ("num_elem_blk", "len_string"))
-                eb_names[0, :] = b"Tetrahedra"
+                eb_names[0, :] = b"TETRA"
 
-                # Connectivity
+                # Node number map (matching C++ ex.node_num_map)
+                node_num_map = rootgrp.createVariable("node_num_map", "i4", ("num_nodes",))
+                node_num_map[:] = np.arange(1, len(points) + 1, dtype=np.int32)
+
+                # Connectivity (matching C++ ex_put_elem_conn)
                 connect1 = rootgrp.createVariable("connect1", "i4", ("num_elem", "four"))
                 for i in range(n_tetrahedra):
-                    # Convert to 1-based indexing for EXODUS
+                    # Convert to 1-based indexing (matching C++: (Mesh->tetrahedronlist[t * 4 + 0]) + 1)
                     connect1[i, :] = connectivity[i*4:(i+1)*4] + 1
 
-                # Element map
+                # Element map (matching C++ ex_put_map)
                 elem_map = rootgrp.createVariable("elem_map", "i4", ("num_elem",))
                 elem_map[:] = np.arange(1, n_tetrahedra + 1, dtype=np.int32)
 
-                # QA records
+                # QA records (matching C++ style)
                 qa_records = rootgrp.createVariable("qa_records", "S1", ("num_elem_blk", "four", "len_string"))
                 qa_records[0, 0, :] = b"MeshIt"
                 qa_records[0, 1, :] = b"1.0"
                 qa_records[0, 2, :] = b"2024-01-01"
                 qa_records[0, 3, :] = b"00:00:00"
 
-                # Info records
+                # Info records (matching C++ style)
                 rootgrp.createDimension("num_info", 1)
                 info_records = rootgrp.createVariable("info_records", "S1", ("num_info", "len_line"))
                 info_records[0, :] = b"Tetrahedral mesh generated by MeshIt Python"
