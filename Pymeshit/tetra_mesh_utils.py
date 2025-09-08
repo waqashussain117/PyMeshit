@@ -82,6 +82,7 @@ class TetrahedralMeshGenerator:
                 return None
             
             # Step 2: Create a TetGen object.
+            # Pass per-facet markers into TetGen so trifacemarkerlist mirrors C++
             tet = tetgen.TetGen(self.plc_vertices, self.plc_facets, self.plc_facet_markers)
             
             # Step 2.5: Add holes to TetGen if any exist
@@ -159,12 +160,12 @@ class TetrahedralMeshGenerator:
                     # Enable region attributes using the regionattrib parameter (equivalent to '-A' switch)
                     if 'A' in tetgen_switches:
                         # Capture the returned attributes when regions are defined
-                        nodes, elements, attributes = tet.tetrahedralize(switches=tetgen_switches, regionattrib=1.0)
+                        nodes, elements, attributes, _ = tet.tetrahedralize(switches=tetgen_switches, regionattrib=1.0)
                     else:
                         # Add 'A' switch if not present
                         modified_switches = tetgen_switches + 'A'
                         logger.info(f"Added 'A' switch for region attributes: '{modified_switches}'")
-                        nodes, elements, attributes = tet.tetrahedralize(switches=modified_switches, regionattrib=1.0)
+                        nodes, elements, attributes, _ = tet.tetrahedralize(switches=modified_switches, regionattrib=1.0)
                     
                     # Apply the material attributes to the grid
                     grid = tet.grid
@@ -245,6 +246,7 @@ class TetrahedralMeshGenerator:
         global_vertices = []
         global_facets = []
         global_facet_markers = []
+        fault_marker_map = {}
         edge_constraints = set()
         global_holes = []
 
@@ -298,7 +300,12 @@ class TetrahedralMeshGenerator:
                                                         np.array(v2) - np.array(v0)))
                     if area > 1e-12:
                         global_facets.append(gtri)
-                        global_facet_markers.append(1000 + s_idx if s_idx in fault_surfaces else s_idx)
+                        if s_idx in fault_surfaces:
+                            marker = 1000 + s_idx
+                            global_facet_markers.append(marker)
+                            fault_marker_map[marker] = s_idx
+                        else:
+                            global_facet_markers.append(s_idx)
                         if s_idx in fault_surfaces:
                             for k in range(3):
                                 e = tuple(sorted((gtri[k], gtri[(k + 1) % 3])))
@@ -389,7 +396,12 @@ class TetrahedralMeshGenerator:
                         gtri.append(g)
                     if valid and len(set(gtri)) == 3:
                         global_facets.append(gtri)
-                        global_facet_markers.append(1000 + s_idx if s_idx in fault_surfaces else s_idx)
+                        if s_idx in fault_surfaces:
+                            marker = 1000 + s_idx
+                            global_facet_markers.append(marker)
+                            fault_marker_map[marker] = s_idx
+                        else:
+                            global_facet_markers.append(s_idx)
 
                 logger.info(f"✓ Fallback triangulation successful for '{surface_name}': {len(local_tris)} triangles")
 
@@ -450,6 +462,8 @@ class TetrahedralMeshGenerator:
         self.plc_facet_markers = np.asarray(validated_facet_markers, dtype=np.int32)
         self.plc_edge_constraints = np.asarray(list(validated_edge_constraints), dtype=np.int32) if validated_edge_constraints else np.empty((0, 2), dtype=np.int32)
         self.plc_edge_markers = np.arange(1, len(self.plc_edge_constraints) + 1, dtype=np.int32)
+        # Map: facet marker -> dataset surface index (only for faults)
+        self.fault_surface_markers = fault_marker_map
         self.plc_holes = np.asarray(global_holes, dtype=np.float64) if global_holes else np.empty((0, 3), dtype=np.float64)
 
         logger.info(f"Final PLC built: {len(self.plc_vertices)} vertices, {len(self.plc_facets)} facets, {len(self.plc_edge_constraints)} edge constraints"
@@ -829,7 +843,7 @@ class TetrahedralMeshGenerator:
                 
                 # Enable region attributes for fallback if 'A' switch is present and we have regions
                 if hasattr(self, 'plc_regions') and self.plc_regions and 'A' in switches:
-                    nodes, elements, attributes = tet.tetrahedralize(switches=switches, regionattrib=1.0)
+                    nodes, elements, attributes, _ = tet.tetrahedralize(switches=switches, regionattrib=1.0)
                     grid = tet.grid
                     # Apply material attributes from fallback too
                     if attributes is not None and len(attributes) > 0:
