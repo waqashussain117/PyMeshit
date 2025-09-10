@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Pymeshit"
-version = "0.3.3"
+version = "0.3.4"
 authors = [
     {name = "Waqas Hussain", email = "waqas.hussain117@gmail.com"},
 ]
