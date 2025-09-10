@@ -8,7 +8,7 @@ import sys
 import subprocess
 from pathlib import Path
 
-def build_exe():
+def build_exe(use_clean=True, debug=False):
     """Build standalone executable for MeshIt GUI"""
 
     # Ensure we're in the project root
@@ -18,24 +18,23 @@ def build_exe():
     print("Building MeshIt executable...")
     print(f"Working directory: {project_root}")
 
-    # Try to find the correct Python environment with PyInstaller
-    pyinstaller_paths = [
-        r"C:\Users\Waqas Hussain\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\local-packages\Python311\Scripts\pyinstaller.exe",
-        "pyinstaller.exe",
-        sys.executable.replace("python.exe", "Scripts\\pyinstaller.exe")
-    ]
+    # Check if we're in OneDrive or similar cloud storage
+    if "OneDrive" in str(project_root) or "Dropbox" in str(project_root) or "Google Drive" in str(project_root):
+        print("⚠️  WARNING: You're building from a cloud-synced directory!")
+        print("   This can cause permission errors. Consider building from a local directory.")
+        print("   Continuing anyway...\n")
 
-    pyinstaller_exe = None
-    for path in pyinstaller_paths:
-        if os.path.exists(path):
-            pyinstaller_exe = path
-            break
+    # PyInstaller should be available in PATH when installed via pip
+    pyinstaller_exe = "pyinstaller"
 
-    if not pyinstaller_exe:
+    # Quick verification that PyInstaller is available
+    try:
+        result = subprocess.run([pyinstaller_exe, "--version"], capture_output=True, text=True, check=True)
+        version = result.stdout.strip().split('\n')[-1]  # Get the version line
+        print(f"Using PyInstaller: {version}")
+    except (subprocess.CalledProcessError, FileNotFoundError):
         print("Error: PyInstaller not found. Please install it with: pip install pyinstaller")
         return False
-
-    print(f"Using PyInstaller: {pyinstaller_exe}")
 
     # Verify critical dependencies are available
     print("Verifying critical dependencies...")
@@ -72,11 +71,15 @@ def build_exe():
         pyinstaller_exe,
         "--name=PyMeshIt",
         "--windowed",  # No console window
-        "--onedir",   # Single executable file
+        "--onefile",  # Single executable file (not directory)
         "--noconfirm", # Overwrite existing build
-        "--clean",    # Clean cache and temporary files
+        *(["--clean"] if use_clean else []),  # Clean cache and temporary files (optional)
         "--noupx",    # Don't use UPX compression (can cause issues)
-        "--log-level=WARN", # Reduce log verbosity to focus on warnings/errors
+        "--log-level=INFO" if debug else "--log-level=WARN", # More verbose in debug mode
+        "--hidden-import=pkg_resources",  # For setuptools
+        "--hidden-import=importlib",
+        "--hidden-import=importlib.util",
+        "--hidden-import=inspect",
         # Main script
         "main.py",
         # Include data files
@@ -97,13 +100,16 @@ def build_exe():
         "--hidden-import=matplotlib.pyplot",
         "--hidden-import=PIL",
         "--hidden-import=pyvista",
+        "--hidden-import=pyvista.plotting",
+        "--hidden-import=pyvista.utilities",
+        # Tetgen and triangle with all submodules
         "--hidden-import=tetgen",
+        "--hidden-import=tetgen.pytetgen",
+        "--hidden-import=tetgen.TetGen",
         "--hidden-import=triangle",
-        # Additional PySide6 imports
-        "--hidden-import=PySide6.QtCore",
-        "--hidden-import=PySide6.QtGui",
-        "--hidden-import=PySide6.QtWidgets",
-        "--hidden-import=shiboken6",
+        "--hidden-import=triangle.tri",
+        "--hidden-import=triangle.data",
+        "--hidden-import=triangle.plot",
         # Additional scientific packages
         "--hidden-import=itertools",
         "--hidden-import=gc",
@@ -118,8 +124,13 @@ def build_exe():
         "--hidden-import=Pymeshit.intersection_utils",
         "--hidden-import=Pymeshit.tetra_mesh_utils",
         "--hidden-import=Pymeshit.core",
+        # Additional meshit dependencies
+        "--hidden-import=typing",
+        "--hidden-import=collections",
+        "--hidden-import=collections.abc",
         # Exclude unnecessary packages to reduce build size
         "--exclude-module=torch",
+        "--exclude-module=PyQt5",
         "--exclude-module=torchvision",
         "--exclude-module=torchaudio",
         "--exclude-module=pandas",
@@ -180,7 +191,7 @@ def build_exe():
         if result.stderr:
             print("STDERR:", result.stderr)
 
-        # Check if exe was created (note: PyInstaller creates PyMeshIt.exe, not MeshIt.exe)
+        # Check if exe was created (with --onefile, PyInstaller creates a single executable)
         exe_path = project_root / "release" / "PyMeshIt.exe"
         if exe_path.exists():
             print(f"\nExecutable created: {exe_path}")
@@ -206,23 +217,53 @@ def build_exe():
 def clean_build():
     """Clean build artifacts"""
     import shutil
+    import time
 
     dirs_to_remove = ["build", "MeshIt.spec"]
     for item in dirs_to_remove:
         if os.path.exists(item):
-            if os.path.isdir(item):
-                shutil.rmtree(item)
-            else:
-                os.remove(item)
-            print(f"Removed: {item}")
+            try:
+                if os.path.isdir(item):
+                    shutil.rmtree(item)
+                else:
+                    os.remove(item)
+                print(f"Removed: {item}")
+            except (PermissionError, OSError) as e:
+                print(f"Warning: Could not remove {item}: {e}")
+                print("This is normal if files are in use or in OneDrive.")
+                print("You can manually delete the build directory later.")
+                # Try to remove individual files instead
+                if os.path.isdir(item):
+                    try:
+                        # Wait a bit and try again
+                        time.sleep(2)
+                        shutil.rmtree(item, ignore_errors=True)
+                        print(f"Removed: {item} (with ignore_errors)")
+                    except:
+                        pass
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "clean":
         clean_build()
-    else:
-        success = build_exe()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--no-clean":
+        print("Building without --clean flag to avoid permission issues...")
+        success = build_exe(use_clean=False)
         if success:
-            #print(" Build completed successfully!")
+            print("You can find the executable in the 'release' folder")
+        else:
+            print("Build failed!")
+            sys.exit(1)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--debug":
+        print("Building with debug analysis to identify missing imports...")
+        success = build_exe(use_clean=False, debug=True)
+        if success:
+            print("You can find the executable in the 'release' folder")
+        else:
+            print("Build failed!")
+            sys.exit(1)
+    else:
+        success = build_exe(use_clean=True, debug=False)
+        if success:
             print("You can find the executable in the 'release' folder")
         else:
             print("Build failed!")
