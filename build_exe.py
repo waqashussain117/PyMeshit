@@ -106,6 +106,8 @@ def build_exe(use_clean=True, debug=False):
         "--hidden-import=PySide6.QtCore",
         "--hidden-import=PySide6.QtGui",
         "--hidden-import=PySide6.QtWidgets",
+        "--hidden-import=PySide6.QtOpenGL",
+        "--hidden-import=PySide6.QtOpenGLWidgets",
         "--hidden-import=shiboken6",
         # Hidden imports for essential scientific packages
         "--hidden-import=scipy",
@@ -119,6 +121,10 @@ def build_exe(use_clean=True, debug=False):
         "--hidden-import=pyvista",
         "--hidden-import=pyvista.plotting",
         "--hidden-import=pyvista.utilities",
+        "--hidden-import=pyvistaqt",
+        "--hidden-import=pyvistaqt.plotting",
+        "--hidden-import=pyvistaqt.QtInteractor",
+        "--hidden-import=pyvistaqt.background_plotter",
         # Tetgen and triangle with all submodules
         "--hidden-import=tetgen",
         "--hidden-import=tetgen._tetgen",  # Compiled extension

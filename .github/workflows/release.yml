@@ -80,6 +80,7 @@ jobs:
           try {
             python -c "import PySide6; print(f'PySide6: {PySide6.__version__}')"
             python -c "import pyvista; print(f'PyVista: {pyvista.__version__}')"
+            python -c "import pyvistaqt; print(f'PyVistaQt: {pyvistaqt.__version__}')"
             python -c "import tetgen; print('TetGen: OK')"
             python -c "import numpy, scipy, matplotlib; print('Scientific stack: OK')"
             Write-Host "All dependencies verified successfully"
