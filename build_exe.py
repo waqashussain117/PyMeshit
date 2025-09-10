@@ -24,6 +24,17 @@ def build_exe(use_clean=True, debug=False):
         print("   This can cause permission errors. Consider building from a local directory.")
         print("   Continuing anyway...\n")
 
+    # Check if we're using the correct conda environment
+    import sys
+    python_path = sys.executable
+    if "conda" not in python_path.lower():
+        print("⚠️  WARNING: You're not using a conda environment Python!")
+        print("   Tetgen and other dependencies are installed in conda environment.")
+        print("   Please activate the environment first:")
+        print("   conda activate PyMeshit")
+        print("   python build_exe.py --no-clean")
+        print("   Continuing anyway...\n")
+
     # PyInstaller should be available in PATH when installed via pip
     pyinstaller_exe = "pyinstaller"
 
@@ -55,8 +66,14 @@ def build_exe(use_clean=True, debug=False):
     try:
         import tetgen
         print("TetGen available")
+        # Check if TetGen class is available
+        from tetgen.pytetgen import TetGen
+        print("TetGen class available")
     except ImportError as e:
         print(f"TetGen not available: {e}")
+        print("Make sure you're running this in the correct conda environment:")
+        print("  conda activate PyMeshit")
+        print("  python build_exe.py --no-clean")
         return False
 
     try:
@@ -104,8 +121,8 @@ def build_exe(use_clean=True, debug=False):
         "--hidden-import=pyvista.utilities",
         # Tetgen and triangle with all submodules
         "--hidden-import=tetgen",
-        "--hidden-import=tetgen.pytetgen",
-        "--hidden-import=tetgen.TetGen",
+        "--hidden-import=tetgen._tetgen",  # Compiled extension
+        "--hidden-import=tetgen.pytetgen", # Python module with TetGen class
         "--hidden-import=triangle",
         "--hidden-import=triangle.tri",
         "--hidden-import=triangle.data",
