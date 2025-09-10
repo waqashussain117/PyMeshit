@@ -161,7 +161,7 @@ if __name__ == "__main__":
         success = build_exe()
         if success:
             #print(" Build completed successfully!")
-            #print("You can find the executable in the 'release' folder")
+            print("You can find the executable in the 'release' folder")
         else:
-            #print("\ Build failed!")
+            print("Build failed!")
             sys.exit(1)
