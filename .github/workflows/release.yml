@@ -114,6 +114,19 @@ jobs:
           $version = python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
           echo "version=$version" >> $env:GITHUB_OUTPUT
 
+      - name: Rename artifact
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.get_version.outputs.version }}"
+          Write-Host "Version: $ver"
+          if (!(Test-Path release/PyMeshIt.exe)) {
+            Write-Host "ERROR: PyMeshIt.exe not found!"
+            exit 1
+          }
+          Write-Host "Renaming PyMeshIt.exe to MeshIt-$ver-win64.exe"
+          Copy-Item release/PyMeshIt.exe "release/MeshIt-$ver-win64.exe"
+          Write-Host "Rename completed successfully"
+
       - name: List release files before upload
         shell: pwsh
         run: |
