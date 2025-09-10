@@ -90,8 +90,8 @@ jobs:
         run: |
           $ver = "${{ steps.get_version.outputs.version }}"
           echo "Version: $ver"
-          if (!(Test-Path release/MeshIt.exe)) { throw 'EXE not found' }
-          Copy-Item release/MeshIt.exe "release/MeshIt-$ver-win64.exe"
+          if (!(Test-Path release/PyMeshIt.exe)) { throw 'EXE not found' }
+          Copy-Item release/PyMeshIt.exe "release/MeshIt-$ver-win64.exe"
 
       - name: Upload EXE to GitHub Release
         uses: softprops/action-gh-release@v2

@@ -37,6 +37,36 @@ def build_exe():
 
     print(f"Using PyInstaller: {pyinstaller_exe}")
 
+    # Verify critical dependencies are available
+    print("Verifying critical dependencies...")
+    try:
+        import PySide6
+        print(f"✓ PySide6 available: {PySide6.__version__}")
+    except ImportError as e:
+        print(f"✗ PySide6 not available: {e}")
+        return False
+
+    try:
+        import pyvista
+        print(f"✓ PyVista available: {pyvista.__version__}")
+    except ImportError as e:
+        print(f"✗ PyVista not available: {e}")
+        return False
+
+    try:
+        import tetgen
+        print("✓ TetGen available")
+    except ImportError as e:
+        print(f"✗ TetGen not available: {e}")
+        return False
+
+    try:
+        from Pymeshit_workflow_gui import MeshItWorkflowGUI
+        print("✓ Main GUI module available")
+    except ImportError as e:
+        print(f"✗ Main GUI module not available: {e}")
+        return False
+
     # PyInstaller command for PySide6 application
     cmd = [
         pyinstaller_exe,
@@ -57,9 +87,11 @@ def build_exe():
         "--hidden-import=PySide6.QtGui",
         "--hidden-import=PySide6.QtWidgets",
         "--hidden-import=shiboken6",
-        # Hidden imports for essential scientific packages only
+        # Hidden imports for essential scientific packages
         "--hidden-import=scipy",
         "--hidden-import=scipy.sparse",
+        "--hidden-import=scipy.spatial",
+        "--hidden-import=scipy.spatial.distance",
         "--hidden-import=numpy",
         "--hidden-import=matplotlib",
         "--hidden-import=matplotlib.pyplot",
@@ -67,6 +99,25 @@ def build_exe():
         "--hidden-import=pyvista",
         "--hidden-import=tetgen",
         "--hidden-import=triangle",
+        # Additional PySide6 imports
+        "--hidden-import=PySide6.QtCore",
+        "--hidden-import=PySide6.QtGui",
+        "--hidden-import=PySide6.QtWidgets",
+        "--hidden-import=shiboken6",
+        # Additional scientific packages
+        "--hidden-import=itertools",
+        "--hidden-import=gc",
+        "--hidden-import=atexit",
+        "--hidden-import=logging",
+        "--hidden-import=re",
+        "--hidden-import=time",
+        "--hidden-import=os",
+        "--hidden-import=sys",
+        # Pymeshit specific imports
+        "--hidden-import=Pymeshit",
+        "--hidden-import=Pymeshit.intersection_utils",
+        "--hidden-import=Pymeshit.tetra_mesh_utils",
+        "--hidden-import=Pymeshit.core",
         # Exclude unnecessary packages to reduce build size
         "--exclude-module=torch",
         "--exclude-module=torchvision",
@@ -121,17 +172,28 @@ def build_exe():
     print(f"Running command: {' '.join(cmd)}")
 
     try:
+        print("Starting PyInstaller build process...")
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         print("Build completed successfully!")
-        print(result.stdout)
+        if result.stdout:
+            print("STDOUT:", result.stdout)
+        if result.stderr:
+            print("STDERR:", result.stderr)
 
-        # Check if exe was created
-        exe_path = project_root / "release" / "MeshIt.exe"
+        # Check if exe was created (note: PyInstaller creates PyMeshIt.exe, not MeshIt.exe)
+        exe_path = project_root / "release" / "PyMeshIt.exe"
         if exe_path.exists():
             print(f"\nExecutable created: {exe_path}")
             print(f"File size: {exe_path.stat().st_size / (1024*1024):.2f} MB")
         else:
             print("\nWarning: Executable not found in expected location")
+            print(f"Looking for: {exe_path}")
+            # List contents of release directory to debug
+            release_dir = project_root / "release"
+            if release_dir.exists():
+                print(f"Contents of release directory: {list(release_dir.iterdir())}")
+            else:
+                print("Release directory does not exist")
 
     except subprocess.CalledProcessError as e:
         print(f"Build failed with error code {e.returncode}")
