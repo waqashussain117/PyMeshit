@@ -41,30 +41,30 @@ def build_exe():
     print("Verifying critical dependencies...")
     try:
         import PySide6
-        print(f"✓ PySide6 available: {PySide6.__version__}")
+        print(f"PySide6 available: {PySide6.__version__}")
     except ImportError as e:
-        print(f"✗ PySide6 not available: {e}")
+        print(f"PySide6 not available: {e}")
         return False
 
     try:
         import pyvista
-        print(f"✓ PyVista available: {pyvista.__version__}")
+        print(f"PyVista available: {pyvista.__version__}")
     except ImportError as e:
-        print(f"✗ PyVista not available: {e}")
+        print(f"PyVista not available: {e}")
         return False
 
     try:
         import tetgen
-        print("✓ TetGen available")
+        print("TetGen available")
     except ImportError as e:
-        print(f"✗ TetGen not available: {e}")
+        print(f"TetGen not available: {e}")
         return False
 
     try:
         from Pymeshit_workflow_gui import MeshItWorkflowGUI
-        print("✓ Main GUI module available")
+        print("Main GUI module available")
     except ImportError as e:
-        print(f"✗ Main GUI module not available: {e}")
+        print(f"Main GUI module not available: {e}")
         return False
 
     # PyInstaller command for PySide6 application
