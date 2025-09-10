@@ -20,7 +20,7 @@ def build_exe(use_clean=True, debug=False):
 
     # Check if we're in OneDrive or similar cloud storage
     if "OneDrive" in str(project_root) or "Dropbox" in str(project_root) or "Google Drive" in str(project_root):
-        print("⚠️  WARNING: You're building from a cloud-synced directory!")
+        print("WARNING: You're building from a cloud-synced directory!")
         print("   This can cause permission errors. Consider building from a local directory.")
         print("   Continuing anyway...\n")
 
@@ -28,12 +28,12 @@ def build_exe(use_clean=True, debug=False):
     import sys
     python_path = sys.executable
     if "conda" not in python_path.lower():
-        print("⚠️  WARNING: You're not using a conda environment Python!")
-        print("   Tetgen and other dependencies are installed in conda environment.")
-        print("   Please activate the environment first:")
-        print("   conda activate PyMeshit")
-        print("   python build_exe.py --no-clean")
-        print("   Continuing anyway...\n")
+        print("WARNING: You're not using a conda environment Python!")
+        print("Tetgen and other dependencies are installed in conda environment.")
+        print("Please activate the environment first:")
+        print("conda activate PyMeshit")
+        print("python build_exe.py --no-clean")
+        print("Continuing anyway...\n")
 
     # PyInstaller should be available in PATH when installed via pip
     pyinstaller_exe = "pyinstaller"
