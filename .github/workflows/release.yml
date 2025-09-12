@@ -132,12 +132,13 @@ jobs:
       - name: Check if EXE was created
         shell: pwsh
         run: |
-          if (Test-Path release/PyMeshIt.exe) {
-            Write-Host "EXE found: release/PyMeshIt.exe"
-            $size = (Get-Item release/PyMeshIt.exe).Length / 1MB
-            Write-Host "EXE size: $($size.ToString('F2')) MB"
+          if (Test-Path release/PyMeshIt/PyMeshIt.exe) {
+            Write-Host "EXE found: release/PyMeshIt/PyMeshIt.exe"
+            $size = (Get-ChildItem release/PyMeshIt -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB
+            Write-Host "Directory size: $($size.ToString('F2')) MB"
+            Write-Host "Note: Directory-based executable (much less likely to trigger AV false positives)"
           } else {
-            Write-Host "EXE not found at release/PyMeshIt.exe"
+            Write-Host "EXE not found at release/PyMeshIt/PyMeshIt.exe"
             Write-Host "Contents of release directory:"
             Get-ChildItem release -ErrorAction SilentlyContinue
             exit 1
@@ -150,31 +151,33 @@ jobs:
           $version = python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
           echo "version=$version" >> $env:GITHUB_OUTPUT
 
-      - name: Rename artifact
+      - name: Create ZIP archive
         shell: pwsh
         run: |
           $ver = "${{ steps.get_version.outputs.version }}"
           Write-Host "Version: $ver"
-          if (!(Test-Path release/PyMeshIt.exe)) {
-            Write-Host "ERROR: PyMeshIt.exe not found!"
+          if (!(Test-Path release/PyMeshIt)) {
+            Write-Host "ERROR: PyMeshIt directory not found!"
             exit 1
           }
-          Write-Host "Renaming PyMeshIt.exe to MeshIt-$ver-win64.exe"
-          Copy-Item release/PyMeshIt.exe "release/MeshIt-$ver-win64.exe"
-          Write-Host "Rename completed successfully"
+          Write-Host "Creating ZIP archive: MeshIt-$ver-win64.zip"
+          Compress-Archive -Path "release/PyMeshIt" -DestinationPath "release/MeshIt-$ver-win64.zip" -Force
+          Write-Host "ZIP archive created successfully"
+          $zipSize = (Get-Item "release/MeshIt-$ver-win64.zip").Length / 1MB
+          Write-Host "ZIP size: $($zipSize.ToString('F2')) MB"
 
       - name: List release files before upload
         shell: pwsh
         run: |
           Write-Host "Files in release directory:"
           Get-ChildItem release -ErrorAction SilentlyContinue
-          Write-Host "Looking for: MeshIt-${{ steps.get_version.outputs.version }}-win64.exe"
+          Write-Host "Looking for: MeshIt-${{ steps.get_version.outputs.version }}-win64.zip"
 
-      - name: Upload EXE to GitHub Release
+      - name: Upload ZIP to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/MeshIt-${{ steps.get_version.outputs.version }}-win64.exe
+            release/MeshIt-${{ steps.get_version.outputs.version }}-win64.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

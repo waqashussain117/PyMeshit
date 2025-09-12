@@ -14,21 +14,18 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
-pyz = PYZ(a.pure)
+pyz = PYZ(a.pure, a.zipped)
 
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='PyMeshIt',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -36,4 +33,14 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['resources\\images\\app_logo_small.png'],
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='PyMeshIt'
 )

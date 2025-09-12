@@ -97,10 +97,12 @@ def build_exe(use_clean=True, debug=False):
         pyinstaller_exe,
         "--name=PyMeshIt",
         "--windowed",  # No console window
-        "--onefile",  # Single executable file (not directory)
+        # "--onefile",  # Removed: causes AV false positives
+        "--onedir",   # Directory-based: less likely to trigger AV
         "--noconfirm", # Overwrite existing build
         *(["--clean"] if use_clean else []),  # Clean cache and temporary files (optional)
         "--noupx",    # Don't use UPX compression (can cause issues)
+        "--runtime-tmpdir=.",  # Use current directory for temp files
         "--log-level=INFO" if debug else "--log-level=WARN", # More verbose in debug mode
         "--hidden-import=pkg_resources",  # For setuptools
         "--hidden-import=importlib",
