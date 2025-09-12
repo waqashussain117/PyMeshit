@@ -20,7 +20,12 @@ The included GUI (main.py) implements a full MeshIt workflow with the following 
 
 ## Installation
 
-### From PyPI (Recommended)
+### From Release (Recommended)
+
+For quick installation, download the exe. file from Releases 
+
+
+### From PyPI 
 
 ```bash
 pip install triangle
@@ -32,8 +37,8 @@ pip install pymeshit # Needs to be fixed
 If you want to install from source:
 
 ```bash
-git clone https://github.com/waqashussain/meshit.git
-cd meshit
+git clone https://github.com/waqashussain117/PyMeshit
+cd PyMeshit
 pip install -e .
 ```
 
@@ -51,6 +56,9 @@ The package will automatically install all required dependencies:
 
 ## Quick start (GUI)
 
+
+
+For installation either install the Requirements and then open through Python.
 After installation, run the GUI:
 
 ```bash
@@ -76,13 +84,7 @@ Typical workflow:
 
 ## Programmatic Usage
 
-```python
-import pymeshit
-from pymeshit.intersection_utils import align_intersections_to_convex_hull
 
-# Use pymeshit functions programmatically
-# ...
-```
 
 ## Contributing
 
