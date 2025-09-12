@@ -71,7 +71,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller
           # Install core dependencies first
-          python -m pip install numpy scipy matplotlib PySide6 pyvista tetgen triangle
+          python -m pip install numpy scipy matplotlib PySide6 pyvista tetgen triangle netCDF4
           # Install pyvistaqt separately (it has special installation requirements)
           python -m pip install pyvistaqt
           # Install from requirements.txt (excluding problematic packages)
@@ -110,6 +110,12 @@ jobs:
             python -c "import numpy, scipy, matplotlib; print('Scientific stack: OK')"
           } catch {
             Write-Host "Scientific stack verification failed: $_"
+            $failed = $true
+          }
+          try {
+            python -c "import netCDF4; print(f'NetCDF4: {netCDF4.__version__}')"
+          } catch {
+            Write-Host "NetCDF4 verification failed: $_"
             $failed = $true
           }
           if ($failed) {

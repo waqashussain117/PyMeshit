@@ -83,6 +83,15 @@ def build_exe(use_clean=True, debug=False):
         print(f"Main GUI module not available: {e}")
         return False
 
+    try:
+        import netCDF4
+        print(f"NetCDF4 available: {netCDF4.__version__}")
+    except ImportError as e:
+        print(f"NetCDF4 not available: {e}")
+        print("NetCDF4 is required for data I/O operations.")
+        print("Install it with: pip install netCDF4")
+        return False
+
     # PyInstaller command for PySide6 application
     cmd = [
         pyinstaller_exe,
@@ -142,6 +151,10 @@ def build_exe(use_clean=True, debug=False):
         "--hidden-import=time",
         "--hidden-import=os",
         "--hidden-import=sys",
+        # NetCDF4 for data I/O operations
+        "--hidden-import=netCDF4",
+        "--hidden-import=netCDF4.Dataset",
+        "--hidden-import=netCDF4.Variable",
         # Pymeshit specific imports
         "--hidden-import=Pymeshit",
         "--hidden-import=Pymeshit.intersection_utils",
