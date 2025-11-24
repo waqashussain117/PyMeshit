@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import re
+import pickle
 
 # import List
 from typing import List, Dict, Tuple, Optional, Any
@@ -1097,6 +1098,23 @@ class MeshItWorkflowGUI(QMainWindow):
         # --- File Menu ---
         file_menu = menu_bar.addMenu("&File")
 
+        # Project management actions
+        new_project_action = QAction("&New Project", self)
+        new_project_action.setStatusTip("Create a new project (clears all data)")
+        new_project_action.triggered.connect(self.new_project)
+        file_menu.addAction(new_project_action)
+        
+        save_project_action = QAction("&Save Project...", self)
+        save_project_action.setStatusTip("Save current project state to file")
+        save_project_action.triggered.connect(self.save_project)
+        file_menu.addAction(save_project_action)
+        
+        load_project_action = QAction("&Load Project...", self)
+        load_project_action.setStatusTip("Load project from file")
+        load_project_action.triggered.connect(self.load_project)
+        file_menu.addAction(load_project_action)
+        
+        file_menu.addSeparator()
 
         # Add Well loaders
         load_well_action = QAction("Load &Well File...", self)
@@ -2080,7 +2098,15 @@ class MeshItWorkflowGUI(QMainWindow):
             plotter = getattr(self, plotter_name, None)
             if plotter and hasattr(plotter, 'clear'):
                 try:
-                    plotter.clear()
+                    # Check if the plotter renderer is valid before clearing
+                    if hasattr(plotter, 'renderer') and plotter.renderer is not None:
+                        plotter.clear()
+                    else:
+                        # Renderer is not valid, skip clearing
+                        logger.debug(f"Skipping clear for {plotter_name} - renderer not initialized")
+                except AttributeError as e:
+                    # Silently skip if renderer doesn't have expected attributes
+                    logger.debug(f"Skipping clear for {plotter_name} - {e}")
                 except Exception as e:
                     logger.warning(f"Error clearing {plotter_name}: {e}")
     def _ensure_segments_plotter(self):
@@ -8532,6 +8558,320 @@ segmentation, triangulation, and visualization.
         """Remove the active dataset"""
         if 0 <= self.current_dataset_index < len(self.datasets):
             self._remove_dataset(self.current_dataset_index)
+    
+    def new_project(self):
+        """
+        Create a new project by resetting everything to initial state.
+        Properly handles plotter cleanup to prevent crashes.
+        """
+        # If there's existing data, confirm before clearing
+        if self.datasets or hasattr(self, 'datasets_intersections') and self.datasets_intersections:
+            confirm = QMessageBox.question(
+                self,
+                "New Project",
+                "Creating a new project will clear all current data and processing results.\n\n"
+                "Are you sure you want to continue?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if confirm != QMessageBox.Yes:
+                return
+        
+        try:
+            logger.info("Creating new project - clearing all data")
+            
+            # Step 1: Clear all visualizations first to prevent plotter crashes
+            self._clear_visualizations()
+            
+            # Step 2: Clear plotter references safely
+            if hasattr(self, 'plotters'):
+                # Just clear the dictionary, don't try to close individual plotters
+                # Qt will handle widget cleanup when layouts are cleared
+                self.plotters.clear()
+            
+            # Process Qt events to allow proper cleanup
+            QApplication.processEvents()
+            # Give Qt time to finish cleanup
+            import time
+            time.sleep(0.1)  # 100ms delay to ensure Qt cleanup is complete
+            
+            # Step 3: Clear all data structures
+            self.datasets = []
+            self.current_dataset_index = -1
+            
+            # Clear intersection data
+            if hasattr(self, 'datasets_intersections'):
+                self.datasets_intersections = {}
+            
+            # Clear refinement data
+            if hasattr(self, 'seg_length_by_surface'):
+                self.seg_length_by_surface = {}
+            if hasattr(self, 'mesh_size_by_surface'):
+                self.mesh_size_by_surface = {}
+            
+            # Clear tetrahedral mesh data
+            if hasattr(self, 'tetra_mesh_data'):
+                self.tetra_mesh_data = None
+            
+            # Step 4: Reset UI elements
+            self._update_dataset_list()
+            self._update_statistics()
+            
+            # Clear refinement tables if they exist
+            if hasattr(self, '_refresh_seg_refine_table'):
+                self._refresh_seg_refine_table()
+            if hasattr(self, '_refresh_mesh_refine_table'):
+                self._refresh_mesh_refine_table()
+            
+            # Step 5: Switch to first tab (Load tab)
+            self.notebook.setCurrentIndex(0)
+            
+            # Step 6: Force garbage collection
+            gc.collect()
+            
+            self.statusBar().showMessage("New project created - all data cleared")
+            logger.info("New project created successfully")
+            
+        except Exception as e:
+            error_msg = f"Error creating new project: {str(e)}"
+            logger.error(error_msg)
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"An error occurred while creating new project:\n{str(e)}"
+            )
+    
+    def save_project(self):
+        """
+        Save the current project state to a file.
+        Saves all datasets, processing results, and current tab state.
+        """
+        # Check if there's anything to save
+        if not self.datasets:
+            QMessageBox.information(
+                self,
+                "Nothing to Save",
+                "There are no datasets to save. Load some data first."
+            )
+            return
+        
+        # Get file path from user
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Project",
+            "",
+            "PyMeshIt Project Files (*.pmit);;All Files (*.*)"
+        )
+        
+        if not file_path:
+            self.statusBar().showMessage("Project save canceled")
+            return
+        
+        # Add .pmit extension if not present
+        if not file_path.endswith('.pmit'):
+            file_path += '.pmit'
+        
+        try:
+            logger.info(f"Saving project to: {file_path}")
+            
+            # Prepare project data
+            project_data = {
+                'version': '1.0',  # Project file version for future compatibility
+                'datasets': self.datasets,
+                'current_dataset_index': self.current_dataset_index,
+                'current_tab_index': self.notebook.currentIndex(),
+                'datasets_intersections': getattr(self, 'datasets_intersections', {}),
+                'seg_length_by_surface': getattr(self, 'seg_length_by_surface', {}),
+                'mesh_size_by_surface': getattr(self, 'mesh_size_by_surface', {}),
+                'tetra_mesh_data': getattr(self, 'tetra_mesh_data', None)
+            }
+            
+            # Save to file using pickle
+            with open(file_path, 'wb') as f:
+                pickle.dump(project_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            self.statusBar().showMessage(f"Project saved successfully to {os.path.basename(file_path)}")
+            logger.info(f"Project saved successfully: {file_path}")
+            
+            QMessageBox.information(
+                self,
+                "Project Saved",
+                f"Project saved successfully to:\n{file_path}\n\n"
+                f"Datasets: {len(self.datasets)}\n"
+                f"Current tab: {self.notebook.tabText(self.notebook.currentIndex())}"
+            )
+            
+        except Exception as e:
+            error_msg = f"Error saving project: {str(e)}"
+            logger.error(error_msg)
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                f"An error occurred while saving the project:\n{str(e)}"
+            )
+            self.statusBar().showMessage(f"Error saving project: {str(e)}")
+    
+    def load_project(self):
+        """
+        Load a project from a file.
+        Properly handles plotter cleanup before loading to prevent crashes.
+        """
+        # If there's existing data, confirm before loading
+        if self.datasets or hasattr(self, 'datasets_intersections') and self.datasets_intersections:
+            confirm = QMessageBox.question(
+                self,
+                "Load Project",
+                "Loading a project will replace all current data and processing results.\n\n"
+                "Are you sure you want to continue?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if confirm != QMessageBox.Yes:
+                return
+        
+        # Get file path from user
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Project",
+            "",
+            "PyMeshIt Project Files (*.pmit);;All Files (*.*)"
+        )
+        
+        if not file_path:
+            self.statusBar().showMessage("Project load canceled")
+            return
+        
+        if not os.path.exists(file_path):
+            QMessageBox.critical(
+                self,
+                "File Not Found",
+                f"The project file does not exist:\n{file_path}"
+            )
+            return
+        
+        try:
+            logger.info(f"Loading project from: {file_path}")
+            
+            # Step 1: Clear all visualizations first to prevent plotter crashes
+            logger.info("Clearing visualizations before loading project")
+            self._clear_visualizations()
+            
+            # Step 2: Clear plotter references safely
+            if hasattr(self, 'plotters'):
+                # Just clear the dictionary, don't try to close individual plotters
+                # Qt will handle widget cleanup when layouts are cleared
+                self.plotters.clear()
+            
+            # Process Qt events to allow proper cleanup
+            QApplication.processEvents()
+            # Give Qt time to finish cleanup  
+            import time
+            time.sleep(0.1)  # 100ms delay to ensure Qt cleanup is complete
+            
+            # Step 3: Load project data from file
+            with open(file_path, 'rb') as f:
+                project_data = pickle.load(f)
+            
+            # Check version (for future compatibility)
+            version = project_data.get('version', '1.0')
+            logger.info(f"Loading project version: {version}")
+            
+            # Step 4: Restore project data
+            self.datasets = project_data.get('datasets', [])
+            self.current_dataset_index = project_data.get('current_dataset_index', -1)
+            saved_tab_index = project_data.get('current_tab_index', 0)
+            
+            # Restore intersection data
+            self.datasets_intersections = project_data.get('datasets_intersections', {})
+            
+            # Restore refinement data
+            self.seg_length_by_surface = project_data.get('seg_length_by_surface', {})
+            self.mesh_size_by_surface = project_data.get('mesh_size_by_surface', {})
+            
+            # Restore tetrahedral mesh data
+            self.tetra_mesh_data = project_data.get('tetra_mesh_data', None)
+            
+            # Step 5: Update UI elements (without triggering visualizations yet)
+            self._update_dataset_list()
+            self._update_statistics()
+            
+            # Update refinement tables if they exist
+            if hasattr(self, '_refresh_seg_refine_table'):
+                self._refresh_seg_refine_table()
+            if hasattr(self, '_refresh_mesh_refine_table'):
+                self._refresh_mesh_refine_table()
+            
+            # Step 6: Switch to the saved tab WITHOUT triggering visualization callbacks
+            # Block signals temporarily to prevent tab change from triggering visualizations
+            self.notebook.blockSignals(True)
+            if 0 <= saved_tab_index < self.notebook.count():
+                self.notebook.setCurrentIndex(saved_tab_index)
+            self.notebook.blockSignals(False)
+            
+            # Step 7: Update visualizations ONCE for the restored data
+            # Call the appropriate visualization for the current tab only
+            current_tab_widget = self.notebook.widget(saved_tab_index) if 0 <= saved_tab_index < self.notebook.count() else None
+            
+            if current_tab_widget == self.file_tab:
+                self._visualize_all_points()
+            elif current_tab_widget == self.hull_tab:
+                if any(d.get('visible', True) and d.get('hull_points') is not None for d in self.datasets):
+                    self._visualize_all_hulls()
+            elif current_tab_widget == self.segment_tab:
+                if any(d.get('visible', True) and d.get('segments') is not None for d in self.datasets):
+                    self._clear_segmentation_visualization_flag()
+                    self._visualize_all_segments()
+            elif current_tab_widget == self.triangulation_tab:
+                if any(d.get('visible', True) and d.get('triangulation_result') is not None for d in self.datasets):
+                    self._visualize_all_triangulations()
+            elif current_tab_widget == self.intersection_tab:
+                if hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections):
+                    self._visualize_intersections()
+            elif current_tab_widget == self.refine_mesh_tab:
+                if hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections):
+                    self._visualize_refined_intersections()
+            elif hasattr(self, 'pre_tetramesh_tab') and current_tab_widget == self.pre_tetramesh_tab:
+                if any(d.get('constrained_triangulation_result') for d in self.datasets):
+                    self._visualize_constrained_meshes()
+            elif hasattr(self, 'tetra_mesh_tab') and current_tab_widget == self.tetra_mesh_tab:
+                if hasattr(self, 'tetrahedral_mesh') and self.tetrahedral_mesh:
+                    self._visualize_tetrahedral_mesh()
+            
+            # Step 8: Force garbage collection
+            gc.collect()
+            
+            num_datasets = len(self.datasets)
+            tab_name = self.notebook.tabText(saved_tab_index) if 0 <= saved_tab_index < self.notebook.count() else "Unknown"
+            
+            self.statusBar().showMessage(f"Project loaded successfully from {os.path.basename(file_path)}")
+            logger.info(f"Project loaded successfully: {file_path}")
+            
+            QMessageBox.information(
+                self,
+                "Project Loaded",
+                f"Project loaded successfully from:\n{os.path.basename(file_path)}\n\n"
+                f"Datasets loaded: {num_datasets}\n"
+                f"Current tab: {tab_name}"
+            )
+            
+        except Exception as e:
+            error_msg = f"Error loading project: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            QMessageBox.critical(
+                self,
+                "Load Error",
+                f"An error occurred while loading the project:\n{str(e)}\n\n"
+                f"The project file may be corrupted or incompatible."
+            )
+            self.statusBar().showMessage(f"Error loading project: {str(e)}")
+            
+            # Try to recover by creating a new project
+            try:
+                logger.info("Attempting to recover by creating new project")
+                self.new_project()
+            except Exception as recovery_error:
+                logger.error(f"Error during recovery: {recovery_error}")
+    
     def _clear_visualizations(self):
         """Clear all visualizations"""
         # ... existing clear calls ...
@@ -10045,20 +10385,40 @@ segmentation, triangulation, and visualization.
             old_plotter = getattr(self, f'{view_type}_plotter')
             if old_plotter:
                 try:
-                    old_plotter.close()
+                    # Check if the plotter's Qt widget is still valid
+                    if hasattr(old_plotter, 'interactor') and old_plotter.interactor is not None:
+                        # Try to access the widget to see if it's still alive
+                        try:
+                            _ = old_plotter.interactor.isVisible()
+                            # Widget is still alive, we can safely clear it
+                            logger.debug(f"Old plotter for {view_type} is still valid, will replace")
+                        except RuntimeError:
+                            # Qt object was already deleted
+                            logger.debug(f"Old plotter for {view_type} Qt object already deleted")
                 except Exception as e:
-                    logger.warning(f"Error closing old plotter for {view_type}: {e}")
+                    logger.debug(f"Error checking old plotter for {view_type}: {e}")
         
         parent_layout = parent_frame.layout()
         if parent_layout is None:
             parent_layout = QVBoxLayout(parent_frame)
             parent_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Clean up old widgets
+        widgets_to_delete = []
         while parent_layout.count():
             item = parent_layout.takeAt(0)
             widget = item.widget()
             if widget:
+                widgets_to_delete.append(widget)
+                widget.setParent(None)
                 widget.deleteLater()
+        
+        # Process events to ensure widgets are actually deleted
+        if widgets_to_delete:
+            QApplication.processEvents()
+            # Give Qt a moment to finish cleanup
+            import time
+            time.sleep(0.05)  # 50ms delay
 
         from pyvistaqt import QtInteractor
         import pyvista as pv
@@ -10912,10 +11272,19 @@ segmentation, triangulation, and visualization.
     def _clear_intersection_plot(self):
         """Clear the embedded intersection PyVista plotter."""
         if hasattr(self, 'intersection_plotter') and self.intersection_plotter:
-            self.intersection_plotter.clear()
-            # Optionally add placeholder text back if desired
-            # self.intersection_plotter.add_text("Compute intersections or select one from the list.", position='upper_edge')
-            self.intersection_plotter.reset_camera()
+            try:
+                # Check if renderer is valid before clearing
+                if hasattr(self.intersection_plotter, 'renderer') and self.intersection_plotter.renderer is not None:
+                    self.intersection_plotter.clear()
+                    # Optionally add placeholder text back if desired
+                    # self.intersection_plotter.add_text("Compute intersections or select one from the list.", position='upper_edge')
+                    self.intersection_plotter.reset_camera()
+                else:
+                    logger.debug("Skipping clear for intersection_plotter - renderer not initialized")
+            except AttributeError as e:
+                logger.debug(f"Skipping clear for intersection_plotter - {e}")
+            except Exception as e:
+                logger.warning(f"Error clearing intersection_plotter: {e}")
 
     def _update_intersection_list(self):
         """Update the list of intersections in the UI"""
@@ -10978,6 +11347,11 @@ segmentation, triangulation, and visualization.
 
     def _visualize_selected_intersection(self, dataset_index, intersection_index):
         """Visualize a specific intersection by highlighting it in the embedded plotter."""
+        # Ensure plotter is valid
+        if not self._ensure_intersection_plotter_valid():
+            logger.warning("Intersection plotter not available for selection visualization.")
+            return
+        
         if not hasattr(self, 'intersection_plotter') or not self.intersection_plotter:
             logger.warning("Intersection plotter not available for selection visualization.")
             return
@@ -11094,8 +11468,70 @@ segmentation, triangulation, and visualization.
             plotter.add_text("Could not display selected intersection.", position='upper_edge', color='white')
             logger.warning("No content added when visualizing selected intersection.")
 
+    def _ensure_intersection_plotter_valid(self):
+        """Ensure intersection plotter exists and is valid, recreate if necessary."""
+        if not hasattr(self, 'intersection_plotter') or self.intersection_plotter is None:
+            # Plotter doesn't exist, create it
+            logger.info("Creating intersection plotter")
+            from pyvistaqt import QtInteractor
+            if hasattr(self, 'intersection_plot_layout'):
+                self.intersection_plotter = QtInteractor(self.intersection_view_frame)
+                self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
+                self.intersection_plotter.set_background('white')
+            return self.intersection_plotter is not None
+        
+        # Check if the Qt widget is still valid
+        try:
+            if hasattr(self.intersection_plotter, 'interactor') and self.intersection_plotter.interactor is not None:
+                # Try to access a property to see if Qt object is still alive
+                _ = self.intersection_plotter.interactor.isVisible()
+                return True
+            else:
+                # Qt widget was deleted, need to recreate
+                logger.info("Intersection plotter Qt widget deleted, recreating")
+                from pyvistaqt import QtInteractor
+                if hasattr(self, 'intersection_plot_layout'):
+                    # Clear old widget from layout
+                    while self.intersection_plot_layout.count():
+                        item = self.intersection_plot_layout.takeAt(0)
+                        widget = item.widget()
+                        if widget:
+                            widget.setParent(None)
+                            widget.deleteLater()
+                    QApplication.processEvents()
+                    
+                    self.intersection_plotter = QtInteractor(self.intersection_view_frame)
+                    self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
+                    self.intersection_plotter.set_background('white')
+                return self.intersection_plotter is not None
+        except RuntimeError as e:
+            # Qt object was deleted
+            logger.info(f"Intersection plotter Qt object deleted, recreating: {e}")
+            from pyvistaqt import QtInteractor
+            if hasattr(self, 'intersection_plot_layout'):
+                # Clear old widget from layout
+                while self.intersection_plot_layout.count():
+                    item = self.intersection_plot_layout.takeAt(0)
+                    widget = item.widget()
+                    if widget:
+                        widget.setParent(None)
+                        widget.deleteLater()
+                QApplication.processEvents()
+                import time
+                time.sleep(0.05)
+                
+                self.intersection_plotter = QtInteractor(self.intersection_view_frame)
+                self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
+                self.intersection_plotter.set_background('white')
+            return self.intersection_plotter is not None
+    
     def _visualize_intersections(self):
         """Visualize all intersections in the embedded PyVista plotter, matching triangulation style."""
+        # Ensure plotter is valid
+        if not self._ensure_intersection_plotter_valid():
+            logger.warning("Intersection plotter not available for visualization.")
+            return
+        
         if not hasattr(self, 'intersection_plotter') or not self.intersection_plotter:
             logger.warning("Intersection plotter not available for visualization.")
             return
@@ -11349,6 +11785,11 @@ segmentation, triangulation, and visualization.
 
     def _visualize_selected_intersection(self, dataset_index, intersection_index):
         """Visualize a specific intersection by highlighting it in the embedded plotter, matching triangulation style."""
+        # Ensure plotter is valid
+        if not self._ensure_intersection_plotter_valid():
+            logger.warning("Intersection plotter not available for selection visualization.")
+            return
+        
         if not hasattr(self, 'intersection_plotter') or not self.intersection_plotter:
             logger.warning("Intersection plotter not available for selection visualization.")
             return
