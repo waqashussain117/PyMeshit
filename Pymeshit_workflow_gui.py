@@ -1255,6 +1255,12 @@ class MeshItWorkflowGUI(QMainWindow):
         load_multiple_btn.clicked.connect(self.load_multiple_files)
         file_layout.addWidget(load_multiple_btn)
         
+        # Button for deleting selected dataset
+        delete_dataset_btn = QPushButton("Delete Selected Dataset")
+        delete_dataset_btn.setToolTip("Delete the currently selected dataset from the list")
+        delete_dataset_btn.clicked.connect(self.delete_selected_dataset)
+        file_layout.addWidget(delete_dataset_btn)
+        
         
         
         control_layout.addWidget(file_group)
@@ -8393,6 +8399,107 @@ segmentation, triangulation, and visualization.
             # Update statistics and visualization
             self._update_statistics()
             self._update_visualization()
+    
+    def delete_selected_dataset(self):
+        """
+        Delete the currently selected dataset from the list.
+        This method properly handles plotter cleanup to prevent crashes.
+        """
+        # Check if there are any datasets
+        if not self.datasets:
+            QMessageBox.information(
+                self, 
+                "No Datasets", 
+                "No datasets available to delete."
+            )
+            return
+        
+        # Get selected items from the dataset list widget
+        selected_items = self.dataset_list_widget.selectedItems()
+        
+        if not selected_items:
+            QMessageBox.information(
+                self, 
+                "No Selection", 
+                "Please select a dataset from the list to delete."
+            )
+            return
+        
+        # Get the index of the selected dataset
+        selected_index = self.dataset_list_widget.row(selected_items[0])
+        
+        if not (0 <= selected_index < len(self.datasets)):
+            return
+        
+        dataset_name = self.datasets[selected_index]['name']
+        
+        # Confirm deletion
+        confirm = QMessageBox.question(
+            self, 
+            "Delete Dataset", 
+            f"Are you sure you want to delete dataset '{dataset_name}'?\n\n"
+            f"This will remove the dataset and all associated data (hull, segments, triangulation).",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if confirm != QMessageBox.Yes:
+            return
+        
+        try:
+            # Step 1: Clear all visualizations before removing the dataset
+            # This prevents plotter crashes when the data is removed
+            logger.info(f"Clearing visualizations before deleting dataset: {dataset_name}")
+            self._clear_visualizations()
+            
+            # Step 2: Clear any intersection data that might reference this dataset
+            if hasattr(self, 'datasets_intersections') and self.datasets_intersections:
+                # Filter out intersections that involve this dataset
+                self.datasets_intersections = {
+                    key: value for key, value in self.datasets_intersections.items()
+                    if selected_index not in key
+                }
+            
+            # Step 3: Remove the dataset from the list
+            logger.info(f"Removing dataset at index {selected_index}: {dataset_name}")
+            self.datasets.pop(selected_index)
+            
+            # Step 4: Update the current dataset index
+            if selected_index == self.current_dataset_index:
+                # If we deleted the current dataset, reset to first available
+                if self.datasets:
+                    self.current_dataset_index = 0
+                else:
+                    self.current_dataset_index = -1
+            elif selected_index < self.current_dataset_index:
+                # If we deleted a dataset before the current one, adjust the index
+                self.current_dataset_index -= 1
+            
+            # Step 5: Update the dataset list widget
+            self._update_dataset_list()
+            
+            # Step 6: Update statistics
+            self._update_statistics()
+            
+            # Step 7: Update visualizations with remaining datasets
+            # This will recreate plotters safely with the updated dataset list
+            self._update_visualization()
+            
+            # Step 8: Force garbage collection to clean up any remaining references
+            gc.collect()
+            
+            # Show success message
+            self.statusBar().showMessage(f"Successfully deleted dataset: {dataset_name}")
+            logger.info(f"Successfully deleted dataset: {dataset_name}")
+            
+        except Exception as e:
+            error_msg = f"Error deleting dataset: {str(e)}"
+            logger.error(error_msg)
+            QMessageBox.critical(
+                self, 
+                "Error", 
+                f"An error occurred while deleting the dataset:\n{str(e)}"
+            )
+            self.statusBar().showMessage(f"Error deleting dataset: {str(e)}")
     
     def clear_all_datasets(self):
         """Clear all loaded datasets"""
