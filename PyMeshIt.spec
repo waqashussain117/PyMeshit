@@ -6,15 +6,15 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('resources', 'resources'), ('Pymeshit', 'Pymeshit')],
-    hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'shiboken6', 'scipy', 'scipy.sparse', 'numpy', 'matplotlib', 'matplotlib.pyplot', 'PIL', 'pyvista', 'tetgen', 'triangle'],
+    hiddenimports=['pkg_resources', 'importlib', 'importlib.util', 'inspect', 'PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'shiboken6', 'scipy', 'scipy.sparse', 'scipy.spatial', 'scipy.spatial.distance', 'numpy', 'matplotlib', 'matplotlib.pyplot', 'PIL', 'pyvista', 'pyvista.plotting', 'pyvista.utilities', 'tetgen', 'tetgen._tetgen', 'tetgen.pytetgen', 'triangle', 'triangle.tri', 'triangle.data', 'triangle.plot', 'itertools', 'gc', 'atexit', 'logging', 're', 'time', 'os', 'sys', 'Pymeshit', 'Pymeshit.intersection_utils', 'Pymeshit.tetra_mesh_utils', 'Pymeshit.core', 'typing', 'collections', 'collections.abc', 'netCDF4', 'netCDF4.Dataset', 'netCDF4.Variable'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['torch', 'torchvision', 'torchaudio', 'pandas', 'pillow', 'Image', 'opencv-python', 'cv2', 'opencv', 'skimage', 'scikit-image', 'sklearn', 'scikit-learn', 'tensorflow', 'tf', 'keras', 'jupyter', 'notebook', 'ipykernel', 'ipython', 'flask', 'django', 'requests', 'urllib3', 'chardet', 'certifi', 'pip', 'setuptools', 'wheel', 'cuda', 'cudnn', 'cupy', 'numba', 'jax', 'jaxlib', 'debugpy', 'ptvsd', 'tqdm', 'rich', 'click', 'pkg_resources'],
+    excludes=['torch', 'PyQt5', 'torchvision', 'torchaudio', 'pandas', 'pillow', 'Image', 'opencv-python', 'cv2', 'opencv', 'skimage', 'scikit-image', 'sklearn', 'scikit-learn', 'tensorflow', 'tf', 'keras', 'jupyter', 'notebook', 'ipykernel', 'ipython', 'flask', 'django', 'requests', 'urllib3', 'chardet', 'certifi', 'pip', 'setuptools', 'wheel', 'cuda', 'cudnn', 'cupy', 'numba', 'jax', 'jaxlib', 'debugpy', 'ptvsd', 'tqdm', 'rich', 'click', 'pkg_resources'],
     noarchive=False,
     optimize=0,
 )
-pyz = PYZ(a.pure)
+pyz = PYZ(a.pure, a.zipped)
 
 exe = EXE(
     pyz,
@@ -37,9 +37,10 @@ exe = EXE(
 coll = COLLECT(
     exe,
     a.binaries,
+    a.zipfiles,
     a.datas,
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='PyMeshIt',
+    name='PyMeshIt'
 )

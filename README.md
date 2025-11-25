@@ -1,5 +1,9 @@
 # PyMeshIt
 
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+
 PyMeshIt is a complete Python package for mesh generation and manipulation with a full-featured Qt-based GUI. It provides a comprehensive workflow to process point clouds and polylines into conforming surface meshes and tetrahedral meshes.
 
 **Note:** This version runs entirely in Python without C++ dependencies, making it easier to install and deploy.
@@ -20,7 +24,12 @@ The included GUI (main.py) implements a full MeshIt workflow with the following 
 
 ## Installation
 
-### From PyPI (Recommended)
+### From Release (Recommended)
+
+For quick installation, download the exe. file from Releases 
+
+
+### From PyPI 
 
 ```bash
 pip install triangle
@@ -32,8 +41,8 @@ pip install pymeshit # Needs to be fixed
 If you want to install from source:
 
 ```bash
-git clone https://github.com/waqashussain/meshit.git
-cd meshit
+git clone https://github.com/waqashussain117/PyMeshit
+cd PyMeshit
 pip install -e .
 ```
 
@@ -51,6 +60,9 @@ The package will automatically install all required dependencies:
 
 ## Quick start (GUI)
 
+
+
+For installation either install the Requirements and then open through Python.
 After installation, run the GUI:
 
 ```bash
@@ -76,13 +88,7 @@ Typical workflow:
 
 ## Programmatic Usage
 
-```python
-import pymeshit
-from pymeshit.intersection_utils import align_intersections_to_convex_hull
 
-# Use pymeshit functions programmatically
-# ...
-```
 
 ## Contributing
 

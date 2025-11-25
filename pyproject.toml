@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Pymeshit"
-version = "0.2.4"
+version = "0.4.2"
 authors = [
     {name = "Waqas Hussain", email = "waqas.hussain117@gmail.com"},
 ]
@@ -36,12 +36,13 @@ dependencies = [
     "matplotlib>=3.3.0",
     "PySide6>=6.0.0",
     "pyvista>=0.30.0",
+    "pyvistaqt>=0.11.0",
     "tetgen>=0.6.0",
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/waqashussain/meshit"
-"Bug Tracker" = "https://github.com/waqashussain/meshit/issues"
+"Homepage" = "https://github.com/waqashussain117/PyMeshit"
+"Bug Tracker" = "https://github.com/waqashussain117/PyMeshit/issues"
 
 [project.scripts]
 meshit-gui = "Pymeshit:main_wrapper"

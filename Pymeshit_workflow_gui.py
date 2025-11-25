@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import re
+import pickle
 
 # import List
 from typing import List, Dict, Tuple, Optional, Any
@@ -851,8 +852,16 @@ class MeshItWorkflowGUI(QMainWindow):
             )
             return
 
-        # default position = geometric centre of all constrained surfaces
-        new_pt = self._calculate_default_location()
+        # Default position: use first location of current material if available,
+        # otherwise use default location calculation
+        if self.tetra_materials[m].get('locations') and len(self.tetra_materials[m]['locations']) > 0:
+            # Use the first location of the current material
+            first_loc = self.tetra_materials[m]['locations'][0]
+            new_pt = [float(first_loc[0]), float(first_loc[1]), float(first_loc[2])]
+        else:
+            # Fallback to default location calculation
+            new_pt = self._calculate_default_location()
+        
         self.tetra_materials[m]["locations"].append(new_pt)
 
         self.material_location_list.setCurrentRow(
@@ -867,6 +876,75 @@ class MeshItWorkflowGUI(QMainWindow):
         del self.tetra_materials[m]["locations"][l]
         self.material_location_list.setCurrentRow(max(0,len(self.tetra_materials[m]["locations"])-1))
         self._refresh_material_list()
+    def _calculate_slider_ranges(self) -> tuple:
+        """
+        Calculate dynamic slider ranges based on all material coordinates.
+        Returns: (x_range, y_range, z_range) where each range is (min, max, center)
+        """
+        # Collect all coordinates from all materials
+        all_x, all_y, all_z = [], [], []
+        
+        if hasattr(self, 'tetra_materials') and self.tetra_materials:
+            for material in self.tetra_materials:
+                for location in material.get('locations', []):
+                    if len(location) >= 3:
+                        all_x.append(float(location[0]))
+                        all_y.append(float(location[1]))
+                        all_z.append(float(location[2]))
+        
+        # Calculate ranges for each axis
+        def get_range(coords, current_value):
+            if not coords:
+                # Default range if no coordinates exist
+                if abs(current_value) < 1.0:
+                    return (-100.0, 100.0, current_value)
+                else:
+                    # Use current value as center with reasonable range
+                    range_size = max(abs(current_value) * 0.2, 100.0)
+                    return (current_value - range_size, current_value + range_size, current_value)
+            
+            min_val = min(coords)
+            max_val = max(coords)
+            center = (min_val + max_val) / 2.0
+            
+            # Add padding (20% of range or minimum 100 units)
+            range_size = max((max_val - min_val) * 0.2, 100.0)
+            if range_size == 0:
+                range_size = max(abs(center) * 0.2, 100.0)
+            
+            return (center - range_size, center + range_size, center)
+        
+        # Get current values if editing
+        m = self.material_list.currentRow()
+        l = self.material_location_list.currentRow()
+        if m >= 0 and l >= 0 and m < len(self.tetra_materials):
+            current_x = float(self.tetra_materials[m]["locations"][l][0])
+            current_y = float(self.tetra_materials[m]["locations"][l][1])
+            current_z = float(self.tetra_materials[m]["locations"][l][2])
+        else:
+            current_x = current_y = current_z = 0.0
+        
+        x_range = get_range(all_x, current_x)
+        y_range = get_range(all_y, current_y)
+        z_range = get_range(all_z, current_z)
+        
+        return (x_range, y_range, z_range)
+    
+    def _value_to_slider(self, value: float, min_val: float, max_val: float) -> int:
+        """Convert a coordinate value to slider position (0-1000000)."""
+        if max_val == min_val:
+            return 500000  # Center position
+        # Map value to slider range [0, 1000000]
+        normalized = (value - min_val) / (max_val - min_val)
+        return int(normalized * 1000000)
+    
+    def _slider_to_value(self, slider_pos: int, min_val: float, max_val: float) -> float:
+        """Convert slider position (0-1000000) to coordinate value."""
+        if max_val == min_val:
+            return min_val
+        # Map slider range [0, 1000000] to value range
+        normalized = slider_pos / 1000000.0
+        return min_val + normalized * (max_val - min_val)
 
     def _update_coordinate_editors(self)->None:
         m=self.material_list.currentRow(); l=self.material_location_list.currentRow()
@@ -885,14 +963,48 @@ class MeshItWorkflowGUI(QMainWindow):
             # Convert numpy types to regular Python floats
             x, y, z = float(x), float(y), float(z)
             self.locX_val.setValue(x); self.locY_val.setValue(y); self.locZ_val.setValue(z)
-            # Ensure slider values stay within range
-            slider_x = max(-1000000, min(1000000, int(x*1000)))
-            slider_y = max(-1000000, min(1000000, int(y*1000)))
-            slider_z = max(-1000000, min(1000000, int(z*1000)))
-            self.locX_slider.setValue(slider_x); self.locY_slider.setValue(slider_y); self.locZ_slider.setValue(slider_z)
+            
+            # Calculate dynamic slider ranges based on all material coordinates
+            x_range, y_range, z_range = self._calculate_slider_ranges()
+            
+            # Update slider ranges
+            self.locX_slider.setRange(0, 1000000)
+            self.locY_slider.setRange(0, 1000000)
+            self.locZ_slider.setRange(0, 1000000)
+            
+            # Calculate step sizes proportional to range (1% of range)
+            x_step = max(1, int((x_range[1] - x_range[0]) * 0.01))
+            y_step = max(1, int((y_range[1] - y_range[0]) * 0.01))
+            z_step = max(1, int((z_range[1] - z_range[0]) * 0.01))
+            
+            self.locX_slider.setSingleStep(max(1, x_step // 100))
+            self.locY_slider.setSingleStep(max(1, y_step // 100))
+            self.locZ_slider.setSingleStep(max(1, z_step // 100))
+            
+            self.locX_slider.setPageStep(max(10, x_step // 10))
+            self.locY_slider.setPageStep(max(10, y_step // 10))
+            self.locZ_slider.setPageStep(max(10, z_step // 10))
+            
+            # Map coordinate values to slider positions
+            slider_x = self._value_to_slider(x, x_range[0], x_range[1])
+            slider_y = self._value_to_slider(y, y_range[0], y_range[1])
+            slider_z = self._value_to_slider(z, z_range[0], z_range[1])
+            
+            # Store ranges for reverse mapping in slider change handler
+            self._slider_x_range = x_range
+            self._slider_y_range = y_range
+            self._slider_z_range = z_range
+            
+            self.locX_slider.setValue(slider_x)
+            self.locY_slider.setValue(slider_y)
+            self.locZ_slider.setValue(slider_z)
         else:
             self.locX_val.setValue(0); self.locY_val.setValue(0); self.locZ_val.setValue(0)
-            self.locX_slider.setValue(0); self.locY_slider.setValue(0); self.locZ_slider.setValue(0)
+            self.locX_slider.setValue(500000); self.locY_slider.setValue(500000); self.locZ_slider.setValue(500000)
+            # Reset ranges to default
+            self._slider_x_range = (-100.0, 100.0, 0.0)
+            self._slider_y_range = (-100.0, 100.0, 0.0)
+            self._slider_z_range = (-100.0, 100.0, 0.0)
 
         # Unblock signals after programmatic updates
         self.locX_val.blockSignals(False)
@@ -908,11 +1020,26 @@ class MeshItWorkflowGUI(QMainWindow):
             return
         axis=self.sender().property("axis"); self._apply_coord_change(axis,val)
 
-    @Slot(int)
     def _coord_slider_changed(self,val:int)->None:
         if self._updating_coordinates:
             return
-        axis=self.sender().property("axis"); self._apply_coord_change(axis,val/1000.0)
+        axis=self.sender().property("axis")
+        
+        # Get the appropriate range for this axis
+        if axis == "X" and hasattr(self, '_slider_x_range'):
+            min_val, max_val, _ = self._slider_x_range
+            value = self._slider_to_value(val, min_val, max_val)
+        elif axis == "Y" and hasattr(self, '_slider_y_range'):
+            min_val, max_val, _ = self._slider_y_range
+            value = self._slider_to_value(val, min_val, max_val)
+        elif axis == "Z" and hasattr(self, '_slider_z_range'):
+            min_val, max_val, _ = self._slider_z_range
+            value = self._slider_to_value(val, min_val, max_val)
+        else:
+            # Fallback to old method if ranges not set
+            value = val / 1000.0
+        
+        self._apply_coord_change(axis, value)
 
     def _apply_coord_change(self,axis:str,value:float)->None:
         m=self.material_list.currentRow(); l=self.material_location_list.currentRow()
@@ -971,6 +1098,23 @@ class MeshItWorkflowGUI(QMainWindow):
         # --- File Menu ---
         file_menu = menu_bar.addMenu("&File")
 
+        # Project management actions
+        new_project_action = QAction("&New Project", self)
+        new_project_action.setStatusTip("Create a new project (clears all data)")
+        new_project_action.triggered.connect(self.new_project)
+        file_menu.addAction(new_project_action)
+        
+        save_project_action = QAction("&Save Project...", self)
+        save_project_action.setStatusTip("Save current project state to file")
+        save_project_action.triggered.connect(self.save_project)
+        file_menu.addAction(save_project_action)
+        
+        load_project_action = QAction("&Load Project...", self)
+        load_project_action.setStatusTip("Load project from file")
+        load_project_action.triggered.connect(self.load_project)
+        file_menu.addAction(load_project_action)
+        
+        file_menu.addSeparator()
 
         # Add Well loaders
         load_well_action = QAction("Load &Well File...", self)
@@ -1128,6 +1272,12 @@ class MeshItWorkflowGUI(QMainWindow):
         load_multiple_btn.setToolTip("Load points from multiple files as separate datasets")
         load_multiple_btn.clicked.connect(self.load_multiple_files)
         file_layout.addWidget(load_multiple_btn)
+        
+        # Button for deleting selected dataset
+        delete_dataset_btn = QPushButton("Delete Selected Dataset")
+        delete_dataset_btn.setToolTip("Delete the currently selected dataset from the list")
+        delete_dataset_btn.clicked.connect(self.delete_selected_dataset)
+        file_layout.addWidget(delete_dataset_btn)
         
         
         
@@ -1948,7 +2098,15 @@ class MeshItWorkflowGUI(QMainWindow):
             plotter = getattr(self, plotter_name, None)
             if plotter and hasattr(plotter, 'clear'):
                 try:
-                    plotter.clear()
+                    # Check if the plotter renderer is valid before clearing
+                    if hasattr(plotter, 'renderer') and plotter.renderer is not None:
+                        plotter.clear()
+                    else:
+                        # Renderer is not valid, skip clearing
+                        logger.debug(f"Skipping clear for {plotter_name} - renderer not initialized")
+                except AttributeError as e:
+                    # Silently skip if renderer doesn't have expected attributes
+                    logger.debug(f"Skipping clear for {plotter_name} - {e}")
                 except Exception as e:
                     logger.warning(f"Error clearing {plotter_name}: {e}")
     def _ensure_segments_plotter(self):
@@ -6291,6 +6449,332 @@ class MeshItWorkflowGUI(QMainWindow):
         proj2d = (points - cen) @ vh[:2].T    # (N,2) projection
         return cen, proj2d
 
+    def _compute_adaptive_alpha(self, points: np.ndarray, projected_2d: np.ndarray) -> float:
+        """
+        Compute an adaptive alpha parameter for alpha shapes based on point cloud characteristics.
+        
+        Uses the convention where triangles with circumradius < 1/alpha are included.
+        Larger alpha = more convex (closer to convex hull), smaller alpha = more concave.
+        
+        Args:
+            points: Original 3D points (N, 3)
+            projected_2d: 2D projected points (N, 2)
+            
+        Returns:
+            Adaptive alpha value for alpha shape computation
+        """
+        # Calculate average edge length in Delaunay triangulation
+        from scipy.spatial import Delaunay
+        
+        try:
+            tri = Delaunay(projected_2d)
+            edge_lengths = []
+            for simplex in tri.simplices:
+                for j in range(3):
+                    p1_idx, p2_idx = simplex[j], simplex[(j + 1) % 3]
+                    edge_length = np.linalg.norm(projected_2d[p1_idx] - projected_2d[p2_idx])
+                    edge_lengths.append(edge_length)
+            
+            if edge_lengths:
+                avg_edge_length = np.mean(edge_lengths)
+                median_edge_length = np.median(edge_lengths)
+                # For wavy surfaces, we want a more concave hull
+                # Use median instead of mean to be less sensitive to outliers
+                # Smaller factor = more concave (better for wavy surfaces)
+                # For the 1/alpha convention, we want 1/alpha ≈ edge_length * factor
+                # So alpha = 1 / (edge_length * factor)
+                # Use a balanced factor for wavy surfaces
+                # Formula: alpha = 1 / (edge_length * factor)
+                # For more concave: need larger alpha → smaller factor
+                # For more convex: need smaller alpha → larger factor
+                # Start with a moderate factor - we'll try multiple values
+                factor = 0.5  # Balanced starting point (was 0.15, too aggressive)
+                alpha = 1.0 / (median_edge_length * factor)
+            else:
+                # Fallback: use a fraction of the bounding box diagonal
+                bbox_size = np.linalg.norm(projected_2d.max(axis=0) - projected_2d.min(axis=0))
+                alpha = 10.0 / bbox_size  # Adjusted for 1/alpha convention
+        except Exception:
+            # Fallback: use a fraction of the bounding box diagonal
+            bbox_size = np.linalg.norm(projected_2d.max(axis=0) - projected_2d.min(axis=0))
+            alpha = 10.0 / bbox_size  # Adjusted for 1/alpha convention
+        
+        return max(alpha, 1e-6)  # Ensure alpha is positive
+
+    def _alpha_shape_boundary(self, points_2d: np.ndarray, alpha: float) -> Optional[np.ndarray]:
+        """
+        Compute the boundary of an alpha shape (concave hull) for 2D points.
+        
+        Args:
+            points_2d: 2D points (N, 2)
+            alpha: Alpha parameter (larger = more convex, smaller = more concave)
+            
+        Returns:
+            Ordered boundary point indices, or None if computation fails
+        """
+        from scipy.spatial import Delaunay
+        
+        try:
+            # Perform Delaunay triangulation
+            tri = Delaunay(points_2d)
+            
+            # Find boundary edges: edges that belong to triangles with circumradius < 1/alpha
+            # Use a dictionary to count edge occurrences (boundary edges appear once, internal edges twice)
+            edge_count = {}
+            
+            for simplex_idx, simplex in enumerate(tri.simplices):
+                # Get triangle vertices
+                triangle_pts = points_2d[simplex]
+                
+                # Compute circumradius
+                a = np.linalg.norm(triangle_pts[1] - triangle_pts[0])
+                b = np.linalg.norm(triangle_pts[2] - triangle_pts[1])
+                c = np.linalg.norm(triangle_pts[0] - triangle_pts[2])
+                
+                # Area using Heron's formula
+                s = (a + b + c) / 2.0
+                area = np.sqrt(max(0, s * (s - a) * (s - b) * (s - c)))
+                
+                if area > 1e-10:  # Avoid division by zero
+                    circumradius = (a * b * c) / (4.0 * area)
+                else:
+                    circumradius = float('inf')
+                
+                # Include triangle if circumradius < 1/alpha
+                # For very small alpha values, use a minimum threshold to avoid numerical issues
+                threshold = 1.0 / alpha if alpha > 1e-6 else float('inf')
+                if circumradius < threshold:
+                    # Count edges of this triangle
+                    for j in range(3):
+                        p1_idx, p2_idx = simplex[j], simplex[(j + 1) % 3]
+                        edge = tuple(sorted((p1_idx, p2_idx)))
+                        edge_count[edge] = edge_count.get(edge, 0) + 1
+            
+            # Extract boundary edges (edges that appear exactly once)
+            boundary_edges = {edge for edge, count in edge_count.items() if count == 1}
+            
+            if not boundary_edges:
+                return None
+            
+            # Extract boundary vertices and order them
+            boundary_vertices = set()
+            for edge in boundary_edges:
+                boundary_vertices.add(edge[0])
+                boundary_vertices.add(edge[1])
+            
+            # Build adjacency list for boundary vertices
+            adjacency = {v: [] for v in boundary_vertices}
+            for edge in boundary_edges:
+                v1, v2 = edge
+                adjacency[v1].append(v2)
+                adjacency[v2].append(v1)
+            
+            # Find starting vertex (one with only one neighbor, or any if all have 2)
+            start_vertex = None
+            for v, neighbors in adjacency.items():
+                if len(neighbors) == 1:
+                    start_vertex = v
+                    break
+            
+            if start_vertex is None:
+                # All vertices have 2 neighbors (closed loop), pick any
+                start_vertex = list(boundary_vertices)[0]
+            
+            # Traverse the boundary
+            ordered_indices = [start_vertex]
+            visited_edges = set()
+            current_vertex = start_vertex
+            
+            while True:
+                next_vertex = None
+                for neighbor in adjacency[current_vertex]:
+                    edge = tuple(sorted((current_vertex, neighbor)))
+                    if edge not in visited_edges:
+                        next_vertex = neighbor
+                        visited_edges.add(edge)
+                        break
+                
+                if next_vertex is None:
+                    break
+                
+                ordered_indices.append(next_vertex)
+                current_vertex = next_vertex
+                
+                # Stop if we've completed a loop
+                if len(ordered_indices) > 1 and ordered_indices[-1] == start_vertex:
+                    break
+                # Stop if we've visited all edges
+                if len(visited_edges) >= len(boundary_edges):
+                    break
+            
+            return np.array(ordered_indices) if len(ordered_indices) >= 3 else None
+            
+        except Exception as e:
+            logger.warning(f"Alpha shape computation failed: {e}")
+            return None
+
+    def _compute_boundary_for_wavy_surface(self, points: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Compute boundary for wavy (non-planar) surfaces using alpha shapes.
+        Tries multiple alpha values to find the best concave hull.
+        
+        Args:
+            points: 3D points (N, 3)
+            
+        Returns:
+            Ordered boundary point indices, or None if computation fails
+        """
+        # Project to 2D using PCA
+        _centroid, projected_2d = self._pca_project(points)
+        
+        # Compute base alpha parameter
+        base_alpha = self._compute_adaptive_alpha(points, projected_2d)
+        
+        # Try multiple alpha values, starting with moderate concavity
+        # Larger alpha → smaller 1/alpha → stricter circumradius → more concave
+        # Start with moderate values and adjust based on point count
+        # We want enough points to form a proper boundary (at least 10-20% of points)
+        min_points_ratio = 0.05  # At least 5% of points should be on boundary
+        min_boundary_points = max(10, int(len(projected_2d) * min_points_ratio))
+        
+        alpha_factors = [1.0, 1.5, 2.0, 0.5, 0.3]  # Start moderate, then try more concave/convex
+        
+        best_result = None
+        best_point_count = 0
+        
+        for factor in alpha_factors:
+            alpha = base_alpha * factor
+            boundary_indices = self._alpha_shape_boundary(projected_2d, alpha)
+            
+            if boundary_indices is not None and len(boundary_indices) >= 3:
+                point_count = len(boundary_indices)
+                logger.info(f"Alpha shape with factor {factor} produced {point_count} boundary points")
+                
+                # Track the best result (most points, but not too many)
+                if point_count > best_point_count and point_count >= min_boundary_points:
+                    best_result = boundary_indices
+                    best_point_count = point_count
+                    logger.info(f"New best result: {point_count} points with factor {factor}")
+        
+        # If we found a good result, use it
+        if best_result is not None and best_point_count >= min_boundary_points:
+            logger.info(f"Using alpha shape boundary with {best_point_count} points")
+            return best_result
+        
+        # If alpha shapes produced too few points, log and fall through to Delaunay
+        if best_result is not None:
+            logger.warning(f"Alpha shapes produced only {best_point_count} points (minimum {min_boundary_points}), falling back to Delaunay")
+        else:
+            logger.warning("Alpha shapes failed to produce any valid boundary, falling back to Delaunay")
+        
+        # If all alpha values failed, try computing boundary directly from Delaunay
+        # but filter by edge length to get a more concave result
+        logger.info("Alpha shapes failed, trying edge-length filtered Delaunay boundary...")
+        from scipy.spatial import Delaunay
+        
+        try:
+            tri = Delaunay(projected_2d)
+            
+            # Compute edge lengths
+            edge_lengths = {}
+            for simplex in tri.simplices:
+                for j in range(3):
+                    p1_idx, p2_idx = simplex[j], simplex[(j + 1) % 3]
+                    edge = tuple(sorted((p1_idx, p2_idx)))
+                    if edge not in edge_lengths:
+                        edge_lengths[edge] = np.linalg.norm(projected_2d[p1_idx] - projected_2d[p2_idx])
+            
+            # Find boundary edges (edges appearing in only one triangle)
+            boundary_edges = set()
+            edge_count = {}
+            for simplex in tri.simplices:
+                for j in range(3):
+                    p1_idx, p2_idx = simplex[j], simplex[(j + 1) % 3]
+                    edge = tuple(sorted((p1_idx, p2_idx)))
+                    edge_count[edge] = edge_count.get(edge, 0) + 1
+            
+            # Get boundary edges (appear exactly once)
+            boundary_edges = {edge for edge, count in edge_count.items() if count == 1}
+            
+            if boundary_edges:
+                # Filter out very long boundary edges (likely artifacts)
+                if edge_lengths:
+                    median_length = np.median(list(edge_lengths.values()))
+                    max_boundary_length = median_length * 3.0  # Allow edges up to 3x median
+                    boundary_edges = {
+                        edge for edge in boundary_edges 
+                        if edge_lengths.get(edge, float('inf')) <= max_boundary_length
+                    }
+                
+                if len(boundary_edges) >= 3:
+                    # Order boundary edges
+                    ordered_indices = []
+                    current_edge = boundary_edges.pop()
+                    ordered_indices.extend(list(current_edge))
+                    
+                    while boundary_edges:
+                        last_point_idx = ordered_indices[-1]
+                        found_next = False
+                        for edge in list(boundary_edges):
+                            if last_point_idx in edge:
+                                next_point_idx = edge[1] if edge[0] == last_point_idx else edge[0]
+                                ordered_indices.append(next_point_idx)
+                                boundary_edges.remove(edge)
+                                found_next = True
+                                break
+                        if not found_next:
+                            break
+                    
+                    if len(ordered_indices) >= 3:
+                        logger.info(f"Edge-filtered Delaunay boundary produced {len(ordered_indices)} points")
+                        return np.array(ordered_indices)
+        except Exception as e:
+            logger.warning(f"Edge-filtered Delaunay boundary failed: {e}")
+        
+        # Final fallback: standard Delaunay boundary (no filtering)
+        # This should always work and produce a proper boundary
+        logger.info("Using standard Delaunay boundary (guaranteed to work)...")
+        try:
+            tri = Delaunay(projected_2d)
+            edges = set()
+            for simplex in tri.simplices:
+                for j in range(3):
+                    p1_idx, p2_idx = simplex[j], simplex[(j + 1) % 3]
+                    edge = tuple(sorted((p1_idx, p2_idx)))
+                    if edge in edges:
+                        edges.remove(edge)
+                    else:
+                        edges.add(edge)
+            
+            if edges:
+                ordered_indices = []
+                current_edge = edges.pop()
+                ordered_indices.extend(list(current_edge))
+                
+                while edges:
+                    last_point_idx = ordered_indices[-1]
+                    found_next = False
+                    for edge in list(edges):
+                        if last_point_idx in edge:
+                            next_point_idx = edge[1] if edge[0] == last_point_idx else edge[0]
+                            ordered_indices.append(next_point_idx)
+                            edges.remove(edge)
+                            found_next = True
+                            break
+                    if not found_next:
+                        break
+                
+                if len(ordered_indices) >= 3:
+                    logger.info(f"Standard Delaunay boundary produced {len(ordered_indices)} points")
+                    return np.array(ordered_indices)
+                else:
+                    logger.error(f"Standard Delaunay boundary produced only {len(ordered_indices)} points (expected >= 3)")
+        except Exception as e:
+            logger.error(f"Standard Delaunay boundary computation failed: {e}")
+        
+        logger.error("All boundary computation methods failed!")
+        return None
+
             # ------------------------------------------------------------------------
     # 2.  Main hull computation
     # ------------------------------------------------------------------------
@@ -6310,8 +6794,8 @@ class MeshItWorkflowGUI(QMainWindow):
         """
         Compute (and store) the boundary poly-line for the selected dataset.
         - For 2D data, this computes the convex hull.
-        - For 3D sheet-like data, this finds the ordered "rim" or "outline"
-        (which can be concave) by finding the boundary of a Delaunay triangulation.
+        - For 3D planar surfaces, this finds the ordered boundary using Delaunay triangulation.
+        - For 3D wavy surfaces, this uses alpha shapes (concave hull) for better boundary detection.
         
         This version also identifies and marks geometric corners as "special points"
         immediately after calculation, preparing it for robust segmentation.
@@ -6345,52 +6829,79 @@ class MeshItWorkflowGUI(QMainWindow):
                 # Convert to 3D for consistency, setting Z=0
                 hull_pts_np = np.hstack([hull_pts_2d, np.zeros((len(hull_pts_2d), 1))])
 
-            # --- BRANCH 2: 3D Data (Handles Convex and Concave Boundaries) ---
+            # --- BRANCH 2: 3D Data (Handles Planar and Wavy Surfaces) ---
             else: # dim >= 3
-                logger.info(f"Computing 3D data boundary for '{ds.get('name')}' using Delaunay triangulation...")
-                # 1. Project all 3D points onto their best-fit 2D plane using PCA.
-                _centroid, projected_pts_2d = self._pca_project(pts)
-
-                # 2. Perform Delaunay triangulation on the 2D projected points.
-                tri = Delaunay(projected_pts_2d)
-
-                # 3. Find the boundary edges (edges that appear in only one triangle).
-                edges = set()
-                for simplex in tri.simplices:
-                    for j in range(3):
-                        p1_idx, p2_idx = simplex[j], simplex[(j + 1) % 3]
-                        edge = tuple(sorted((p1_idx, p2_idx)))
-                        if edge in edges:
-                            edges.remove(edge) # Internal edge, remove it.
-                        else:
-                            edges.add(edge) # Potential boundary edge.
+                # Detect if the surface is planar or wavy
+                # Use stricter tolerance (0.1) to better detect wavy surfaces
+                # Lower tolerance = stricter planar detection (more surfaces detected as wavy)
+                is_planar = self._is_quasi_planar(pts, tol=0.1)
                 
-                if not edges:
-                    logger.warning("Delaunay method found no boundary edges. Falling back to convex hull on projected points.")
-                    hull = ConvexHull(projected_pts_2d)
-                    hull_pts_np = pts[hull.vertices]
+                # Log the detection result for debugging
+                if is_planar:
+                    logger.info(f"Surface '{ds.get('name')}' detected as PLANAR (will use Delaunay method)")
                 else:
-                    # 4. Stitch the unordered boundary edges into a continuous path.
-                    ordered_indices = []
-                    current_edge = edges.pop()
-                    ordered_indices.extend(list(current_edge))
+                    logger.info(f"Surface '{ds.get('name')}' detected as WAVY (will use alpha shapes)")
+                
+                if is_planar:
+                    # For planar surfaces, use the efficient Delaunay boundary method
+                    logger.info(f"Computing 3D planar surface boundary for '{ds.get('name')}' using Delaunay triangulation...")
+                    # 1. Project all 3D points onto their best-fit 2D plane using PCA.
+                    _centroid, projected_pts_2d = self._pca_project(pts)
+
+                    # 2. Perform Delaunay triangulation on the 2D projected points.
+                    tri = Delaunay(projected_pts_2d)
+
+                    # 3. Find the boundary edges (edges that appear in only one triangle).
+                    edges = set()
+                    for simplex in tri.simplices:
+                        for j in range(3):
+                            p1_idx, p2_idx = simplex[j], simplex[(j + 1) % 3]
+                            edge = tuple(sorted((p1_idx, p2_idx)))
+                            if edge in edges:
+                                edges.remove(edge) # Internal edge, remove it.
+                            else:
+                                edges.add(edge) # Potential boundary edge.
                     
-                    while edges:
-                        last_point_idx = ordered_indices[-1]
-                        found_next = False
-                        for edge in list(edges): # Iterate over a copy
-                            if last_point_idx in edge:
-                                next_point_idx = edge[1] if edge[0] == last_point_idx else edge[0]
-                                ordered_indices.append(next_point_idx)
-                                edges.remove(edge)
-                                found_next = True
+                    if not edges:
+                        logger.warning("Delaunay method found no boundary edges. Falling back to convex hull on projected points.")
+                        hull = ConvexHull(projected_pts_2d)
+                        hull_pts_np = pts[hull.vertices]
+                    else:
+                        # 4. Stitch the unordered boundary edges into a continuous path.
+                        ordered_indices = []
+                        current_edge = edges.pop()
+                        ordered_indices.extend(list(current_edge))
+                        
+                        while edges:
+                            last_point_idx = ordered_indices[-1]
+                            found_next = False
+                            for edge in list(edges): # Iterate over a copy
+                                if last_point_idx in edge:
+                                    next_point_idx = edge[1] if edge[0] == last_point_idx else edge[0]
+                                    ordered_indices.append(next_point_idx)
+                                    edges.remove(edge)
+                                    found_next = True
+                                    break
+                            if not found_next:
+                                logger.warning("Boundary walk broken. The result might be incomplete or have multiple loops.")
                                 break
-                        if not found_next:
-                            logger.warning("Boundary walk broken. The result might be incomplete or have multiple loops.")
-                            break
+                        
+                        # 5. Get the final ordered polyline from the original 3D points.
+                        hull_pts_np = pts[ordered_indices]
+                else:
+                    # For wavy surfaces, use alpha shapes for better boundary detection
+                    logger.info(f"Computing 3D wavy surface boundary for '{ds.get('name')}' using alpha shapes...")
+                    boundary_indices = self._compute_boundary_for_wavy_surface(pts)
                     
-                    # 5. Get the final ordered polyline from the original 3D points.
-                    hull_pts_np = pts[ordered_indices]
+                    if boundary_indices is not None and len(boundary_indices) >= 3:
+                        # Get the final ordered polyline from the original 3D points
+                        hull_pts_np = pts[boundary_indices]
+                    else:
+                        # Fallback to convex hull if alpha shape fails
+                        logger.warning("Alpha shape method failed, falling back to convex hull for wavy surface.")
+                        _centroid, projected_pts_2d = self._pca_project(pts)
+                        hull = ConvexHull(projected_pts_2d)
+                        hull_pts_np = pts[hull.vertices]
 
             # --- Post-processing for BOTH cases ---
 
@@ -7915,6 +8426,107 @@ segmentation, triangulation, and visualization.
             self._update_statistics()
             self._update_visualization()
     
+    def delete_selected_dataset(self):
+        """
+        Delete the currently selected dataset from the list.
+        This method properly handles plotter cleanup to prevent crashes.
+        """
+        # Check if there are any datasets
+        if not self.datasets:
+            QMessageBox.information(
+                self, 
+                "No Datasets", 
+                "No datasets available to delete."
+            )
+            return
+        
+        # Get selected items from the dataset list widget
+        selected_items = self.dataset_list_widget.selectedItems()
+        
+        if not selected_items:
+            QMessageBox.information(
+                self, 
+                "No Selection", 
+                "Please select a dataset from the list to delete."
+            )
+            return
+        
+        # Get the index of the selected dataset
+        selected_index = self.dataset_list_widget.row(selected_items[0])
+        
+        if not (0 <= selected_index < len(self.datasets)):
+            return
+        
+        dataset_name = self.datasets[selected_index]['name']
+        
+        # Confirm deletion
+        confirm = QMessageBox.question(
+            self, 
+            "Delete Dataset", 
+            f"Are you sure you want to delete dataset '{dataset_name}'?\n\n"
+            f"This will remove the dataset and all associated data (hull, segments, triangulation).",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if confirm != QMessageBox.Yes:
+            return
+        
+        try:
+            # Step 1: Clear all visualizations before removing the dataset
+            # This prevents plotter crashes when the data is removed
+            logger.info(f"Clearing visualizations before deleting dataset: {dataset_name}")
+            self._clear_visualizations()
+            
+            # Step 2: Clear any intersection data that might reference this dataset
+            if hasattr(self, 'datasets_intersections') and self.datasets_intersections:
+                # Filter out intersections that involve this dataset
+                self.datasets_intersections = {
+                    key: value for key, value in self.datasets_intersections.items()
+                    if selected_index not in key
+                }
+            
+            # Step 3: Remove the dataset from the list
+            logger.info(f"Removing dataset at index {selected_index}: {dataset_name}")
+            self.datasets.pop(selected_index)
+            
+            # Step 4: Update the current dataset index
+            if selected_index == self.current_dataset_index:
+                # If we deleted the current dataset, reset to first available
+                if self.datasets:
+                    self.current_dataset_index = 0
+                else:
+                    self.current_dataset_index = -1
+            elif selected_index < self.current_dataset_index:
+                # If we deleted a dataset before the current one, adjust the index
+                self.current_dataset_index -= 1
+            
+            # Step 5: Update the dataset list widget
+            self._update_dataset_list()
+            
+            # Step 6: Update statistics
+            self._update_statistics()
+            
+            # Step 7: Update visualizations with remaining datasets
+            # This will recreate plotters safely with the updated dataset list
+            self._update_visualization()
+            
+            # Step 8: Force garbage collection to clean up any remaining references
+            gc.collect()
+            
+            # Show success message
+            self.statusBar().showMessage(f"Successfully deleted dataset: {dataset_name}")
+            logger.info(f"Successfully deleted dataset: {dataset_name}")
+            
+        except Exception as e:
+            error_msg = f"Error deleting dataset: {str(e)}"
+            logger.error(error_msg)
+            QMessageBox.critical(
+                self, 
+                "Error", 
+                f"An error occurred while deleting the dataset:\n{str(e)}"
+            )
+            self.statusBar().showMessage(f"Error deleting dataset: {str(e)}")
+    
     def clear_all_datasets(self):
         """Clear all loaded datasets"""
         if not self.datasets:
@@ -7946,6 +8558,320 @@ segmentation, triangulation, and visualization.
         """Remove the active dataset"""
         if 0 <= self.current_dataset_index < len(self.datasets):
             self._remove_dataset(self.current_dataset_index)
+    
+    def new_project(self):
+        """
+        Create a new project by resetting everything to initial state.
+        Properly handles plotter cleanup to prevent crashes.
+        """
+        # If there's existing data, confirm before clearing
+        if self.datasets or hasattr(self, 'datasets_intersections') and self.datasets_intersections:
+            confirm = QMessageBox.question(
+                self,
+                "New Project",
+                "Creating a new project will clear all current data and processing results.\n\n"
+                "Are you sure you want to continue?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if confirm != QMessageBox.Yes:
+                return
+        
+        try:
+            logger.info("Creating new project - clearing all data")
+            
+            # Step 1: Clear all visualizations first to prevent plotter crashes
+            self._clear_visualizations()
+            
+            # Step 2: Clear plotter references safely
+            if hasattr(self, 'plotters'):
+                # Just clear the dictionary, don't try to close individual plotters
+                # Qt will handle widget cleanup when layouts are cleared
+                self.plotters.clear()
+            
+            # Process Qt events to allow proper cleanup
+            QApplication.processEvents()
+            # Give Qt time to finish cleanup
+            import time
+            time.sleep(0.1)  # 100ms delay to ensure Qt cleanup is complete
+            
+            # Step 3: Clear all data structures
+            self.datasets = []
+            self.current_dataset_index = -1
+            
+            # Clear intersection data
+            if hasattr(self, 'datasets_intersections'):
+                self.datasets_intersections = {}
+            
+            # Clear refinement data
+            if hasattr(self, 'seg_length_by_surface'):
+                self.seg_length_by_surface = {}
+            if hasattr(self, 'mesh_size_by_surface'):
+                self.mesh_size_by_surface = {}
+            
+            # Clear tetrahedral mesh data
+            if hasattr(self, 'tetra_mesh_data'):
+                self.tetra_mesh_data = None
+            
+            # Step 4: Reset UI elements
+            self._update_dataset_list()
+            self._update_statistics()
+            
+            # Clear refinement tables if they exist
+            if hasattr(self, '_refresh_seg_refine_table'):
+                self._refresh_seg_refine_table()
+            if hasattr(self, '_refresh_mesh_refine_table'):
+                self._refresh_mesh_refine_table()
+            
+            # Step 5: Switch to first tab (Load tab)
+            self.notebook.setCurrentIndex(0)
+            
+            # Step 6: Force garbage collection
+            gc.collect()
+            
+            self.statusBar().showMessage("New project created - all data cleared")
+            logger.info("New project created successfully")
+            
+        except Exception as e:
+            error_msg = f"Error creating new project: {str(e)}"
+            logger.error(error_msg)
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"An error occurred while creating new project:\n{str(e)}"
+            )
+    
+    def save_project(self):
+        """
+        Save the current project state to a file.
+        Saves all datasets, processing results, and current tab state.
+        """
+        # Check if there's anything to save
+        if not self.datasets:
+            QMessageBox.information(
+                self,
+                "Nothing to Save",
+                "There are no datasets to save. Load some data first."
+            )
+            return
+        
+        # Get file path from user
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Project",
+            "",
+            "PyMeshIt Project Files (*.pmit);;All Files (*.*)"
+        )
+        
+        if not file_path:
+            self.statusBar().showMessage("Project save canceled")
+            return
+        
+        # Add .pmit extension if not present
+        if not file_path.endswith('.pmit'):
+            file_path += '.pmit'
+        
+        try:
+            logger.info(f"Saving project to: {file_path}")
+            
+            # Prepare project data
+            project_data = {
+                'version': '1.0',  # Project file version for future compatibility
+                'datasets': self.datasets,
+                'current_dataset_index': self.current_dataset_index,
+                'current_tab_index': self.notebook.currentIndex(),
+                'datasets_intersections': getattr(self, 'datasets_intersections', {}),
+                'seg_length_by_surface': getattr(self, 'seg_length_by_surface', {}),
+                'mesh_size_by_surface': getattr(self, 'mesh_size_by_surface', {}),
+                'tetra_mesh_data': getattr(self, 'tetra_mesh_data', None)
+            }
+            
+            # Save to file using pickle
+            with open(file_path, 'wb') as f:
+                pickle.dump(project_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            self.statusBar().showMessage(f"Project saved successfully to {os.path.basename(file_path)}")
+            logger.info(f"Project saved successfully: {file_path}")
+            
+            QMessageBox.information(
+                self,
+                "Project Saved",
+                f"Project saved successfully to:\n{file_path}\n\n"
+                f"Datasets: {len(self.datasets)}\n"
+                f"Current tab: {self.notebook.tabText(self.notebook.currentIndex())}"
+            )
+            
+        except Exception as e:
+            error_msg = f"Error saving project: {str(e)}"
+            logger.error(error_msg)
+            QMessageBox.critical(
+                self,
+                "Save Error",
+                f"An error occurred while saving the project:\n{str(e)}"
+            )
+            self.statusBar().showMessage(f"Error saving project: {str(e)}")
+    
+    def load_project(self):
+        """
+        Load a project from a file.
+        Properly handles plotter cleanup before loading to prevent crashes.
+        """
+        # If there's existing data, confirm before loading
+        if self.datasets or hasattr(self, 'datasets_intersections') and self.datasets_intersections:
+            confirm = QMessageBox.question(
+                self,
+                "Load Project",
+                "Loading a project will replace all current data and processing results.\n\n"
+                "Are you sure you want to continue?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if confirm != QMessageBox.Yes:
+                return
+        
+        # Get file path from user
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Project",
+            "",
+            "PyMeshIt Project Files (*.pmit);;All Files (*.*)"
+        )
+        
+        if not file_path:
+            self.statusBar().showMessage("Project load canceled")
+            return
+        
+        if not os.path.exists(file_path):
+            QMessageBox.critical(
+                self,
+                "File Not Found",
+                f"The project file does not exist:\n{file_path}"
+            )
+            return
+        
+        try:
+            logger.info(f"Loading project from: {file_path}")
+            
+            # Step 1: Clear all visualizations first to prevent plotter crashes
+            logger.info("Clearing visualizations before loading project")
+            self._clear_visualizations()
+            
+            # Step 2: Clear plotter references safely
+            if hasattr(self, 'plotters'):
+                # Just clear the dictionary, don't try to close individual plotters
+                # Qt will handle widget cleanup when layouts are cleared
+                self.plotters.clear()
+            
+            # Process Qt events to allow proper cleanup
+            QApplication.processEvents()
+            # Give Qt time to finish cleanup  
+            import time
+            time.sleep(0.1)  # 100ms delay to ensure Qt cleanup is complete
+            
+            # Step 3: Load project data from file
+            with open(file_path, 'rb') as f:
+                project_data = pickle.load(f)
+            
+            # Check version (for future compatibility)
+            version = project_data.get('version', '1.0')
+            logger.info(f"Loading project version: {version}")
+            
+            # Step 4: Restore project data
+            self.datasets = project_data.get('datasets', [])
+            self.current_dataset_index = project_data.get('current_dataset_index', -1)
+            saved_tab_index = project_data.get('current_tab_index', 0)
+            
+            # Restore intersection data
+            self.datasets_intersections = project_data.get('datasets_intersections', {})
+            
+            # Restore refinement data
+            self.seg_length_by_surface = project_data.get('seg_length_by_surface', {})
+            self.mesh_size_by_surface = project_data.get('mesh_size_by_surface', {})
+            
+            # Restore tetrahedral mesh data
+            self.tetra_mesh_data = project_data.get('tetra_mesh_data', None)
+            
+            # Step 5: Update UI elements (without triggering visualizations yet)
+            self._update_dataset_list()
+            self._update_statistics()
+            
+            # Update refinement tables if they exist
+            if hasattr(self, '_refresh_seg_refine_table'):
+                self._refresh_seg_refine_table()
+            if hasattr(self, '_refresh_mesh_refine_table'):
+                self._refresh_mesh_refine_table()
+            
+            # Step 6: Switch to the saved tab WITHOUT triggering visualization callbacks
+            # Block signals temporarily to prevent tab change from triggering visualizations
+            self.notebook.blockSignals(True)
+            if 0 <= saved_tab_index < self.notebook.count():
+                self.notebook.setCurrentIndex(saved_tab_index)
+            self.notebook.blockSignals(False)
+            
+            # Step 7: Update visualizations ONCE for the restored data
+            # Call the appropriate visualization for the current tab only
+            current_tab_widget = self.notebook.widget(saved_tab_index) if 0 <= saved_tab_index < self.notebook.count() else None
+            
+            if current_tab_widget == self.file_tab:
+                self._visualize_all_points()
+            elif current_tab_widget == self.hull_tab:
+                if any(d.get('visible', True) and d.get('hull_points') is not None for d in self.datasets):
+                    self._visualize_all_hulls()
+            elif current_tab_widget == self.segment_tab:
+                if any(d.get('visible', True) and d.get('segments') is not None for d in self.datasets):
+                    self._clear_segmentation_visualization_flag()
+                    self._visualize_all_segments()
+            elif current_tab_widget == self.triangulation_tab:
+                if any(d.get('visible', True) and d.get('triangulation_result') is not None for d in self.datasets):
+                    self._visualize_all_triangulations()
+            elif current_tab_widget == self.intersection_tab:
+                if hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections):
+                    self._visualize_intersections()
+            elif current_tab_widget == self.refine_mesh_tab:
+                if hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections):
+                    self._visualize_refined_intersections()
+            elif hasattr(self, 'pre_tetramesh_tab') and current_tab_widget == self.pre_tetramesh_tab:
+                if any(d.get('constrained_triangulation_result') for d in self.datasets):
+                    self._visualize_constrained_meshes()
+            elif hasattr(self, 'tetra_mesh_tab') and current_tab_widget == self.tetra_mesh_tab:
+                if hasattr(self, 'tetrahedral_mesh') and self.tetrahedral_mesh:
+                    self._visualize_tetrahedral_mesh()
+            
+            # Step 8: Force garbage collection
+            gc.collect()
+            
+            num_datasets = len(self.datasets)
+            tab_name = self.notebook.tabText(saved_tab_index) if 0 <= saved_tab_index < self.notebook.count() else "Unknown"
+            
+            self.statusBar().showMessage(f"Project loaded successfully from {os.path.basename(file_path)}")
+            logger.info(f"Project loaded successfully: {file_path}")
+            
+            QMessageBox.information(
+                self,
+                "Project Loaded",
+                f"Project loaded successfully from:\n{os.path.basename(file_path)}\n\n"
+                f"Datasets loaded: {num_datasets}\n"
+                f"Current tab: {tab_name}"
+            )
+            
+        except Exception as e:
+            error_msg = f"Error loading project: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            QMessageBox.critical(
+                self,
+                "Load Error",
+                f"An error occurred while loading the project:\n{str(e)}\n\n"
+                f"The project file may be corrupted or incompatible."
+            )
+            self.statusBar().showMessage(f"Error loading project: {str(e)}")
+            
+            # Try to recover by creating a new project
+            try:
+                logger.info("Attempting to recover by creating new project")
+                self.new_project()
+            except Exception as recovery_error:
+                logger.error(f"Error during recovery: {recovery_error}")
+    
     def _clear_visualizations(self):
         """Clear all visualizations"""
         # ... existing clear calls ...
@@ -9459,20 +10385,40 @@ segmentation, triangulation, and visualization.
             old_plotter = getattr(self, f'{view_type}_plotter')
             if old_plotter:
                 try:
-                    old_plotter.close()
+                    # Check if the plotter's Qt widget is still valid
+                    if hasattr(old_plotter, 'interactor') and old_plotter.interactor is not None:
+                        # Try to access the widget to see if it's still alive
+                        try:
+                            _ = old_plotter.interactor.isVisible()
+                            # Widget is still alive, we can safely clear it
+                            logger.debug(f"Old plotter for {view_type} is still valid, will replace")
+                        except RuntimeError:
+                            # Qt object was already deleted
+                            logger.debug(f"Old plotter for {view_type} Qt object already deleted")
                 except Exception as e:
-                    logger.warning(f"Error closing old plotter for {view_type}: {e}")
+                    logger.debug(f"Error checking old plotter for {view_type}: {e}")
         
         parent_layout = parent_frame.layout()
         if parent_layout is None:
             parent_layout = QVBoxLayout(parent_frame)
             parent_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Clean up old widgets
+        widgets_to_delete = []
         while parent_layout.count():
             item = parent_layout.takeAt(0)
             widget = item.widget()
             if widget:
+                widgets_to_delete.append(widget)
+                widget.setParent(None)
                 widget.deleteLater()
+        
+        # Process events to ensure widgets are actually deleted
+        if widgets_to_delete:
+            QApplication.processEvents()
+            # Give Qt a moment to finish cleanup
+            import time
+            time.sleep(0.05)  # 50ms delay
 
         from pyvistaqt import QtInteractor
         import pyvista as pv
@@ -10326,10 +11272,19 @@ segmentation, triangulation, and visualization.
     def _clear_intersection_plot(self):
         """Clear the embedded intersection PyVista plotter."""
         if hasattr(self, 'intersection_plotter') and self.intersection_plotter:
-            self.intersection_plotter.clear()
-            # Optionally add placeholder text back if desired
-            # self.intersection_plotter.add_text("Compute intersections or select one from the list.", position='upper_edge')
-            self.intersection_plotter.reset_camera()
+            try:
+                # Check if renderer is valid before clearing
+                if hasattr(self.intersection_plotter, 'renderer') and self.intersection_plotter.renderer is not None:
+                    self.intersection_plotter.clear()
+                    # Optionally add placeholder text back if desired
+                    # self.intersection_plotter.add_text("Compute intersections or select one from the list.", position='upper_edge')
+                    self.intersection_plotter.reset_camera()
+                else:
+                    logger.debug("Skipping clear for intersection_plotter - renderer not initialized")
+            except AttributeError as e:
+                logger.debug(f"Skipping clear for intersection_plotter - {e}")
+            except Exception as e:
+                logger.warning(f"Error clearing intersection_plotter: {e}")
 
     def _update_intersection_list(self):
         """Update the list of intersections in the UI"""
@@ -10392,6 +11347,11 @@ segmentation, triangulation, and visualization.
 
     def _visualize_selected_intersection(self, dataset_index, intersection_index):
         """Visualize a specific intersection by highlighting it in the embedded plotter."""
+        # Ensure plotter is valid
+        if not self._ensure_intersection_plotter_valid():
+            logger.warning("Intersection plotter not available for selection visualization.")
+            return
+        
         if not hasattr(self, 'intersection_plotter') or not self.intersection_plotter:
             logger.warning("Intersection plotter not available for selection visualization.")
             return
@@ -10508,8 +11468,70 @@ segmentation, triangulation, and visualization.
             plotter.add_text("Could not display selected intersection.", position='upper_edge', color='white')
             logger.warning("No content added when visualizing selected intersection.")
 
+    def _ensure_intersection_plotter_valid(self):
+        """Ensure intersection plotter exists and is valid, recreate if necessary."""
+        if not hasattr(self, 'intersection_plotter') or self.intersection_plotter is None:
+            # Plotter doesn't exist, create it
+            logger.info("Creating intersection plotter")
+            from pyvistaqt import QtInteractor
+            if hasattr(self, 'intersection_plot_layout'):
+                self.intersection_plotter = QtInteractor(self.intersection_view_frame)
+                self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
+                self.intersection_plotter.set_background('white')
+            return self.intersection_plotter is not None
+        
+        # Check if the Qt widget is still valid
+        try:
+            if hasattr(self.intersection_plotter, 'interactor') and self.intersection_plotter.interactor is not None:
+                # Try to access a property to see if Qt object is still alive
+                _ = self.intersection_plotter.interactor.isVisible()
+                return True
+            else:
+                # Qt widget was deleted, need to recreate
+                logger.info("Intersection plotter Qt widget deleted, recreating")
+                from pyvistaqt import QtInteractor
+                if hasattr(self, 'intersection_plot_layout'):
+                    # Clear old widget from layout
+                    while self.intersection_plot_layout.count():
+                        item = self.intersection_plot_layout.takeAt(0)
+                        widget = item.widget()
+                        if widget:
+                            widget.setParent(None)
+                            widget.deleteLater()
+                    QApplication.processEvents()
+                    
+                    self.intersection_plotter = QtInteractor(self.intersection_view_frame)
+                    self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
+                    self.intersection_plotter.set_background('white')
+                return self.intersection_plotter is not None
+        except RuntimeError as e:
+            # Qt object was deleted
+            logger.info(f"Intersection plotter Qt object deleted, recreating: {e}")
+            from pyvistaqt import QtInteractor
+            if hasattr(self, 'intersection_plot_layout'):
+                # Clear old widget from layout
+                while self.intersection_plot_layout.count():
+                    item = self.intersection_plot_layout.takeAt(0)
+                    widget = item.widget()
+                    if widget:
+                        widget.setParent(None)
+                        widget.deleteLater()
+                QApplication.processEvents()
+                import time
+                time.sleep(0.05)
+                
+                self.intersection_plotter = QtInteractor(self.intersection_view_frame)
+                self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
+                self.intersection_plotter.set_background('white')
+            return self.intersection_plotter is not None
+    
     def _visualize_intersections(self):
         """Visualize all intersections in the embedded PyVista plotter, matching triangulation style."""
+        # Ensure plotter is valid
+        if not self._ensure_intersection_plotter_valid():
+            logger.warning("Intersection plotter not available for visualization.")
+            return
+        
         if not hasattr(self, 'intersection_plotter') or not self.intersection_plotter:
             logger.warning("Intersection plotter not available for visualization.")
             return
@@ -10763,6 +11785,11 @@ segmentation, triangulation, and visualization.
 
     def _visualize_selected_intersection(self, dataset_index, intersection_index):
         """Visualize a specific intersection by highlighting it in the embedded plotter, matching triangulation style."""
+        # Ensure plotter is valid
+        if not self._ensure_intersection_plotter_valid():
+            logger.warning("Intersection plotter not available for selection visualization.")
+            return
+        
         if not hasattr(self, 'intersection_plotter') or not self.intersection_plotter:
             logger.warning("Intersection plotter not available for selection visualization.")
             return
@@ -13774,11 +14801,26 @@ segmentation, triangulation, and visualization.
 
     
     def _calculate_default_location(self):
-        """Calculate a default location based on surface centers."""
-        if not self.datasets:
+        """
+        Calculate a default location for new materials.
+        If existing materials exist, use the first location of the first material.
+        Otherwise, use 0,0,0 or surface center if available.
+        """
+        # Priority 1: Use existing material coordinates if available
+        if hasattr(self, 'tetra_materials') and self.tetra_materials:
+            # Get the first location from the first material
+            first_material = self.tetra_materials[0]
+            if first_material.get('locations') and len(first_material['locations']) > 0:
+                first_location = first_material['locations'][0]
+                if len(first_location) >= 3:
+                    # Return coordinates of existing material
+                    return [float(first_location[0]), float(first_location[1]), float(first_location[2])]
+        
+        # Priority 2: Use 0,0,0 if no materials exist
+        if not hasattr(self, 'datasets') or not self.datasets:
             return [0.0, 0.0, 0.0]
         
-        # Use center of all constrained surfaces
+        # Priority 3: Use center of all constrained surfaces as fallback
         all_coords = []
         for dataset in self.datasets:
             if 'constrained_vertices' in dataset:

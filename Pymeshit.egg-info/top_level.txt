@@ -1,3 +1,0 @@
-Pymeshit
-Pymeshit_workflow_gui
-main
