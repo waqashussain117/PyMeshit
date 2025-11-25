@@ -13236,11 +13236,12 @@ segmentation, triangulation, and visualization.
             return None
 
         # --------------- direct probe ------------- #
-        known_face_names   = ("f", "faces", "trifaces", "triangle_faces",
+        # NOTE: New tetgen library (v0.8+) removed aliases and uses only 'trifaces' and 'triface_markers'
+        # Old aliases: face_markers, trifacemarkers, facetmarkerlist, etc. - kept for backward compatibility
+        known_face_names   = ("trifaces", "f", "faces", "triangle_faces",
                               "shellfaces", "triface_list")
-        known_marker_names = ("face_markers", "trifacemarkers", "facetmarkerlist",
-                              "face_marker_list", "shell_face_markers",
-                              "triface_markers", "face_attributes")
+        known_marker_names = ("triface_markers", "face_markers", "trifacemarkers", "facetmarkerlist",
+                              "face_marker_list", "shell_face_markers", "face_attributes")
 
         faces = None
         marks = None
