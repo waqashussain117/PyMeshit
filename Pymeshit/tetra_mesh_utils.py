@@ -842,6 +842,11 @@ class TetrahedralMeshGenerator:
         - Material IDs MUST be sequential indices (0, 1, 2...) like C++ Mats array
         - This matches C++ where faults are facetmarkerlist[], formations are regionlist[]
         
+        NOTE: Fault detection is now MANUAL via GUI checkboxes (C++ style).
+        No automatic name-based fault detection. A material is only a fault if:
+        - Its 'type' field is explicitly set to 'FAULT'
+        - OR its surface index is in self.fault_surface_indices (from GUI checkboxes)
+        
         Returns:
             tuple: (volumetric_regions, surface_materials)
         """
@@ -866,19 +871,19 @@ class TetrahedralMeshGenerator:
             sorted_materials = sorted(self.materials, key=lambda m: m.get('attribute', 0))
             
             for material in sorted_materials:
-                material_name = material.get('name', '').lower()
+                material_name = material.get('name', '')
                 material_type = material.get('type', 'FORMATION')
                 locations = material.get('locations', [])
                 material_attribute = material.get('attribute', 0)  # Geological material ID
                 
-                # Check if this is a fault
-                is_fault = (material_type == 'FAULT' or 
-                           any(keyword in material_name for keyword in ['fault', 'fracture', 'crack', 'fissure']))
+                # Check if this is a fault - ONLY by explicit type, NOT by name (C++ style manual selection)
+                # Faults are marked via GUI checkboxes which set type='FAULT'
+                is_fault = (material_type == 'FAULT')
                 
                 if is_fault:
                     # CRITICAL: Faults are ONLY surface constraints - NO volumetric regions!
                     surface_materials.append(material)
-                    logger.info(f"Material {material_attribute} '{material_name}' -> FAULT (surface constraint only)")
+                    logger.info(f"Material {material_attribute} '{material_name}' -> FAULT (surface constraint only, manually selected)")
                     continue
                 
                 # ONLY formations/units get volumetric regions
@@ -889,16 +894,17 @@ class TetrahedralMeshGenerator:
                         volumetric_regions.append([float(loc[0]), float(loc[1]), float(loc[2]), region_id, 0])
                         self.region_attribute_map[region_id] = material_attribute
                         logger.info(
-                            f"Added 3D region seed {region_id} for '{material.get('name')}' "
+                            f"Added 3D region seed {region_id} for '{material_name}' "
                             f"(material ID {material_attribute})"
                         )
         
         max_region_id = max([int(region[3]) for region in volumetric_regions]) if volumetric_regions else -1
         logger.info(
-            f"✓ TRUE C++ Style: {len(volumetric_regions)} volumetric region seeds (region IDs 0-{max_region_id}) "
+            f"✓ C++ Style: {len(volumetric_regions)} volumetric region seeds (region IDs 0-{max_region_id}) "
             f"covering {len(set(self.region_attribute_map.values()))} formation material(s)"
         )
-        logger.info(f"✓ TRUE C++ Style: {len(surface_materials)} surface materials (faults only, surface constraints)")
+        logger.info(f"✓ C++ Style: {len(surface_materials)} surface materials (faults only, manually selected)")
+        logger.info(f"✓ C++ Style: {len(self.fault_surface_indices)} surface indices marked as faults via GUI")
         
         return volumetric_regions, surface_materials
 
