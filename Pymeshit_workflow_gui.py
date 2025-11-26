@@ -13637,8 +13637,8 @@ segmentation, triangulation, and visualization.
         file_path, file_filter = QFileDialog.getSaveFileName(
             self,
             "Export Tetrahedral Mesh",
-            "tetrahedral_mesh.vtk",
-            "VTK files (*.vtk);;VTU files (*.vtu);;PLY files (*.ply);;STL files (*.stl);;NetCDF files (*.nc);;EXODUS files (*.exo);;All files (*.*)"
+            "tetrahedral_mesh.vtm",
+            "VTM Multi-Block files (*.vtm);;VTK files (*.vtk);;VTU files (*.vtu);;PLY files (*.ply);;STL files (*.stl);;NetCDF files (*.nc);;EXODUS files (*.exo);;All files (*.*)"
         )
         
         if not file_path:
@@ -13659,9 +13659,26 @@ segmentation, triangulation, and visualization.
                 return
 
         try:
+            # Update generator with current materials (including faults with markers)
+            if hasattr(self, 'tetra_materials'):
+                self.tetra_mesh_generator.tetra_materials = self.tetra_materials
+                logger.info(f"Updated generator with {len(self.tetra_materials)} materials for export")
+            
             success = self.tetra_mesh_generator.export_mesh(file_path, self.tetrahedral_mesh)
             if success:
-                QMessageBox.information(self, "Export Successful", f"Tetrahedral mesh exported to:\n{file_path}")
+                # Provide helpful message about viewing in ParaView
+                file_ext = file_path.lower().split('.')[-1]
+                msg = f"Tetrahedral mesh exported to:\n{file_path}\n\n"
+                
+                if file_ext in ['vtm', 'vtu', 'vtk']:
+                    msg += "ParaView Tips:\n"
+                    msg += "• Color by 'MaterialID' to see different materials\n"
+                    msg += "• Color by 'CellType' to see tetrahedra(0) vs faults(1)\n"
+                    msg += "• Faults are embedded as triangles within the volume\n"
+                    msg += "• Use 'Extract Surface' or wireframe to see fault outlines\n"
+                    msg += "• Use 'Threshold' on MaterialID to isolate materials"
+                
+                QMessageBox.information(self, "Export Successful", msg)
             else:
                 QMessageBox.critical(self, "Export Error", "Failed to export mesh. Check logs for details.")
                 
