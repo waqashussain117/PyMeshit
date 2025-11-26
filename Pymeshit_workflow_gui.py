@@ -12959,10 +12959,10 @@ segmentation, triangulation, and visualization.
             return
 
         try:
-            # Clear existing tetrahedral mesh actors
+            # Clear existing tetrahedral mesh actors AND fault overlays
             actors_to_remove = []
             for name in list(self.tetra_plotter.actors.keys()):
-                if 'tetrahedral' in name:
+                if 'tetrahedral' in name or 'fault_overlay' in name:
                     actors_to_remove.append(name)
 
             for name in actors_to_remove:
@@ -13382,28 +13382,29 @@ segmentation, triangulation, and visualization.
         # Get selected material for color calculation
         selected_material_id = self._get_selected_material_id()
 
-        if show_materials:
-            # Check if MaterialID exists in surface mesh
-            has_material_id = hasattr(surface_mesh, 'cell_data') and 'MaterialID' in surface_mesh.cell_data
-            
-            if has_material_id:
-                unique_ids = np.unique(surface_mesh.cell_data['MaterialID'])
-                if len(unique_ids) > 1:
-                    # Multiple different material IDs - use colormap (only for solid mode)
+        # Check if MaterialID exists in surface mesh
+        has_material_id = hasattr(surface_mesh, 'cell_data') and 'MaterialID' in surface_mesh.cell_data
+        
+        if has_material_id:
+            unique_ids = np.unique(surface_mesh.cell_data['MaterialID'])
+            if len(unique_ids) > 1:
+                # Multiple different material IDs - use colormap (only for solid mode)
+                if show_materials:
                     scalars = 'MaterialID'
                     cmap = self._get_selected_colormap()
                     clim = self._get_full_material_clim()
                     show_scalar_bar = True
                     use_scalars_coloring = True
-                else:
-                    # Single material ID - compute color
-                    single_material_color = self._get_material_color(int(unique_ids[0]))
-                    logger.debug(f"Single MaterialID {unique_ids[0]} -> color: {single_material_color}")
-            
-            # Always compute color for selected material (for wireframe mode)
-            if selected_material_id != -1 and single_material_color is None:
-                single_material_color = self._get_material_color(selected_material_id)
-                logger.debug(f"Selected material {selected_material_id} -> color: {single_material_color}")
+            else:
+                # Single material ID - ALWAYS compute color from colormap
+                # This ensures faults and formations get proper colors even when show_materials is off
+                single_material_color = self._get_material_color(int(unique_ids[0]))
+                logger.debug(f"Single MaterialID {unique_ids[0]} -> color: {single_material_color}")
+        
+        # Also compute color for selected material (backup method)
+        if selected_material_id != -1 and single_material_color is None:
+            single_material_color = self._get_material_color(selected_material_id)
+            logger.debug(f"Selected material {selected_material_id} -> color: {single_material_color}")
 
         # Determine display color (for wireframe and single-material solid modes)
         display_color = single_material_color if single_material_color else 'lightgray'
@@ -13556,7 +13557,9 @@ segmentation, triangulation, and visualization.
                     continue
                 
                 # Get the color for this fault from the colormap
-                fault_color = self._get_material_color(material_id) if show_materials else 'gray'
+                # *** FIX: Always use colormap for faults regardless of show_materials setting ***
+                fault_color = self._get_material_color(material_id)
+                logger.debug(f"Fault {material_id} overlay color: {fault_color}")
                 
                 if show_wireframe:
                     self.tetra_plotter.add_mesh(
