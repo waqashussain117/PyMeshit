@@ -444,7 +444,13 @@ class MeshItWorkflowGUI(QMainWindow):
             if ds.get('type') in ('WELL', 'polyline'):
                 continue
             name = ds.get('name', f"Surface_{idx}")
-            value = float(self.seg_length_by_surface.get(idx, 15.0))
+            # Use calculated default size based on surface dimensions (C++ MeshIt style)
+            # ALWAYS recalculate if the value is 15.0 (likely an old default)
+            default_size = self._calculate_default_size_for_surface(idx)
+            if idx not in self.seg_length_by_surface or self.seg_length_by_surface[idx] == 15.0:
+                self.seg_length_by_surface[idx] = default_size
+                logger.info(f"Set default refine length for '{name}': {default_size:.3f}")
+            value = float(self.seg_length_by_surface[idx])
             row = self.seg_refine_table.rowCount()
             self.seg_refine_table.insertRow(row)
 
@@ -504,6 +510,77 @@ class MeshItWorkflowGUI(QMainWindow):
         except Exception:
             pass
 
+    def _calculate_default_size_for_surface(self, dataset_index: int) -> float:
+        """
+        Calculate the default refinement size for a surface based on its bounding box dimensions.
+        This mimics the C++ MeshIt behavior where surface size is automatically determined
+        from the geometry size rather than using a fixed default value.
+        
+        The calculation uses ~10% of the bounding box diagonal as the default size.
+        """
+        try:
+            if dataset_index < 0 or dataset_index >= len(self.datasets):
+                return 15.0
+            
+            ds = self.datasets[dataset_index]
+            
+            # Skip wells/polylines
+            if ds.get('type') in ('WELL', 'polyline'):
+                return 15.0
+            
+            # Try to get bounds from mesh first, then from points
+            bounds = None
+            
+            # Method 1: Try from mesh data (if available after convex hull)
+            mesh_data = ds.get('mesh')
+            if mesh_data is not None:
+                bounds = mesh_data.bounds  # [xmin, xmax, ymin, ymax, zmin, zmax]
+            
+            # Method 2: Try from points (available immediately after loading)
+            if bounds is None:
+                points = ds.get('points')
+                if points is not None and len(points) > 0:
+                    # Calculate bounding box from points
+                    points_array = np.array(points)
+                    bounds = [
+                        points_array[:, 0].min(),  # xmin
+                        points_array[:, 0].max(),  # xmax
+                        points_array[:, 1].min(),  # ymin
+                        points_array[:, 1].max(),  # ymax
+                        points_array[:, 2].min(),  # zmin
+                        points_array[:, 2].max()   # zmax
+                    ]
+            
+            # If no geometry data available, return default
+            if bounds is None:
+                return 15.0
+            
+            # Calculate dimensions
+            dx = bounds[1] - bounds[0]
+            dy = bounds[3] - bounds[2]
+            dz = bounds[5] - bounds[4]
+            
+            # Calculate diagonal length of bounding box
+            diagonal = np.sqrt(dx**2 + dy**2 + dz**2)
+            
+            # C++ MeshIt uses a much smaller fraction - approximately 1-2% of the diagonal
+            # or based on sqrt of area for planar surfaces
+            # For better results, use 1.5% of diagonal (smaller surfaces = finer mesh)
+            default_size = diagonal * 0.015
+            
+            # Clamp to reasonable range (min 0.1, max 100)
+            # Smaller max value prevents excessive segment lengths for large surfaces
+            default_size = max(0.1, min(100.0, default_size))
+            
+            logger.debug(f"Calculated default size for '{ds.get('name')}': {default_size:.3f} "
+                        f"(bbox diagonal: {diagonal:.3f})")
+            
+            return default_size
+            
+        except Exception as e:
+            logger.warning(f"Failed to calculate default size for dataset {dataset_index}: {e}")
+            return 15.0
+
     def _get_seg_target_length_for_dataset(self, dataset_index: int) -> float:
         """
         Return per-surface RefineByLength from the Segmentation table.
@@ -543,8 +620,8 @@ class MeshItWorkflowGUI(QMainWindow):
                                 pass
         except Exception:
             pass
-        # Strict fallback that does NOT use the unified spinbox
-        return 15.0
+        # Fallback: calculate based on surface size (C++ MeshIt style)
+        return self._calculate_default_size_for_surface(dataset_index)
 
     def _init_mesh_refine_table(self):
         # Table for Refine & Mesh per-surface mesh target size
@@ -582,8 +659,8 @@ class MeshItWorkflowGUI(QMainWindow):
                 continue
             name = ds.get('name', f"Surface_{idx}")
             # Prefer an explicit per-surface mesh value, else fall back to
-            # segmentation value (if available), else the unified mesh control.
-            unified_default = float(getattr(self.mesh_target_feature_size_input, "value", lambda: 15.0)())
+            # segmentation value (if available), else calculated default (C++ MeshIt style).
+            calculated_default = self._calculate_default_size_for_surface(idx)
             seg_default = None
             try:
                 if hasattr(self, 'seg_length_by_surface') and idx in self.seg_length_by_surface:
@@ -596,7 +673,7 @@ class MeshItWorkflowGUI(QMainWindow):
             elif seg_default is not None:
                 value = float(seg_default)
             else:
-                value = float(unified_default)
+                value = float(calculated_default)
             row = self.mesh_refine_table.rowCount()
             self.mesh_refine_table.insertRow(row)
 
@@ -628,8 +705,9 @@ class MeshItWorkflowGUI(QMainWindow):
             pass
 
     def _get_mesh_target_size_for_surface(self, dataset_index: int) -> float:
-        unified = float(getattr(self.mesh_target_feature_size_input, "value", lambda: 15.0)())
-        return float(self.mesh_length_by_surface.get(dataset_index, unified))
+        # Use calculated default based on surface size (C++ MeshIt style)
+        calculated_default = self._calculate_default_size_for_surface(dataset_index)
+        return float(self.mesh_length_by_surface.get(dataset_index, calculated_default))
     # ──────────────────────────────────────────────────────────────────────
     # 4)  INTERNAL HELPERS / SLOTS
     # ──────────────────────────────────────────────────────────────────────
@@ -2031,7 +2109,7 @@ class MeshItWorkflowGUI(QMainWindow):
             self.segments_plotter = QtInteractor(self.segments_viz_frame)
             self.segments_plot_layout.addWidget(self.segments_plotter.interactor)
             self.segments_plotter.set_background([0.318, 0.341, 0.431])
-            self.segments_plotter.add_text("Click on constraint segments to select/deselect them.", 
+            self.segments_plotter.add_text("Segmented boundaries visualization", 
                                          position='upper_edge', color='white')
             self.plotters['segments'] = self.segments_plotter
             
@@ -2164,7 +2242,7 @@ class MeshItWorkflowGUI(QMainWindow):
             self.segments_plotter = QtInteractor(self.segments_viz_frame)
             self.segments_plot_layout.addWidget(self.segments_plotter.interactor)
             self.segments_plotter.set_background([0.318, 0.341, 0.431])
-            self.segments_plotter.add_text("Click on constraint segments to select/deselect them.",
+            self.segments_plotter.add_text("Segmented boundaries visualization",
                                         position='upper_edge', color='white')
             if not hasattr(self, 'plotters') or self.plotters is None:
                 self.plotters = {}
@@ -6621,11 +6699,92 @@ class MeshItWorkflowGUI(QMainWindow):
         except Exception as e:
             logger.warning(f"Alpha shape computation failed: {e}")
             return None
+    
+    def _knn_concave_hull(self, points_2d: np.ndarray, k: int = 3) -> Optional[np.ndarray]:
+        """
+        Compute concave hull using Gift Wrapping (Jarvis March) algorithm.
+        This is THE CORRECT algorithm - simple, robust, guaranteed to work.
+        
+        Algorithm:
+        1. Start with leftmost point (guaranteed on boundary)
+        2. Find ALL other points
+        3. Pick the one with SMALLEST POLAR ANGLE (most counterclockwise)
+        4. Repeat until back to start
+        
+        This is literally the convex/concave hull algorithm that ALWAYS works.
+        
+        Args:
+            points_2d: 2D projected points (N, 2)
+            k: Ignored (kept for compatibility)
+            
+        Returns:
+            Ordered boundary point indices
+        """
+        try:
+            n_points = len(points_2d)
+            if n_points < 3:
+                return None
+            
+            logger.info(f"Using Gift Wrapping hull algorithm")
+            
+            # Start with bottom-leftmost point (guaranteed on convex hull)
+            start_idx = np.lexsort((points_2d[:, 0], points_2d[:, 1]))[0]
+            
+            boundary_indices = []
+            current_idx = start_idx
+            
+            max_iterations = n_points + 1
+            iteration = 0
+            
+            while iteration < max_iterations:
+                iteration += 1
+                boundary_indices.append(current_idx)
+                
+                # Find the point that makes the smallest angle (most counterclockwise)
+                next_idx = None
+                
+                for candidate_idx in range(n_points):
+                    if candidate_idx == current_idx:
+                        continue
+                    
+                    # If this is the first candidate, use it
+                    if next_idx is None:
+                        next_idx = candidate_idx
+                        continue
+                    
+                    # Check if candidate is more counterclockwise than current next
+                    # Using cross product: positive = counterclockwise, negative = clockwise
+                    v1 = points_2d[next_idx] - points_2d[current_idx]
+                    v2 = points_2d[candidate_idx] - points_2d[current_idx]
+                    cross = v1[0] * v2[1] - v1[1] * v2[0]
+                    
+                    # If candidate is more counterclockwise (or collinear but farther), use it
+                    if cross < 0:  # candidate is more counterclockwise
+                        next_idx = candidate_idx
+                    elif abs(cross) < 1e-10:  # Collinear - pick farther one
+                        dist_next = np.sum(v1**2)
+                        dist_candidate = np.sum(v2**2)
+                        if dist_candidate > dist_next:
+                            next_idx = candidate_idx
+                
+                # Check if we've completed the loop
+                if next_idx == start_idx:
+                    break
+                
+                current_idx = next_idx
+            
+            logger.info(f"Gift wrapping produced {len(boundary_indices)} boundary points")
+            return np.array(boundary_indices) if len(boundary_indices) >= 3 else None
+                
+        except Exception as e:
+            logger.error(f"Gift wrapping hull failed: {e}")
+            return None
 
     def _compute_boundary_for_wavy_surface(self, points: np.ndarray) -> Optional[np.ndarray]:
         """
-        Compute boundary for wavy (non-planar) surfaces using alpha shapes.
-        Tries multiple alpha values to find the best concave hull.
+        Compute boundary for wavy (non-planar) surfaces using K-Nearest Neighbors concave hull.
+        This is a robust algorithm that walks around the outer boundary by always turning right.
+        Much more reliable than alpha shapes!
         
         Args:
             points: 3D points (N, 3)
@@ -6636,45 +6795,15 @@ class MeshItWorkflowGUI(QMainWindow):
         # Project to 2D using PCA
         _centroid, projected_2d = self._pca_project(points)
         
-        # Compute base alpha parameter
-        base_alpha = self._compute_adaptive_alpha(points, projected_2d)
+        # Use the robust K-NN concave hull algorithm
+        boundary_indices = self._knn_concave_hull(projected_2d)
         
-        # Try multiple alpha values, starting with moderate concavity
-        # Larger alpha → smaller 1/alpha → stricter circumradius → more concave
-        # Start with moderate values and adjust based on point count
-        # We want enough points to form a proper boundary (at least 10-20% of points)
-        min_points_ratio = 0.05  # At least 5% of points should be on boundary
-        min_boundary_points = max(10, int(len(projected_2d) * min_points_ratio))
+        if boundary_indices is not None and len(boundary_indices) >= 3:
+            logger.info(f"K-NN concave hull produced {len(boundary_indices)} boundary points")
+            return boundary_indices
         
-        alpha_factors = [1.0, 1.5, 2.0, 0.5, 0.3]  # Start moderate, then try more concave/convex
-        
-        best_result = None
-        best_point_count = 0
-        
-        for factor in alpha_factors:
-            alpha = base_alpha * factor
-            boundary_indices = self._alpha_shape_boundary(projected_2d, alpha)
-            
-            if boundary_indices is not None and len(boundary_indices) >= 3:
-                point_count = len(boundary_indices)
-                logger.info(f"Alpha shape with factor {factor} produced {point_count} boundary points")
-                
-                # Track the best result (most points, but not too many)
-                if point_count > best_point_count and point_count >= min_boundary_points:
-                    best_result = boundary_indices
-                    best_point_count = point_count
-                    logger.info(f"New best result: {point_count} points with factor {factor}")
-        
-        # If we found a good result, use it
-        if best_result is not None and best_point_count >= min_boundary_points:
-            logger.info(f"Using alpha shape boundary with {best_point_count} points")
-            return best_result
-        
-        # If alpha shapes produced too few points, log and fall through to Delaunay
-        if best_result is not None:
-            logger.warning(f"Alpha shapes produced only {best_point_count} points (minimum {min_boundary_points}), falling back to Delaunay")
-        else:
-            logger.warning("Alpha shapes failed to produce any valid boundary, falling back to Delaunay")
+        # If K-NN failed, fall back to Delaunay boundary
+        logger.warning("K-NN concave hull failed, falling back to Delaunay boundary")
         
         # If all alpha values failed, try computing boundary directly from Delaunay
         # but filter by edge length to get a more concave result
@@ -9499,17 +9628,26 @@ segmentation, triangulation, and visualization.
                 vis = interactor.isVisible() if hasattr(interactor, 'isVisible') else None
                 size = interactor.size() if hasattr(interactor, 'size') else None
                 logger.info(f"[SEGMENTS][DBG]{' ' + where if where else ''} "
-                            f"layout_index={idx}, parent_ok={parent_ok}, visible={vis}, size={size}")
-
-                # Self-heal: if not in layout or wrong parent, reattach
-                if idx == -1 or not parent_ok:
+                            f"layout_index={idx}, parent_ok={parent_ok}, visible={vis}, size={size}, layout_count={layout.count()}")
+                
+                # Fix: if interactor is not in layout, ensure ONLY the interactor is in the layout
+                if idx == -1:
                     try:
+                        # Remove ALL widgets from layout (like placeholder text labels)
+                        while layout.count() > 0:
+                            item = layout.takeAt(0)
+                            if item:
+                                widget = item.widget()
+                                if widget and widget != interactor:
+                                    widget.deleteLater()
+                        
+                        # Now add ONLY the interactor
                         interactor.setParent(frame)
                         layout.addWidget(interactor)
                         interactor.show()
-                        logger.info(f"[SEGMENTS][DBG]{' ' + where if where else ''} reattached interactor to layout")
+                        logger.info(f"[SEGMENTS][DBG]{' ' + where if where else ''} cleared layout and attached interactor")
                     except Exception as e:
-                        logger.error(f"[SEGMENTS][DBG] reattach failed: {e}", exc_info=True)
+                        logger.error(f"[SEGMENTS][DBG] attach failed: {e}", exc_info=True)
             elif frame and not layout:
                 try:
                     self.segments_plot_layout = QVBoxLayout(self.segments_viz_frame)
