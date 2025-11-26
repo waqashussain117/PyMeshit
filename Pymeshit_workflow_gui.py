@@ -6932,8 +6932,8 @@ class MeshItWorkflowGUI(QMainWindow):
         """
         Compute (and store) the boundary poly-line for the selected dataset.
         - For 2D data, this computes the convex hull.
-        - For 3D planar surfaces, this finds the ordered boundary using Delaunay triangulation.
-        - For 3D wavy surfaces, this uses alpha shapes (concave hull) for better boundary detection.
+        - For 3D sheet-like data, this finds the ordered "rim" or "outline"
+        (which can be concave) by finding the boundary of a Delaunay triangulation.
         
         This version also identifies and marks geometric corners as "special points"
         immediately after calculation, preparing it for robust segmentation.
@@ -6967,79 +6967,52 @@ class MeshItWorkflowGUI(QMainWindow):
                 # Convert to 3D for consistency, setting Z=0
                 hull_pts_np = np.hstack([hull_pts_2d, np.zeros((len(hull_pts_2d), 1))])
 
-            # --- BRANCH 2: 3D Data (Handles Planar and Wavy Surfaces) ---
+            # --- BRANCH 2: 3D Data (Handles Convex and Concave Boundaries) ---
             else: # dim >= 3
-                # Detect if the surface is planar or wavy
-                # Use stricter tolerance (0.1) to better detect wavy surfaces
-                # Lower tolerance = stricter planar detection (more surfaces detected as wavy)
-                is_planar = self._is_quasi_planar(pts, tol=0.1)
+                logger.info(f"Computing 3D data boundary for '{ds.get('name')}' using Delaunay triangulation...")
+                # 1. Project all 3D points onto their best-fit 2D plane using PCA.
+                _centroid, projected_pts_2d = self._pca_project(pts)
+
+                # 2. Perform Delaunay triangulation on the 2D projected points.
+                tri = Delaunay(projected_pts_2d)
+
+                # 3. Find the boundary edges (edges that appear in only one triangle).
+                edges = set()
+                for simplex in tri.simplices:
+                    for j in range(3):
+                        p1_idx, p2_idx = simplex[j], simplex[(j + 1) % 3]
+                        edge = tuple(sorted((p1_idx, p2_idx)))
+                        if edge in edges:
+                            edges.remove(edge) # Internal edge, remove it.
+                        else:
+                            edges.add(edge) # Potential boundary edge.
                 
-                # Log the detection result for debugging
-                if is_planar:
-                    logger.info(f"Surface '{ds.get('name')}' detected as PLANAR (will use Delaunay method)")
+                if not edges:
+                    logger.warning("Delaunay method found no boundary edges. Falling back to convex hull on projected points.")
+                    hull = ConvexHull(projected_pts_2d)
+                    hull_pts_np = pts[hull.vertices]
                 else:
-                    logger.info(f"Surface '{ds.get('name')}' detected as WAVY (will use alpha shapes)")
-                
-                if is_planar:
-                    # For planar surfaces, use the efficient Delaunay boundary method
-                    logger.info(f"Computing 3D planar surface boundary for '{ds.get('name')}' using Delaunay triangulation...")
-                    # 1. Project all 3D points onto their best-fit 2D plane using PCA.
-                    _centroid, projected_pts_2d = self._pca_project(pts)
-
-                    # 2. Perform Delaunay triangulation on the 2D projected points.
-                    tri = Delaunay(projected_pts_2d)
-
-                    # 3. Find the boundary edges (edges that appear in only one triangle).
-                    edges = set()
-                    for simplex in tri.simplices:
-                        for j in range(3):
-                            p1_idx, p2_idx = simplex[j], simplex[(j + 1) % 3]
-                            edge = tuple(sorted((p1_idx, p2_idx)))
-                            if edge in edges:
-                                edges.remove(edge) # Internal edge, remove it.
-                            else:
-                                edges.add(edge) # Potential boundary edge.
+                    # 4. Stitch the unordered boundary edges into a continuous path.
+                    ordered_indices = []
+                    current_edge = edges.pop()
+                    ordered_indices.extend(list(current_edge))
                     
-                    if not edges:
-                        logger.warning("Delaunay method found no boundary edges. Falling back to convex hull on projected points.")
-                        hull = ConvexHull(projected_pts_2d)
-                        hull_pts_np = pts[hull.vertices]
-                    else:
-                        # 4. Stitch the unordered boundary edges into a continuous path.
-                        ordered_indices = []
-                        current_edge = edges.pop()
-                        ordered_indices.extend(list(current_edge))
-                        
-                        while edges:
-                            last_point_idx = ordered_indices[-1]
-                            found_next = False
-                            for edge in list(edges): # Iterate over a copy
-                                if last_point_idx in edge:
-                                    next_point_idx = edge[1] if edge[0] == last_point_idx else edge[0]
-                                    ordered_indices.append(next_point_idx)
-                                    edges.remove(edge)
-                                    found_next = True
-                                    break
-                            if not found_next:
-                                logger.warning("Boundary walk broken. The result might be incomplete or have multiple loops.")
+                    while edges:
+                        last_point_idx = ordered_indices[-1]
+                        found_next = False
+                        for edge in list(edges): # Iterate over a copy
+                            if last_point_idx in edge:
+                                next_point_idx = edge[1] if edge[0] == last_point_idx else edge[0]
+                                ordered_indices.append(next_point_idx)
+                                edges.remove(edge)
+                                found_next = True
                                 break
-                        
-                        # 5. Get the final ordered polyline from the original 3D points.
-                        hull_pts_np = pts[ordered_indices]
-                else:
-                    # For wavy surfaces, use alpha shapes for better boundary detection
-                    logger.info(f"Computing 3D wavy surface boundary for '{ds.get('name')}' using alpha shapes...")
-                    boundary_indices = self._compute_boundary_for_wavy_surface(pts)
+                        if not found_next:
+                            logger.warning("Boundary walk broken. The result might be incomplete or have multiple loops.")
+                            break
                     
-                    if boundary_indices is not None and len(boundary_indices) >= 3:
-                        # Get the final ordered polyline from the original 3D points
-                        hull_pts_np = pts[boundary_indices]
-                    else:
-                        # Fallback to convex hull if alpha shape fails
-                        logger.warning("Alpha shape method failed, falling back to convex hull for wavy surface.")
-                        _centroid, projected_pts_2d = self._pca_project(pts)
-                        hull = ConvexHull(projected_pts_2d)
-                        hull_pts_np = pts[hull.vertices]
+                    # 5. Get the final ordered polyline from the original 3D points.
+                    hull_pts_np = pts[ordered_indices]
 
             # --- Post-processing for BOTH cases ---
 
@@ -7072,6 +7045,8 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.error(f"Hull/Boundary computation failed for dataset {dataset_index}: {exc}")
             logger.debug(traceback.format_exc())
             return False
+
+
 
     
     def compute_hull(self):
