@@ -513,11 +513,17 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _calculate_default_size_for_surface(self, dataset_index: int) -> float:
         """
-        Calculate the default refinement size for a surface based on its bounding box dimensions.
-        This mimics the C++ MeshIt behavior where surface size is automatically determined
-        from the geometry size rather than using a fixed default value.
+        Calculate the default refinement size (RefineByLength) for a surface based on its 
+        bounding box dimensions. This matches the C++ MeshIt behavior from geometry.cpp:
         
-        The calculation uses ~10% of the bounding box diagonal as the default size.
+        C++ implementation (C_Surface::calculate_min_max and C_Polyline::calculate_min_max):
+            if (this->size == 0) size = length(max - min) / 16;
+        
+        The calculation uses the bounding box diagonal divided by 16, which equals 
+        approximately 6.25% of the diagonal length. This provides appropriate segment 
+        lengths for surface meshing that scale with the geometry size.
+        
+        Units: Same as input geometry (typically meters for geological models).
         """
         try:
             if dataset_index < 0 or dataset_index >= len(self.datasets):
@@ -525,9 +531,9 @@ class MeshItWorkflowGUI(QMainWindow):
             
             ds = self.datasets[dataset_index]
             
-            # Skip wells/polylines
+            # Skip wells/polylines - they use their own size calculation
             if ds.get('type') in ('WELL', 'polyline'):
-                return 15.0
+                return self._calculate_default_size_for_polyline(dataset_index)
             
             # Try to get bounds from mesh first, then from points
             bounds = None
@@ -556,30 +562,75 @@ class MeshItWorkflowGUI(QMainWindow):
             if bounds is None:
                 return 15.0
             
-            # Calculate dimensions
+            # Calculate dimensions (max - min vector components)
             dx = bounds[1] - bounds[0]
             dy = bounds[3] - bounds[2]
             dz = bounds[5] - bounds[4]
             
-            # Calculate diagonal length of bounding box
+            # Calculate diagonal length of bounding box: length(max - min)
             diagonal = np.sqrt(dx**2 + dy**2 + dz**2)
             
-            # C++ MeshIt uses a much smaller fraction - approximately 1-2% of the diagonal
-            # or based on sqrt of area for planar surfaces
-            # For better results, use 1.5% of diagonal (smaller surfaces = finer mesh)
-            default_size = diagonal * 0.015
+            # C++ MeshIt formula: size = length(max - min) / 16
+            # This equals approximately 6.25% of the diagonal
+            default_size = diagonal / 16.0
             
-            # Clamp to reasonable range (min 0.1, max 100)
-            # Smaller max value prevents excessive segment lengths for large surfaces
-            default_size = max(0.1, min(100.0, default_size))
+            # Apply reasonable bounds to prevent extreme values
+            # Minimum size prevents too fine meshes, maximum prevents too coarse
+            min_size = 0.1
+            max_size = diagonal / 4.0  # At most 25% of diagonal (very coarse)
+            default_size = max(min_size, min(max_size, default_size))
             
-            logger.debug(f"Calculated default size for '{ds.get('name')}': {default_size:.3f} "
-                        f"(bbox diagonal: {diagonal:.3f})")
+            logger.debug(f"Calculated default RefineByLength for '{ds.get('name')}': {default_size:.3f} "
+                        f"(bbox diagonal: {diagonal:.3f}, formula: diagonal/16)")
             
             return default_size
             
         except Exception as e:
             logger.warning(f"Failed to calculate default size for dataset {dataset_index}: {e}")
+            return 15.0
+    
+    def _calculate_default_size_for_polyline(self, dataset_index: int) -> float:
+        """
+        Calculate the default refinement size for a polyline (well) based on its extent.
+        This matches the C++ MeshIt behavior from geometry.cpp (C_Polyline::calculate_min_max):
+        
+            if (this->size == 0) this->size = length(max - min) / 16;
+        
+        For polylines, the bounding box diagonal divided by 16 provides appropriate 
+        segment lengths for well path discretization.
+        """
+        try:
+            if dataset_index < 0 or dataset_index >= len(self.datasets):
+                return 15.0
+            
+            ds = self.datasets[dataset_index]
+            points = ds.get('points')
+            
+            if points is None or len(points) < 2:
+                return 15.0
+            
+            points_array = np.array(points)
+            
+            # Calculate bounding box
+            min_pt = points_array.min(axis=0)
+            max_pt = points_array.max(axis=0)
+            
+            # Calculate diagonal: length(max - min)
+            diagonal = np.linalg.norm(max_pt - min_pt)
+            
+            # C++ formula: size = length(max - min) / 16
+            default_size = diagonal / 16.0
+            
+            # Apply bounds
+            default_size = max(0.1, min(diagonal / 4.0, default_size))
+            
+            logger.debug(f"Calculated default RefineByLength for polyline '{ds.get('name')}': "
+                        f"{default_size:.3f} (extent diagonal: {diagonal:.3f})")
+            
+            return default_size
+            
+        except Exception as e:
+            logger.warning(f"Failed to calculate default size for polyline {dataset_index}: {e}")
             return 15.0
 
     def _get_seg_target_length_for_dataset(self, dataset_index: int) -> float:
