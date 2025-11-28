@@ -510,6 +510,14 @@ class TetrahedralMeshGenerator:
             if self._is_valid_triangle(tri, global_vertices):
                 validated_facets.append(tri)
                 validated_facet_markers.append(global_facet_markers[i])
+        
+        # 6) CRITICAL: Remove duplicate/overlapping triangles (C++ MeshIt style)
+        # When two surfaces share an intersection, both might generate triangles
+        # at the same location. TetGen will fail if the same triangle exists twice
+        # with different facet markers.
+        validated_facets, validated_facet_markers = self._remove_duplicate_triangles(
+            validated_facets, validated_facet_markers, global_vertices
+        )
 
         # Final assignment
         self.plc_vertices = np.asarray(global_vertices, dtype=np.float64)
@@ -665,6 +673,127 @@ class TetrahedralMeshGenerator:
             
         except Exception:
             return False
+    
+    def _remove_duplicate_triangles(self, triangles, markers, vertices):
+        """
+        Remove duplicate and overlapping triangles from the PLC.
+        
+        This is critical for TetGen because overlapping facets with different markers
+        will cause meshing to fail. When two surfaces share an intersection line,
+        they can each generate triangles that are geometrically identical or very close.
+        
+        Strategy (C++ MeshIt style):
+        1. Remove exact duplicates (same vertex indices, regardless of order)
+        2. Remove geometrically duplicate triangles (same vertices, different indices due to tolerance)
+        3. When duplicates exist with different markers, keep one (prefer boundary over fault)
+        
+        Returns:
+            Tuple of (cleaned_triangles, cleaned_markers)
+        """
+        if len(triangles) == 0:
+            return triangles, markers
+        
+        # Ensure we're working with lists for consistent behavior
+        triangles = [list(t) for t in triangles]
+        markers = list(markers)
+        
+        logger.info(f"Checking {len(triangles)} triangles for duplicates/overlaps...")
+        
+        # Step 1: Remove exact duplicates (same vertex indices)
+        # Use frozenset to catch triangles with same vertices in any order
+        seen_index_sets = {}  # frozenset(tri) -> (first_index, marker)
+        index_duplicates = 0
+        duplicate_pairs = []  # For logging which surfaces are overlapping
+        
+        for i, tri in enumerate(triangles):
+            tri_set = frozenset(tri)
+            if tri_set in seen_index_sets:
+                index_duplicates += 1
+                orig_idx, orig_marker = seen_index_sets[tri_set]
+                curr_marker = markers[i]
+                if orig_marker != curr_marker:
+                    duplicate_pairs.append((orig_marker, curr_marker, tri))
+            else:
+                seen_index_sets[tri_set] = (i, markers[i])
+        
+        if index_duplicates > 0:
+            logger.warning(f"Found {index_duplicates} duplicate triangles (same vertex indices, different markers)")
+            # Log which surface pairs have overlapping triangles
+            marker_conflicts = {}
+            for orig_m, curr_m, tri in duplicate_pairs:
+                key = tuple(sorted([orig_m, curr_m]))
+                if key not in marker_conflicts:
+                    marker_conflicts[key] = 0
+                marker_conflicts[key] += 1
+            for (m1, m2), count in marker_conflicts.items():
+                logger.warning(f"  Surfaces {m1} and {m2}: {count} shared triangles")
+        
+        # Keep only unique triangles after index dedup
+        unique_indices = [info[0] for info in seen_index_sets.values()]
+        triangles = [triangles[i] for i in sorted(unique_indices)]
+        markers = [markers[i] for i in sorted(unique_indices)]
+        
+        # Step 2: Remove geometrically duplicate triangles
+        # Two triangles are geometric duplicates if their centroids and areas match closely
+        def get_triangle_signature(tri):
+            """Create a geometric signature for a triangle."""
+            try:
+                v0, v1, v2 = [np.array(vertices[idx]) for idx in tri]
+                centroid = (v0 + v1 + v2) / 3.0
+                edge1 = v1 - v0
+                edge2 = v2 - v0
+                area = 0.5 * np.linalg.norm(np.cross(edge1, edge2))
+                # Round to tolerance for comparison
+                cx, cy, cz = round(centroid[0], 6), round(centroid[1], 6), round(centroid[2], 6)
+                a = round(area, 6)
+                return (cx, cy, cz, a)
+            except Exception:
+                return None
+        
+        # Group triangles by their geometric signature
+        signature_to_tris = {}  # signature -> [(tri_index, marker), ...]
+        for i, tri in enumerate(triangles):
+            sig = get_triangle_signature(tri)
+            if sig is not None:
+                if sig not in signature_to_tris:
+                    signature_to_tris[sig] = []
+                signature_to_tris[sig].append((i, markers[i]))
+        
+        # For each group of geometric duplicates, keep only one
+        # Priority: boundary surfaces (lower marker) over faults (marker >= 1000)
+        kept_indices = set()
+        geometric_duplicates = 0
+        
+        for sig, tri_list in signature_to_tris.items():
+            if len(tri_list) == 1:
+                kept_indices.add(tri_list[0][0])
+            else:
+                geometric_duplicates += len(tri_list) - 1
+                # Sort by marker: prefer lower markers (boundary surfaces)
+                # Fault markers are >= 1000, so boundaries will be preferred
+                tri_list_sorted = sorted(tri_list, key=lambda x: x[1])
+                kept_indices.add(tri_list_sorted[0][0])
+                
+                # Log what we're removing
+                removed_markers = [m for _, m in tri_list_sorted[1:]]
+                kept_marker = tri_list_sorted[0][1]
+                logger.debug(f"Geometric duplicate: keeping marker {kept_marker}, removing markers {removed_markers}")
+        
+        if geometric_duplicates > 0:
+            logger.warning(f"Removed {geometric_duplicates} geometrically duplicate triangles (overlapping surfaces)")
+        
+        # Build final lists
+        final_triangles = []
+        final_markers = []
+        for i in sorted(kept_indices):
+            final_triangles.append(triangles[i])
+            final_markers.append(markers[i])
+        
+        total_removed = len(triangles) - len(final_triangles) + index_duplicates
+        if total_removed > 0:
+            logger.info(f"✓ Duplicate removal complete: {total_removed} triangles removed, {len(final_triangles)} remaining")
+        
+        return final_triangles, final_markers
 
     def _resolve_overlapping_triangles(self, triangles, markers, vertices):
         """
