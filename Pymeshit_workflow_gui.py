@@ -386,6 +386,60 @@ class MeshItWorkflowGUI(QMainWindow):
         h_loc_btns.addWidget(btn_del_loc)
         h_loc_btns.addWidget(btn_auto_loc)         # show the 3rd button
         v_main.addLayout(h_loc_btns)
+        
+        # 3.2-ter  Interactive mouse placement controls
+        mouse_group = QGroupBox("🖱️ Interactive Placement")
+        mouse_layout = QVBoxLayout(mouse_group)
+        
+        # Toggle button for mouse placement mode
+        self.material_mouse_mode_btn = QPushButton("🎯 Enable Mouse Placement")
+        self.material_mouse_mode_btn.setCheckable(True)
+        self.material_mouse_mode_btn.setChecked(False)
+        self.material_mouse_mode_btn.clicked.connect(self._toggle_material_mouse_mode)
+        self.material_mouse_mode_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4a4a4a;
+                color: white;
+                padding: 6px;
+                border: 2px solid #666;
+                border-radius: 4px;
+            }
+            QPushButton:checked {
+                background-color: #2e7d32;
+                border-color: #4caf50;
+            }
+            QPushButton:hover {
+                background-color: #5a5a5a;
+            }
+            QPushButton:checked:hover {
+                background-color: #388e3c;
+            }
+        """)
+        mouse_layout.addWidget(self.material_mouse_mode_btn)
+        
+        # Instructions label
+        self.material_mouse_instructions = QLabel(
+            "1. Select a material from the list above\n"
+            "2. Enable mouse placement (button above)\n"
+            "3. LEFT-CLICK on any surface to place seed\n"
+            "   → New location added automatically!"
+        )
+        self.material_mouse_instructions.setStyleSheet("color: #888; font-size: 10px;")
+        self.material_mouse_instructions.setWordWrap(True)
+        mouse_layout.addWidget(self.material_mouse_instructions)
+        
+        # Status label for mouse mode feedback
+        self.material_mouse_status = QLabel("")
+        self.material_mouse_status.setStyleSheet("color: #4caf50; font-weight: bold;")
+        mouse_layout.addWidget(self.material_mouse_status)
+        
+        v_main.addWidget(mouse_group)
+        
+        # Initialize mouse mode state
+        self._material_mouse_mode_active = False
+        self._material_drag_active = False
+        self._material_drag_seed_info = None  # (mat_idx, loc_idx) being dragged
+        
         # 3.3  coordinate editors
         gb_coord   = QGroupBox("Edit selected location")
         grid       = QGridLayout(gb_coord)
@@ -1244,11 +1298,11 @@ class MeshItWorkflowGUI(QMainWindow):
     def _update_material_visualisation(self) -> None:
         """
         Draw/refresh coloured spheres for every material seed.
-        Works with either self.constraint_plotter (main 3-D view in this tab)
-        or the fallback self.tetra_plotter.
+        Uses tetra_plotter in the Tetra Mesh tab.
         """
-        plotter = getattr(self, "constraint_plotter", None) or getattr(self, "tetra_plotter", None)
+        plotter = self._get_material_plotter()
         if not plotter:
+            logger.warning("No tetra_plotter available for material visualization")
             return
 
         # remove previous seed actors and highlights
@@ -1266,19 +1320,21 @@ class MeshItWorkflowGUI(QMainWindow):
                     cloud,
                     name=f"mat_seed_{midx}_{lidx}",
                     render_points_as_spheres=True,
-                    point_size=12,
+                    point_size=15,  # Slightly larger for visibility
                     color=colour,
                     reset_camera=False  # Don't reset camera when adding points
                 )
         plotter.render()
+        logger.debug(f"Updated material visualization: {len(self.tetra_materials)} materials")
     
     def _highlight_selected_material(self) -> None:
         """
         Highlight the currently selected material and location with a larger, 
         brighter sphere to show which seed point is active.
         """
-        plotter = getattr(self, "constraint_plotter", None) or getattr(self, "tetra_plotter", None)
+        plotter = self._get_material_plotter()
         if not plotter:
+            logger.warning("No plotter available for highlighting")
             return
         
         # Remove previous highlights
@@ -1291,7 +1347,8 @@ class MeshItWorkflowGUI(QMainWindow):
         loc_idx = self.material_location_list.currentRow()
         
         if mat_idx < 0 or mat_idx >= len(self.tetra_materials):
-            plotter.render()
+            if hasattr(plotter, 'render'):
+                plotter.render()
             return
         
         mat = self.tetra_materials[mat_idx]
@@ -1300,7 +1357,8 @@ class MeshItWorkflowGUI(QMainWindow):
             loc_idx = 0
         
         if loc_idx >= len(mat["locations"]):
-            plotter.render()
+            if hasattr(plotter, 'render'):
+                plotter.render()
             return
         
         # Add highlight sphere at selected location
@@ -1313,7 +1371,7 @@ class MeshItWorkflowGUI(QMainWindow):
             cloud,
             name="mat_highlight",
             render_points_as_spheres=True,
-            point_size=25,  # Larger than regular seeds
+            point_size=30,  # Larger than regular seeds for visibility
             color='gold',
             opacity=1.0,
             reset_camera=False  # Don't reset camera
@@ -1324,14 +1382,14 @@ class MeshItWorkflowGUI(QMainWindow):
         # Get bounds from plotter to compute adaptive radius
         try:
             bounds = plotter.bounds
-            if bounds:
-                # Use 1% of the diagonal as sphere radius
+            if bounds and all(b is not None for b in bounds):
+                # Use 1.5% of the diagonal as sphere radius
                 diagonal = ((bounds[1]-bounds[0])**2 + (bounds[3]-bounds[2])**2 + (bounds[5]-bounds[4])**2)**0.5
-                sphere_radius = max(diagonal * 0.01, 1.0)  # At least 1 unit
+                sphere_radius = max(diagonal * 0.015, 5.0)  # At least 5 units
             else:
-                sphere_radius = 10  # Fallback
+                sphere_radius = 50  # Larger fallback for geological scale
         except:
-            sphere_radius = 10  # Fallback
+            sphere_radius = 50  # Larger fallback
         
         sphere = pv.Sphere(radius=sphere_radius, center=xyz)
         plotter.add_mesh(
@@ -1339,22 +1397,22 @@ class MeshItWorkflowGUI(QMainWindow):
             name="mat_highlight_sphere",
             style='wireframe',
             color='yellow',
-            line_width=3,
-            opacity=0.6,
+            line_width=4,
+            opacity=0.8,
             reset_camera=False  # CRITICAL: Don't reset camera when adding mesh
         )
         
         # Render without auto-reset
         if hasattr(plotter, 'render'):
             plotter.render()
-        logger.info(f"Highlighted material {mat_idx} ('{mat['name']}'), location {loc_idx} at {xyz}")
+        logger.info(f"Highlighted material {mat_idx} ('{mat['name']}'), location {loc_idx} at ({xyz[0]:.1f}, {xyz[1]:.1f}, {xyz[2]:.1f})")
     
     def _update_single_material_seed(self, mat_idx: int, loc_idx: int, new_xyz: list) -> None:
         """
         Lightweight update that only moves a single seed point without redrawing everything.
         This makes slider movement smooth and prevents camera resets.
         """
-        plotter = getattr(self, "constraint_plotter", None) or getattr(self, "tetra_plotter", None)
+        plotter = self._get_material_plotter()
         if not plotter:
             return
         
@@ -1423,6 +1481,283 @@ class MeshItWorkflowGUI(QMainWindow):
         # Render without resetting camera
         if hasattr(plotter, 'render'):
             plotter.render()
+    
+    # ──────────────────────────────────────────────────────────────────────
+    # INTERACTIVE MOUSE PLACEMENT FOR MATERIALS
+    # ──────────────────────────────────────────────────────────────────────
+    
+    def _get_material_plotter(self):
+        """Get the tetra mesh plotter for material placement and visualization.
+        
+        Uses tetra_plotter which is the 3D view in the Tetra Mesh tab where 
+        conforming surfaces are displayed and materials are assigned.
+        """
+        # Use tetra_plotter - the 3D view in Tetra Mesh tab
+        plotter = getattr(self, "tetra_plotter", None)
+        if plotter and hasattr(plotter, 'render'):
+            return plotter
+        
+        # Fallback to constraint_plotter if tetra_plotter not available
+        plotter = getattr(self, "constraint_plotter", None)
+        return plotter
+    
+    def _toggle_material_mouse_mode(self, checked: bool) -> None:
+        """Toggle interactive mouse placement mode for material seeds."""
+        self._material_mouse_mode_active = checked
+        
+        # Get the tetra mesh plotter
+        plotter = self._get_material_plotter()
+        
+        if not plotter:
+            self.material_mouse_status.setText("Error: No 3D view available")
+            self.material_mouse_status.setStyleSheet("color: red;")
+            self.material_mouse_mode_btn.setChecked(False)
+            return
+        
+        if checked:
+            # Enable mouse mode
+            self.material_mouse_mode_btn.setText("🎯 Mouse Placement ACTIVE")
+            self.material_mouse_status.setText("Click on surface to place seed")
+            self.material_mouse_status.setStyleSheet("color: #4caf50; font-weight: bold;")
+            
+            # Enable picking - try surface/point picking first
+            try:
+                # Use enable_surface_point_picking for better precision on mesh surfaces
+                plotter.enable_surface_point_picking(
+                    callback=self._on_material_surface_pick,
+                    show_message=False,
+                    show_point=True,
+                    point_size=15,
+                    color='yellow',
+                    tolerance=0.025
+                )
+                logger.info("Material mouse placement mode enabled (surface point picking)")
+            except Exception as e:
+                logger.warning(f"Could not enable surface point picking: {e}")
+                # Try regular point picking
+                try:
+                    plotter.enable_point_picking(
+                        callback=self._on_material_mouse_click,
+                        show_message=False,
+                        use_picker=True,
+                        picker='point',
+                        tolerance=0.01,
+                        show_point=False
+                    )
+                    logger.info("Material mouse placement mode enabled (point picking)")
+                except Exception as e2:
+                    logger.warning(f"Could not enable point picking: {e2}")
+                    # Try cell picking as last resort
+                    try:
+                        plotter.enable_cell_picking(
+                            callback=self._on_material_cell_click,
+                            show_message=False
+                        )
+                        logger.info("Material mouse placement mode enabled (cell picking)")
+                    except Exception as e3:
+                        logger.error(f"Could not enable any picking mode: {e3}")
+                        self._material_mouse_mode_active = False
+                        self.material_mouse_mode_btn.setChecked(False)
+                        self.material_mouse_status.setText("Error: Picking not available")
+                        self.material_mouse_status.setStyleSheet("color: red;")
+                        return
+        else:
+            # Disable mouse mode
+            self.material_mouse_mode_btn.setText("🎯 Enable Mouse Placement")
+            self.material_mouse_status.setText("")
+            
+            try:
+                # Disable picking
+                plotter.disable_picking()
+            except:
+                pass
+            logger.info("Material mouse placement mode disabled")
+    
+    def _on_material_surface_pick(self, point) -> None:
+        """Handle surface point picking callback for material placement.
+        
+        Note: PyVista's enable_surface_point_picking only passes the point,
+        not (point, picker) like some older documentation suggests.
+        """
+        if not self._material_mouse_mode_active:
+            return
+        
+        if point is None:
+            self.material_mouse_status.setText("No point picked - click on a surface")
+            return
+        
+        # Use the picked point directly
+        import numpy as np
+        if isinstance(point, np.ndarray):
+            point = point.tolist()
+        
+        logger.info(f"Surface pick at: ({point[0]:.1f}, {point[1]:.1f}, {point[2]:.1f})")
+        self._process_material_pick(point)
+    
+    def _on_material_mouse_click(self, point) -> None:
+        """Handle mouse click in material placement mode - point picking callback."""
+        if not self._material_mouse_mode_active:
+            return
+        
+        if point is None:
+            return
+        
+        # Convert to list if numpy array
+        import numpy as np
+        if isinstance(point, np.ndarray):
+            point = point.tolist()
+        
+        self._process_material_pick(point)
+    
+    def _process_material_pick(self, point: list) -> None:
+        """Process a picked point for material placement or selection."""
+        if point is None:
+            return
+        
+        import numpy as np
+        if isinstance(point, np.ndarray):
+            point = point.tolist()
+        
+        # Check if we clicked near an existing seed (for selection)
+        seed_info = self._find_nearest_material_seed(point)
+        
+        if seed_info is not None:
+            mat_idx, loc_idx, distance = seed_info
+            # If close enough to an existing seed, select it
+            if distance < self._get_seed_pick_tolerance():
+                # Select this material and location in the lists
+                self.material_list.setCurrentRow(mat_idx)
+                self.material_location_list.setCurrentRow(loc_idx)
+                self.material_mouse_status.setText(f"Selected: {self.tetra_materials[mat_idx]['name']} loc {loc_idx}")
+                logger.info(f"Selected existing seed: material {mat_idx}, location {loc_idx}")
+                self._highlight_selected_material()
+                return
+        
+        # Place new seed at clicked point for current material
+        self._place_material_seed_at_point(point)
+    
+    def _on_material_cell_click(self, cell_data) -> None:
+        """Handle cell click callback (fallback if point picking fails)."""
+        if not self._material_mouse_mode_active:
+            return
+        
+        if cell_data is None:
+            return
+        
+        # Try to extract the center point of the clicked cell
+        try:
+            import numpy as np
+            if hasattr(cell_data, 'center'):
+                point = cell_data.center
+            elif hasattr(cell_data, 'points'):
+                point = np.mean(cell_data.points, axis=0)
+            else:
+                return
+            
+            self._process_material_pick(point)
+        except Exception as e:
+            logger.warning(f"Could not process cell click: {e}")
+    
+    def _find_nearest_material_seed(self, point: list) -> tuple:
+        """Find the nearest material seed to a given point.
+        
+        Returns:
+            Tuple of (mat_idx, loc_idx, distance) or None if no seeds exist
+        """
+        import numpy as np
+        
+        if not self.tetra_materials:
+            return None
+        
+        min_dist = float('inf')
+        nearest_seed = None
+        
+        for mat_idx, mat in enumerate(self.tetra_materials):
+            for loc_idx, loc in enumerate(mat.get("locations", [])):
+                dist = np.linalg.norm(np.array(point) - np.array(loc))
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest_seed = (mat_idx, loc_idx, dist)
+        
+        return nearest_seed
+    
+    def _get_seed_pick_tolerance(self) -> float:
+        """Calculate an appropriate pick tolerance based on scene scale."""
+        plotter = getattr(self, "constraint_plotter", None) or getattr(self, "tetra_plotter", None)
+        if not plotter:
+            return 50.0  # Default fallback
+        
+        try:
+            bounds = plotter.bounds
+            if bounds:
+                diagonal = ((bounds[1]-bounds[0])**2 + (bounds[3]-bounds[2])**2 + (bounds[5]-bounds[4])**2)**0.5
+                return diagonal * 0.02  # 2% of scene diagonal
+        except:
+            pass
+        
+        return 50.0
+    
+    def _place_material_seed_at_point(self, point: list) -> None:
+        """Place a new material seed at the given point for the currently selected material."""
+        mat_idx = self.material_list.currentRow()
+        
+        if mat_idx < 0:
+            # No material selected, select/create the first one
+            if not self.tetra_materials:
+                self._add_material()
+            mat_idx = 0
+            self.material_list.setCurrentRow(0)
+        
+        if mat_idx >= len(self.tetra_materials):
+            self.material_mouse_status.setText("Error: No material selected")
+            return
+        
+        mat = self.tetra_materials[mat_idx]
+        
+        # Add the new location
+        new_loc = [float(point[0]), float(point[1]), float(point[2])]
+        mat["locations"].append(new_loc)
+        
+        # Refresh the location list
+        self._refresh_location_list_only()
+        
+        # Select the new location
+        new_loc_idx = len(mat["locations"]) - 1
+        self.material_location_list.setCurrentRow(new_loc_idx)
+        
+        # Update visualization
+        self._update_material_visualisation()
+        self._highlight_selected_material()
+        self._update_coordinate_editors()
+        
+        self.material_mouse_status.setText(
+            f"Placed seed for '{mat['name']}' at ({point[0]:.1f}, {point[1]:.1f}, {point[2]:.1f})"
+        )
+        logger.info(f"Placed material seed for '{mat['name']}' at {new_loc}")
+    
+    def _move_selected_material_seed_to_point(self, point: list) -> None:
+        """Move the currently selected material seed to the given point."""
+        mat_idx = self.material_list.currentRow()
+        loc_idx = self.material_location_list.currentRow()
+        
+        if mat_idx < 0 or mat_idx >= len(self.tetra_materials):
+            return
+        
+        mat = self.tetra_materials[mat_idx]
+        if loc_idx < 0 or loc_idx >= len(mat["locations"]):
+            return
+        
+        # Update the location
+        new_loc = [float(point[0]), float(point[1]), float(point[2])]
+        mat["locations"][loc_idx] = new_loc
+        
+        # Update visualization without full refresh
+        self._update_single_material_seed(mat_idx, loc_idx, new_loc)
+        self._update_coordinate_editors()
+        
+        self.material_mouse_status.setText(
+            f"Moved seed to ({point[0]:.1f}, {point[1]:.1f}, {point[2]:.1f})"
+        )
     
     def _create_menu_bar(self):
         """Create the menu bar"""
@@ -12665,6 +13000,13 @@ segmentation, triangulation, and visualization.
         self.export_mesh_btn.setEnabled(False)
         generate_layout.addWidget(self.export_mesh_btn)
         
+        # Statistics button
+        self.mesh_statistics_btn = QPushButton("📊 Mesh Statistics")
+        self.mesh_statistics_btn.clicked.connect(self._show_mesh_statistics_dialog)
+        self.mesh_statistics_btn.setEnabled(False)
+        self.mesh_statistics_btn.setToolTip("Show detailed statistics about the generated mesh")
+        generate_layout.addWidget(self.mesh_statistics_btn)
+        
         control_layout.addWidget(generate_group)
         
         control_layout.addStretch()  # Push everything to the top
@@ -13491,6 +13833,7 @@ segmentation, triangulation, and visualization.
             
             QMessageBox.information(self, "Success", "Tetrahedral mesh generated successfully!")
             self.export_mesh_btn.setEnabled(True)
+            self.mesh_statistics_btn.setEnabled(True)  # Enable statistics button
             self._visualize_tetrahedral_mesh_in_tetra_tab()
             self._update_tetra_stats()
         else:
@@ -14064,6 +14407,364 @@ segmentation, triangulation, and visualization.
         except Exception as e:
             logger.error(f"Export failed: {str(e)}")
             QMessageBox.critical(self, "Export Error", f"Failed to export mesh:\n{str(e)}")
+
+    def _show_mesh_statistics_dialog(self):
+        """Show a dialog with detailed mesh statistics."""
+        if not hasattr(self, 'tetrahedral_mesh') or self.tetrahedral_mesh is None:
+            QMessageBox.warning(self, "No Mesh", "No tetrahedral mesh available. Generate a mesh first.")
+            return
+        
+        try:
+            import numpy as np
+            from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, 
+                                          QTableWidgetItem, QPushButton, QLabel, QTextEdit,
+                                          QHeaderView, QFileDialog, QGroupBox)
+            from PySide6.QtCore import Qt
+            
+            mesh = self.tetrahedral_mesh
+            
+            # Gather mesh statistics
+            stats = self._calculate_mesh_statistics(mesh)
+            
+            # Create dialog
+            dialog = QDialog(self)
+            dialog.setWindowTitle("📊 Mesh Statistics")
+            dialog.setMinimumSize(700, 600)
+            dialog.setModal(False)  # Allow interaction with main window
+            
+            main_layout = QVBoxLayout(dialog)
+            
+            # Title
+            title_label = QLabel("<h2>Tetrahedral Mesh Statistics</h2>")
+            title_label.setAlignment(Qt.AlignCenter)
+            main_layout.addWidget(title_label)
+            
+            # === General Statistics Table ===
+            general_group = QGroupBox("General Statistics")
+            general_layout = QVBoxLayout(general_group)
+            
+            general_table = QTableWidget()
+            general_table.setColumnCount(2)
+            general_table.setHorizontalHeaderLabels(["Property", "Value"])
+            general_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            general_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            general_table.setAlternatingRowColors(True)
+            
+            general_stats = [
+                ("Number of Points", f"{stats['n_points']:,}"),
+                ("Number of Elements (Total)", f"{stats['n_cells']:,}"),
+                ("0D Elements (Points)", f"{stats['n_0d']:,}" if stats['n_0d'] > 0 else "-"),
+                ("1D Elements (Lines)", f"{stats['n_1d']:,}" if stats['n_1d'] > 0 else "-"),
+                ("2D Elements (Triangles)", f"{stats['n_2d']:,}" if stats['n_2d'] > 0 else "-"),
+                ("3D Elements (Tetrahedra)", f"{stats['n_3d']:,}" if stats['n_3d'] > 0 else "-"),
+            ]
+            
+            general_table.setRowCount(len(general_stats))
+            for row, (prop, val) in enumerate(general_stats):
+                general_table.setItem(row, 0, QTableWidgetItem(prop))
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                general_table.setItem(row, 1, item)
+            
+            general_table.setMaximumHeight(200)
+            general_layout.addWidget(general_table)
+            main_layout.addWidget(general_group)
+            
+            # === Material Statistics Table ===
+            material_group = QGroupBox("Elements by Material")
+            material_layout = QVBoxLayout(material_group)
+            
+            material_table = QTableWidget()
+            material_table.setColumnCount(4)
+            material_table.setHorizontalHeaderLabels(["Material ID", "Material Name", "Type", "Elements"])
+            material_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            material_table.setAlternatingRowColors(True)
+            
+            material_stats = stats.get('material_stats', [])
+            material_table.setRowCount(len(material_stats))
+            
+            for row, mat_stat in enumerate(material_stats):
+                material_table.setItem(row, 0, QTableWidgetItem(str(mat_stat['id'])))
+                material_table.setItem(row, 1, QTableWidgetItem(mat_stat['name']))
+                material_table.setItem(row, 2, QTableWidgetItem(mat_stat['type']))
+                elem_item = QTableWidgetItem(f"{mat_stat['count']:,}")
+                elem_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                material_table.setItem(row, 3, elem_item)
+            
+            material_layout.addWidget(material_table)
+            main_layout.addWidget(material_group)
+            
+            # === Summary Text ===
+            summary_group = QGroupBox("Summary")
+            summary_layout = QVBoxLayout(summary_group)
+            
+            summary_text = QTextEdit()
+            summary_text.setReadOnly(True)
+            summary_text.setMaximumHeight(120)
+            
+            # Generate summary text
+            summary = self._generate_mesh_summary(stats)
+            summary_text.setPlainText(summary)
+            
+            summary_layout.addWidget(summary_text)
+            main_layout.addWidget(summary_group)
+            
+            # === Buttons ===
+            button_layout = QHBoxLayout()
+            
+            save_btn = QPushButton("💾 Save Statistics")
+            save_btn.clicked.connect(lambda: self._save_mesh_statistics(stats, summary))
+            button_layout.addWidget(save_btn)
+            
+            copy_btn = QPushButton("📋 Copy to Clipboard")
+            copy_btn.clicked.connect(lambda: self._copy_statistics_to_clipboard(stats, summary))
+            button_layout.addWidget(copy_btn)
+            
+            button_layout.addStretch()
+            
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(dialog.close)
+            button_layout.addWidget(close_btn)
+            
+            main_layout.addLayout(button_layout)
+            
+            dialog.show()
+            
+        except Exception as e:
+            logger.error(f"Failed to show mesh statistics: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Failed to generate mesh statistics:\n{str(e)}")
+    
+    def _calculate_mesh_statistics(self, mesh) -> dict:
+        """Calculate detailed statistics from the tetrahedral mesh."""
+        import numpy as np
+        
+        stats = {
+            'n_points': mesh.n_points,
+            'n_cells': mesh.n_cells,
+            'n_0d': 0,
+            'n_1d': 0,
+            'n_2d': 0,
+            'n_3d': 0,
+            'material_stats': []
+        }
+        
+        # Count elements by type
+        cell_types = mesh.celltypes
+        
+        # VTK cell types:
+        # 1 = VTK_VERTEX (0D)
+        # 2 = VTK_POLY_VERTEX (0D)
+        # 3 = VTK_LINE (1D)
+        # 4 = VTK_POLY_LINE (1D)
+        # 5 = VTK_TRIANGLE (2D)
+        # 9 = VTK_QUAD (2D)
+        # 10 = VTK_TETRA (3D)
+        # 12 = VTK_HEXAHEDRON (3D)
+        
+        stats['n_0d'] = np.sum((cell_types == 1) | (cell_types == 2))
+        stats['n_1d'] = np.sum((cell_types == 3) | (cell_types == 4))
+        stats['n_2d'] = np.sum((cell_types == 5) | (cell_types == 9) | (cell_types == 7))  # triangle, quad, polygon
+        stats['n_3d'] = np.sum((cell_types == 10) | (cell_types == 12) | (cell_types == 13) | (cell_types == 14))  # tetra, hex, wedge, pyramid
+        
+        # Material statistics
+        if 'MaterialID' in mesh.cell_data:
+            material_ids = mesh.cell_data['MaterialID']
+            unique_materials = np.unique(material_ids)
+            
+            # Get material names from tetra_materials if available
+            material_names = {}
+            material_types = {}
+            if hasattr(self, 'tetra_materials'):
+                for mat in self.tetra_materials:
+                    mat_id = mat.get('attribute', -1)
+                    material_names[mat_id] = mat.get('name', f'Material_{mat_id}')
+                    material_types[mat_id] = mat.get('type', 'FORMATION')
+            
+            for mat_id in sorted(unique_materials):
+                count = np.sum(material_ids == mat_id)
+                
+                # Determine element type for this material
+                mat_mask = material_ids == mat_id
+                mat_cell_types = cell_types[mat_mask]
+                
+                # Check if mostly 2D (fault) or 3D (formation)
+                n_2d_mat = np.sum((mat_cell_types == 5) | (mat_cell_types == 9))
+                n_3d_mat = np.sum((mat_cell_types == 10) | (mat_cell_types == 12))
+                
+                if n_2d_mat > n_3d_mat:
+                    elem_type = "2D (Fault)"
+                elif n_3d_mat > 0:
+                    elem_type = "3D (Formation)"
+                else:
+                    elem_type = "Mixed"
+                
+                stats['material_stats'].append({
+                    'id': int(mat_id),
+                    'name': material_names.get(int(mat_id), f'Material_{mat_id}'),
+                    'type': material_types.get(int(mat_id), elem_type),
+                    'count': int(count),
+                    'n_2d': int(n_2d_mat),
+                    'n_3d': int(n_3d_mat)
+                })
+        
+        return stats
+    
+    def _generate_mesh_summary(self, stats: dict) -> str:
+        """Generate a human-readable summary of the mesh statistics."""
+        lines = []
+        
+        lines.append(f"The mesh consists of approximately {stats['n_cells']:,} elements.")
+        lines.append("")
+        
+        # Breakdown by element type
+        if stats['n_2d'] > 0:
+            lines.append(f"• {stats['n_2d']:,} triangles represent fault surfaces")
+        if stats['n_3d'] > 0:
+            lines.append(f"• {stats['n_3d']:,} tetrahedra represent volumetric regions")
+        
+        lines.append("")
+        
+        # Breakdown by material
+        material_stats = stats.get('material_stats', [])
+        
+        # Separate faults and formations
+        faults = [m for m in material_stats if 'FAULT' in m.get('type', '').upper() or m.get('n_2d', 0) > m.get('n_3d', 0)]
+        formations = [m for m in material_stats if m not in faults]
+        
+        if faults:
+            fault_total = sum(f['count'] for f in faults)
+            lines.append(f"Fault surfaces ({len(faults)} faults): {fault_total:,} elements")
+            for f in faults:
+                lines.append(f"  - {f['name']}: {f['count']:,} triangles")
+        
+        if formations:
+            form_total = sum(f['count'] for f in formations)
+            lines.append(f"Geological units ({len(formations)} formations): {form_total:,} elements")
+            for f in formations:
+                lines.append(f"  - {f['name']}: {f['count']:,} tetrahedra")
+        
+        return "\n".join(lines)
+    
+    def _save_mesh_statistics(self, stats: dict, summary: str):
+        """Save mesh statistics to a file."""
+        from PySide6.QtWidgets import QFileDialog
+        
+        file_path, file_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save Mesh Statistics",
+            "mesh_statistics.csv",
+            "CSV files (*.csv);;Text files (*.txt);;All files (*.*)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            file_ext = file_path.lower().split('.')[-1]
+            
+            if file_ext == 'csv':
+                self._save_statistics_csv(file_path, stats)
+            else:
+                self._save_statistics_txt(file_path, stats, summary)
+            
+            QMessageBox.information(self, "Saved", f"Statistics saved to:\n{file_path}")
+            logger.info(f"Mesh statistics saved to: {file_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save statistics: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to save statistics:\n{str(e)}")
+    
+    def _save_statistics_csv(self, file_path: str, stats: dict):
+        """Save statistics in CSV format."""
+        import csv
+        
+        with open(file_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            
+            # General statistics
+            writer.writerow(["=== General Statistics ==="])
+            writer.writerow(["Property", "Value"])
+            writer.writerow(["Number of Points", stats['n_points']])
+            writer.writerow(["Number of Elements (Total)", stats['n_cells']])
+            writer.writerow(["0D Elements", stats['n_0d'] if stats['n_0d'] > 0 else "-"])
+            writer.writerow(["1D Elements", stats['n_1d'] if stats['n_1d'] > 0 else "-"])
+            writer.writerow(["2D Elements (Triangles)", stats['n_2d'] if stats['n_2d'] > 0 else "-"])
+            writer.writerow(["3D Elements (Tetrahedra)", stats['n_3d'] if stats['n_3d'] > 0 else "-"])
+            writer.writerow([])
+            
+            # Material statistics
+            writer.writerow(["=== Material Statistics ==="])
+            writer.writerow(["Material ID", "Material Name", "Type", "Elements", "2D Elements", "3D Elements"])
+            
+            for mat in stats.get('material_stats', []):
+                writer.writerow([
+                    mat['id'],
+                    mat['name'],
+                    mat['type'],
+                    mat['count'],
+                    mat.get('n_2d', 0),
+                    mat.get('n_3d', 0)
+                ])
+    
+    def _save_statistics_txt(self, file_path: str, stats: dict, summary: str):
+        """Save statistics in text format."""
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 60 + "\n")
+            f.write("TETRAHEDRAL MESH STATISTICS\n")
+            f.write("=" * 60 + "\n\n")
+            
+            f.write("GENERAL STATISTICS\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"Number of Points:           {stats['n_points']:>15,}\n")
+            f.write(f"Number of Elements (Total): {stats['n_cells']:>15,}\n")
+            f.write(f"0D Elements:                {stats['n_0d']:>15,}\n" if stats['n_0d'] > 0 else "0D Elements:                              -\n")
+            f.write(f"1D Elements:                {stats['n_1d']:>15,}\n" if stats['n_1d'] > 0 else "1D Elements:                              -\n")
+            f.write(f"2D Elements (Triangles):    {stats['n_2d']:>15,}\n" if stats['n_2d'] > 0 else "2D Elements (Triangles):                  -\n")
+            f.write(f"3D Elements (Tetrahedra):   {stats['n_3d']:>15,}\n" if stats['n_3d'] > 0 else "3D Elements (Tetrahedra):                 -\n")
+            f.write("\n")
+            
+            f.write("MATERIAL STATISTICS\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"{'ID':<6} {'Name':<25} {'Type':<15} {'Elements':>12}\n")
+            f.write("-" * 60 + "\n")
+            
+            for mat in stats.get('material_stats', []):
+                f.write(f"{mat['id']:<6} {mat['name']:<25} {mat['type']:<15} {mat['count']:>12,}\n")
+            
+            f.write("\n")
+            f.write("SUMMARY\n")
+            f.write("-" * 40 + "\n")
+            f.write(summary)
+            f.write("\n")
+    
+    def _copy_statistics_to_clipboard(self, stats: dict, summary: str):
+        """Copy statistics to clipboard."""
+        from PySide6.QtWidgets import QApplication
+        
+        text_lines = []
+        text_lines.append("TETRAHEDRAL MESH STATISTICS")
+        text_lines.append("=" * 40)
+        text_lines.append("")
+        text_lines.append(f"Number of Points:           {stats['n_points']:,}")
+        text_lines.append(f"Number of Elements (Total): {stats['n_cells']:,}")
+        text_lines.append(f"0D Elements:                {stats['n_0d']:,}" if stats['n_0d'] > 0 else "0D Elements:                -")
+        text_lines.append(f"1D Elements:                {stats['n_1d']:,}" if stats['n_1d'] > 0 else "1D Elements:                -")
+        text_lines.append(f"2D Elements (Triangles):    {stats['n_2d']:,}" if stats['n_2d'] > 0 else "2D Elements (Triangles):    -")
+        text_lines.append(f"3D Elements (Tetrahedra):   {stats['n_3d']:,}" if stats['n_3d'] > 0 else "3D Elements (Tetrahedra):   -")
+        text_lines.append("")
+        text_lines.append("MATERIALS:")
+        
+        for mat in stats.get('material_stats', []):
+            text_lines.append(f"  {mat['name']} (ID {mat['id']}): {mat['count']:,} elements ({mat['type']})")
+        
+        text_lines.append("")
+        text_lines.append("SUMMARY:")
+        text_lines.append(summary)
+        
+        clipboard = QApplication.clipboard()
+        clipboard.setText("\n".join(text_lines))
+        
+        self.statusBar().showMessage("Statistics copied to clipboard!", 3000)
 
 
     def _get_border_surface_indices(self) -> set:
