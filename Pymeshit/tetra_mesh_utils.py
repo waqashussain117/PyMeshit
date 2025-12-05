@@ -1431,6 +1431,12 @@ class TetrahedralMeshGenerator:
                 multi_block.append(volume_mesh, "Combined_Mesh")
                 multi_block.save(file_path)
                 logger.info(f"Saved combined mesh in VTM format: {file_path}")
+            elif file_ext == 'stl':
+                # STL: Export each PLC surface/fault as separate STL files
+                return self._export_surfaces_as_separate_stl(file_path)
+            elif file_ext in ['obj', 'ply']:
+                # OBJ and PLY: Export each PLC surface/fault as separate files
+                return self._export_surfaces_as_separate_files(file_path, file_ext)
             else:
                 # For other formats, use PyVista's default
                 volume_mesh.save(file_path)
@@ -1449,12 +1455,142 @@ class TetrahedralMeshGenerator:
             logger.error(f"Enhanced export failed: {e}", exc_info=True)
             # Fallback to simple export
             try:
-                mesh_data.save(file_path)
-                logger.warning("Fell back to simple export without material blocks")
+                file_ext = file_path.lower().split('.')[-1]
+                if file_ext in ['stl', 'obj', 'ply']:
+                    # Try separate surface export first
+                    if self.surface_data:
+                        return self._export_surfaces_as_separate_files(file_path, file_ext)
+                    else:
+                        # No surface data available, extract from volume mesh
+                        surface_mesh = mesh_data.extract_surface().triangulate()
+                        surface_mesh.save(file_path)
+                        logger.warning(f"Fell back to volume surface extraction for {file_ext.upper()} format")
+                else:
+                    mesh_data.save(file_path)
+                    logger.warning("Fell back to simple export without material blocks")
                 return True
             except Exception as e2:
                 logger.error(f"Simple export also failed: {e2}")
                 return False
+
+    def _export_surfaces_as_separate_stl(self, file_path: str) -> bool:
+        """
+        Export each PLC surface (conforming mesh) and fault as separate STL files.
+        
+        Instead of extracting the volume mesh surface, this exports the actual
+        triangulated PLC surfaces that were used to generate the tetrahedral mesh.
+        Each surface is exported as: basename_surfacename.stl
+        
+        Args:
+            file_path: Base file path for STL export (e.g., "mesh.stl")
+        
+        Returns:
+            bool: True if at least one surface was exported successfully
+        """
+        return self._export_surfaces_as_separate_files(file_path, 'stl')
+
+    def _export_surfaces_as_separate_files(self, file_path: str, file_ext: str) -> bool:
+        """
+        Export each PLC surface (conforming mesh) and fault as separate files.
+        
+        Args:
+            file_path: Base file path for export (e.g., "mesh.stl")
+            file_ext: File extension without dot (e.g., 'stl', 'obj', 'ply')
+        
+        Returns:
+            bool: True if at least one surface was exported successfully
+        """
+        import os
+        import numpy as np
+        import pyvista as pv
+        
+        # Get base name without extension
+        base_path = os.path.splitext(file_path)[0]
+        output_dir = os.path.dirname(file_path)
+        
+        logger.info(f"Exporting PLC surfaces as separate {file_ext.upper()} files...")
+        
+        exported_count = 0
+        total_triangles = 0
+        
+        # Get all surfaces (boundary + fault)
+        boundary_surfaces = (self.border_surface_indices | self.unit_surface_indices) & self.selected_surfaces
+        fault_surfaces = self.fault_surface_indices & self.selected_surfaces
+        all_surfaces = boundary_surfaces | fault_surfaces
+        
+        for s_idx in sorted(all_surfaces):
+            if s_idx not in self.surface_data:
+                logger.debug(f"Surface {s_idx} not found in surface_data, skipping")
+                continue
+            
+            conforming_mesh = self.surface_data[s_idx]
+            vertices = conforming_mesh.get('vertices')
+            triangles = conforming_mesh.get('triangles')
+            
+            if vertices is None or triangles is None or len(vertices) == 0 or len(triangles) == 0:
+                logger.debug(f"Surface {s_idx} has no valid mesh data, skipping")
+                continue
+            
+            # Get surface name
+            if s_idx < len(self.datasets):
+                surface_name = self.datasets[s_idx].get("name", f"Surface_{s_idx}")
+            else:
+                surface_name = f"Surface_{s_idx}"
+            
+            # Sanitize surface name for filename (remove invalid chars)
+            safe_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in surface_name)
+            
+            # Determine surface type for naming
+            if s_idx in fault_surfaces:
+                surface_type = "fault"
+            elif s_idx in self.border_surface_indices:
+                surface_type = "border"
+            else:
+                surface_type = "unit"
+            
+            # Create output filename
+            output_filename = f"{base_path}_{surface_type}_{safe_name}.{file_ext}"
+            
+            try:
+                # Create PyVista PolyData from vertices and triangles
+                vertices_np = np.array(vertices, dtype=np.float64)
+                triangles_np = np.array(triangles, dtype=np.int32)
+                
+                # Create faces array for PyVista (each face prefixed with number of vertices)
+                n_triangles = len(triangles_np)
+                faces = np.column_stack([
+                    np.full(n_triangles, 3, dtype=np.int32),
+                    triangles_np[:, 0],
+                    triangles_np[:, 1],
+                    triangles_np[:, 2]
+                ]).flatten()
+                
+                # Create PolyData mesh
+                surface_mesh = pv.PolyData(vertices_np, faces)
+                
+                # Add surface metadata
+                surface_mesh.field_data['SurfaceName'] = [surface_name]
+                surface_mesh.field_data['SurfaceIndex'] = [s_idx]
+                surface_mesh.field_data['SurfaceType'] = [surface_type]
+                
+                # Save the mesh
+                surface_mesh.save(output_filename)
+                
+                exported_count += 1
+                total_triangles += n_triangles
+                logger.info(f"  ✓ Exported {surface_type} '{surface_name}': {len(vertices_np)} vertices, {n_triangles} triangles → {os.path.basename(output_filename)}")
+                
+            except Exception as e:
+                logger.error(f"  ✗ Failed to export surface '{surface_name}': {e}")
+                continue
+        
+        if exported_count > 0:
+            logger.info(f"✓ Successfully exported {exported_count} surfaces ({total_triangles} total triangles) as {file_ext.upper()} files")
+            logger.info(f"  Output directory: {output_dir}")
+            return True
+        else:
+            logger.error("No surfaces could be exported")
+            return False
     
     def _extract_fault_surface_for_export(self, material_id: int):
         """Extract fault surface from TetGen for export (similar to GUI extraction)."""
