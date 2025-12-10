@@ -360,7 +360,8 @@ class TetrahedralMeshGenerator:
                             global_facet_markers.append(marker)
                             fault_marker_map[marker] = s_idx
                         else:
-                            global_facet_markers.append(s_idx)
+                            # Use 1-based markers to avoid collision with TetGen's internal marker 0
+                            global_facet_markers.append(s_idx + 1)
                         if s_idx in fault_surfaces:
                             for k in range(3):
                                 e = tuple(sorted((gtri[k], gtri[(k + 1) % 3])))
@@ -456,7 +457,8 @@ class TetrahedralMeshGenerator:
                             global_facet_markers.append(marker)
                             fault_marker_map[marker] = s_idx
                         else:
-                            global_facet_markers.append(s_idx)
+                            # Use 1-based markers to avoid collision with TetGen's internal marker 0
+                            global_facet_markers.append(s_idx + 1)
 
                 logger.info(f"✓ Fallback triangulation successful for '{surface_name}': {len(local_tris)} triangles")
 
@@ -1129,17 +1131,22 @@ class TetrahedralMeshGenerator:
 
     def _export_netcdf(self, file_path: str, mesh_data: pv.UnstructuredGrid) -> bool:
         """
-        Export tetrahedral mesh to NetCDF/EXODUS format following C++ MeshIt approach.
+        Export tetrahedral mesh to EXODUS II format for GOLEM/MOOSE/ParaView compatibility.
+        
+        This follows the EXODUS II specification with proper:
+        - Element Blocks: One per material domain with proper naming
+        - Sidesets: One per surface boundary for boundary conditions
+        - All required EXODUS II attributes for ParaView compatibility
 
         Args:
-            file_path: Path to save the NetCDF file
+            file_path: Path to save the EXODUS file (.exo)
             mesh_data: PyVista UnstructuredGrid containing the tetrahedral mesh
 
         Returns:
             bool: True if export successful, False otherwise
         """
         if not HAS_NETCDF:
-            logger.error("netCDF4 library not available. Cannot export to NetCDF format.")
+            logger.error("netCDF4 library not available. Cannot export to EXODUS format.")
             return False
 
         try:
@@ -1154,9 +1161,9 @@ class TetrahedralMeshGenerator:
                 logger.error("No tetrahedral cells found in mesh")
                 return False
 
-            # Extract tetrahedral cells only
-            tetra_indices = np.where(tetra_mask)[0]
+            # Extract tetrahedral cells and their connectivity
             tetra_cells = []
+            tetra_global_indices = []
             offset = 0
 
             for i, cell_type in enumerate(cell_types):
@@ -1164,6 +1171,7 @@ class TetrahedralMeshGenerator:
                     n_points = cells[offset]
                     cell_data = cells[offset:offset + n_points + 1]
                     tetra_cells.append(cell_data)
+                    tetra_global_indices.append(i)
                 offset += cells[offset] + 1
 
             tetra_cells = np.array(tetra_cells)
@@ -1173,92 +1181,401 @@ class TetrahedralMeshGenerator:
                 logger.error("No tetrahedral cells found after processing")
                 return False
 
-            # Extract connectivity for tetrahedra only (skip the first element which is the number of points)
+            # Extract material IDs from mesh data
+            material_ids = None
+            if 'MaterialID' in mesh_data.cell_data:
+                all_material_ids = mesh_data.cell_data['MaterialID']
+                material_ids = np.array([all_material_ids[idx] for idx in tetra_global_indices], dtype=np.int32)
+            else:
+                material_ids = np.ones(n_tetrahedra, dtype=np.int32)
+            
+            # Group tetrahedra by material
+            unique_materials = np.unique(material_ids)
+            num_elem_blk = len(unique_materials)
+            
+            # Build element blocks: {material_id: [tetra_indices]}
+            elem_blocks = {}
+            for mat_id in unique_materials:
+                elem_blocks[mat_id] = np.where(material_ids == mat_id)[0]
+            
+            logger.info(f"EXODUS export: {num_elem_blk} element blocks for materials {list(unique_materials)}")
+
+            # Build sidesets from TetGen surface triangles
+            sidesets = self._build_exodus_sidesets(mesh_data, tetra_cells, tetra_global_indices)
+            num_side_sets = len(sidesets)
+            logger.info(f"EXODUS export: {num_side_sets} sidesets for boundary surfaces")
+
+            # Extract connectivity for tetrahedra only
             connectivity = []
             for tetra_cell in tetra_cells:
-                connectivity.extend(tetra_cell[1:])  # Skip the first element (number of points)
-
+                connectivity.extend(tetra_cell[1:])
             connectivity = np.array(connectivity, dtype=np.int32)
 
-            # Create NetCDF file following C++ EXODUS structure
-            with nc.Dataset(file_path, 'w', format='NETCDF4') as rootgrp:
-                # Set global attributes (matching C++ version)
-                rootgrp.title = "MeshIt export"
-                rootgrp.api_version = "4.98"
-                rootgrp.version = "4.98"
-                rootgrp.floating_point_word_size = "8"
-                rootgrp.file_size = "0"
+            # Create EXODUS II file using NETCDF3_64BIT_OFFSET for maximum compatibility
+            with nc.Dataset(file_path, 'w', format='NETCDF3_64BIT_OFFSET') as rootgrp:
+                
+                # ========== EXODUS II REQUIRED GLOBAL ATTRIBUTES ==========
+                rootgrp.setncattr('api_version', np.float32(4.98))
+                rootgrp.setncattr('version', np.float32(4.98))
+                rootgrp.setncattr('floating_point_word_size', np.int32(8))
+                rootgrp.setncattr('file_size', np.int32(1))
+                rootgrp.setncattr('maximum_name_length', np.int32(32))
+                rootgrp.setncattr('int64_status', np.int32(0))
+                rootgrp.setncattr('title', 'PyMeshIt mesh for GOLEM/MOOSE')
 
-                # Dimensions (matching C++ structure)
-                rootgrp.createDimension("num_dim", 3)
-                rootgrp.createDimension("num_nodes", len(points))
-                rootgrp.createDimension("num_elem", n_tetrahedra)
-                rootgrp.createDimension("num_elem_blk", 1)  # Single block for now
-                rootgrp.createDimension("num_node_sets", 0)
-                rootgrp.createDimension("num_side_sets", 0)
-                rootgrp.createDimension("len_string", 33)
-                rootgrp.createDimension("len_line", 81)
-                rootgrp.createDimension("four", 4)
-                rootgrp.createDimension("time_step", None)  # unlimited
+                # ========== EXODUS II REQUIRED DIMENSIONS ==========
+                rootgrp.createDimension('len_string', 33)
+                rootgrp.createDimension('len_name', 33)
+                rootgrp.createDimension('len_line', 81)
+                rootgrp.createDimension('four', 4)
+                rootgrp.createDimension('num_dim', 3)
+                rootgrp.createDimension('num_nodes', len(points))
+                rootgrp.createDimension('num_elem', n_tetrahedra)
+                rootgrp.createDimension('num_el_blk', num_elem_blk)
+                rootgrp.createDimension('num_node_sets', 0)
+                rootgrp.createDimension('num_side_sets', num_side_sets)
+                rootgrp.createDimension('num_qa_rec', 1)
+                rootgrp.createDimension('time_step', 1)  # Fixed size for NETCDF3 compatibility
 
-                # Coordinate variables (matching C++ naming)
-                coordx = rootgrp.createVariable("coordx", "f8", ("num_nodes",))
-                coordy = rootgrp.createVariable("coordy", "f8", ("num_nodes",))
-                coordz = rootgrp.createVariable("coordz", "f8", ("num_nodes",))
-
+                # ========== COORDINATES ==========
+                coordx = rootgrp.createVariable('coordx', 'f8', ('num_nodes',))
+                coordy = rootgrp.createVariable('coordy', 'f8', ('num_nodes',))
+                coordz = rootgrp.createVariable('coordz', 'f8', ('num_nodes',))
                 coordx[:] = points[:, 0]
                 coordy[:] = points[:, 1]
                 coordz[:] = points[:, 2]
 
-                coordx.units = "mesh units"
-                coordy.units = "mesh units"
-                coordz.units = "mesh units"
+                # Coordinate names
+                coor_names = rootgrp.createVariable('coor_names', 'S1', ('num_dim', 'len_name'))
+                self._write_exodus_string_v2(coor_names, 0, 'x', 33)
+                self._write_exodus_string_v2(coor_names, 1, 'y', 33)
+                self._write_exodus_string_v2(coor_names, 2, 'z', 33)
 
-                # Coordinate names (matching C++ const_cast<char**>(ex.coord_names))
-                coor_names = rootgrp.createVariable("coor_names", "S1", ("num_dim", "len_string"))
-                coor_names[0, :] = b"xcoor"
-                coor_names[1, :] = b"ycoor"
-                coor_names[2, :] = b"zcoor"
+                # ========== ELEMENT BLOCK METADATA ==========
+                eb_status = rootgrp.createVariable('eb_status', 'i4', ('num_el_blk',))
+                eb_prop1 = rootgrp.createVariable('eb_prop1', 'i4', ('num_el_blk',))
+                eb_prop1.setncattr('name', 'ID')
+                
+                eb_names = rootgrp.createVariable('eb_names', 'S1', ('num_el_blk', 'len_name'))
 
-                # Element block info (matching C++ ex.ebids)
-                eb_prop1 = rootgrp.createVariable("eb_prop1", "i4", ("num_elem_blk",))
-                eb_prop1[0] = 1  # Default material ID
+                # CRITICAL: Build mapping from TetGen element index to EXODUS global element index
+                # This is needed because EXODUS stores elements grouped by blocks, but sidesets
+                # need to reference the EXODUS global element numbers
+                tetgen_to_exodus_elem = np.zeros(n_tetrahedra, dtype=np.int32)
+                exodus_elem_counter = 0
 
-                eb_names = rootgrp.createVariable("eb_names", "S1", ("num_elem_blk", "len_string"))
-                eb_names[0, :] = b"TETRA"
+                # Create element blocks
+                for blk_idx, mat_id in enumerate(unique_materials):
+                    mat_id_int = int(mat_id)
+                    block_tetra_indices = elem_blocks[mat_id]
+                    num_el_in_blk = len(block_tetra_indices)
+                    
+                    # Build the mapping: TetGen index -> EXODUS global index (0-based)
+                    for local_idx, tetgen_idx in enumerate(block_tetra_indices):
+                        tetgen_to_exodus_elem[tetgen_idx] = exodus_elem_counter + local_idx
+                    exodus_elem_counter += num_el_in_blk
+                    
+                    # Block ID and status
+                    eb_prop1[blk_idx] = mat_id_int + 1  # 1-based block IDs
+                    eb_status[blk_idx] = 1
+                    
+                    # Block name
+                    block_name = self._generate_block_name(mat_id_int)
+                    self._write_exodus_string_v2(eb_names, blk_idx, block_name, 33)
+                    
+                    # Create dimensions for this block
+                    blk_num = blk_idx + 1
+                    rootgrp.createDimension(f'num_el_in_blk{blk_num}', num_el_in_blk)
+                    rootgrp.createDimension(f'num_nod_per_el{blk_num}', 4)
+                    
+                    # Connectivity variable
+                    connect = rootgrp.createVariable(
+                        f'connect{blk_num}', 'i4',
+                        (f'num_el_in_blk{blk_num}', f'num_nod_per_el{blk_num}')
+                    )
+                    connect.setncattr('elem_type', 'TETRA4')
+                    
+                    # Write connectivity (1-based)
+                    for local_idx, global_tetra_idx in enumerate(block_tetra_indices):
+                        connect[local_idx, :] = connectivity[global_tetra_idx*4:(global_tetra_idx+1)*4] + 1
+                    
+                    logger.info(f"  Block {blk_num}: '{block_name}' - {num_el_in_blk} elements")
 
-                # Node number map (matching C++ ex.node_num_map)
-                node_num_map = rootgrp.createVariable("node_num_map", "i4", ("num_nodes",))
-                node_num_map[:] = np.arange(1, len(points) + 1, dtype=np.int32)
+                # ========== SIDESETS ==========
+                if num_side_sets > 0:
+                    ss_status = rootgrp.createVariable('ss_status', 'i4', ('num_side_sets',))
+                    ss_prop1 = rootgrp.createVariable('ss_prop1', 'i4', ('num_side_sets',))
+                    ss_prop1.setncattr('name', 'ID')
+                    ss_names = rootgrp.createVariable('ss_names', 'S1', ('num_side_sets', 'len_name'))
+                    
+                    for ss_idx, (surface_marker, sideset_data) in enumerate(sidesets.items()):
+                        elem_list = sideset_data['elem_list']
+                        side_list = sideset_data['side_list']
+                        surface_name = sideset_data['name']
+                        num_sides = len(elem_list)
+                        
+                        ss_num = ss_idx + 1
+                        ss_prop1[ss_idx] = int(surface_marker)
+                        ss_status[ss_idx] = 1
+                        self._write_exodus_string_v2(ss_names, ss_idx, surface_name, 33)
+                        
+                        # Create dimension for sideset
+                        rootgrp.createDimension(f'num_side_ss{ss_num}', num_sides)
+                        
+                        # Element and side lists
+                        # CRITICAL: Map TetGen element indices to EXODUS global indices
+                        elem_ss = rootgrp.createVariable(f'elem_ss{ss_num}', 'i4', (f'num_side_ss{ss_num}',))
+                        side_ss = rootgrp.createVariable(f'side_ss{ss_num}', 'i4', (f'num_side_ss{ss_num}',))
+                        
+                        # Convert TetGen indices to EXODUS indices (then add 1 for 1-based)
+                        exodus_elem_indices = tetgen_to_exodus_elem[np.array(elem_list)]
+                        elem_ss[:] = exodus_elem_indices + 1  # 1-based
+                        side_ss[:] = np.array(side_list, dtype=np.int32)
+                        
+                        logger.info(f"  Sideset {ss_num}: '{surface_name}' - {num_sides} faces")
 
-                # Connectivity (matching C++ ex_put_elem_conn)
-                connect1 = rootgrp.createVariable("connect1", "i4", ("num_elem", "four"))
-                for i in range(n_tetrahedra):
-                    # Convert to 1-based indexing (matching C++: (Mesh->tetrahedronlist[t * 4 + 0]) + 1)
-                    connect1[i, :] = connectivity[i*4:(i+1)*4] + 1
+                # ========== QA RECORDS ==========
+                qa_records = rootgrp.createVariable('qa_records', 'S1', ('num_qa_rec', 'four', 'len_string'))
+                import datetime
+                self._write_exodus_string_v2(qa_records[0], 0, 'PyMeshIt', 33)
+                self._write_exodus_string_v2(qa_records[0], 1, '1.0', 33)
+                self._write_exodus_string_v2(qa_records[0], 2, datetime.datetime.now().strftime('%m/%d/%y'), 33)
+                self._write_exodus_string_v2(qa_records[0], 3, datetime.datetime.now().strftime('%H:%M:%S'), 33)
 
-                # Element map (matching C++ ex_put_map)
-                elem_map = rootgrp.createVariable("elem_map", "i4", ("num_elem",))
-                elem_map[:] = np.arange(1, n_tetrahedra + 1, dtype=np.int32)
+                # ========== TIME VALUES (required for EXODUS II) ==========
+                time_whole = rootgrp.createVariable('time_whole', 'f8', ('time_step',))
+                time_whole[0] = 0.0  # Initial time step
 
-                # QA records (matching C++ style)
-                qa_records = rootgrp.createVariable("qa_records", "S1", ("num_elem_blk", "four", "len_string"))
-                qa_records[0, 0, :] = b"MeshIt"
-                qa_records[0, 1, :] = b"1.0"
-                qa_records[0, 2, :] = b"2024-01-01"
-                qa_records[0, 3, :] = b"00:00:00"
-
-                # Info records (matching C++ style)
-                rootgrp.createDimension("num_info", 1)
-                info_records = rootgrp.createVariable("info_records", "S1", ("num_info", "len_line"))
-                info_records[0, :] = b"Tetrahedral mesh generated by MeshIt Python"
-
-            logger.info(f"Tetrahedral mesh exported to NetCDF/EXODUS format: {file_path}")
+            logger.info(f"✓ EXODUS II mesh exported: {file_path}")
+            logger.info(f"  {n_tetrahedra} tetrahedra in {num_elem_blk} blocks, {num_side_sets} sidesets")
             return True
 
         except Exception as e:
-            logger.error(f"NetCDF export failed: {str(e)}")
+            logger.error(f"EXODUS export failed: {str(e)}", exc_info=True)
             return False
+
+    def _write_exodus_string_v2(self, var, idx, string, max_len):
+        """Write a string to an EXODUS character variable with proper null-padding."""
+        try:
+            # Truncate and encode
+            s = string[:max_len-1] if len(string) >= max_len else string
+            encoded = s.encode('ascii')
+            # Pad with null bytes
+            padded = encoded + b'\x00' * (max_len - len(encoded))
+            # Write character by character
+            for i, c in enumerate(padded):
+                var[idx, i] = bytes([c])
+        except Exception as e:
+            logger.warning(f"Failed to write EXODUS string '{string}': {e}")
+
+    def _generate_block_name(self, material_id: int) -> str:
+        """
+        Generate a meaningful block name for GOLEM/MOOSE compatibility.
+        
+        GOLEM expects block names that combine the bounding surfaces:
+        e.g., 'bottom_40m_granitoid_40m' for the domain between those surfaces.
+        """
+        # Try to get material name from materials list
+        mat_name = self._get_material_name_by_id(material_id)
+        
+        # If we have surface information, try to build a descriptive name
+        if hasattr(self, 'materials') and self.materials:
+            for mat in self.materials:
+                if mat.get('attribute') == material_id:
+                    # Get associated surfaces for this material
+                    mat_name = mat.get('name', f'material_{material_id}')
+                    # Try to get bounding surface names
+                    locations = mat.get('locations', [])
+                    if locations and hasattr(self, 'datasets'):
+                        # Find surfaces that bound this material
+                        bounding_surfaces = self._find_bounding_surfaces_for_material(material_id)
+                        if len(bounding_surfaces) >= 2:
+                            # GOLEM style: lower_surface_upper_surface
+                            names = [self._sanitize_surface_name(s) for s in bounding_surfaces[:2]]
+                            return '_'.join(names)
+                    break
+        
+        return self._sanitize_surface_name(mat_name)
+
+    def _sanitize_surface_name(self, name: str) -> str:
+        """Sanitize a surface/material name for EXODUS/GOLEM compatibility."""
+        if not name:
+            return "unnamed"
+        # Replace spaces and special characters
+        sanitized = name.replace(' ', '_').replace('-', '_').replace('.', '_')
+        # Remove any non-alphanumeric characters except underscore
+        sanitized = ''.join(c if c.isalnum() or c == '_' else '' for c in sanitized)
+        # Ensure it doesn't start with a number
+        if sanitized and sanitized[0].isdigit():
+            sanitized = 'surface_' + sanitized
+        return sanitized[:64] if sanitized else "unnamed"  # EXODUS name length limit
+
+    def _find_bounding_surfaces_for_material(self, material_id: int) -> List[str]:
+        """Find the surface names that bound a material region."""
+        bounding_surfaces = []
+        
+        if not hasattr(self, 'datasets') or not self.datasets:
+            return bounding_surfaces
+        
+        # Get material location
+        mat_location = None
+        if hasattr(self, 'materials') and self.materials:
+            for mat in self.materials:
+                if mat.get('attribute') == material_id:
+                    locations = mat.get('locations', [])
+                    if locations:
+                        mat_location = np.array(locations[0])
+                    break
+        
+        if mat_location is None:
+            return bounding_surfaces
+        
+        # Find surfaces closest to this material location
+        for s_idx in self.selected_surfaces:
+            if s_idx < len(self.datasets):
+                dataset = self.datasets[s_idx]
+                surface_name = dataset.get('name', f'Surface_{s_idx}')
+                # Add to bounding surfaces (simplified - could be improved with actual geometry)
+                if dataset.get('type') in ['UNIT', 'BORDER']:
+                    bounding_surfaces.append(surface_name)
+        
+        return bounding_surfaces[:2]  # Return at most 2 surfaces
+
+    def _build_exodus_sidesets(self, mesh_data: pv.UnstructuredGrid, 
+                               tetra_cells: np.ndarray, 
+                               tetra_global_indices: List[int]) -> Dict:
+        """
+        Build sidesets from TetGen surface triangles following C++ MeshIt approach.
+        
+        In EXODUS, a sideset contains:
+        - elem_list: Element (tetrahedron) indices
+        - side_list: Side numbers (1-4 for tetrahedra)
+        - name: Surface name for GOLEM boundary conditions
+        
+        C++ MeshIt approach:
+        1. Use TetGen's trifaces and triface_markers directly (these are the refined boundary faces)
+        2. Build a lookup from face vertex sets to tetrahedra
+        3. Match boundary faces to tetrahedra to get elem_list and side_list
+        """
+        sidesets = {}
+        
+        # Get TetGen's surface triangles and markers - these are the REFINED boundary faces
+        if not hasattr(self, 'tetgen_object') or self.tetgen_object is None:
+            logger.warning("No TetGen object available for sideset generation")
+            return sidesets
+            
+        try:
+            tet = self.tetgen_object
+            
+            # Get TetGen output data directly
+            trifaces = tet.trifaces if hasattr(tet, 'trifaces') else None
+            triface_markers = tet.triface_markers if hasattr(tet, 'triface_markers') else None
+            tetra_elements = tet.elem if hasattr(tet, 'elem') else None
+            
+            if trifaces is None or triface_markers is None or tetra_elements is None:
+                logger.warning("TetGen output data not available for sideset generation")
+                return sidesets
+                
+            if len(trifaces) == 0:
+                logger.warning("No boundary faces in TetGen output")
+                return sidesets
+                
+            logger.info(f"Building sidesets from {len(trifaces)} TetGen boundary faces")
+            
+            # Build lookup: frozenset of face nodes -> list of (tetra_idx, side_num)
+            # Use TetGen's element array directly (0-based indexing)
+            tetra_face_lookup = {}
+            
+            for tetra_idx, tetra_nodes in enumerate(tetra_elements):
+                # TetGen tetrahedra have 4 nodes: c1, c2, c3, c4
+                c1, c2, c3, c4 = tetra_nodes[0], tetra_nodes[1], tetra_nodes[2], tetra_nodes[3]
+                
+                # EXODUS side numbering (from C++ MeshIt exodus.cpp):
+                # Side 1: face opposite to c3 (face contains c1, c2, c4)
+                # Side 2: face opposite to c1 (face contains c2, c3, c4)
+                # Side 3: face opposite to c2 (face contains c1, c3, c4)
+                # Side 4: face opposite to c4 (face contains c1, c2, c3)
+                faces = [
+                    (frozenset([c1, c2, c4]), 1),  # opposite to c3
+                    (frozenset([c2, c3, c4]), 2),  # opposite to c1
+                    (frozenset([c1, c3, c4]), 3),  # opposite to c2
+                    (frozenset([c1, c2, c3]), 4),  # opposite to c4
+                ]
+                
+                for face_set, side_num in faces:
+                    if face_set not in tetra_face_lookup:
+                        tetra_face_lookup[face_set] = []
+                    tetra_face_lookup[face_set].append((tetra_idx, side_num))
+            
+            # Get unique surface markers
+            # With 1-based surface markers, marker 0 is truly internal/unmarked faces
+            # So we can safely exclude it
+            unique_markers = np.unique(triface_markers)
+            unique_markers = unique_markers[unique_markers > 0]  # Exclude internal faces (marker 0)
+            
+            logger.info(f"Found {len(unique_markers)} unique surface markers: {list(unique_markers)}")
+            
+            # Process each surface marker
+            matched_faces = 0
+            unmatched_faces = 0
+            
+            for marker in unique_markers:
+                marker_int = int(marker)
+                surface_name = self._get_surface_name_by_marker(marker_int)
+                
+                # Find all triangles with this marker
+                tri_indices = np.where(triface_markers == marker)[0]
+                
+                elem_list = []
+                side_list = []
+                
+                for tri_idx in tri_indices:
+                    tri_nodes = trifaces[tri_idx]
+                    tri_set = frozenset(tri_nodes)
+                    
+                    # Find tetrahedron owning this face
+                    if tri_set in tetra_face_lookup:
+                        # For boundary faces, there should be exactly one tetrahedron
+                        # Take the first (and usually only) match
+                        tetra_idx, side_num = tetra_face_lookup[tri_set][0]
+                        elem_list.append(tetra_idx)
+                        side_list.append(side_num)
+                        matched_faces += 1
+                    else:
+                        unmatched_faces += 1
+                
+                if elem_list:
+                    sidesets[marker_int] = {
+                        'elem_list': elem_list,
+                        'side_list': side_list,
+                        'name': surface_name
+                    }
+            
+            logger.info(f"Sideset building: {matched_faces} faces matched, {unmatched_faces} unmatched")
+            return sidesets
+            
+        except Exception as e:
+            logger.error(f"Failed to build sidesets from TetGen: {e}", exc_info=True)
+            return sidesets
+
+    def _get_surface_name_by_marker(self, marker: int) -> str:
+        """Get surface name from marker ID for sideset naming."""
+        # Check if marker is a fault marker (>= 1000)
+        if marker >= 1000:
+            surface_idx = marker - 1000
+        else:
+            # Regular surface markers are 1-based (marker = s_idx + 1)
+            # So surface_idx = marker - 1
+            surface_idx = marker - 1
+        
+        # Try to get name from datasets
+        if hasattr(self, 'datasets') and self.datasets:
+            if 0 <= surface_idx < len(self.datasets):
+                name = self.datasets[surface_idx].get('name', f'surface_{surface_idx}')
+                return self._sanitize_surface_name(name)
+        
+        # Fallback name
+        return f"surface_{marker}"
 
     def export_mesh(self, file_path: str, mesh_data: Optional[Dict] = None) -> bool:
         if mesh_data is None: mesh_data = self.tetrahedral_mesh
