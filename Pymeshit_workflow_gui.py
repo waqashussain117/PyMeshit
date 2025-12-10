@@ -1067,12 +1067,32 @@ class MeshItWorkflowGUI(QMainWindow):
         self.material_list.setCurrentRow(len(self.tetra_materials) - 1)
         self._refresh_material_list()
 
-    def _remove_material(self)->None:
-        row=self.material_list.currentRow()
-        if row>=0:
-            del self.tetra_materials[row]
-            self.material_list.setCurrentRow(max(0,len(self.tetra_materials)-1))
-            self._refresh_material_list()
+    def _remove_material(self) -> None:
+        """Remove the currently selected material and all its seed locations."""
+        row = self.material_list.currentRow()
+        if row < 0:
+            return
+        
+        material_name = self.tetra_materials[row].get('name', f'Material_{row}')
+        num_locations = len(self.tetra_materials[row].get('locations', []))
+        
+        # Delete the material from data
+        del self.tetra_materials[row]
+        
+        # Refresh visualization to remove all actors for this material
+        # (actors for materials with higher indices need to be renamed anyway)
+        plotter = self._get_material_plotter()
+        if plotter:
+            self._update_material_visualisation()
+        
+        # Update selection
+        self.material_list.setCurrentRow(max(0, len(self.tetra_materials) - 1))
+        self._refresh_material_list()
+        
+        # Update highlight
+        self._highlight_selected_material()
+        
+        logger.info(f"Removed material '{material_name}' with {num_locations} seed locations")
 
     def _add_location(self) -> None:
         """Append a new seed point to the currently selected material."""
@@ -1101,13 +1121,39 @@ class MeshItWorkflowGUI(QMainWindow):
         )
         self._refresh_material_list()
 
-    def _remove_location(self)->None:
-        m=self.material_list.currentRow()
-        l=self.material_location_list.currentRow()
-        if m<0 or l<0: return
+    def _remove_location(self) -> None:
+        """Remove the currently selected seed location from the material."""
+        m = self.material_list.currentRow()
+        l = self.material_location_list.currentRow()
+        if m < 0 or l < 0:
+            return
+        
+        # Get the actor name before deleting
+        actor_name = f"mat_seed_{m}_{l}"
+        
+        # Delete the location from data
         del self.tetra_materials[m]["locations"][l]
-        self.material_location_list.setCurrentRow(max(0,len(self.tetra_materials[m]["locations"])-1))
+        
+        # Remove the specific actor from the plotter
+        plotter = self._get_material_plotter()
+        if plotter:
+            # Remove the specific seed actor
+            if actor_name in plotter.actors:
+                plotter.remove_actor(actor_name)
+            
+            # Also need to rename remaining actors for this material since indices shifted
+            # It's easier to just refresh all actors for this material
+            self._update_material_visualisation()
+        
+        # Update the location list selection
+        self.material_location_list.setCurrentRow(max(0, len(self.tetra_materials[m]["locations"]) - 1))
         self._refresh_material_list()
+        
+        # Update highlight to reflect new selection
+        self._highlight_selected_material()
+        
+        logger.info(f"Removed location {l} from material {m} ('{self.tetra_materials[m]['name']}')")
+    
     def _calculate_slider_ranges(self) -> tuple:
         """
         Calculate dynamic slider ranges based on all material coordinates.
@@ -9684,14 +9730,15 @@ segmentation, triangulation, and visualization.
             
             # Prepare project data
             project_data = {
-                'version': '1.0',  # Project file version for future compatibility
+                'version': '1.1',  # Project file version for future compatibility (1.1 adds tetra_materials)
                 'datasets': self.datasets,
                 'current_dataset_index': self.current_dataset_index,
                 'current_tab_index': self.notebook.currentIndex(),
                 'datasets_intersections': getattr(self, 'datasets_intersections', {}),
                 'seg_length_by_surface': getattr(self, 'seg_length_by_surface', {}),
                 'mesh_size_by_surface': getattr(self, 'mesh_size_by_surface', {}),
-                'tetra_mesh_data': getattr(self, 'tetra_mesh_data', None)
+                'tetra_mesh_data': getattr(self, 'tetra_mesh_data', None),
+                'tetra_materials': getattr(self, 'tetra_materials', [])  # Save material seed locations
             }
             
             # Save to file using pickle
@@ -9799,9 +9846,17 @@ segmentation, triangulation, and visualization.
             # Restore tetrahedral mesh data
             self.tetra_mesh_data = project_data.get('tetra_mesh_data', None)
             
+            # Restore material seed locations (added in version 1.1)
+            self.tetra_materials = project_data.get('tetra_materials', [])
+            logger.info(f"Loaded {len(self.tetra_materials)} material definitions with seed locations")
+            
             # Step 5: Update UI elements (without triggering visualizations yet)
             self._update_dataset_list()
             self._update_statistics()
+            
+            # Update material list if we have materials
+            if hasattr(self, '_refresh_material_list') and self.tetra_materials:
+                self._refresh_material_list()
             
             # Update refinement tables if they exist
             if hasattr(self, '_refresh_seg_refine_table'):
@@ -14449,11 +14504,20 @@ segmentation, triangulation, and visualization.
         if has_material_id:
             unique_ids = np.unique(surface_mesh.cell_data['MaterialID'])
             if len(unique_ids) > 1:
-                # Multiple different material IDs - use colormap (only for solid mode)
+                # Multiple different material IDs - use discrete colormap (only for solid mode)
                 if show_materials:
-                    scalars = 'MaterialID'
-                    cmap = self._get_selected_colormap()
-                    clim = self._get_full_material_clim()
+                    # Apply discrete colors to ensure distinct colors per material
+                    discrete_colors = self._apply_discrete_material_colors_to_mesh(surface_mesh)
+                    if discrete_colors is not None:
+                        surface_mesh.cell_data['MaterialColors'] = discrete_colors
+                        scalars = 'MaterialColors'
+                        cmap = None  # Use RGB colors directly
+                        clim = None
+                    else:
+                        # Fallback to colormap approach
+                        scalars = 'MaterialID'
+                        cmap = self._get_selected_colormap()
+                        clim = self._get_full_material_clim()
                     show_scalar_bar = True
                     use_scalars_coloring = True
             else:
@@ -14485,19 +14549,36 @@ segmentation, triangulation, and visualization.
         else:
             # Solid mode
             if use_scalars_coloring and scalars is not None:
-                # Multiple materials - use colormap with scalar bar
-                self.tetra_plotter.add_mesh(
-                    surface_mesh,
-                    scalars=scalars,
-                    cmap=cmap,
-                    clim=clim,
-                    opacity=opacity,
-                    show_edges=True,
-                    edge_color='black',
-                    line_width=0.5,
-                    scalar_bar_args={'title': 'Material ID'},
-                    name='tetrahedral_surface'
-                )
+                # Multiple materials - use discrete colormap for distinct colors
+                if scalars == 'MaterialColors':
+                    # RGB colors directly - use without colormap
+                    self.tetra_plotter.add_mesh(
+                        surface_mesh,
+                        scalars=scalars,
+                        rgb=True,  # Interpret scalars as RGB colors
+                        opacity=opacity,
+                        show_edges=True,
+                        edge_color='black',
+                        line_width=0.5,
+                        show_scalar_bar=False,  # RGB doesn't use scalar bar
+                        name='tetrahedral_surface'
+                    )
+                    # Add a custom legend for materials instead of scalar bar
+                    self._add_material_legend_to_plotter()
+                else:
+                    # Fallback: use colormap with scalar bar
+                    self.tetra_plotter.add_mesh(
+                        surface_mesh,
+                        scalars=scalars,
+                        cmap=cmap,
+                        clim=clim,
+                        opacity=opacity,
+                        show_edges=True,
+                        edge_color='black',
+                        line_width=0.5,
+                        scalar_bar_args={'title': 'Material ID'},
+                        name='tetrahedral_surface'
+                    )
             elif single_material_color is not None:
                 # Single material - use computed color
                 self.tetra_plotter.add_mesh(
@@ -14551,19 +14632,32 @@ segmentation, triangulation, and visualization.
                 
                 # Also add very transparent faces to show volume structure
                 if show_materials and 'MaterialID' in internal_cells.cell_data:
-                    # Show material colors on internal faces (no scalar bar to avoid duplicates)
-                    # *** CRITICAL FIX: Use full material range for consistent colors ***
-                    clim = self._get_full_material_clim()
-                    self.tetra_plotter.add_mesh(
-                        internal_cells,
-                        scalars='MaterialID',
-                        cmap=self._get_selected_colormap(),  # Use user-selected colormap
-                        clim=clim,  # Use full material range for consistent colors
-                        opacity=0.12,  # Very transparent to see through
-                        show_edges=False,
-                        show_scalar_bar=False,  # Prevent duplicate scalar bars
-                        name='tetrahedral_internal_faces'
-                    )
+                    # *** DISCRETE COLORS: Apply distinct colors per material ***
+                    discrete_colors = self._apply_discrete_material_colors_to_mesh(internal_cells)
+                    if discrete_colors is not None:
+                        internal_cells.cell_data['MaterialColors'] = discrete_colors
+                        self.tetra_plotter.add_mesh(
+                            internal_cells,
+                            scalars='MaterialColors',
+                            rgb=True,  # Interpret as RGB colors
+                            opacity=0.12,  # Very transparent to see through
+                            show_edges=False,
+                            show_scalar_bar=False,
+                            name='tetrahedral_internal_faces'
+                        )
+                    else:
+                        # Fallback: use colormap approach
+                        clim = self._get_full_material_clim()
+                        self.tetra_plotter.add_mesh(
+                            internal_cells,
+                            scalars='MaterialID',
+                            cmap=self._get_selected_colormap(),
+                            clim=clim,
+                            opacity=0.12,
+                            show_edges=False,
+                            show_scalar_bar=False,
+                            name='tetrahedral_internal_faces'
+                        )
                 else:
                     # Show uniform transparent faces if no materials
                     self.tetra_plotter.add_mesh(
@@ -15122,6 +15216,15 @@ segmentation, triangulation, and visualization.
                                           QTabWidget, QWidget, QFormLayout, QColorDialog,
                                           QSlider, QRadioButton, QButtonGroup)
             from PySide6.QtCore import Qt
+            
+            # Capture the current camera position from tetra_plotter BEFORE opening dialog
+            self._captured_camera_position = None
+            if hasattr(self, 'tetra_plotter') and self.tetra_plotter is not None:
+                try:
+                    self._captured_camera_position = self.tetra_plotter.camera_position
+                    logger.info(f"Captured tetra_plotter camera position for export")
+                except Exception as e:
+                    logger.warning(f"Could not capture camera position: {e}")
             
             dialog = QDialog(self)
             dialog.setWindowTitle("📸 Export High-Quality Figure")
@@ -15717,51 +15820,57 @@ segmentation, triangulation, and visualization.
         # Get the actual range of MaterialID for proper colorbar limits
         clim = None
         n_materials = 1
+        use_discrete_colors = False
         if color_by == "MaterialID" and "MaterialID" in mesh.cell_data:
             unique_vals = np.unique(mesh.cell_data["MaterialID"])
             n_materials = len(unique_vals)
             clim = [int(unique_vals.min()), int(unique_vals.max())]
+            use_discrete_colors = self.fig_discrete_cbar.isChecked()
         
-        # Common mesh parameters
-        mesh_params = {
-            'cmap': cmap,
-            'style': style,
-            'edge_color': self._fig_edge_color,
-            'line_width': 1.0 if show_edges or render_style == "Wireframe" else 0,
-            'ambient': self.fig_ambient.value(),
-            'specular': self.fig_specular.value(),
-            'show_edges': show_edges and style == 'surface',
-        }
-        
-        # Add clim if we have MaterialID
-        if clim is not None:
-            mesh_params['clim'] = clim
-        
-        # For discrete materials, create discrete colormap
-        if self.fig_discrete_cbar.isChecked() and color_by == "MaterialID" and scalars is not None:
-            plotter.add_mesh(
-                mesh,
-                scalars=scalars,
-                show_scalar_bar=False,  # We'll add custom one
-                **mesh_params
-            )
-            
-            # Add custom scalar bar with annotations
-            if self.fig_show_colorbar.isChecked():
-                plotter.add_scalar_bar(
-                    title=self.fig_cbar_title.text() or scalar_name,
-                    vertical=self.fig_cbar_vertical.isChecked(),
-                    n_labels=n_materials + 1,
-                    fmt="%.0f",
-                    title_font_size=self.fig_font_size.value(),
-                    label_font_size=max(self.fig_font_size.value() - 2, 8),
-                    position_x=0.85 if self.fig_cbar_position.currentText() == "Right" else 0.05,
-                    position_y=0.1,
-                    width=0.08,
-                    height=0.7,
-                    color=text_color,  # Text color based on background
+        # For discrete materials, apply distinct RGB colors
+        if use_discrete_colors and scalars is not None:
+            # Apply discrete colors for distinct material visualization
+            discrete_colors = self._apply_discrete_material_colors_to_mesh(mesh)
+            if discrete_colors is not None:
+                mesh.cell_data['MaterialColors'] = discrete_colors
+                
+                # Render with RGB colors
+                plotter.add_mesh(
+                    mesh,
+                    scalars='MaterialColors',
+                    rgb=True,  # Interpret as RGB colors
+                    style=style,
+                    edge_color=self._fig_edge_color,
+                    line_width=1.0 if show_edges or render_style == "Wireframe" else 0,
+                    ambient=self.fig_ambient.value(),
+                    specular=self.fig_specular.value(),
+                    show_edges=show_edges and style == 'surface',
+                    show_scalar_bar=False,  # RGB doesn't use scalar bar
                 )
-        else:
+                
+                # Add a custom legend for materials
+                if self.fig_show_colorbar.isChecked():
+                    self._add_material_legend_to_export_plotter(plotter, text_color)
+            else:
+                # Fallback to colormap approach
+                use_discrete_colors = False
+        
+        if not use_discrete_colors:
+            # Common mesh parameters
+            mesh_params = {
+                'cmap': cmap,
+                'style': style,
+                'edge_color': self._fig_edge_color,
+                'line_width': 1.0 if show_edges or render_style == "Wireframe" else 0,
+                'ambient': self.fig_ambient.value(),
+                'specular': self.fig_specular.value(),
+                'show_edges': show_edges and style == 'surface',
+            }
+            
+            # Add clim if we have MaterialID
+            if clim is not None:
+                mesh_params['clim'] = clim
+            
             plotter.add_mesh(
                 mesh,
                 scalars=scalars,
@@ -15799,7 +15908,19 @@ segmentation, triangulation, and visualization.
         
         # Camera view
         view_preset = self.fig_view_preset.currentText()
-        if view_preset == "Isometric":
+        if view_preset == "Current View":
+            # Use the captured camera position from tetra_plotter
+            if hasattr(self, '_captured_camera_position') and self._captured_camera_position is not None:
+                try:
+                    plotter.camera_position = self._captured_camera_position
+                    logger.info("Applied captured tetra_plotter camera position to export")
+                except Exception as e:
+                    logger.warning(f"Could not apply captured camera position: {e}")
+                    plotter.view_isometric()  # Fallback to isometric
+            else:
+                logger.warning("No captured camera position available, using isometric view")
+                plotter.view_isometric()  # Fallback to isometric
+        elif view_preset == "Isometric":
             plotter.view_isometric()
         elif view_preset == "Top (XY)":
             plotter.view_xy()
@@ -15811,7 +15932,12 @@ segmentation, triangulation, and visualization.
             plotter.camera_position = 'iso'
             plotter.camera.elevation = 30
             plotter.camera.azimuth = 45
-        # "Current View" uses whatever camera position was last used
+        elif view_preset == "Custom...":
+            # For custom, still use captured if available, otherwise isometric
+            if hasattr(self, '_captured_camera_position') and self._captured_camera_position is not None:
+                plotter.camera_position = self._captured_camera_position
+            else:
+                plotter.view_isometric()
         
         # Axes - color based on background
         if self.fig_show_axes.isChecked():
@@ -17209,6 +17335,111 @@ segmentation, triangulation, and visualization.
         # Extract colormap name from dropdown text (before " - ")
         return colormap_text.split(" - ")[0] if " - " in colormap_text else colormap_text
     
+    def _add_material_legend_to_plotter(self):
+        """
+        Add a legend showing material names and their colors to the tetra plotter.
+        Used when RGB colors are applied directly (discrete coloring).
+        """
+        if not hasattr(self, 'tetra_plotter') or self.tetra_plotter is None:
+            return
+        
+        if not hasattr(self, 'tetra_materials') or not self.tetra_materials:
+            return
+        
+        # Remove existing legend if any
+        try:
+            if 'material_legend' in self.tetra_plotter.actors:
+                self.tetra_plotter.remove_actor('material_legend')
+        except:
+            pass
+        
+        # Build legend entries
+        color_map = self._get_discrete_material_colors()
+        legend_entries = []
+        
+        for mat in self.tetra_materials:
+            mat_id = mat.get('attribute', 0)
+            mat_name = mat.get('name', f'Material_{mat_id}')
+            mat_type = mat.get('type', 'FORMATION')
+            
+            # Get color as normalized RGB tuple (0-1 range)
+            if mat_id in color_map:
+                rgb = color_map[mat_id]
+                color = [rgb[0]/255.0, rgb[1]/255.0, rgb[2]/255.0]
+            else:
+                color = [0.5, 0.5, 0.5]  # Gray fallback
+            
+            # Add type indicator
+            type_prefix = "⚡" if mat_type == 'FAULT' else "🏔️"
+            display_name = f"{type_prefix} {mat_name}"
+            
+            legend_entries.append([display_name, color])
+        
+        if legend_entries:
+            try:
+                self.tetra_plotter.add_legend(
+                    legend_entries,
+                    bcolor=(0.1, 0.1, 0.15, 0.7),  # Semi-transparent dark background
+                    face='circle',
+                    size=(0.15, 0.02 * len(legend_entries)),
+                    loc='upper right',
+                    name='material_legend'
+                )
+            except Exception as e:
+                logger.debug(f"Could not add legend: {e}")
+    
+    def _add_material_legend_to_export_plotter(self, plotter, text_color='black'):
+        """
+        Add a legend showing material names and colors to an export plotter.
+        Similar to _add_material_legend_to_plotter but for export figures.
+        
+        Args:
+            plotter: PyVista plotter to add legend to
+            text_color: Color for text (black or white based on background)
+        """
+        if not hasattr(self, 'tetra_materials') or not self.tetra_materials:
+            return
+        
+        # Build legend entries
+        color_map = self._get_discrete_material_colors()
+        legend_entries = []
+        
+        for mat in self.tetra_materials:
+            mat_id = mat.get('attribute', 0)
+            mat_name = mat.get('name', f'Material_{mat_id}')
+            mat_type = mat.get('type', 'FORMATION')
+            
+            # Get color as normalized RGB tuple (0-1 range)
+            if mat_id in color_map:
+                rgb = color_map[mat_id]
+                color = [rgb[0]/255.0, rgb[1]/255.0, rgb[2]/255.0]
+            else:
+                color = [0.5, 0.5, 0.5]  # Gray fallback
+            
+            # Add type indicator (simpler for export)
+            type_prefix = "[F]" if mat_type == 'FAULT' else ""
+            display_name = f"{type_prefix} {mat_name}" if type_prefix else mat_name
+            
+            legend_entries.append([display_name, color])
+        
+        if legend_entries:
+            try:
+                # Determine background color for legend based on text color
+                if text_color == 'white':
+                    bcolor = (0.1, 0.1, 0.15, 0.8)  # Dark background
+                else:
+                    bcolor = (0.95, 0.95, 0.95, 0.8)  # Light background
+                
+                plotter.add_legend(
+                    legend_entries,
+                    bcolor=bcolor,
+                    face='circle',
+                    size=(0.18, 0.025 * len(legend_entries)),
+                    loc='upper right',
+                )
+            except Exception as e:
+                logger.debug(f"Could not add legend to export plotter: {e}")
+    
     def _get_selected_material_id(self) -> int:
         """Get the material ID corresponding to the selected material in dropdown."""
         if not hasattr(self, 'tetra_material_combo'):
@@ -17284,11 +17515,92 @@ segmentation, triangulation, and visualization.
         
         logger.debug(f"Material clim fallback: [{min_id}, {max_id}]")
         return (min_id, max_id)
+    
+    def _get_discrete_material_colors(self) -> dict:
+        """
+        Get a dictionary mapping material IDs to distinct RGB colors.
+        This ensures each material gets a visually distinct color.
+        
+        Returns:
+            Dict[int, tuple]: Mapping of material_id -> (R, G, B) tuple with values 0-255
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Get all material IDs
+        all_ids = self._get_all_material_ids_sorted()
+        n_materials = len(all_ids)
+        
+        if n_materials == 0:
+            return {}
+        
+        # Get colormap
+        cmap_name = self._get_selected_colormap()
+        try:
+            cmap = plt.get_cmap(cmap_name)
+        except ValueError:
+            cmap = plt.get_cmap('tab10')
+        
+        # Check if discrete colormap
+        is_discrete_cmap = cmap_name in ['tab10', 'tab20', 'Set1', 'Set2', 'Set3', 'Paired', 
+                                          'Accent', 'Dark2', 'Pastel1', 'Pastel2']
+        
+        color_map = {}
+        for idx, mat_id in enumerate(all_ids):
+            if is_discrete_cmap and hasattr(cmap, 'N'):
+                normalized = (idx % cmap.N) / cmap.N
+            else:
+                # Evenly distribute in [0.05, 0.95]
+                if n_materials == 1:
+                    normalized = 0.5
+                else:
+                    normalized = 0.05 + (idx / (n_materials - 1)) * 0.9
+            
+            rgba = cmap(normalized)
+            color_map[mat_id] = (int(rgba[0] * 255), int(rgba[1] * 255), int(rgba[2] * 255))
+        
+        return color_map
+    
+    def _apply_discrete_material_colors_to_mesh(self, mesh):
+        """
+        Apply discrete colors to mesh cells based on MaterialID.
+        This creates a new cell data array with RGB colors for each cell.
+        
+        Args:
+            mesh: PyVista mesh with 'MaterialID' in cell_data
+            
+        Returns:
+            numpy array of RGB colors (n_cells, 3) with values 0-255
+        """
+        import numpy as np
+        
+        if not hasattr(mesh, 'cell_data') or 'MaterialID' not in mesh.cell_data:
+            return None
+        
+        material_ids = mesh.cell_data['MaterialID']
+        color_map = self._get_discrete_material_colors()
+        
+        # Create RGB array for all cells
+        colors = np.zeros((len(material_ids), 3), dtype=np.uint8)
+        
+        for mat_id, rgb in color_map.items():
+            mask = material_ids == mat_id
+            colors[mask] = rgb
+        
+        # Handle any materials not in the color map (gray fallback)
+        unmapped_mask = ~np.isin(material_ids, list(color_map.keys()))
+        if np.any(unmapped_mask):
+            colors[unmapped_mask] = (128, 128, 128)
+        
+        return colors
 
     def _get_material_color(self, material_id: int) -> str:
         """
         Get the color for a specific material ID based on the selected colormap.
         This ensures individual material visualization uses consistent colors with 'All Materials' view.
+        
+        Uses discrete color sampling to ensure each material gets a DISTINCT color,
+        even when using continuous colormaps.
         
         Args:
             material_id: The material ID to get the color for
@@ -17304,17 +17616,40 @@ segmentation, triangulation, and visualization.
         try:
             cmap = plt.get_cmap(cmap_name)
         except ValueError:
-            cmap = plt.get_cmap('viridis')  # Fallback
+            cmap = plt.get_cmap('tab10')  # Fallback to discrete colormap
         
-        # Get the full material range
-        clim = self._get_full_material_clim()
-        min_id, max_id = clim
+        # Get all unique material IDs for proper discrete color assignment
+        all_material_ids = self._get_all_material_ids_sorted()
+        n_materials = len(all_material_ids)
         
-        # Normalize the material_id to [0, 1] range based on full material range
-        if max_id != min_id:
-            normalized = (material_id - min_id) / (max_id - min_id)
+        if n_materials == 0:
+            return '#808080'  # Gray fallback
+        
+        # Find the INDEX of this material in the sorted list
+        if material_id in all_material_ids:
+            material_index = all_material_ids.index(material_id)
         else:
-            normalized = 0.5
+            # Material not found - use modulo to get a valid index
+            material_index = material_id % n_materials
+        
+        # For discrete/qualitative colormaps (like tab10, Set1, etc.), use direct indexing
+        # For continuous colormaps, evenly space colors around the colormap
+        
+        # Check if this is a discrete colormap with limited colors
+        is_discrete_cmap = cmap_name in ['tab10', 'tab20', 'Set1', 'Set2', 'Set3', 'Paired', 
+                                          'Accent', 'Dark2', 'Pastel1', 'Pastel2', 'Category10']
+        
+        if is_discrete_cmap and hasattr(cmap, 'N'):
+            # Use modulo for discrete colormaps
+            normalized = (material_index % cmap.N) / cmap.N
+        else:
+            # For continuous colormaps: evenly distribute colors
+            # Add small offsets to avoid edge colors (0 and 1) which can be too similar
+            if n_materials == 1:
+                normalized = 0.5
+            else:
+                # Distribute evenly in range [0.05, 0.95] to avoid extreme colors
+                normalized = 0.05 + (material_index / (n_materials - 1)) * 0.9
         
         # Clamp to [0, 1]
         normalized = max(0.0, min(1.0, normalized))
@@ -17329,8 +17664,39 @@ segmentation, triangulation, and visualization.
             int(rgba[2] * 255)
         )
         
-        logger.debug(f"Material {material_id}: normalized={normalized:.3f}, color={hex_color} (clim={clim})")
+        logger.debug(f"Material {material_id} (index {material_index}/{n_materials}): normalized={normalized:.3f}, color={hex_color}")
         return hex_color
+    
+    def _get_all_material_ids_sorted(self) -> list:
+        """
+        Get a sorted list of all unique material IDs.
+        This is used for consistent discrete color assignment.
+        """
+        import numpy as np
+        
+        all_ids = set()
+        
+        # Get IDs from tetra_materials list
+        if hasattr(self, 'tetra_materials') and self.tetra_materials:
+            for mat in self.tetra_materials:
+                all_ids.add(mat.get('attribute', 0))
+        
+        # Also get IDs from mesh data (in case some materials are in mesh but not in list)
+        if hasattr(self, 'full_tetra_mesh') and self.full_tetra_mesh is not None:
+            mesh = self.full_tetra_mesh
+            if hasattr(mesh, 'cell_data') and 'MaterialID' in mesh.cell_data:
+                unique_in_mesh = np.unique(mesh.cell_data['MaterialID'])
+                all_ids.update(int(x) for x in unique_in_mesh)
+        
+        if hasattr(self, 'tetrahedral_mesh') and self.tetrahedral_mesh is not None:
+            mesh = self.tetrahedral_mesh
+            if isinstance(mesh, dict):
+                mesh = mesh.get('pyvista_grid')
+            if mesh and hasattr(mesh, 'cell_data') and 'MaterialID' in mesh.cell_data:
+                unique_in_mesh = np.unique(mesh.cell_data['MaterialID'])
+                all_ids.update(int(x) for x in unique_in_mesh)
+        
+        return sorted(list(all_ids))
 
     def _filter_mesh_by_material(self, mesh, material_id: int):
         """
