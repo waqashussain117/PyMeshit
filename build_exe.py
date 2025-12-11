@@ -155,8 +155,14 @@ def build_exe(use_clean=True, debug=False):
         "--hidden-import=sys",
         # NetCDF4 for data I/O operations
         "--hidden-import=netCDF4",
-        "--hidden-import=netCDF4.Dataset",
-        "--hidden-import=netCDF4.Variable",
+        "--hidden-import=netCDF4.utils",
+        "--hidden-import=cftime",
+        "--hidden-import=certifi",
+        "--hidden-import=h5py",
+        "--hidden-import=hdf5plugin",
+        "--collect-all=netCDF4",
+        "--collect-all=cftime",
+        "--collect-binaries=netCDF4",
         # Pymeshit specific imports
         "--hidden-import=Pymeshit",
         "--hidden-import=Pymeshit.intersection_utils",
@@ -193,7 +199,7 @@ def build_exe(use_clean=True, debug=False):
         "--exclude-module=requests",
         "--exclude-module=urllib3",
         "--exclude-module=chardet",
-        "--exclude-module=certifi",
+        # Note: certifi is needed by netCDF4, don't exclude it
         "--exclude-module=pip",
         "--exclude-module=setuptools",
         "--exclude-module=wheel",
