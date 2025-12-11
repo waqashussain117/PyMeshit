@@ -210,6 +210,281 @@ class ComputationWorker(QObject):
         logger.info(f"Worker: Global intersection task finished. Success: {success}. Elapsed: {elapsed_time:.2f}s.")
 
 
+class ExodusExportOptionsDialog(QDialog):
+    """
+    Dialog for customizing EXODUS file export options.
+    Allows editing domain names (element blocks) and sideset names for GOLEM/MOOSE compatibility.
+    """
+    
+    def __init__(self, parent=None, block_names: Dict[int, str] = None, 
+                 sideset_names: Dict[int, str] = None, materials: List[Dict] = None,
+                 datasets: List[Dict] = None):
+        super().__init__(parent)
+        self.setWindowTitle("EXODUS Export Options")
+        self.setMinimumSize(600, 500)
+        self.setModal(True)
+        
+        # Store the names (use copies to avoid modifying original)
+        self.block_names = dict(block_names) if block_names else {}
+        self.sideset_names = dict(sideset_names) if sideset_names else {}
+        self.materials = materials or []
+        self.datasets = datasets or []
+        
+        self._setup_ui()
+    
+    def _setup_ui(self):
+        """Setup the dialog UI."""
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(10)
+        
+        # Description
+        desc_label = QLabel(
+            "Configure domain (block) and sideset names for GOLEM/MOOSE compatibility."
+        )
+        desc_label.setWordWrap(True)
+        main_layout.addWidget(desc_label)
+        
+        # Create tab widget for blocks and sidesets
+        tab_widget = QTabWidget()
+        
+        # === Domain/Block Names Tab ===
+        block_tab = QWidget()
+        block_layout = QVBoxLayout(block_tab)
+        
+        block_info = QLabel("Domain names define the 3D volumetric regions (materials).")
+        block_layout.addWidget(block_info)
+        
+        # Block names table
+        self.block_table = QTableWidget()
+        self.block_table.setColumnCount(3)
+        self.block_table.setHorizontalHeaderLabels(["ID", "Original Name", "Export Name"])
+        self.block_table.horizontalHeader().setStretchLastSection(True)
+        self._populate_block_table()
+        block_layout.addWidget(self.block_table)
+        
+        # Block naming presets
+        block_preset_layout = QHBoxLayout()
+        
+        self.block_prefix_btn = QPushButton("Add Prefix...")
+        self.block_prefix_btn.clicked.connect(lambda: self._add_prefix_to_names('block'))
+        block_preset_layout.addWidget(self.block_prefix_btn)
+        
+        self.block_suffix_btn = QPushButton("Add Suffix...")
+        self.block_suffix_btn.clicked.connect(lambda: self._add_suffix_to_names('block'))
+        block_preset_layout.addWidget(self.block_suffix_btn)
+        
+        self.block_reset_btn = QPushButton("Reset")
+        self.block_reset_btn.clicked.connect(lambda: self._reset_names('block'))
+        block_preset_layout.addWidget(self.block_reset_btn)
+        
+        block_preset_layout.addStretch()
+        block_layout.addLayout(block_preset_layout)
+        
+        tab_widget.addTab(block_tab, "Domain Names")
+        
+        # === Sideset Names Tab ===
+        sideset_tab = QWidget()
+        sideset_layout = QVBoxLayout(sideset_tab)
+        
+        sideset_info = QLabel("Sideset names define boundary surfaces for boundary conditions.")
+        sideset_layout.addWidget(sideset_info)
+        
+        # Sideset names table
+        self.sideset_table = QTableWidget()
+        self.sideset_table.setColumnCount(3)
+        self.sideset_table.setHorizontalHeaderLabels(["ID", "Original Name", "Export Name"])
+        self.sideset_table.horizontalHeader().setStretchLastSection(True)
+        self._populate_sideset_table()
+        sideset_layout.addWidget(self.sideset_table)
+        
+        # Sideset naming presets
+        sideset_preset_layout = QHBoxLayout()
+        
+        self.sideset_prefix_btn = QPushButton("Add Prefix...")
+        self.sideset_prefix_btn.clicked.connect(lambda: self._add_prefix_to_names('sideset'))
+        sideset_preset_layout.addWidget(self.sideset_prefix_btn)
+        
+        self.sideset_suffix_btn = QPushButton("Add Suffix...")
+        self.sideset_suffix_btn.clicked.connect(lambda: self._add_suffix_to_names('sideset'))
+        sideset_preset_layout.addWidget(self.sideset_suffix_btn)
+        
+        self.sideset_reset_btn = QPushButton("Reset")
+        self.sideset_reset_btn.clicked.connect(lambda: self._reset_names('sideset'))
+        sideset_preset_layout.addWidget(self.sideset_reset_btn)
+        
+        sideset_preset_layout.addStretch()
+        sideset_layout.addLayout(sideset_preset_layout)
+        
+        tab_widget.addTab(sideset_tab, "Sideset Names")
+        
+        main_layout.addWidget(tab_widget)
+        
+        # === GOLEM Tips Section ===
+        tips_group = QGroupBox("GOLEM Usage")
+        tips_layout = QVBoxLayout(tips_group)
+        tips_text = QLabel(
+            "Block names: [Materials] block = 'name'  |  [Kernels] block = 'name'\n"
+            "Sideset names: [BCs] boundary = 'name'"
+        )
+        tips_text.setWordWrap(True)
+        tips_layout.addWidget(tips_text)
+        main_layout.addWidget(tips_group)
+        
+        # === Dialog buttons ===
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(self.cancel_btn)
+        
+        self.export_btn = QPushButton("Export")
+        self.export_btn.setDefault(True)
+        self.export_btn.clicked.connect(self._validate_and_accept)
+        button_layout.addWidget(self.export_btn)
+        
+        main_layout.addLayout(button_layout)
+    
+    def _populate_block_table(self):
+        """Populate the block names table."""
+        self.block_table.setRowCount(len(self.block_names))
+        
+        for row, (block_id, original_name) in enumerate(sorted(self.block_names.items())):
+            # Block ID (read-only)
+            id_item = QTableWidgetItem(str(block_id))
+            id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
+            self.block_table.setItem(row, 0, id_item)
+            
+            # Original name (read-only)
+            orig_item = QTableWidgetItem(original_name)
+            orig_item.setFlags(orig_item.flags() & ~Qt.ItemIsEditable)
+            self.block_table.setItem(row, 1, orig_item)
+            
+            # Export name (editable)
+            export_item = QTableWidgetItem(original_name)
+            self.block_table.setItem(row, 2, export_item)
+        
+        self.block_table.resizeColumnsToContents()
+    
+    def _populate_sideset_table(self):
+        """Populate the sideset names table."""
+        self.sideset_table.setRowCount(len(self.sideset_names))
+        
+        for row, (sideset_id, original_name) in enumerate(sorted(self.sideset_names.items())):
+            # Sideset ID (read-only)
+            id_item = QTableWidgetItem(str(sideset_id))
+            id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
+            self.sideset_table.setItem(row, 0, id_item)
+            
+            # Original name (read-only)
+            orig_item = QTableWidgetItem(original_name)
+            orig_item.setFlags(orig_item.flags() & ~Qt.ItemIsEditable)
+            self.sideset_table.setItem(row, 1, orig_item)
+            
+            # Export name (editable)
+            export_item = QTableWidgetItem(original_name)
+            self.sideset_table.setItem(row, 2, export_item)
+        
+        self.sideset_table.resizeColumnsToContents()
+    
+    def _add_prefix_to_names(self, table_type: str):
+        """Add a prefix to all names in the specified table."""
+        from PySide6.QtWidgets import QInputDialog
+        prefix, ok = QInputDialog.getText(self, "Add Prefix", "Enter prefix to add:")
+        if ok and prefix:
+            table = self.block_table if table_type == 'block' else self.sideset_table
+            for row in range(table.rowCount()):
+                item = table.item(row, 2)
+                if item:
+                    current_name = item.text()
+                    item.setText(f"{prefix}{current_name}")
+    
+    def _add_suffix_to_names(self, table_type: str):
+        """Add a suffix to all names in the specified table."""
+        from PySide6.QtWidgets import QInputDialog
+        suffix, ok = QInputDialog.getText(self, "Add Suffix", "Enter suffix to add:")
+        if ok and suffix:
+            table = self.block_table if table_type == 'block' else self.sideset_table
+            for row in range(table.rowCount()):
+                item = table.item(row, 2)
+                if item:
+                    current_name = item.text()
+                    item.setText(f"{current_name}{suffix}")
+    
+    def _reset_names(self, table_type: str):
+        """Reset names to their original values."""
+        table = self.block_table if table_type == 'block' else self.sideset_table
+        for row in range(table.rowCount()):
+            orig_item = table.item(row, 1)
+            export_item = table.item(row, 2)
+            if orig_item and export_item:
+                export_item.setText(orig_item.text())
+    
+    def _validate_and_accept(self):
+        """Validate the names and accept the dialog."""
+        # Check for empty names
+        for row in range(self.block_table.rowCount()):
+            item = self.block_table.item(row, 2)
+            if item and not item.text().strip():
+                QMessageBox.warning(self, "Invalid Name", 
+                    f"Block name in row {row + 1} cannot be empty.")
+                return
+        
+        for row in range(self.sideset_table.rowCount()):
+            item = self.sideset_table.item(row, 2)
+            if item and not item.text().strip():
+                QMessageBox.warning(self, "Invalid Name", 
+                    f"Sideset name in row {row + 1} cannot be empty.")
+                return
+        
+        # Check for duplicate names
+        block_export_names = []
+        for row in range(self.block_table.rowCount()):
+            item = self.block_table.item(row, 2)
+            if item:
+                name = item.text().strip()
+                if name in block_export_names:
+                    QMessageBox.warning(self, "Duplicate Name", 
+                        f"Duplicate block name '{name}' found. All names must be unique.")
+                    return
+                block_export_names.append(name)
+        
+        sideset_export_names = []
+        for row in range(self.sideset_table.rowCount()):
+            item = self.sideset_table.item(row, 2)
+            if item:
+                name = item.text().strip()
+                if name in sideset_export_names:
+                    QMessageBox.warning(self, "Duplicate Name", 
+                        f"Duplicate sideset name '{name}' found. All names must be unique.")
+                    return
+                sideset_export_names.append(name)
+        
+        self.accept()
+    
+    def get_block_names(self) -> Dict[int, str]:
+        """Get the edited block names."""
+        result = {}
+        for row in range(self.block_table.rowCount()):
+            id_item = self.block_table.item(row, 0)
+            export_item = self.block_table.item(row, 2)
+            if id_item and export_item:
+                block_id = int(id_item.text())
+                result[block_id] = export_item.text().strip()
+        return result
+    
+    def get_sideset_names(self) -> Dict[int, str]:
+        """Get the edited sideset names."""
+        result = {}
+        for row in range(self.sideset_table.rowCount()):
+            id_item = self.sideset_table.item(row, 0)
+            export_item = self.sideset_table.item(row, 2)
+            if id_item and export_item:
+                sideset_id = int(id_item.text())
+                result[sideset_id] = export_item.text().strip()
+        return result
+
+
 class MeshItWorkflowGUI(QMainWindow):
     # Define a color cycle for datasets
     DEFAULT_COLORS = [
@@ -2656,6 +2931,30 @@ class MeshItWorkflowGUI(QMainWindow):
         self.show_conforming_meshes_checkbox.setChecked(True)
         self.show_conforming_meshes_checkbox.toggled.connect(self._update_refined_visualization)
         ag.addWidget(self.show_conforming_meshes_checkbox)
+
+        # High-quality figure export button
+        self.refine_export_figure_btn = QPushButton("📸 Export Figure")
+        self.refine_export_figure_btn.clicked.connect(lambda: self._show_generic_figure_export_dialog('refine_mesh'))
+        self.refine_export_figure_btn.setEnabled(False)
+        self.refine_export_figure_btn.setToolTip("Export high-resolution figure of refine mesh visualization")
+        self.refine_export_figure_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1565C0;
+                color: white;
+                font-weight: bold;
+                padding: 6px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+        """)
+        ag.addWidget(self.refine_export_figure_btn)
 
         # Mesh settings (compact form)
         mesh_settings_group = QGroupBox("Global Mesh Settings")
@@ -10627,9 +10926,14 @@ segmentation, triangulation, and visualization.
             
             logger.info(f"Statistics: Constraints={len(constraint_points)}")
             logger.info("Updated refined intersections view with enhanced special point visualization.")
+            
+            # Enable export figure button
+            if hasattr(self, 'refine_export_figure_btn'):
+                self.refine_export_figure_btn.setEnabled(True)
         else:
             plotter.add_text("No valid data to display in refined view.", position='upper_edge', color='white')
             plotter.reset_camera()
+    
     def _clear_refine_mesh_plot(self):
         """Clear all refine mesh tab plotters"""
         try:
@@ -10650,6 +10954,10 @@ segmentation, triangulation, and visualization.
                 plotter.reset_camera()
                 
             logger.info("Cleared all refine mesh visualizations")
+            
+            # Disable export figure button
+            if hasattr(self, 'refine_export_figure_btn'):
+                self.refine_export_figure_btn.setEnabled(False)
         except Exception as e:
             logger.warning(f"Error in _clear_refine_mesh_plot: {e}")
     def _debug_segments_widget_tree(self, where: str = ""):
@@ -14938,13 +15246,48 @@ segmentation, triangulation, and visualization.
                                   "NetCDF library is not installed. Please install netCDF4 to export to NetCDF format.")
                 return
 
+        # For EXODUS files, show the options dialog for domain/sideset name customization
+        custom_block_names = None
+        custom_sideset_names = None
+        
+        if file_ext == 'exo':
+            # Get current block and sideset names from the mesh generator
+            block_names, sideset_names = self._get_exodus_default_names()
+            
+            # Show the EXODUS export options dialog
+            dialog = ExodusExportOptionsDialog(
+                self,
+                block_names=block_names,
+                sideset_names=sideset_names,
+                materials=self.tetra_materials if hasattr(self, 'tetra_materials') else [],
+                datasets=self.datasets if hasattr(self, 'datasets') else []
+            )
+            
+            if dialog.exec() != QDialog.Accepted:
+                return  # User cancelled
+            
+            # Get the customized names
+            custom_block_names = dialog.get_block_names()
+            custom_sideset_names = dialog.get_sideset_names()
+            logger.info(f"EXODUS export with custom names: {len(custom_block_names)} blocks, {len(custom_sideset_names)} sidesets")
+
         try:
             # Update generator with current materials (including faults with markers)
             if hasattr(self, 'tetra_materials'):
                 self.tetra_mesh_generator.tetra_materials = self.tetra_materials
                 logger.info(f"Updated generator with {len(self.tetra_materials)} materials for export")
             
-            success = self.tetra_mesh_generator.export_mesh(file_path, self.tetrahedral_mesh)
+            # Pass custom names for EXODUS export
+            if file_ext == 'exo' and (custom_block_names or custom_sideset_names):
+                success = self.tetra_mesh_generator.export_mesh(
+                    file_path, 
+                    self.tetrahedral_mesh,
+                    custom_block_names=custom_block_names,
+                    custom_sideset_names=custom_sideset_names
+                )
+            else:
+                success = self.tetra_mesh_generator.export_mesh(file_path, self.tetrahedral_mesh)
+                
             if success:
                 # Provide helpful message about viewing in ParaView
                 file_ext = file_path.lower().split('.')[-1]
@@ -14957,6 +15300,11 @@ segmentation, triangulation, and visualization.
                     msg += "• Faults are embedded as triangles within the volume\n"
                     msg += "• Use 'Extract Surface' or wireframe to see fault outlines\n"
                     msg += "• Use 'Threshold' on MaterialID to isolate materials"
+                elif file_ext == 'exo':
+                    msg += "GOLEM/MOOSE Tips:\n"
+                    msg += "• Use domain names in [Materials] block = 'domain_name'\n"
+                    msg += "• Use sideset names in [BCs] boundary = 'sideset_name'\n"
+                    msg += "• Open in ParaView to verify block and sideset names"
                 
                 QMessageBox.information(self, "Export Successful", msg)
             else:
@@ -14965,6 +15313,101 @@ segmentation, triangulation, and visualization.
         except Exception as e:
             logger.error(f"Export failed: {str(e)}")
             QMessageBox.critical(self, "Export Error", f"Failed to export mesh:\n{str(e)}")
+
+    def _get_exodus_default_names(self) -> Tuple[Dict[int, str], Dict[int, str]]:
+        """
+        Get the default block and sideset names for EXODUS export.
+        Returns: (block_names dict, sideset_names dict)
+        """
+        block_names = {}
+        sideset_names = {}
+        
+        try:
+            # Get block names from materials
+            if hasattr(self, 'tetrahedral_mesh') and self.tetrahedral_mesh is not None:
+                mesh = self.tetrahedral_mesh
+                
+                # Get unique material IDs from the mesh
+                if 'MaterialID' in mesh.cell_data:
+                    # Filter for tetrahedral cells only (cell type 10)
+                    cell_types = mesh.celltypes
+                    tetra_mask = cell_types == 10
+                    
+                    if np.any(tetra_mask):
+                        all_material_ids = mesh.cell_data['MaterialID']
+                        tetra_material_ids = all_material_ids[tetra_mask]
+                        unique_materials = np.unique(tetra_material_ids)
+                        
+                        for mat_id in unique_materials:
+                            mat_id_int = int(mat_id)
+                            # Try to get name from tetra_materials
+                            mat_name = self._get_material_name_for_exodus(mat_id_int)
+                            block_names[mat_id_int] = mat_name
+            
+            # Get sideset names from TetGen surface markers
+            if hasattr(self, 'tetra_mesh_generator') and self.tetra_mesh_generator is not None:
+                gen = self.tetra_mesh_generator
+                if hasattr(gen, 'tetgen_object') and gen.tetgen_object is not None:
+                    tet = gen.tetgen_object
+                    
+                    if hasattr(tet, 'triface_markers') and tet.triface_markers is not None:
+                        triface_markers = tet.triface_markers
+                        unique_markers = np.unique(triface_markers)
+                        unique_markers = unique_markers[unique_markers > 0]  # Exclude internal faces
+                        
+                        for marker in unique_markers:
+                            marker_int = int(marker)
+                            # Get surface name from datasets
+                            surface_name = self._get_sideset_name_for_exodus(marker_int)
+                            sideset_names[marker_int] = surface_name
+            
+            logger.info(f"EXODUS defaults: {len(block_names)} blocks, {len(sideset_names)} sidesets")
+            
+        except Exception as e:
+            logger.warning(f"Error getting EXODUS default names: {e}")
+        
+        return block_names, sideset_names
+    
+    def _get_material_name_for_exodus(self, material_id: int) -> str:
+        """Get a sanitized material name for EXODUS export."""
+        # Try tetra_materials first
+        if hasattr(self, 'tetra_materials') and self.tetra_materials:
+            for mat in self.tetra_materials:
+                if mat.get('attribute') == material_id:
+                    name = mat.get('name', f'material_{material_id}')
+                    return self._sanitize_exodus_name(name)
+        
+        # Fallback
+        return f'material_{material_id}'
+    
+    def _get_sideset_name_for_exodus(self, marker: int) -> str:
+        """Get a sanitized sideset name for EXODUS export."""
+        # Determine surface index from marker
+        if marker >= 1000:
+            surface_idx = marker - 1000
+        else:
+            surface_idx = marker - 1
+        
+        # Try to get name from datasets
+        if hasattr(self, 'datasets') and self.datasets:
+            if 0 <= surface_idx < len(self.datasets):
+                name = self.datasets[surface_idx].get('name', f'surface_{marker}')
+                return self._sanitize_exodus_name(name)
+        
+        return f'surface_{marker}'
+    
+    def _sanitize_exodus_name(self, name: str) -> str:
+        """Sanitize a name for EXODUS/GOLEM compatibility."""
+        if not name:
+            return "unnamed"
+        # Replace spaces and special characters
+        sanitized = name.replace(' ', '_').replace('-', '_').replace('.', '_')
+        # Remove any non-alphanumeric characters except underscore
+        sanitized = ''.join(c if c.isalnum() or c == '_' else '' for c in sanitized)
+        # Ensure it doesn't start with a number
+        if sanitized and sanitized[0].isdigit():
+            sanitized = 'surface_' + sanitized
+        return sanitized[:32] if sanitized else "unnamed"  # EXODUS name length limit
 
     def _show_mesh_statistics_dialog(self):
         """Show a dialog with detailed mesh statistics."""
@@ -15729,7 +16172,8 @@ segmentation, triangulation, and visualization.
                 'hulls': 'Convex Hull',
                 'segments': 'Segmentation', 
                 'triangulation': 'Triangulation',
-                'intersection': 'Intersection'
+                'intersection': 'Intersection',
+                'refine_mesh': 'Refine & Mesh'
             }
             dialog.setWindowTitle(f"📸 Export {view_names.get(view_type, view_type)} Figure")
             dialog.setMinimumSize(500, 550)
@@ -15881,7 +16325,7 @@ segmentation, triangulation, and visualization.
         """Get the appropriate plotter for a given view type.
         
         Args:
-            view_type: The type of view ('hulls', 'segments', 'triangulation', 'intersection')
+            view_type: The type of view ('hulls', 'segments', 'triangulation', 'intersection', 'refine_mesh')
             
         Returns:
             The plotter object or None if not available.
@@ -15891,6 +16335,7 @@ segmentation, triangulation, and visualization.
             'segments': 'segments_plotter',
             'triangulation': 'triangulation_plotter',
             'intersection': 'intersection_plotter',
+            'refine_mesh': 'refine_mesh_plotter',
         }
         
         plotter_attr = plotter_map.get(view_type)
@@ -15976,7 +16421,8 @@ segmentation, triangulation, and visualization.
             'hulls': 'convex_hull',
             'segments': 'segmentation', 
             'triangulation': 'triangulation',
-            'intersection': 'intersection'
+            'intersection': 'intersection',
+            'refine_mesh': 'refine_mesh'
         }
         default_name = f"{view_names.get(view_type, view_type)}_figure.{ext}"
         

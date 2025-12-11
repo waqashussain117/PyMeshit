@@ -1129,7 +1129,9 @@ class TetrahedralMeshGenerator:
         except Exception as e:
             logger.error(f"Failed to export PLC debug files: {e}")
 
-    def _export_netcdf(self, file_path: str, mesh_data: pv.UnstructuredGrid) -> bool:
+    def _export_netcdf(self, file_path: str, mesh_data: pv.UnstructuredGrid,
+                       custom_block_names: Optional[Dict[int, str]] = None,
+                       custom_sideset_names: Optional[Dict[int, str]] = None) -> bool:
         """
         Export tetrahedral mesh to EXODUS II format for GOLEM/MOOSE/ParaView compatibility.
         
@@ -1141,6 +1143,8 @@ class TetrahedralMeshGenerator:
         Args:
             file_path: Path to save the EXODUS file (.exo)
             mesh_data: PyVista UnstructuredGrid containing the tetrahedral mesh
+            custom_block_names: Optional dict mapping material_id -> custom block name
+            custom_sideset_names: Optional dict mapping marker_id -> custom sideset name
 
         Returns:
             bool: True if export successful, False otherwise
@@ -1148,6 +1152,10 @@ class TetrahedralMeshGenerator:
         if not HAS_NETCDF:
             logger.error("netCDF4 library not available. Cannot export to EXODUS format.")
             return False
+
+        # Store custom names for use by helper methods
+        self._custom_block_names = custom_block_names or {}
+        self._custom_sideset_names = custom_sideset_names or {}
 
         try:
             # Get mesh data
@@ -1348,10 +1356,18 @@ class TetrahedralMeshGenerator:
 
             logger.info(f"✓ EXODUS II mesh exported: {file_path}")
             logger.info(f"  {n_tetrahedra} tetrahedra in {num_elem_blk} blocks, {num_side_sets} sidesets")
+            
+            # Clean up custom names after successful export
+            self._custom_block_names = {}
+            self._custom_sideset_names = {}
+            
             return True
 
         except Exception as e:
             logger.error(f"EXODUS export failed: {str(e)}", exc_info=True)
+            # Clean up custom names on error too
+            self._custom_block_names = {}
+            self._custom_sideset_names = {}
             return False
 
     def _write_exodus_string_v2(self, var, idx, string, max_len):
@@ -1374,7 +1390,14 @@ class TetrahedralMeshGenerator:
         
         GOLEM expects block names that combine the bounding surfaces:
         e.g., 'bottom_40m_granitoid_40m' for the domain between those surfaces.
+        
+        If custom block names were provided via _custom_block_names, use those instead.
         """
+        # Check for custom block name first
+        if hasattr(self, '_custom_block_names') and self._custom_block_names:
+            if material_id in self._custom_block_names:
+                return self._sanitize_surface_name(self._custom_block_names[material_id])
+        
         # Try to get material name from materials list
         mat_name = self._get_material_name_by_id(material_id)
         
@@ -1559,7 +1582,15 @@ class TetrahedralMeshGenerator:
             return sidesets
 
     def _get_surface_name_by_marker(self, marker: int) -> str:
-        """Get surface name from marker ID for sideset naming."""
+        """Get surface name from marker ID for sideset naming.
+        
+        If custom sideset names were provided via _custom_sideset_names, use those instead.
+        """
+        # Check for custom sideset name first
+        if hasattr(self, '_custom_sideset_names') and self._custom_sideset_names:
+            if marker in self._custom_sideset_names:
+                return self._sanitize_surface_name(self._custom_sideset_names[marker])
+        
         # Check if marker is a fault marker (>= 1000)
         if marker >= 1000:
             surface_idx = marker - 1000
@@ -1577,7 +1608,9 @@ class TetrahedralMeshGenerator:
         # Fallback name
         return f"surface_{marker}"
 
-    def export_mesh(self, file_path: str, mesh_data: Optional[Dict] = None) -> bool:
+    def export_mesh(self, file_path: str, mesh_data: Optional[Dict] = None,
+                    custom_block_names: Optional[Dict[int, str]] = None,
+                    custom_sideset_names: Optional[Dict[int, str]] = None) -> bool:
         if mesh_data is None: mesh_data = self.tetrahedral_mesh
         if not mesh_data:
             logger.error("No tetrahedral mesh to export")
@@ -1589,8 +1622,10 @@ class TetrahedralMeshGenerator:
                 file_ext = file_path.lower().split('.')[-1]
 
                 if file_ext in ['nc', 'nc4', 'cdf', 'exo']:
-                    # Use NetCDF/EXODUS export
-                    return self._export_netcdf(file_path, mesh_data)
+                    # Use NetCDF/EXODUS export with optional custom names
+                    return self._export_netcdf(file_path, mesh_data, 
+                                               custom_block_names=custom_block_names,
+                                               custom_sideset_names=custom_sideset_names)
                 else:
                     # Enhanced export for VTK/VTU formats with material information
                     return self._export_with_materials(file_path, mesh_data)
