@@ -30,7 +30,8 @@ class TetrahedralMeshGenerator:
     def __init__(self, datasets: List[Dict], selected_surfaces: set, 
                  border_surface_indices: set, unit_surface_indices: set, 
                  fault_surface_indices: set, materials: List[Dict] = None,
-                 surface_data: Dict = None, holes: List = None):
+                 surface_data: Dict = None, holes: List = None,
+                 well_data: Dict = None):
         """
         Initialize the tetrahedral mesh generator.
         
@@ -43,6 +44,8 @@ class TetrahedralMeshGenerator:
             materials: List of material definitions with locations.
             surface_data: Dictionary of conforming mesh data {surface_idx: mesh_data}.
             holes: List of hole points [(x, y, z), ...] to be passed to TetGen.
+            well_data: Dictionary of well data for 1D edge constraints (C++ style).
+                       Format: {well_idx: {'points': [], 'marker': int, 'name': str}}
         """
         self.datasets = datasets
         self.selected_surfaces = selected_surfaces
@@ -52,6 +55,7 @@ class TetrahedralMeshGenerator:
         self.materials = materials or []
         self.surface_data = surface_data or {}
         self.external_holes = holes or []  # Holes passed from GUI
+        self.well_data = well_data or {}  # Well data for 1D edge constraints (C++ style)
         self.tetrahedral_mesh = None
         
         # PLC data containers
@@ -1131,12 +1135,14 @@ class TetrahedralMeshGenerator:
 
     def _export_netcdf(self, file_path: str, mesh_data: pv.UnstructuredGrid,
                        custom_block_names: Optional[Dict[int, str]] = None,
-                       custom_sideset_names: Optional[Dict[int, str]] = None) -> bool:
+                       custom_sideset_names: Optional[Dict[int, str]] = None,
+                       custom_well_names: Optional[Dict[int, str]] = None) -> bool:
         """
         Export tetrahedral mesh to EXODUS II format for GOLEM/MOOSE/ParaView compatibility.
         
         This follows the EXODUS II specification with proper:
-        - Element Blocks: One per material domain with proper naming
+        - Element Blocks: One per material domain (3D tetrahedra) with proper naming
+        - Element Blocks: One per well (1D edges/BAR2) - C++ MeshIt style
         - Sidesets: One per surface boundary for boundary conditions
         - All required EXODUS II attributes for ParaView compatibility
 
@@ -1145,6 +1151,7 @@ class TetrahedralMeshGenerator:
             mesh_data: PyVista UnstructuredGrid containing the tetrahedral mesh
             custom_block_names: Optional dict mapping material_id -> custom block name
             custom_sideset_names: Optional dict mapping marker_id -> custom sideset name
+            custom_well_names: Optional dict mapping well_marker -> custom well block name
 
         Returns:
             bool: True if export successful, False otherwise
@@ -1156,6 +1163,7 @@ class TetrahedralMeshGenerator:
         # Store custom names for use by helper methods
         self._custom_block_names = custom_block_names or {}
         self._custom_sideset_names = custom_sideset_names or {}
+        self._custom_well_names = custom_well_names or {}
 
         try:
             # Get mesh data
@@ -1199,14 +1207,54 @@ class TetrahedralMeshGenerator:
             
             # Group tetrahedra by material
             unique_materials = np.unique(material_ids)
-            num_elem_blk = len(unique_materials)
+            num_tetra_blk = len(unique_materials)
             
             # Build element blocks: {material_id: [tetra_indices]}
             elem_blocks = {}
             for mat_id in unique_materials:
                 elem_blocks[mat_id] = np.where(material_ids == mat_id)[0]
             
-            logger.info(f"EXODUS export: {num_elem_blk} element blocks for materials {list(unique_materials)}")
+            # ========== COLLECT WELL DATA (C++ MeshIt style: 1D element blocks) ==========
+            well_blocks = {}  # {well_marker: {'points': [], 'edges': [], 'name': str}}
+            total_well_edges = 0
+            
+            if hasattr(self, 'well_data') and self.well_data:
+                for well_idx, well_info in self.well_data.items():
+                    well_pts = well_info.get('points')
+                    well_marker = well_info.get('marker', well_idx + 2)
+                    well_name = well_info.get('name', f'Well_{well_idx}')
+                    
+                    if well_pts is None or len(well_pts) < 2:
+                        continue
+                    
+                    # Get custom name if provided
+                    if hasattr(self, '_custom_well_names') and well_marker in self._custom_well_names:
+                        well_name = self._custom_well_names[well_marker]
+                    
+                    # Convert points to array
+                    pts_arr = []
+                    for p in well_pts:
+                        if hasattr(p, 'x'):
+                            pts_arr.append([p.x, p.y, p.z])
+                        elif len(p) >= 3:
+                            pts_arr.append([float(p[0]), float(p[1]), float(p[2])])
+                    
+                    if len(pts_arr) < 2:
+                        continue
+                    
+                    n_edges = len(pts_arr) - 1
+                    well_blocks[well_marker] = {
+                        'points': np.array(pts_arr),
+                        'n_edges': n_edges,
+                        'name': well_name
+                    }
+                    total_well_edges += n_edges
+                    logger.info(f"  Well block '{well_name}' (marker {well_marker}): {n_edges} edges")
+            
+            num_well_blk = len(well_blocks)
+            num_elem_blk = num_tetra_blk + num_well_blk
+            
+            logger.info(f"EXODUS export: {num_tetra_blk} tetra blocks + {num_well_blk} well blocks = {num_elem_blk} total")
 
             # Build sidesets from TetGen surface triangles
             sidesets = self._build_exodus_sidesets(mesh_data, tetra_cells, tetra_global_indices)
@@ -1231,14 +1279,26 @@ class TetrahedralMeshGenerator:
                 rootgrp.setncattr('int64_status', np.int32(0))
                 rootgrp.setncattr('title', 'PyMeshIt mesh for GOLEM/MOOSE')
 
+                # ========== PREPARE WELL POINT DATA ==========
+                # Well points need to be added to the coordinate list
+                all_points = points.copy()
+                well_point_offsets = {}  # {well_marker: starting_point_index}
+                
+                for well_marker, well_blk in well_blocks.items():
+                    well_point_offsets[well_marker] = len(all_points)
+                    all_points = np.vstack([all_points, well_blk['points']])
+                
+                total_elements = n_tetrahedra + total_well_edges
+                total_points = len(all_points)
+                
                 # ========== EXODUS II REQUIRED DIMENSIONS ==========
                 rootgrp.createDimension('len_string', 33)
                 rootgrp.createDimension('len_name', 33)
                 rootgrp.createDimension('len_line', 81)
                 rootgrp.createDimension('four', 4)
                 rootgrp.createDimension('num_dim', 3)
-                rootgrp.createDimension('num_nodes', len(points))
-                rootgrp.createDimension('num_elem', n_tetrahedra)
+                rootgrp.createDimension('num_nodes', total_points)
+                rootgrp.createDimension('num_elem', total_elements)
                 rootgrp.createDimension('num_el_blk', num_elem_blk)
                 rootgrp.createDimension('num_node_sets', 0)
                 rootgrp.createDimension('num_side_sets', num_side_sets)
@@ -1249,9 +1309,9 @@ class TetrahedralMeshGenerator:
                 coordx = rootgrp.createVariable('coordx', 'f8', ('num_nodes',))
                 coordy = rootgrp.createVariable('coordy', 'f8', ('num_nodes',))
                 coordz = rootgrp.createVariable('coordz', 'f8', ('num_nodes',))
-                coordx[:] = points[:, 0]
-                coordy[:] = points[:, 1]
-                coordz[:] = points[:, 2]
+                coordx[:] = all_points[:, 0]
+                coordy[:] = all_points[:, 1]
+                coordz[:] = all_points[:, 2]
 
                 # Coordinate names
                 coor_names = rootgrp.createVariable('coor_names', 'S1', ('num_dim', 'len_name'))
@@ -1308,6 +1368,40 @@ class TetrahedralMeshGenerator:
                         connect[local_idx, :] = connectivity[global_tetra_idx*4:(global_tetra_idx+1)*4] + 1
                     
                     logger.info(f"  Block {blk_num}: '{block_name}' - {num_el_in_blk} elements")
+                
+                # ========== WELL ELEMENT BLOCKS (C++ MeshIt style: BAR2/BEAM2) ==========
+                for well_idx, (well_marker, well_blk) in enumerate(well_blocks.items()):
+                    blk_idx = num_tetra_blk + well_idx
+                    blk_num = blk_idx + 1
+                    
+                    well_name = well_blk['name']
+                    n_edges = well_blk['n_edges']
+                    point_offset = well_point_offsets[well_marker]
+                    
+                    # Block ID and status
+                    eb_prop1[blk_idx] = int(well_marker) + 1000  # Use marker + 1000 to distinguish from tetra blocks
+                    eb_status[blk_idx] = 1
+                    
+                    # Write block name
+                    self._write_exodus_string_v2(eb_names, blk_idx, well_name, 33)
+                    
+                    # Create dimensions for this well block
+                    rootgrp.createDimension(f'num_el_in_blk{blk_num}', n_edges)
+                    rootgrp.createDimension(f'num_nod_per_el{blk_num}', 2)  # BAR2 = 2 nodes per edge
+                    
+                    # Connectivity variable
+                    connect = rootgrp.createVariable(
+                        f'connect{blk_num}', 'i4',
+                        (f'num_el_in_blk{blk_num}', f'num_nod_per_el{blk_num}')
+                    )
+                    connect.setncattr('elem_type', 'BAR2')  # EXODUS BAR2 element type
+                    
+                    # Write well edge connectivity (1-based)
+                    for edge_idx in range(n_edges):
+                        connect[edge_idx, 0] = point_offset + edge_idx + 1  # First node (1-based)
+                        connect[edge_idx, 1] = point_offset + edge_idx + 2  # Second node (1-based)
+                    
+                    logger.info(f"  Well Block {blk_num}: '{well_name}' - {n_edges} BAR2 elements")
 
                 # ========== SIDESETS ==========
                 if num_side_sets > 0:
@@ -1355,11 +1449,14 @@ class TetrahedralMeshGenerator:
                 time_whole[0] = 0.0  # Initial time step
 
             logger.info(f"✓ EXODUS II mesh exported: {file_path}")
-            logger.info(f"  {n_tetrahedra} tetrahedra in {num_elem_blk} blocks, {num_side_sets} sidesets")
+            logger.info(f"  {n_tetrahedra} tetrahedra in {num_tetra_blk} blocks, {num_side_sets} sidesets")
+            if num_well_blk > 0:
+                logger.info(f"  {total_well_edges} well edges in {num_well_blk} BAR2 element blocks")
             
             # Clean up custom names after successful export
             self._custom_block_names = {}
             self._custom_sideset_names = {}
+            self._custom_well_names = {}
             
             return True
 
@@ -1368,6 +1465,7 @@ class TetrahedralMeshGenerator:
             # Clean up custom names on error too
             self._custom_block_names = {}
             self._custom_sideset_names = {}
+            self._custom_well_names = {}
             return False
 
     def _write_exodus_string_v2(self, var, idx, string, max_len):
@@ -1610,7 +1708,18 @@ class TetrahedralMeshGenerator:
 
     def export_mesh(self, file_path: str, mesh_data: Optional[Dict] = None,
                     custom_block_names: Optional[Dict[int, str]] = None,
-                    custom_sideset_names: Optional[Dict[int, str]] = None) -> bool:
+                    custom_sideset_names: Optional[Dict[int, str]] = None,
+                    custom_well_names: Optional[Dict[int, str]] = None) -> bool:
+        """
+        Export tetrahedral mesh to various formats.
+        
+        Args:
+            file_path: Output file path
+            mesh_data: PyVista mesh data (uses self.tetrahedral_mesh if None)
+            custom_block_names: Custom names for element blocks (3D domains)
+            custom_sideset_names: Custom names for sidesets (boundary surfaces)
+            custom_well_names: Custom names for well blocks (1D edge elements, C++ style)
+        """
         if mesh_data is None: mesh_data = self.tetrahedral_mesh
         if not mesh_data:
             logger.error("No tetrahedral mesh to export")
@@ -1625,7 +1734,8 @@ class TetrahedralMeshGenerator:
                     # Use NetCDF/EXODUS export with optional custom names
                     return self._export_netcdf(file_path, mesh_data, 
                                                custom_block_names=custom_block_names,
-                                               custom_sideset_names=custom_sideset_names)
+                                               custom_sideset_names=custom_sideset_names,
+                                               custom_well_names=custom_well_names)
                 else:
                     # Enhanced export for VTK/VTU formats with material information
                     return self._export_with_materials(file_path, mesh_data)
@@ -1770,6 +1880,92 @@ class TetrahedralMeshGenerator:
                     volume_mesh = combined_mesh
                 else:
                     logger.info("No fault surfaces found - exporting volume mesh only")
+            
+            # =========================================================================
+            # ADD 1D WELL MATERIALS (C++ MeshIt: edgemarkerlist / edgelist)
+            # Wells are added as VTK_LINE cells (type 3) following C++ ExportVTU3D
+            # =========================================================================
+            well_edges_added = 0
+            if hasattr(self, 'well_data') and self.well_data:
+                logger.info(f"Processing {len(self.well_data)} wells for 1D material export...")
+                
+                all_well_points = []
+                all_well_cells = []
+                all_well_material_ids = []
+                
+                current_point_offset = volume_mesh.n_points
+                
+                for well_idx, well_info in self.well_data.items():
+                    well_pts = well_info.get('points')
+                    well_marker = well_info.get('marker', well_idx + 2)  # C++ style: markers start at 2
+                    well_name = well_info.get('name', f'Well_{well_idx}')
+                    
+                    if well_pts is None or len(well_pts) < 2:
+                        continue
+                    
+                    # Convert points to array
+                    pts_arr = []
+                    for p in well_pts:
+                        if hasattr(p, 'x'):
+                            pts_arr.append([p.x, p.y, p.z])
+                        elif len(p) >= 3:
+                            pts_arr.append([float(p[0]), float(p[1]), float(p[2])])
+                    
+                    if len(pts_arr) < 2:
+                        continue
+                    
+                    pts_arr = np.array(pts_arr)
+                    n_pts = len(pts_arr)
+                    n_edges = n_pts - 1
+                    
+                    # Create edge cells for VTK (format: [2, i1, i2, 2, i2, i3, ...])
+                    edge_cells = []
+                    for i in range(n_edges):
+                        edge_cells.extend([2, current_point_offset + i, current_point_offset + i + 1])
+                    
+                    all_well_points.append(pts_arr)
+                    all_well_cells.append(np.array(edge_cells, dtype=np.int64))
+                    all_well_material_ids.append(np.full(n_edges, well_marker, dtype=np.int32))
+                    
+                    well_edges_added += n_edges
+                    current_point_offset += n_pts
+                    logger.info(f"  Added well '{well_name}' (marker {well_marker}): {n_edges} edges")
+                
+                # Merge wells with volume mesh (C++ style: single combined mesh with mixed element types)
+                if well_edges_added > 0:
+                    logger.info(f"Merging {well_edges_added} well edges with mesh...")
+                    
+                    # Get current mesh data
+                    current_points = volume_mesh.points
+                    current_cells = volume_mesh.cells
+                    current_cell_types = volume_mesh.celltypes
+                    
+                    if 'MaterialID' in volume_mesh.cell_data:
+                        current_material_ids = volume_mesh.cell_data['MaterialID']
+                    else:
+                        current_material_ids = np.zeros(volume_mesh.n_cells, dtype=np.int32)
+                    
+                    # Combine with wells
+                    final_points = np.vstack([current_points] + all_well_points)
+                    final_cells = np.hstack([current_cells] + all_well_cells)
+                    final_cell_types = np.hstack([current_cell_types] + 
+                                                  [np.full(len(ids), 3, dtype=np.uint8) for ids in all_well_material_ids])  # VTK_LINE = 3
+                    final_material_ids = np.hstack([current_material_ids] + all_well_material_ids)
+                    
+                    # Create new combined mesh
+                    combined_with_wells = pv.UnstructuredGrid(final_cells, final_cell_types, final_points)
+                    combined_with_wells.cell_data['MaterialID'] = final_material_ids
+                    
+                    # Update CellType array: 0=Tetrahedra, 1=Triangle(Fault), 2=Line(Well)
+                    cell_type_names = np.where(
+                        final_cell_types == 10, 0,  # Tetrahedra
+                        np.where(final_cell_types == 5, 1,  # Triangle (Fault)
+                                 2)  # Line (Well)
+                    )
+                    combined_with_wells.cell_data['CellType'] = cell_type_names
+                    
+                    volume_mesh = combined_with_wells
+                    logger.info(f"✓ Added {well_edges_added} well edges (1D materials) to mesh")
             
             # Save the combined mesh
             file_ext = file_path.lower().split('.')[-1]
