@@ -2396,6 +2396,33 @@ class MeshItWorkflowGUI(QMainWindow):
         
         control_layout.addWidget(stats_group)
         
+        # -- Research Statistics Button --
+        self.hull_stats_btn = QPushButton("📊 Generate Hull Comparison Statistics")
+        self.hull_stats_btn.setToolTip(
+            "Compare Alpha Shape vs Delaunay 2D methods across all datasets.\n"
+            "Generates metrics for research papers: boundary length, vertices,\n"
+            "area, perimeter ratio, computation time, and more."
+        )
+        self.hull_stats_btn.clicked.connect(self._generate_hull_comparison_statistics)
+        self.hull_stats_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7B1FA2;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #9C27B0;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+        """)
+        control_layout.addWidget(self.hull_stats_btn)
+        
         # High-quality figure export button
         self.hull_export_figure_btn = QPushButton("📸 Export Figure")
         self.hull_export_figure_btn.clicked.connect(lambda: self._show_generic_figure_export_dialog('hulls'))
@@ -2663,6 +2690,32 @@ class MeshItWorkflowGUI(QMainWindow):
         stats_layout.addWidget(self.uniformity_label) # Added for completeness
         control_layout.addWidget(stats_group) # Added for completeness
 
+        # -- Research Statistics Button for Interpolation Methods --
+        self.interp_stats_btn = QPushButton("📊 Generate Interpolation Comparison Statistics")
+        self.interp_stats_btn.setToolTip(
+            "Compare TPS vs IDW interpolation methods across all datasets.\n"
+            "Generates metrics for research papers: RMSE, MAE, Max Error,\n"
+            "R², computation time using cross-validation."
+        )
+        self.interp_stats_btn.clicked.connect(self._generate_interpolation_comparison_statistics)
+        self.interp_stats_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7B1FA2;
+                color: white;
+                font-weight: bold;
+                padding: 8px;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #9C27B0;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+        """)
+        control_layout.addWidget(self.interp_stats_btn)
 
         # Export button (remain the same)
         # ... (export_btn setup remains the same) ...
@@ -8423,9 +8476,402 @@ class MeshItWorkflowGUI(QMainWindow):
             return
         self._run_batch_computation("hulls", len(self.datasets))
     
+    def _generate_hull_comparison_statistics(self):
+        """
+        Generate comprehensive comparison statistics between Alpha Shape and Delaunay 2D methods.
         
+        Computes for each dataset and both methods:
+        - Boundary length (perimeter)
+        - Number of vertices
+        - Enclosed area (2D projected)
+        - Perimeter-to-area ratio (compactness)
+        - Convexity ratio (area / convex hull area)
+        - Computation time
+        """
+        from scipy.spatial import ConvexHull, Delaunay
+        import time
+        
+        if not self.datasets:
+            QMessageBox.information(self, "No Data", "No datasets loaded to analyze.")
+            return
+        
+        # Filter datasets suitable for hull computation
+        valid_datasets = [(i, ds) for i, ds in enumerate(self.datasets) 
+                          if ds.get('type') != 'WELL' and ds.get('points') is not None and len(ds.get('points', [])) >= 3]
+        
+        if not valid_datasets:
+            QMessageBox.information(self, "No Valid Data", "No datasets with sufficient points for hull analysis.")
+            return
+        
+        self.statusBar().showMessage("Generating hull comparison statistics...")
+        QApplication.processEvents()
+        
+        results = []
+        
+        for idx, ds in valid_datasets:
+            pts = ds.get("points")
+            name = ds.get('name', f'Dataset_{idx}')
+            
+            try:
+                dim = pts.shape[1]
+                
+                # Get PCA projection for 3D data
+                if dim >= 3:
+                    _centroid, projected_pts_2d = self._pca_project(pts)
+                else:
+                    projected_pts_2d = pts[:, :2] if dim == 2 else pts
+                
+                result = {'name': name, 'num_points': len(pts)}
+                
+                # --- Compute Delaunay 2D boundary ---
+                start_time = time.perf_counter()
+                try:
+                    if dim == 2:
+                        hull = ConvexHull(pts)
+                        delaunay_indices = hull.vertices
+                    else:
+                        tri = Delaunay(projected_pts_2d)
+                        edges = set()
+                        for simplex in tri.simplices:
+                            for j in range(3):
+                                p1_idx, p2_idx = simplex[j], simplex[(j + 1) % 3]
+                                edge = tuple(sorted((p1_idx, p2_idx)))
+                                if edge in edges:
+                                    edges.remove(edge)
+                                else:
+                                    edges.add(edge)
+                        
+                        if edges:
+                            ordered_indices = []
+                            current_edge = edges.pop()
+                            ordered_indices.extend(list(current_edge))
+                            while edges:
+                                last_point_idx = ordered_indices[-1]
+                                found_next = False
+                                for edge in list(edges):
+                                    if last_point_idx in edge:
+                                        next_point_idx = edge[1] if edge[0] == last_point_idx else edge[0]
+                                        ordered_indices.append(next_point_idx)
+                                        edges.remove(edge)
+                                        found_next = True
+                                        break
+                                if not found_next:
+                                    break
+                            delaunay_indices = np.array(ordered_indices)
+                        else:
+                            hull = ConvexHull(projected_pts_2d)
+                            delaunay_indices = hull.vertices
+                    
+                    delaunay_time = time.perf_counter() - start_time
+                    delaunay_pts_2d = projected_pts_2d[delaunay_indices]
+                    delaunay_metrics = self._compute_hull_metrics(delaunay_pts_2d, projected_pts_2d)
+                    delaunay_metrics['time_ms'] = delaunay_time * 1000
+                    delaunay_metrics['num_vertices'] = len(delaunay_indices)
+                    result['delaunay'] = delaunay_metrics
+                except Exception as e:
+                    logger.warning(f"Delaunay computation failed for {name}: {e}")
+                    result['delaunay'] = {'error': str(e)}
+                
+                # --- Compute Alpha Shape boundary ---
+                start_time = time.perf_counter()
+                try:
+                    alpha_factor = self.hull_alpha_spin.value() if hasattr(self, 'hull_alpha_spin') else 1.0
+                    alpha_indices = self._compute_alpha_shape_boundary_robust(projected_pts_2d, alpha_factor)
+                    
+                    if alpha_indices is not None and len(alpha_indices) >= 3:
+                        alpha_time = time.perf_counter() - start_time
+                        alpha_pts_2d = projected_pts_2d[alpha_indices]
+                        alpha_metrics = self._compute_hull_metrics(alpha_pts_2d, projected_pts_2d)
+                        alpha_metrics['time_ms'] = alpha_time * 1000
+                        alpha_metrics['num_vertices'] = len(alpha_indices)
+                        result['alpha'] = alpha_metrics
+                    else:
+                        result['alpha'] = {'error': 'Alpha shape computation failed'}
+                except Exception as e:
+                    logger.warning(f"Alpha shape computation failed for {name}: {e}")
+                    result['alpha'] = {'error': str(e)}
+                
+                results.append(result)
+                
+            except Exception as e:
+                logger.error(f"Error computing hull statistics for {name}: {e}")
+                results.append({'name': name, 'error': str(e)})
+        
+        # Display results dialog
+        self._show_hull_statistics_dialog(results)
+        self.statusBar().showMessage("Hull comparison statistics generated.")
     
+    def _compute_hull_metrics(self, hull_pts_2d: np.ndarray, all_pts_2d: np.ndarray) -> dict:
+        """
+        Compute geometric metrics for a hull boundary.
+        
+        Args:
+            hull_pts_2d: Ordered boundary points in 2D
+            all_pts_2d: All original points in 2D (for convex hull comparison)
+            
+        Returns:
+            Dictionary with metrics: perimeter, area, compactness, convexity_ratio
+        """
+        from scipy.spatial import ConvexHull
+        
+        metrics = {}
+        
+        try:
+            # Close the hull if not closed
+            if not np.allclose(hull_pts_2d[0], hull_pts_2d[-1]):
+                hull_pts_closed = np.vstack([hull_pts_2d, hull_pts_2d[0:1]])
+            else:
+                hull_pts_closed = hull_pts_2d
+            
+            # Perimeter (boundary length)
+            edges = np.diff(hull_pts_closed, axis=0)
+            edge_lengths = np.linalg.norm(edges, axis=1)
+            perimeter = float(np.sum(edge_lengths))
+            metrics['perimeter'] = perimeter
+            metrics['mean_edge_length'] = float(np.mean(edge_lengths))
+            metrics['std_edge_length'] = float(np.std(edge_lengths))
+            
+            # Area using shoelace formula
+            n = len(hull_pts_2d)
+            area = 0.0
+            for i in range(n):
+                j = (i + 1) % n
+                area += hull_pts_2d[i, 0] * hull_pts_2d[j, 1]
+                area -= hull_pts_2d[j, 0] * hull_pts_2d[i, 1]
+            area = abs(area) / 2.0
+            metrics['area'] = area
+            
+            # Compactness (4π * area / perimeter²) - circle = 1.0
+            if perimeter > 0:
+                metrics['compactness'] = (4 * np.pi * area) / (perimeter ** 2)
+            else:
+                metrics['compactness'] = 0.0
+            
+            # Convexity ratio (area / convex hull area)
+            try:
+                convex_hull = ConvexHull(hull_pts_2d)
+                convex_area = convex_hull.volume  # In 2D, volume is area
+                metrics['convexity_ratio'] = area / convex_area if convex_area > 0 else 1.0
+            except Exception:
+                metrics['convexity_ratio'] = 1.0
+            
+            # Bounding box metrics
+            min_coords = np.min(hull_pts_2d, axis=0)
+            max_coords = np.max(hull_pts_2d, axis=0)
+            bbox_width = max_coords[0] - min_coords[0]
+            bbox_height = max_coords[1] - min_coords[1]
+            bbox_area = bbox_width * bbox_height
+            metrics['bbox_fill_ratio'] = area / bbox_area if bbox_area > 0 else 0.0
+            
+        except Exception as e:
+            logger.error(f"Error computing hull metrics: {e}")
+            metrics['error'] = str(e)
+        
+        return metrics
     
+    def _show_hull_statistics_dialog(self, results: list):
+        """Display hull comparison statistics in a dialog with exportable table."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton, QFileDialog, QTabWidget
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Hull Method Comparison Statistics")
+        dialog.setMinimumSize(900, 600)
+        layout = QVBoxLayout(dialog)
+        
+        # Create tab widget for different views
+        tabs = QTabWidget()
+        
+        # --- Summary Tab ---
+        summary_text = QTextEdit()
+        summary_text.setReadOnly(True)
+        
+        alpha_factor = self.hull_alpha_spin.value() if hasattr(self, 'hull_alpha_spin') else 1.0
+        summary_html = f"""
+        <style>
+            table {{ border-collapse: collapse; width: 100%; font-family: monospace; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: right; }}
+            th {{ background-color: #4a4a4a; color: white; }}
+            tr:nth-child(even) {{ background-color: #f9f9f9; }}
+            .header {{ font-size: 16px; font-weight: bold; margin: 10px 0; }}
+            .method-delaunay {{ color: #2196F3; }}
+            .method-alpha {{ color: #9C27B0; }}
+            .better {{ color: #4CAF50; font-weight: bold; }}
+        </style>
+        <div class="header">Hull Method Comparison: Alpha Shape vs Delaunay 2D</div>
+        <p>Analysis of {len(results)} dataset(s) with alpha_factor = {alpha_factor:.2f}</p>
+        <table>
+            <tr>
+                <th>Dataset</th>
+                <th>Points</th>
+                <th colspan="2">Vertices</th>
+                <th colspan="2">Perimeter</th>
+                <th colspan="2">Area</th>
+                <th colspan="2">Convexity</th>
+                <th colspan="2">Time (ms)</th>
+            </tr>
+            <tr>
+                <th></th>
+                <th></th>
+                <th class="method-delaunay">Del.</th>
+                <th class="method-alpha">Alpha</th>
+                <th class="method-delaunay">Del.</th>
+                <th class="method-alpha">Alpha</th>
+                <th class="method-delaunay">Del.</th>
+                <th class="method-alpha">Alpha</th>
+                <th class="method-delaunay">Del.</th>
+                <th class="method-alpha">Alpha</th>
+                <th class="method-delaunay">Del.</th>
+                <th class="method-alpha">Alpha</th>
+            </tr>
+        """
+        
+        # Aggregate statistics
+        del_perimeters, alpha_perimeters = [], []
+        del_areas, alpha_areas = [], []
+        del_convexities, alpha_convexities = [], []
+        del_times, alpha_times = [], []
+        
+        for r in results:
+            if 'error' in r:
+                continue
+            
+            del_data = r.get('delaunay', {})
+            alpha_data = r.get('alpha', {})
+            
+            # Helper function to format values
+            def fmt(val, decimals=2):
+                return f"{val:.{decimals}f}" if val is not None else "-"
+            
+            row = f"<tr><td style='text-align:left;'>{r['name']}</td><td>{r['num_points']}</td>"
+            
+            # Vertices
+            del_v = del_data.get('num_vertices', '-')
+            alpha_v = alpha_data.get('num_vertices', '-')
+            row += f"<td>{del_v}</td><td>{alpha_v}</td>"
+            
+            # Perimeter
+            del_p = del_data.get('perimeter', None)
+            alpha_p = alpha_data.get('perimeter', None)
+            row += f"<td>{fmt(del_p, 2)}</td><td>{fmt(alpha_p, 2)}</td>"
+            if del_p: del_perimeters.append(del_p)
+            if alpha_p: alpha_perimeters.append(alpha_p)
+            
+            # Area
+            del_a = del_data.get('area', None)
+            alpha_a = alpha_data.get('area', None)
+            row += f"<td>{fmt(del_a, 2)}</td><td>{fmt(alpha_a, 2)}</td>"
+            if del_a: del_areas.append(del_a)
+            if alpha_a: alpha_areas.append(alpha_a)
+            
+            # Convexity
+            del_c = del_data.get('convexity_ratio', None)
+            alpha_c = alpha_data.get('convexity_ratio', None)
+            row += f"<td>{fmt(del_c, 3)}</td><td>{fmt(alpha_c, 3)}</td>"
+            if del_c: del_convexities.append(del_c)
+            if alpha_c: alpha_convexities.append(alpha_c)
+            
+            # Time
+            del_t = del_data.get('time_ms', None)
+            alpha_t = alpha_data.get('time_ms', None)
+            row += f"<td>{fmt(del_t, 2)}</td><td>{fmt(alpha_t, 2)}</td>"
+            if del_t: del_times.append(del_t)
+            if alpha_t: alpha_times.append(alpha_t)
+            
+            row += "</tr>"
+            summary_html += row
+        
+        # Helper for aggregate formatting
+        def fmt_mean(arr, decimals=2):
+            return f"{np.mean(arr):.{decimals}f}" if arr else "-"
+        
+        # Add aggregate row
+        summary_html += "<tr style='font-weight:bold; background-color:#e0e0e0;'>"
+        summary_html += "<td>MEAN</td><td>-</td>"
+        summary_html += "<td>-</td><td>-</td>"
+        summary_html += f"<td>{fmt_mean(del_perimeters, 2)}</td>"
+        summary_html += f"<td>{fmt_mean(alpha_perimeters, 2)}</td>"
+        summary_html += f"<td>{fmt_mean(del_areas, 2)}</td>"
+        summary_html += f"<td>{fmt_mean(alpha_areas, 2)}</td>"
+        summary_html += f"<td>{fmt_mean(del_convexities, 3)}</td>"
+        summary_html += f"<td>{fmt_mean(alpha_convexities, 3)}</td>"
+        summary_html += f"<td>{fmt_mean(del_times, 2)}</td>"
+        summary_html += f"<td>{fmt_mean(alpha_times, 2)}</td>"
+        summary_html += "</tr></table>"
+        
+        # Add interpretation
+        summary_html += """
+        <div class="header" style="margin-top: 20px;">Interpretation Guide</div>
+        <ul>
+            <li><b>Convexity Ratio</b>: 1.0 = convex boundary, &lt;1.0 = concave (Alpha typically lower for wavy surfaces)</li>
+            <li><b>Perimeter</b>: Alpha shape typically has longer perimeter when capturing concavities</li>
+            <li><b>Area</b>: Alpha shape typically has smaller area (excludes concave regions)</li>
+            <li><b>Use Alpha Shape</b> when: surfaces have wavy/undulating boundaries, concave features matter</li>
+            <li><b>Use Delaunay 2D</b> when: surfaces are quasi-planar, simpler boundaries preferred</li>
+        </ul>
+        """
+        
+        summary_text.setHtml(summary_html)
+        tabs.addTab(summary_text, "Summary Table")
+        
+        # --- CSV Data Tab ---
+        csv_text = QTextEdit()
+        csv_text.setReadOnly(True)
+        csv_text.setFontFamily("monospace")
+        
+        csv_data = "Dataset,Points,Del_Vertices,Alpha_Vertices,Del_Perimeter,Alpha_Perimeter,"
+        csv_data += "Del_Area,Alpha_Area,Del_Convexity,Alpha_Convexity,Del_Time_ms,Alpha_Time_ms\n"
+        
+        for r in results:
+            if 'error' in r:
+                continue
+            del_d = r.get('delaunay', {})
+            alpha_d = r.get('alpha', {})
+            csv_data += f"{r['name']},{r['num_points']},"
+            csv_data += f"{del_d.get('num_vertices', '')},{alpha_d.get('num_vertices', '')},"
+            csv_data += f"{del_d.get('perimeter', ''):.6f},{alpha_d.get('perimeter', ''):.6f}," if del_d.get('perimeter') else ",,"
+            csv_data += f"{del_d.get('area', ''):.6f},{alpha_d.get('area', ''):.6f}," if del_d.get('area') else ",,"
+            csv_data += f"{del_d.get('convexity_ratio', ''):.6f},{alpha_d.get('convexity_ratio', ''):.6f}," if del_d.get('convexity_ratio') else ",,"
+            csv_data += f"{del_d.get('time_ms', ''):.4f},{alpha_d.get('time_ms', ''):.4f}\n" if del_d.get('time_ms') else ",\n"
+        
+        csv_text.setPlainText(csv_data)
+        tabs.addTab(csv_text, "CSV Data")
+        
+        layout.addWidget(tabs)
+        
+        # Export buttons
+        btn_layout = QHBoxLayout()
+        
+        export_csv_btn = QPushButton("Export as CSV")
+        export_csv_btn.clicked.connect(lambda: self._export_statistics_csv(csv_data, "hull_comparison"))
+        btn_layout.addWidget(export_csv_btn)
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(close_btn)
+        
+        layout.addLayout(btn_layout)
+        dialog.exec()
+    
+    def _export_statistics_csv(self, csv_data: str, prefix: str):
+        """Export statistics data as CSV file."""
+        from PySide6.QtWidgets import QFileDialog
+        import datetime
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"{prefix}_statistics_{timestamp}.csv"
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Statistics CSV", default_name, "CSV Files (*.csv)"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(csv_data)
+                self.statusBar().showMessage(f"Statistics exported to {file_path}")
+                QMessageBox.information(self, "Export Complete", f"Statistics saved to:\n{file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", f"Failed to export: {e}")
 
     
     def _set_height_factor(self, height):
@@ -9099,6 +9545,478 @@ segmentation, triangulation, and visualization.
             return
         self._run_batch_computation("triangulations", len(datasets_with_segments_indices))
     
+    def _generate_interpolation_comparison_statistics(self):
+        """
+        Generate comprehensive comparison statistics between TPS and IDW interpolation methods.
+        
+        Uses k-fold cross-validation to compute:
+        - RMSE (Root Mean Square Error)
+        - MAE (Mean Absolute Error)
+        - Max Error
+        - R² (Coefficient of Determination)
+        - Computation time
+        """
+        from scipy.spatial import cKDTree
+        from scipy.interpolate import RBFInterpolator
+        import time
+        
+        if not self.datasets:
+            QMessageBox.information(self, "No Data", "No datasets loaded to analyze.")
+            return
+        
+        # Filter datasets with sufficient points
+        valid_datasets = [(i, ds) for i, ds in enumerate(self.datasets) 
+                          if ds.get('type') != 'WELL' and ds.get('points') is not None and len(ds.get('points', [])) >= 10]
+        
+        if not valid_datasets:
+            QMessageBox.information(self, "No Valid Data", "No datasets with sufficient points for interpolation analysis (need >= 10 points).")
+            return
+        
+        self.statusBar().showMessage("Generating interpolation comparison statistics (this may take a moment)...")
+        QApplication.processEvents()
+        
+        smoothing = float(self.interp_smoothing_input.value()) if hasattr(self, "interp_smoothing_input") else 0.0
+        results = []
+        
+        for idx, ds in valid_datasets:
+            pts = ds.get("points")
+            name = ds.get('name', f'Dataset_{idx}')
+            
+            try:
+                # Project to 2D using PCA
+                all_pts = np.asarray(pts, dtype=float)
+                if all_pts.shape[1] >= 3:
+                    centred = all_pts - all_pts.mean(axis=0, keepdims=True)
+                    _, _, vh = np.linalg.svd(centred, full_matrices=False)
+                    normal = vh[-1]
+                    normal = -normal if normal[2] < 0.0 else normal
+                    z_axis = np.array([0.0, 0.0, 1.0], dtype=float)
+                    
+                    # Build rotation matrix
+                    axis = np.cross(normal, z_axis)
+                    c = float(np.dot(z_axis, normal))
+                    an = np.linalg.norm(axis)
+                    if 1.0 - abs(c) < 1e-12 or an < 1e-15:
+                        R = np.eye(3)
+                    else:
+                        axis = axis / an
+                        s = np.sqrt(1.0 - c*c)
+                        C = 1.0 - c
+                        r1 = np.array([axis[0]*axis[0]*C + c, axis[0]*axis[1]*C - axis[2]*s, axis[0]*axis[2]*C + axis[1]*s])
+                        r2 = np.array([axis[1]*axis[0]*C + axis[2]*s, axis[1]*axis[1]*C + c, axis[1]*axis[2]*C - axis[0]*s])
+                        r3 = np.array([axis[2]*axis[0]*C - axis[1]*s, axis[2]*axis[1]*C + axis[0]*s, axis[2]*axis[2]*C + c])
+                        R = np.vstack([r1, r2, r3])
+                    
+                    all_pts_rot = (R @ all_pts.T).T
+                    sample_xy = all_pts_rot[:, :2]
+                    sample_z = all_pts_rot[:, 2]
+                else:
+                    sample_xy = all_pts[:, :2]
+                    sample_z = np.zeros(len(all_pts))
+                
+                result = {
+                    'name': name,
+                    'num_points': len(pts),
+                    'z_range': float(np.max(sample_z) - np.min(sample_z)),
+                    'z_std': float(np.std(sample_z))
+                }
+                
+                # K-fold cross-validation (k=5 or len(pts) if small)
+                n = len(sample_xy)
+                k_folds = min(5, n)
+                indices = np.arange(n)
+                np.random.seed(42)  # Reproducibility
+                np.random.shuffle(indices)
+                fold_size = n // k_folds
+                
+                # --- IDW Cross-Validation ---
+                idw_errors = []
+                idw_time_total = 0.0
+                
+                for fold in range(k_folds):
+                    test_start = fold * fold_size
+                    test_end = (fold + 1) * fold_size if fold < k_folds - 1 else n
+                    test_idx = indices[test_start:test_end]
+                    train_idx = np.concatenate([indices[:test_start], indices[test_end:]])
+                    
+                    train_xy = sample_xy[train_idx]
+                    train_z = sample_z[train_idx]
+                    test_xy = sample_xy[test_idx]
+                    test_z = sample_z[test_idx]
+                    
+                    start_time = time.perf_counter()
+                    
+                    # IDW prediction
+                    tree = cKDTree(train_xy)
+                    k_neighbors = min(64, len(train_xy))
+                    d, idx_nn = tree.query(test_xy, k=k_neighbors)
+                    if k_neighbors == 1:
+                        d = d[:, None]
+                        idx_nn = idx_nn[:, None]
+                    
+                    power = 4  # IDW power from "IDW (p=4)"
+                    r2 = np.maximum(d * d, 1e-24)
+                    w = 1.0 / (r2 ** power)
+                    wsum = np.sum(w, axis=1)
+                    pred_z = np.sum(w * train_z[idx_nn], axis=1) / wsum
+                    
+                    idw_time_total += time.perf_counter() - start_time
+                    idw_errors.extend((pred_z - test_z).tolist())
+                
+                idw_errors = np.array(idw_errors)
+                result['idw'] = {
+                    'rmse': float(np.sqrt(np.mean(idw_errors ** 2))),
+                    'mae': float(np.mean(np.abs(idw_errors))),
+                    'max_error': float(np.max(np.abs(idw_errors))),
+                    'r2': float(1 - np.sum(idw_errors ** 2) / np.sum((sample_z - np.mean(sample_z)) ** 2)) if np.var(sample_z) > 0 else 0.0,
+                    'time_ms': idw_time_total * 1000,
+                    'std_error': float(np.std(idw_errors))
+                }
+                
+                # --- TPS Cross-Validation ---
+                tps_errors = []
+                tps_time_total = 0.0
+                
+                for fold in range(k_folds):
+                    test_start = fold * fold_size
+                    test_end = (fold + 1) * fold_size if fold < k_folds - 1 else n
+                    test_idx = indices[test_start:test_end]
+                    train_idx = np.concatenate([indices[:test_start], indices[test_end:]])
+                    
+                    train_xy = sample_xy[train_idx]
+                    train_z = sample_z[train_idx]
+                    test_xy = sample_xy[test_idx]
+                    test_z = sample_z[test_idx]
+                    
+                    start_time = time.perf_counter()
+                    
+                    try:
+                        rbf = RBFInterpolator(
+                            train_xy, train_z,
+                            kernel='thin_plate_spline',
+                            smoothing=float(smoothing)
+                        )
+                        pred_z = rbf(test_xy)
+                    except Exception:
+                        # Fallback to IDW if TPS fails
+                        tree = cKDTree(train_xy)
+                        k_neighbors = min(64, len(train_xy))
+                        d, idx_nn = tree.query(test_xy, k=k_neighbors)
+                        if k_neighbors == 1:
+                            d = d[:, None]
+                            idx_nn = idx_nn[:, None]
+                        r2 = np.maximum(d * d, 1e-24)
+                        w = 1.0 / (r2 ** 2)
+                        wsum = np.sum(w, axis=1)
+                        pred_z = np.sum(w * train_z[idx_nn], axis=1) / wsum
+                    
+                    tps_time_total += time.perf_counter() - start_time
+                    tps_errors.extend((pred_z - test_z).tolist())
+                
+                tps_errors = np.array(tps_errors)
+                result['tps'] = {
+                    'rmse': float(np.sqrt(np.mean(tps_errors ** 2))),
+                    'mae': float(np.mean(np.abs(tps_errors))),
+                    'max_error': float(np.max(np.abs(tps_errors))),
+                    'r2': float(1 - np.sum(tps_errors ** 2) / np.sum((sample_z - np.mean(sample_z)) ** 2)) if np.var(sample_z) > 0 else 0.0,
+                    'time_ms': tps_time_total * 1000,
+                    'std_error': float(np.std(tps_errors))
+                }
+                
+                results.append(result)
+                
+            except Exception as e:
+                logger.error(f"Error computing interpolation statistics for {name}: {e}")
+                results.append({'name': name, 'error': str(e)})
+        
+        # Display results dialog
+        self._show_interpolation_statistics_dialog(results, smoothing)
+        self.statusBar().showMessage("Interpolation comparison statistics generated.")
+    
+    def _show_interpolation_statistics_dialog(self, results: list, smoothing: float):
+        """Display interpolation comparison statistics in a dialog with exportable table."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTextEdit, QPushButton, QFileDialog, QTabWidget
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Interpolation Method Comparison Statistics")
+        dialog.setMinimumSize(1000, 650)
+        layout = QVBoxLayout(dialog)
+        
+        # Create tab widget for different views
+        tabs = QTabWidget()
+        
+        # --- Summary Tab ---
+        summary_text = QTextEdit()
+        summary_text.setReadOnly(True)
+        
+        summary_html = f"""
+        <style>
+            table {{ border-collapse: collapse; width: 100%; font-family: monospace; font-size: 11px; }}
+            th, td {{ border: 1px solid #ddd; padding: 6px; text-align: right; }}
+            th {{ background-color: #4a4a4a; color: white; }}
+            tr:nth-child(even) {{ background-color: #f9f9f9; }}
+            .header {{ font-size: 16px; font-weight: bold; margin: 10px 0; }}
+            .method-tps {{ color: #2196F3; }}
+            .method-idw {{ color: #FF9800; }}
+            .better {{ color: #4CAF50; font-weight: bold; }}
+            .worse {{ color: #f44336; }}
+        </style>
+        <div class="header">Interpolation Method Comparison: TPS vs IDW (p=4)</div>
+        <p>Cross-validation analysis of {len(results)} dataset(s) | Smoothing = {smoothing:.6f} | K-Folds = 5</p>
+        <table>
+            <tr>
+                <th>Dataset</th>
+                <th>Points</th>
+                <th>Z Range</th>
+                <th colspan="2">RMSE</th>
+                <th colspan="2">MAE</th>
+                <th colspan="2">Max Error</th>
+                <th colspan="2">R²</th>
+                <th colspan="2">Time (ms)</th>
+            </tr>
+            <tr>
+                <th></th>
+                <th></th>
+                <th></th>
+                <th class="method-tps">TPS</th>
+                <th class="method-idw">IDW</th>
+                <th class="method-tps">TPS</th>
+                <th class="method-idw">IDW</th>
+                <th class="method-tps">TPS</th>
+                <th class="method-idw">IDW</th>
+                <th class="method-tps">TPS</th>
+                <th class="method-idw">IDW</th>
+                <th class="method-tps">TPS</th>
+                <th class="method-idw">IDW</th>
+            </tr>
+        """
+        
+        # Aggregate statistics
+        tps_rmse, idw_rmse = [], []
+        tps_mae, idw_mae = [], []
+        tps_r2, idw_r2 = [], []
+        tps_times, idw_times = [], []
+        
+        for r in results:
+            if 'error' in r:
+                continue
+            
+            tps_data = r.get('tps', {})
+            idw_data = r.get('idw', {})
+            
+            # Helper function to format values
+            def fmt(val, decimals=6):
+                return f"{val:.{decimals}f}" if val is not None else "-"
+            
+            row = f"<tr><td style='text-align:left;'>{r['name']}</td>"
+            row += f"<td>{r['num_points']}</td>"
+            row += f"<td>{r['z_range']:.3f}</td>"
+            
+            # RMSE (lower is better)
+            tps_r = tps_data.get('rmse', None)
+            idw_r = idw_data.get('rmse', None)
+            tps_class = 'better' if tps_r and idw_r and tps_r < idw_r else ''
+            idw_class = 'better' if tps_r and idw_r and idw_r < tps_r else ''
+            row += f"<td class='{tps_class}'>{fmt(tps_r, 6)}</td>"
+            row += f"<td class='{idw_class}'>{fmt(idw_r, 6)}</td>"
+            if tps_r: tps_rmse.append(tps_r)
+            if idw_r: idw_rmse.append(idw_r)
+            
+            # MAE (lower is better)
+            tps_m = tps_data.get('mae', None)
+            idw_m = idw_data.get('mae', None)
+            tps_class = 'better' if tps_m and idw_m and tps_m < idw_m else ''
+            idw_class = 'better' if tps_m and idw_m and idw_m < tps_m else ''
+            row += f"<td class='{tps_class}'>{fmt(tps_m, 6)}</td>"
+            row += f"<td class='{idw_class}'>{fmt(idw_m, 6)}</td>"
+            if tps_m: tps_mae.append(tps_m)
+            if idw_m: idw_mae.append(idw_m)
+            
+            # Max Error (lower is better)
+            tps_max = tps_data.get('max_error', None)
+            idw_max = idw_data.get('max_error', None)
+            tps_class = 'better' if tps_max and idw_max and tps_max < idw_max else ''
+            idw_class = 'better' if tps_max and idw_max and idw_max < tps_max else ''
+            row += f"<td class='{tps_class}'>{fmt(tps_max, 6)}</td>"
+            row += f"<td class='{idw_class}'>{fmt(idw_max, 6)}</td>"
+            
+            # R² (higher is better)
+            tps_r2_val = tps_data.get('r2', None)
+            idw_r2_val = idw_data.get('r2', None)
+            tps_class = 'better' if tps_r2_val and idw_r2_val and tps_r2_val > idw_r2_val else ''
+            idw_class = 'better' if tps_r2_val and idw_r2_val and idw_r2_val > tps_r2_val else ''
+            row += f"<td class='{tps_class}'>{fmt(tps_r2_val, 6)}</td>"
+            row += f"<td class='{idw_class}'>{fmt(idw_r2_val, 6)}</td>"
+            if tps_r2_val: tps_r2.append(tps_r2_val)
+            if idw_r2_val: idw_r2.append(idw_r2_val)
+            
+            # Time (lower is better, but informational)
+            tps_t = tps_data.get('time_ms', None)
+            idw_t = idw_data.get('time_ms', None)
+            row += f"<td>{fmt(tps_t, 2)}</td>"
+            row += f"<td>{fmt(idw_t, 2)}</td>"
+            if tps_t: tps_times.append(tps_t)
+            if idw_t: idw_times.append(idw_t)
+            
+            row += "</tr>"
+            summary_html += row
+        
+        # Helper for aggregate formatting
+        def fmt_mean(arr, decimals=6):
+            return f"{np.mean(arr):.{decimals}f}" if arr else "-"
+        
+        # Add aggregate row
+        summary_html += "<tr style='font-weight:bold; background-color:#e0e0e0;'>"
+        summary_html += "<td>MEAN</td><td>-</td><td>-</td>"
+        summary_html += f"<td>{fmt_mean(tps_rmse, 6)}</td>"
+        summary_html += f"<td>{fmt_mean(idw_rmse, 6)}</td>"
+        summary_html += f"<td>{fmt_mean(tps_mae, 6)}</td>"
+        summary_html += f"<td>{fmt_mean(idw_mae, 6)}</td>"
+        summary_html += "<td>-</td><td>-</td>"
+        summary_html += f"<td>{fmt_mean(tps_r2, 6)}</td>"
+        summary_html += f"<td>{fmt_mean(idw_r2, 6)}</td>"
+        summary_html += f"<td>{fmt_mean(tps_times, 2)}</td>"
+        summary_html += f"<td>{fmt_mean(idw_times, 2)}</td>"
+        summary_html += "</tr></table>"
+        
+        # Add interpretation
+        summary_html += """
+        <div class="header" style="margin-top: 20px;">Interpretation Guide</div>
+        <ul>
+            <li><b>RMSE</b> (Root Mean Square Error): Lower is better. Emphasizes large errors.</li>
+            <li><b>MAE</b> (Mean Absolute Error): Lower is better. Average error magnitude.</li>
+            <li><b>Max Error</b>: Lower is better. Worst-case prediction error.</li>
+            <li><b>R²</b> (Coefficient of Determination): Higher is better. 1.0 = perfect fit, 0.0 = baseline.</li>
+            <li><span class="better">Green</span> indicates the better method for each metric.</li>
+        </ul>
+        <div class="header">Method Characteristics</div>
+        <ul>
+            <li><b>TPS (Thin Plate Spline)</b>: Global interpolator, smooth surfaces, handles sparse data well.</li>
+            <li><b>IDW (Inverse Distance Weighting)</b>: Local interpolator, preserves local variations, faster for large datasets.</li>
+            <li><b>Smoothing parameter</b>: Higher values reduce overfitting but may miss local variations.</li>
+        </ul>
+        """
+        
+        summary_text.setHtml(summary_html)
+        tabs.addTab(summary_text, "Summary Table")
+        
+        # --- Detailed Statistics Tab ---
+        detail_text = QTextEdit()
+        detail_text.setReadOnly(True)
+        
+        detail_html = """
+        <style>
+            table { border-collapse: collapse; width: 100%; font-family: monospace; font-size: 11px; }
+            th, td { border: 1px solid #ddd; padding: 6px; text-align: right; }
+            th { background-color: #4a4a4a; color: white; }
+        </style>
+        <div style="font-size:16px; font-weight:bold; margin:10px 0;">Detailed Error Statistics</div>
+        <table>
+            <tr>
+                <th>Dataset</th>
+                <th>Z Std Dev</th>
+                <th colspan="2">Std Error</th>
+                <th colspan="2">RMSE/Z_Range (%)</th>
+                <th colspan="2">Improvement TPS vs IDW</th>
+            </tr>
+            <tr>
+                <th></th><th></th>
+                <th>TPS</th><th>IDW</th>
+                <th>TPS</th><th>IDW</th>
+                <th>RMSE (%)</th><th>R²</th>
+            </tr>
+        """
+        
+        for r in results:
+            if 'error' in r:
+                continue
+            
+            tps_data = r.get('tps', {})
+            idw_data = r.get('idw', {})
+            
+            row = f"<tr><td style='text-align:left;'>{r['name']}</td>"
+            row += f"<td>{r.get('z_std', 0):.4f}</td>"
+            
+            # Std Error
+            row += f"<td>{tps_data.get('std_error', 0):.6f}</td>"
+            row += f"<td>{idw_data.get('std_error', 0):.6f}</td>"
+            
+            # RMSE as % of Z range
+            z_range = r.get('z_range', 1)
+            if z_range > 0:
+                tps_pct = (tps_data.get('rmse', 0) / z_range) * 100
+                idw_pct = (idw_data.get('rmse', 0) / z_range) * 100
+                row += f"<td>{tps_pct:.2f}%</td><td>{idw_pct:.2f}%</td>"
+            else:
+                row += "<td>-</td><td>-</td>"
+            
+            # Improvement
+            tps_rmse_val = tps_data.get('rmse', None)
+            idw_rmse_val = idw_data.get('rmse', None)
+            if tps_rmse_val and idw_rmse_val and idw_rmse_val > 0:
+                rmse_improvement = ((idw_rmse_val - tps_rmse_val) / idw_rmse_val) * 100
+                color = '#4CAF50' if rmse_improvement > 0 else '#f44336'
+                row += f"<td style='color:{color};'>{rmse_improvement:+.2f}%</td>"
+            else:
+                row += "<td>-</td>"
+            
+            tps_r2_val = tps_data.get('r2', None)
+            idw_r2_val = idw_data.get('r2', None)
+            if tps_r2_val and idw_r2_val:
+                r2_diff = tps_r2_val - idw_r2_val
+                color = '#4CAF50' if r2_diff > 0 else '#f44336'
+                row += f"<td style='color:{color};'>{r2_diff:+.6f}</td>"
+            else:
+                row += "<td>-</td>"
+            
+            row += "</tr>"
+            detail_html += row
+        
+        detail_html += "</table>"
+        detail_text.setHtml(detail_html)
+        tabs.addTab(detail_text, "Detailed Statistics")
+        
+        # --- CSV Data Tab ---
+        csv_text = QTextEdit()
+        csv_text.setReadOnly(True)
+        csv_text.setFontFamily("monospace")
+        
+        csv_data = "Dataset,Points,Z_Range,Z_Std,"
+        csv_data += "TPS_RMSE,IDW_RMSE,TPS_MAE,IDW_MAE,TPS_MaxError,IDW_MaxError,"
+        csv_data += "TPS_R2,IDW_R2,TPS_StdError,IDW_StdError,TPS_Time_ms,IDW_Time_ms\n"
+        
+        for r in results:
+            if 'error' in r:
+                continue
+            tps_d = r.get('tps', {})
+            idw_d = r.get('idw', {})
+            csv_data += f"{r['name']},{r['num_points']},{r.get('z_range', ''):.6f},{r.get('z_std', ''):.6f},"
+            csv_data += f"{tps_d.get('rmse', '')},{idw_d.get('rmse', '')},"
+            csv_data += f"{tps_d.get('mae', '')},{idw_d.get('mae', '')},"
+            csv_data += f"{tps_d.get('max_error', '')},{idw_d.get('max_error', '')},"
+            csv_data += f"{tps_d.get('r2', '')},{idw_d.get('r2', '')},"
+            csv_data += f"{tps_d.get('std_error', '')},{idw_d.get('std_error', '')},"
+            csv_data += f"{tps_d.get('time_ms', '')},{idw_d.get('time_ms', '')}\n"
+        
+        csv_text.setPlainText(csv_data)
+        tabs.addTab(csv_text, "CSV Data")
+        
+        layout.addWidget(tabs)
+        
+        # Export buttons
+        btn_layout = QHBoxLayout()
+        
+        export_csv_btn = QPushButton("Export as CSV")
+        export_csv_btn.clicked.connect(lambda: self._export_statistics_csv(csv_data, "interpolation_comparison"))
+        btn_layout.addWidget(export_csv_btn)
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(close_btn)
+        
+        layout.addLayout(btn_layout)
+        dialog.exec()
+
     def export_results(self):
         """Export the triangulation results to a file for the active dataset"""
         self.statusBar().showMessage("Exporting results...")
@@ -16277,6 +17195,44 @@ segmentation, triangulation, and visualization.
             
             main_layout.addWidget(quality_group)
             
+            # === Line & Point Settings (for better visibility at high resolutions) ===
+            line_group = QGroupBox("Line & Point Settings")
+            line_form = QFormLayout(line_group)
+            
+            self.generic_fig_line_scale = QDoubleSpinBox()
+            self.generic_fig_line_scale.setRange(0.5, 10.0)
+            self.generic_fig_line_scale.setValue(2.0)
+            self.generic_fig_line_scale.setSingleStep(0.5)
+            self.generic_fig_line_scale.setSuffix("x")
+            self.generic_fig_line_scale.setToolTip("Scale factor for line widths (increase for better visibility at high resolutions)")
+            line_form.addRow("Line Width Scale:", self.generic_fig_line_scale)
+            
+            self.generic_fig_point_scale = QDoubleSpinBox()
+            self.generic_fig_point_scale.setRange(0.5, 10.0)
+            self.generic_fig_point_scale.setValue(2.0)
+            self.generic_fig_point_scale.setSingleStep(0.5)
+            self.generic_fig_point_scale.setSuffix("x")
+            self.generic_fig_point_scale.setToolTip("Scale factor for point sizes (increase for better visibility at high resolutions)")
+            line_form.addRow("Point Size Scale:", self.generic_fig_point_scale)
+            
+            self.generic_fig_min_line_width = QDoubleSpinBox()
+            self.generic_fig_min_line_width.setRange(1.0, 20.0)
+            self.generic_fig_min_line_width.setValue(3.0)
+            self.generic_fig_min_line_width.setSingleStep(0.5)
+            self.generic_fig_min_line_width.setSuffix(" px")
+            self.generic_fig_min_line_width.setToolTip("Minimum line width to ensure visibility")
+            line_form.addRow("Min Line Width:", self.generic_fig_min_line_width)
+            
+            self.generic_fig_min_point_size = QDoubleSpinBox()
+            self.generic_fig_min_point_size.setRange(1.0, 30.0)
+            self.generic_fig_min_point_size.setValue(6.0)
+            self.generic_fig_min_point_size.setSingleStep(1.0)
+            self.generic_fig_min_point_size.setSuffix(" px")
+            self.generic_fig_min_point_size.setToolTip("Minimum point size to ensure visibility")
+            line_form.addRow("Min Point Size:", self.generic_fig_min_point_size)
+            
+            main_layout.addWidget(line_group)
+            
             # === Title ===
             title_group = QGroupBox("Title")
             title_form = QFormLayout(title_group)
@@ -16519,6 +17475,19 @@ segmentation, triangulation, and visualization.
         
         text_color = 'white' if is_dark_bg else 'black'
         
+        # Get line and point scaling settings
+        line_scale = getattr(self, 'generic_fig_line_scale', None)
+        line_scale = line_scale.value() if line_scale else 2.0
+        
+        point_scale = getattr(self, 'generic_fig_point_scale', None)
+        point_scale = point_scale.value() if point_scale else 2.0
+        
+        min_line_width = getattr(self, 'generic_fig_min_line_width', None)
+        min_line_width = min_line_width.value() if min_line_width else 3.0
+        
+        min_point_size = getattr(self, 'generic_fig_min_point_size', None)
+        min_point_size = min_point_size.value() if min_point_size else 6.0
+        
         # Copy actors from source plotter to export plotter
         try:
             # Get all actors from the source plotter's renderer
@@ -16539,13 +17508,69 @@ segmentation, triangulation, and visualization.
                                 opacity = prop.GetOpacity() if prop else 1.0
                                 edge_visibility = prop.GetEdgeVisibility() if prop else False
                                 
-                                # Add mesh with similar properties
-                                plotter.add_mesh(
-                                    mesh,
-                                    color=color,
-                                    opacity=opacity,
-                                    show_edges=edge_visibility,
-                                )
+                                # Get line width and point size - scale them for better visibility
+                                orig_line_width = prop.GetLineWidth() if prop else 1.0
+                                orig_point_size = prop.GetPointSize() if prop else 1.0
+                                
+                                # Apply scaling and enforce minimums
+                                scaled_line_width = max(orig_line_width * line_scale, min_line_width)
+                                scaled_point_size = max(orig_point_size * point_scale, min_point_size)
+                                
+                                # Get representation mode (0=points, 1=wireframe, 2=surface)
+                                representation = prop.GetRepresentation() if prop else 2
+                                
+                                # Get edge color if edges are visible
+                                edge_color = None
+                                if edge_visibility and prop:
+                                    edge_color = prop.GetEdgeColor()
+                                
+                                # Determine rendering style based on representation
+                                style = 'surface'
+                                if representation == 0:
+                                    style = 'points'
+                                elif representation == 1:
+                                    style = 'wireframe'
+                                
+                                # Check if this is a point-only mesh (vertices without faces/lines)
+                                is_point_cloud = (mesh.n_cells == mesh.n_points or 
+                                                 (hasattr(mesh, 'n_lines') and mesh.n_lines == 0 and 
+                                                  hasattr(mesh, 'n_faces') and mesh.n_faces == 0))
+                                
+                                # Check if this is a line mesh
+                                is_line_mesh = (hasattr(mesh, 'n_lines') and mesh.n_lines > 0 and 
+                                               (not hasattr(mesh, 'n_faces') or mesh.n_faces == 0))
+                                
+                                # Add mesh with appropriate properties
+                                if is_point_cloud or representation == 0:
+                                    # Point cloud - use larger point size for visibility
+                                    plotter.add_mesh(
+                                        mesh,
+                                        color=color,
+                                        opacity=opacity,
+                                        point_size=scaled_point_size,
+                                        render_points_as_spheres=True,
+                                        style='points',
+                                    )
+                                elif is_line_mesh or representation == 1:
+                                    # Line mesh - use scaled line width
+                                    plotter.add_mesh(
+                                        mesh,
+                                        color=color,
+                                        opacity=opacity,
+                                        line_width=scaled_line_width,
+                                        style='wireframe',
+                                    )
+                                else:
+                                    # Surface mesh
+                                    plotter.add_mesh(
+                                        mesh,
+                                        color=color,
+                                        opacity=opacity,
+                                        show_edges=edge_visibility,
+                                        edge_color=edge_color if edge_color else 'black',
+                                        line_width=scaled_line_width if edge_visibility else 1.0,
+                                        style=style,
+                                    )
                     except Exception as e:
                         logger.debug(f"Could not copy actor: {e}")
                         continue
