@@ -1136,13 +1136,14 @@ class TetrahedralMeshGenerator:
     def _export_netcdf(self, file_path: str, mesh_data: pv.UnstructuredGrid,
                        custom_block_names: Optional[Dict[int, str]] = None,
                        custom_sideset_names: Optional[Dict[int, str]] = None,
-                       custom_well_names: Optional[Dict[int, str]] = None) -> bool:
+                       custom_well_names: Optional[Dict[int, str]] = None,
+                       well_export_type: str = "Node Sets") -> bool:
         """
         Export tetrahedral mesh to EXODUS II format for GOLEM/MOOSE/ParaView compatibility.
         
         This follows the EXODUS II specification with proper:
         - Element Blocks: One per material domain (3D tetrahedra) with proper naming
-        - Element Blocks: One per well (1D edges/BAR2) - C++ MeshIt style
+        - Node Sets: Well nodes for point sources/sinks (GOLEM DiracKernels)
         - Sidesets: One per surface boundary for boundary conditions
         - All required EXODUS II attributes for ParaView compatibility
 
@@ -1151,7 +1152,8 @@ class TetrahedralMeshGenerator:
             mesh_data: PyVista UnstructuredGrid containing the tetrahedral mesh
             custom_block_names: Optional dict mapping material_id -> custom block name
             custom_sideset_names: Optional dict mapping marker_id -> custom sideset name
-            custom_well_names: Optional dict mapping well_marker -> custom well block name
+            custom_well_names: Optional dict mapping well_marker -> custom well name
+            well_export_type: "Node Sets" (for GOLEM DiracKernels) or "Element Blocks" (BAR2)
 
         Returns:
             bool: True if export successful, False otherwise
@@ -1164,6 +1166,7 @@ class TetrahedralMeshGenerator:
         self._custom_block_names = custom_block_names or {}
         self._custom_sideset_names = custom_sideset_names or {}
         self._custom_well_names = custom_well_names or {}
+        self._well_export_type = well_export_type
 
         try:
             # Get mesh data
@@ -1214,11 +1217,18 @@ class TetrahedralMeshGenerator:
             for mat_id in unique_materials:
                 elem_blocks[mat_id] = np.where(material_ids == mat_id)[0]
             
-            # ========== COLLECT WELL DATA (C++ MeshIt style: 1D element blocks) ==========
-            well_blocks = {}  # {well_marker: {'points': [], 'edges': [], 'name': str}}
+            # ========== COLLECT WELL DATA ==========
+            # Wells can be exported as Node Sets (for GOLEM DiracKernels) or Element Blocks (BAR2)
+            well_blocks = {}  # {well_marker: {'points': [], 'n_edges': int, 'name': str}}
+            well_node_sets = {}  # {well_marker: {'node_indices': [], 'name': str}}
             total_well_edges = 0
+            total_well_nodes = 0
+            
+            export_wells_as_nodesets = (self._well_export_type == "Node Sets")
             
             if hasattr(self, 'well_data') and self.well_data:
+                logger.info(f"Processing wells as {'Node Sets' if export_wells_as_nodesets else 'Element Blocks'}...")
+                
                 for well_idx, well_info in self.well_data.items():
                     well_pts = well_info.get('points')
                     well_marker = well_info.get('marker', well_idx + 2)
@@ -1242,19 +1252,36 @@ class TetrahedralMeshGenerator:
                     if len(pts_arr) < 2:
                         continue
                     
-                    n_edges = len(pts_arr) - 1
-                    well_blocks[well_marker] = {
-                        'points': np.array(pts_arr),
-                        'n_edges': n_edges,
-                        'name': well_name
-                    }
-                    total_well_edges += n_edges
-                    logger.info(f"  Well block '{well_name}' (marker {well_marker}): {n_edges} edges")
+                    n_pts = len(pts_arr)
+                    n_edges = n_pts - 1
+                    
+                    if export_wells_as_nodesets:
+                        # Store for node set export
+                        well_node_sets[well_marker] = {
+                            'points': np.array(pts_arr),
+                            'n_nodes': n_pts,
+                            'name': well_name
+                        }
+                        total_well_nodes += n_pts
+                        logger.info(f"  Well node set '{well_name}' (marker {well_marker}): {n_pts} nodes")
+                    else:
+                        # Store for element block export (BAR2)
+                        well_blocks[well_marker] = {
+                            'points': np.array(pts_arr),
+                            'n_edges': n_edges,
+                            'name': well_name
+                        }
+                        total_well_edges += n_edges
+                        logger.info(f"  Well element block '{well_name}' (marker {well_marker}): {n_edges} BAR2 elements")
             
-            num_well_blk = len(well_blocks)
+            num_well_blk = len(well_blocks) if not export_wells_as_nodesets else 0
+            num_well_nodesets = len(well_node_sets) if export_wells_as_nodesets else 0
             num_elem_blk = num_tetra_blk + num_well_blk
             
-            logger.info(f"EXODUS export: {num_tetra_blk} tetra blocks + {num_well_blk} well blocks = {num_elem_blk} total")
+            if export_wells_as_nodesets:
+                logger.info(f"EXODUS export: {num_tetra_blk} tetra blocks, {num_well_nodesets} well node sets")
+            else:
+                logger.info(f"EXODUS export: {num_tetra_blk} tetra blocks + {num_well_blk} well element blocks = {num_elem_blk} total")
 
             # Build sidesets from TetGen surface triangles
             sidesets = self._build_exodus_sidesets(mesh_data, tetra_cells, tetra_global_indices)
@@ -1284,11 +1311,17 @@ class TetrahedralMeshGenerator:
                 all_points = points.copy()
                 well_point_offsets = {}  # {well_marker: starting_point_index}
                 
-                for well_marker, well_blk in well_blocks.items():
-                    well_point_offsets[well_marker] = len(all_points)
-                    all_points = np.vstack([all_points, well_blk['points']])
+                # Add well points for either node sets or element blocks
+                if export_wells_as_nodesets:
+                    for well_marker, well_ns in well_node_sets.items():
+                        well_point_offsets[well_marker] = len(all_points)
+                        all_points = np.vstack([all_points, well_ns['points']])
+                else:
+                    for well_marker, well_blk in well_blocks.items():
+                        well_point_offsets[well_marker] = len(all_points)
+                        all_points = np.vstack([all_points, well_blk['points']])
                 
-                total_elements = n_tetrahedra + total_well_edges
+                total_elements = n_tetrahedra + total_well_edges  # No elements added for node sets
                 total_points = len(all_points)
                 
                 # ========== EXODUS II REQUIRED DIMENSIONS ==========
@@ -1300,7 +1333,7 @@ class TetrahedralMeshGenerator:
                 rootgrp.createDimension('num_nodes', total_points)
                 rootgrp.createDimension('num_elem', total_elements)
                 rootgrp.createDimension('num_el_blk', num_elem_blk)
-                rootgrp.createDimension('num_node_sets', 0)
+                rootgrp.createDimension('num_node_sets', num_well_nodesets)  # Well node sets for GOLEM
                 rootgrp.createDimension('num_side_sets', num_side_sets)
                 rootgrp.createDimension('num_qa_rec', 1)
                 rootgrp.createDimension('time_step', 1)  # Fixed size for NETCDF3 compatibility
@@ -1369,39 +1402,71 @@ class TetrahedralMeshGenerator:
                     
                     logger.info(f"  Block {blk_num}: '{block_name}' - {num_el_in_blk} elements")
                 
-                # ========== WELL ELEMENT BLOCKS (C++ MeshIt style: BAR2/BEAM2) ==========
-                for well_idx, (well_marker, well_blk) in enumerate(well_blocks.items()):
-                    blk_idx = num_tetra_blk + well_idx
-                    blk_num = blk_idx + 1
+                # ========== WELL ELEMENT BLOCKS (BAR2) - Only if not using Node Sets ==========
+                if not export_wells_as_nodesets and well_blocks:
+                    for well_idx, (well_marker, well_blk) in enumerate(well_blocks.items()):
+                        blk_idx = num_tetra_blk + well_idx
+                        blk_num = blk_idx + 1
+                        
+                        well_name = well_blk['name']
+                        n_edges = well_blk['n_edges']
+                        point_offset = well_point_offsets[well_marker]
+                        
+                        # Block ID and status
+                        eb_prop1[blk_idx] = int(well_marker) + 1000  # Use marker + 1000 to distinguish from tetra blocks
+                        eb_status[blk_idx] = 1
+                        
+                        # Write block name
+                        self._write_exodus_string_v2(eb_names, blk_idx, well_name, 33)
+                        
+                        # Create dimensions for this well block
+                        rootgrp.createDimension(f'num_el_in_blk{blk_num}', n_edges)
+                        rootgrp.createDimension(f'num_nod_per_el{blk_num}', 2)  # BAR2 = 2 nodes per edge
+                        
+                        # Connectivity variable
+                        connect = rootgrp.createVariable(
+                            f'connect{blk_num}', 'i4',
+                            (f'num_el_in_blk{blk_num}', f'num_nod_per_el{blk_num}')
+                        )
+                        connect.setncattr('elem_type', 'BAR2')  # EXODUS BAR2 element type
+                        
+                        # Write well edge connectivity (1-based)
+                        for edge_idx in range(n_edges):
+                            connect[edge_idx, 0] = point_offset + edge_idx + 1  # First node (1-based)
+                            connect[edge_idx, 1] = point_offset + edge_idx + 2  # Second node (1-based)
+                        
+                        logger.info(f"  Well Block {blk_num}: '{well_name}' - {n_edges} BAR2 elements")
+                
+                # ========== WELL NODE SETS (for GOLEM DiracKernels) ==========
+                if export_wells_as_nodesets and num_well_nodesets > 0:
+                    ns_status = rootgrp.createVariable('ns_status', 'i4', ('num_node_sets',))
+                    ns_prop1 = rootgrp.createVariable('ns_prop1', 'i4', ('num_node_sets',))
+                    ns_prop1.setncattr('name', 'ID')
+                    ns_names = rootgrp.createVariable('ns_names', 'S1', ('num_node_sets', 'len_name'))
                     
-                    well_name = well_blk['name']
-                    n_edges = well_blk['n_edges']
-                    point_offset = well_point_offsets[well_marker]
-                    
-                    # Block ID and status
-                    eb_prop1[blk_idx] = int(well_marker) + 1000  # Use marker + 1000 to distinguish from tetra blocks
-                    eb_status[blk_idx] = 1
-                    
-                    # Write block name
-                    self._write_exodus_string_v2(eb_names, blk_idx, well_name, 33)
-                    
-                    # Create dimensions for this well block
-                    rootgrp.createDimension(f'num_el_in_blk{blk_num}', n_edges)
-                    rootgrp.createDimension(f'num_nod_per_el{blk_num}', 2)  # BAR2 = 2 nodes per edge
-                    
-                    # Connectivity variable
-                    connect = rootgrp.createVariable(
-                        f'connect{blk_num}', 'i4',
-                        (f'num_el_in_blk{blk_num}', f'num_nod_per_el{blk_num}')
-                    )
-                    connect.setncattr('elem_type', 'BAR2')  # EXODUS BAR2 element type
-                    
-                    # Write well edge connectivity (1-based)
-                    for edge_idx in range(n_edges):
-                        connect[edge_idx, 0] = point_offset + edge_idx + 1  # First node (1-based)
-                        connect[edge_idx, 1] = point_offset + edge_idx + 2  # Second node (1-based)
-                    
-                    logger.info(f"  Well Block {blk_num}: '{well_name}' - {n_edges} BAR2 elements")
+                    for ns_idx, (well_marker, well_ns) in enumerate(well_node_sets.items()):
+                        well_name = well_ns['name']
+                        n_nodes = well_ns['n_nodes']
+                        point_offset = well_point_offsets[well_marker]
+                        
+                        ns_num = ns_idx + 1
+                        ns_prop1[ns_idx] = int(well_marker)  # Node set ID
+                        ns_status[ns_idx] = 1
+                        self._write_exodus_string_v2(ns_names, ns_idx, well_name, 33)
+                        
+                        # Create dimension for this node set
+                        rootgrp.createDimension(f'num_nod_ns{ns_num}', n_nodes)
+                        
+                        # Node list (1-based node indices)
+                        node_ns = rootgrp.createVariable(f'node_ns{ns_num}', 'i4', (f'num_nod_ns{ns_num}',))
+                        node_indices = np.arange(point_offset + 1, point_offset + n_nodes + 1, dtype=np.int32)
+                        node_ns[:] = node_indices
+                        
+                        # Distribution factors (optional but good practice - all 1.0)
+                        dist_fact_ns = rootgrp.createVariable(f'dist_fact_ns{ns_num}', 'f8', (f'num_nod_ns{ns_num}',))
+                        dist_fact_ns[:] = np.ones(n_nodes, dtype=np.float64)
+                        
+                        logger.info(f"  Well Node Set {ns_num}: '{well_name}' - {n_nodes} nodes (for DiracKernels)")
 
                 # ========== SIDESETS ==========
                 if num_side_sets > 0:
@@ -1450,13 +1515,16 @@ class TetrahedralMeshGenerator:
 
             logger.info(f"✓ EXODUS II mesh exported: {file_path}")
             logger.info(f"  {n_tetrahedra} tetrahedra in {num_tetra_blk} blocks, {num_side_sets} sidesets")
-            if num_well_blk > 0:
+            if export_wells_as_nodesets and num_well_nodesets > 0:
+                logger.info(f"  {total_well_nodes} well nodes in {num_well_nodesets} node sets (for GOLEM DiracKernels)")
+            elif num_well_blk > 0:
                 logger.info(f"  {total_well_edges} well edges in {num_well_blk} BAR2 element blocks")
             
             # Clean up custom names after successful export
             self._custom_block_names = {}
             self._custom_sideset_names = {}
             self._custom_well_names = {}
+            self._well_export_type = "Node Sets"
             
             return True
 
@@ -1466,6 +1534,7 @@ class TetrahedralMeshGenerator:
             self._custom_block_names = {}
             self._custom_sideset_names = {}
             self._custom_well_names = {}
+            self._well_export_type = "Node Sets"
             return False
 
     def _write_exodus_string_v2(self, var, idx, string, max_len):
@@ -1709,7 +1778,8 @@ class TetrahedralMeshGenerator:
     def export_mesh(self, file_path: str, mesh_data: Optional[Dict] = None,
                     custom_block_names: Optional[Dict[int, str]] = None,
                     custom_sideset_names: Optional[Dict[int, str]] = None,
-                    custom_well_names: Optional[Dict[int, str]] = None) -> bool:
+                    custom_well_names: Optional[Dict[int, str]] = None,
+                    well_export_type: str = "Node Sets") -> bool:
         """
         Export tetrahedral mesh to various formats.
         
@@ -1718,7 +1788,9 @@ class TetrahedralMeshGenerator:
             mesh_data: PyVista mesh data (uses self.tetrahedral_mesh if None)
             custom_block_names: Custom names for element blocks (3D domains)
             custom_sideset_names: Custom names for sidesets (boundary surfaces)
-            custom_well_names: Custom names for well blocks (1D edge elements, C++ style)
+            custom_well_names: Custom names for wells
+            well_export_type: How to export wells - "Node Sets" (for GOLEM DiracKernels) 
+                             or "Element Blocks" (BAR2 line elements)
         """
         if mesh_data is None: mesh_data = self.tetrahedral_mesh
         if not mesh_data:
@@ -1735,7 +1807,8 @@ class TetrahedralMeshGenerator:
                     return self._export_netcdf(file_path, mesh_data, 
                                                custom_block_names=custom_block_names,
                                                custom_sideset_names=custom_sideset_names,
-                                               custom_well_names=custom_well_names)
+                                               custom_well_names=custom_well_names,
+                                               well_export_type=well_export_type)
                 else:
                     # Enhanced export for VTK/VTU formats with material information
                     return self._export_with_materials(file_path, mesh_data)

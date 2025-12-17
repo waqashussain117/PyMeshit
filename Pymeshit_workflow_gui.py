@@ -214,7 +214,7 @@ class ExodusExportOptionsDialog(QDialog):
     """
     Dialog for customizing EXODUS file export options.
     Allows editing domain names (element blocks), sideset names, and well names for GOLEM/MOOSE compatibility.
-    C++ MeshIt style: Wells are exported as 1D element blocks (BEAM2/BAR2).
+    Wells can be exported as Node Sets (for point sources/sinks) or Element Blocks (BAR2 elements).
     """
     
     def __init__(self, parent=None, block_names: Dict[int, str] = None, 
@@ -222,15 +222,18 @@ class ExodusExportOptionsDialog(QDialog):
                  datasets: List[Dict] = None, well_names: Dict[int, str] = None):
         super().__init__(parent)
         self.setWindowTitle("EXODUS Export Options")
-        self.setMinimumSize(600, 550)
+        self.setMinimumSize(600, 580)
         self.setModal(True)
         
         # Store the names (use copies to avoid modifying original)
         self.block_names = dict(block_names) if block_names else {}
         self.sideset_names = dict(sideset_names) if sideset_names else {}
-        self.well_names = dict(well_names) if well_names else {}  # 1D well element blocks (C++ style)
+        self.well_names = dict(well_names) if well_names else {}
         self.materials = materials or []
         self.datasets = datasets or []
+        
+        # Well export type (default to Node Sets for GOLEM source/sink terms)
+        self.well_export_type = "Node Sets"
         
         self._setup_ui()
     
@@ -319,16 +322,45 @@ class ExodusExportOptionsDialog(QDialog):
         
         tab_widget.addTab(sideset_tab, "Sideset Names")
         
-        # === Well/Edgeset Names Tab (C++ MeshIt style: 1D materials) ===
+        # === Well Export Tab ===
         well_tab = QWidget()
         well_layout = QVBoxLayout(well_tab)
         
-        well_info = QLabel("Well names define 1D edge element blocks (BEAM2/BAR2 in EXODUS).\n"
-                          "C++ MeshIt exports wells as T3D2 in ABAQUS, VTK_LINE in VTU.")
-        well_info.setStyleSheet("color: #7B1FA2;")
-        well_layout.addWidget(well_info)
+        # Well export type selection (critical for GOLEM/MOOSE)
+        export_type_group = QGroupBox("Well Export Type")
+        export_type_layout = QVBoxLayout(export_type_group)
+        
+        export_type_row = QHBoxLayout()
+        export_type_row.addWidget(QLabel("Export wells as:"))
+        self.well_export_combo = QComboBox()
+        self.well_export_combo.addItems([
+            "Node Sets",           # For point sources/sinks (recommended for GOLEM)
+            "Element Blocks"       # BAR2 elements (C++ MeshIt style)
+        ])
+        self.well_export_combo.setCurrentText("Node Sets")
+        self.well_export_combo.currentTextChanged.connect(self._on_well_export_type_changed)
+        self.well_export_combo.setToolTip(
+            "Node Sets: Well nodes as point sources/sinks (recommended for GOLEM DiracKernels)\n"
+            "Element Blocks: Wells as BAR2 line elements (for line source/sink along well path)"
+        )
+        export_type_row.addWidget(self.well_export_combo)
+        export_type_row.addStretch()
+        export_type_layout.addLayout(export_type_row)
+        
+        self.well_export_info = QLabel(
+            "💡 Node Sets: Each well becomes a node set containing all well path nodes.\n"
+            "   Use with DiracKernels in GOLEM for point source/sink injection/extraction."
+        )
+        self.well_export_info.setStyleSheet("color: #1976D2; font-size: 10px;")
+        self.well_export_info.setWordWrap(True)
+        export_type_layout.addWidget(self.well_export_info)
+        
+        well_layout.addWidget(export_type_group)
         
         # Well names table
+        well_names_label = QLabel("Well Names (for node sets or element blocks):")
+        well_layout.addWidget(well_names_label)
+        
         self.well_table = QTableWidget()
         self.well_table.setColumnCount(3)
         self.well_table.setHorizontalHeaderLabels(["ID", "Original Name", "Export Name"])
@@ -354,19 +386,21 @@ class ExodusExportOptionsDialog(QDialog):
         well_preset_layout.addStretch()
         well_layout.addLayout(well_preset_layout)
         
-        tab_widget.addTab(well_tab, f"Well Names ({len(self.well_names)})")
+        tab_widget.addTab(well_tab, f"Wells ({len(self.well_names)})")
         
         main_layout.addWidget(tab_widget)
         
         # === GOLEM Tips Section ===
-        tips_group = QGroupBox("GOLEM Usage")
+        tips_group = QGroupBox("GOLEM/MOOSE Usage")
         tips_layout = QVBoxLayout(tips_group)
         tips_text = QLabel(
             "Block names: [Materials] block = 'name'  |  [Kernels] block = 'name'\n"
             "Sideset names: [BCs] boundary = 'name'\n"
-            "Well blocks: Use for 1D line sources/sinks in GOLEM (heat/mass exchange)"
+            "Well Node Sets: [DiracKernels] type = ConstantPointSource  point = 'well_name'\n"
+            "Well Element Blocks: Use for line sources along well path (BAR2 elements)"
         )
         tips_text.setWordWrap(True)
+        tips_text.setStyleSheet("font-size: 10px;")
         tips_layout.addWidget(tips_text)
         main_layout.addWidget(tips_group)
         
@@ -578,7 +612,7 @@ class ExodusExportOptionsDialog(QDialog):
         return result
     
     def get_well_names(self) -> Dict[int, str]:
-        """Get the edited well names (1D element blocks)."""
+        """Get the edited well names (for node sets or element blocks)."""
         result = {}
         for row in range(self.well_table.rowCount()):
             id_item = self.well_table.item(row, 0)
@@ -587,6 +621,27 @@ class ExodusExportOptionsDialog(QDialog):
                 well_id = int(id_item.text())
                 result[well_id] = export_item.text().strip()
         return result
+    
+    def get_well_export_type(self) -> str:
+        """Get the selected well export type ('Node Sets' or 'Element Blocks')."""
+        return self.well_export_type
+    
+    def _on_well_export_type_changed(self, export_type: str):
+        """Handle well export type dropdown change."""
+        self.well_export_type = export_type
+        
+        if export_type == "Node Sets":
+            self.well_export_info.setText(
+                "💡 Node Sets: Each well becomes a node set containing all well path nodes.\n"
+                "   Use with DiracKernels in GOLEM for point source/sink injection/extraction."
+            )
+            self.well_export_info.setStyleSheet("color: #1976D2; font-size: 10px;")
+        else:  # Element Blocks
+            self.well_export_info.setText(
+                "💡 Element Blocks: Wells exported as BAR2 line elements (2 nodes per edge).\n"
+                "   Use for distributed line sources along the well path."
+            )
+            self.well_export_info.setStyleSheet("color: #7B1FA2; font-size: 10px;")
 
 
 class MeshItWorkflowGUI(QMainWindow):
@@ -17034,6 +17089,8 @@ segmentation, triangulation, and visualization.
         # For EXODUS files, show the options dialog for domain/sideset name customization
         custom_block_names = None
         custom_sideset_names = None
+        custom_well_names = None
+        well_export_type = "Node Sets"  # Default for non-EXODUS or when dialog not shown
         
         if file_ext == 'exo':
             # Get current block, sideset, and well names from the mesh generator
@@ -17052,11 +17109,12 @@ segmentation, triangulation, and visualization.
             if dialog.exec() != QDialog.Accepted:
                 return  # User cancelled
             
-            # Get the customized names
+            # Get the customized names and export options
             custom_block_names = dialog.get_block_names()
             custom_sideset_names = dialog.get_sideset_names()
-            custom_well_names = dialog.get_well_names()  # Get well block names
-            logger.info(f"EXODUS export with custom names: {len(custom_block_names)} blocks, {len(custom_sideset_names)} sidesets, {len(custom_well_names)} wells")
+            custom_well_names = dialog.get_well_names()
+            well_export_type = dialog.get_well_export_type()  # "Node Sets" or "Element Blocks"
+            logger.info(f"EXODUS export: {len(custom_block_names)} blocks, {len(custom_sideset_names)} sidesets, {len(custom_well_names)} wells as {well_export_type}")
 
         try:
             # Update generator with current materials (including faults with markers)
@@ -17071,7 +17129,8 @@ segmentation, triangulation, and visualization.
                     self.tetrahedral_mesh,
                     custom_block_names=custom_block_names,
                     custom_sideset_names=custom_sideset_names,
-                    custom_well_names=custom_well_names  # Pass well names for 1D blocks (C++ style)
+                    custom_well_names=custom_well_names,
+                    well_export_type=well_export_type  # "Node Sets" or "Element Blocks"
                 )
             else:
                 success = self.tetra_mesh_generator.export_mesh(file_path, self.tetrahedral_mesh)
@@ -17102,8 +17161,12 @@ segmentation, triangulation, and visualization.
                     msg += "• Use domain names in [Materials] block = 'domain_name'\n"
                     msg += "• Use sideset names in [BCs] boundary = 'sideset_name'\n"
                     if well_count > 0:
-                        msg += f"• {well_count} well(s) exported as BAR2 element blocks\n"
-                        msg += "• Wells can be used for 1D line sources/sinks\n"
+                        if well_export_type == "Node Sets":
+                            msg += f"• {well_count} well(s) exported as Node Sets\n"
+                            msg += "• Use in [DiracKernels] for point sources/sinks\n"
+                        else:
+                            msg += f"• {well_count} well(s) exported as BAR2 element blocks\n"
+                            msg += "• Wells can be used for 1D line sources/sinks\n"
                     msg += "• Open in ParaView to verify block and sideset names"
                 
                 QMessageBox.information(self, "Export Successful", msg)
