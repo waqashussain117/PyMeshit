@@ -348,7 +348,7 @@ class ExodusExportOptionsDialog(QDialog):
         export_type_layout.addLayout(export_type_row)
         
         self.well_export_info = QLabel(
-            "💡 Node Sets: Each well becomes a node set containing all well path nodes.\n"
+            "Node Sets: Each well becomes a node set containing all well path nodes.\n"
             "   Use with DiracKernels in GOLEM for point source/sink injection/extraction."
         )
         self.well_export_info.setStyleSheet("color: #1976D2; font-size: 10px;")
@@ -632,13 +632,13 @@ class ExodusExportOptionsDialog(QDialog):
         
         if export_type == "Node Sets":
             self.well_export_info.setText(
-                "💡 Node Sets: Each well becomes a node set containing all well path nodes.\n"
+                "Node Sets: Each well becomes a node set containing all well path nodes.\n"
                 "   Use with DiracKernels in GOLEM for point source/sink injection/extraction."
             )
             self.well_export_info.setStyleSheet("color: #1976D2; font-size: 10px;")
         else:  # Element Blocks
             self.well_export_info.setText(
-                "💡 Element Blocks: Wells exported as BAR2 line elements (2 nodes per edge).\n"
+                "Element Blocks: Wells exported as BAR2 line elements (2 nodes per edge).\n"
                 "   Use for distributed line sources along the well path."
             )
             self.well_export_info.setStyleSheet("color: #7B1FA2; font-size: 10px;")
@@ -832,7 +832,7 @@ class MeshItWorkflowGUI(QMainWindow):
         mouse_layout.setSpacing(4)
         
         # Toggle button for mouse placement mode
-        self.material_mouse_mode_btn = QPushButton("🎯 Enable Mouse Placement")
+        self.material_mouse_mode_btn = QPushButton("Enable Mouse Placement")
         self.material_mouse_mode_btn.setCheckable(True)
         self.material_mouse_mode_btn.setChecked(False)
         self.material_mouse_mode_btn.clicked.connect(self._toggle_material_mouse_mode)
@@ -1329,7 +1329,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
         if refined_count > 0:
             logger.info(f"Refined {refined_count} wells")
-            self.statusBar().showMessage(f"✓ Refined {refined_count} wells")
+            self.statusBar().showMessage(f"Refined {refined_count} wells")
         
         return refined_count
 
@@ -1476,7 +1476,7 @@ class MeshItWorkflowGUI(QMainWindow):
             row = self.mesh_well_refine_table.rowCount()
             self.mesh_well_refine_table.insertRow(row)
             
-            item_name = QTableWidgetItem(f"🔵 {name}")  # Add well icon
+            item_name = QTableWidgetItem(f"{name}")  # Add well icon
             item_name.setFlags(item_name.flags() & ~Qt.ItemIsEditable)
             item_name.setData(Qt.UserRole, idx)
             self.mesh_well_refine_table.setItem(row, 0, item_name)
@@ -2266,7 +2266,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
         if checked:
             # Enable mouse mode
-            self.material_mouse_mode_btn.setText("🎯 Mouse Placement ACTIVE")
+            self.material_mouse_mode_btn.setText("Mouse Placement ACTIVE")
             self.material_mouse_status.setText("Click on surface to place seed")
             self.material_mouse_status.setStyleSheet("color: #4caf50; font-weight: bold;")
             
@@ -2313,7 +2313,7 @@ class MeshItWorkflowGUI(QMainWindow):
                         return
         else:
             # Disable mouse mode
-            self.material_mouse_mode_btn.setText("🎯 Enable Mouse Placement")
+            self.material_mouse_mode_btn.setText("Enable Mouse Placement")
             self.material_mouse_status.setText("")
             
             try:
@@ -2826,7 +2826,7 @@ class MeshItWorkflowGUI(QMainWindow):
         control_layout.addWidget(stats_group)
         
         # -- Research Statistics Button --
-        self.hull_stats_btn = QPushButton("📊 Generate Hull Comparison Statistics")
+        self.hull_stats_btn = QPushButton("Generate Hull Comparison Statistics")
         self.hull_stats_btn.setToolTip(
             "Compare Alpha Shape vs Delaunay 2D methods across all datasets.\n"
             "Generates metrics for research papers: boundary length, vertices,\n"
@@ -2853,7 +2853,7 @@ class MeshItWorkflowGUI(QMainWindow):
         control_layout.addWidget(self.hull_stats_btn)
         
         # High-quality figure export button
-        self.hull_export_figure_btn = QPushButton("📸 Export Figure")
+        self.hull_export_figure_btn = QPushButton("Export Figure")
         self.hull_export_figure_btn.clicked.connect(lambda: self._show_generic_figure_export_dialog('hulls'))
         self.hull_export_figure_btn.setEnabled(False)
         self.hull_export_figure_btn.setToolTip("Export high-resolution figure of convex hull visualization")
@@ -2985,7 +2985,7 @@ class MeshItWorkflowGUI(QMainWindow):
         control_layout.addWidget(stats_group)
 
         # High-quality figure export button
-        self.segment_export_figure_btn = QPushButton("📸 Export Figure")
+        self.segment_export_figure_btn = QPushButton("Export Figure")
         self.segment_export_figure_btn.clicked.connect(lambda: self._show_generic_figure_export_dialog('segments'))
         self.segment_export_figure_btn.setEnabled(False)
         self.segment_export_figure_btn.setToolTip("Export high-resolution figure of segmentation visualization")
@@ -3126,7 +3126,7 @@ class MeshItWorkflowGUI(QMainWindow):
         control_layout.addWidget(stats_group) # Added for completeness
 
         # -- Research Statistics Button for Interpolation Methods --
-        self.interp_stats_btn = QPushButton("📊 Generate Interpolation Comparison Statistics")
+        self.interp_stats_btn = QPushButton("Generate Interpolation Comparison Statistics")
         self.interp_stats_btn.setToolTip(
             "Compare TPS vs IDW interpolation methods across all datasets.\n"
             "Generates metrics for research papers: RMSE, MAE, Max Error,\n"
@@ -3159,7 +3159,7 @@ class MeshItWorkflowGUI(QMainWindow):
         control_layout.addWidget(export_btn) # Added for completeness
 
         # High-quality figure export button
-        self.tri_export_figure_btn = QPushButton("📸 Export Figure")
+        self.tri_export_figure_btn = QPushButton("Export Figure")
         self.tri_export_figure_btn.clicked.connect(lambda: self._show_generic_figure_export_dialog('triangulation'))
         self.tri_export_figure_btn.setEnabled(False)
         self.tri_export_figure_btn.setToolTip("Export high-resolution figure of triangulation visualization")
@@ -3240,7 +3240,7 @@ class MeshItWorkflowGUI(QMainWindow):
         controls_layout.addWidget(self.clear_intersections_btn)
         
         # High-quality figure export button
-        self.intersection_export_figure_btn = QPushButton("📸 Export Figure")
+        self.intersection_export_figure_btn = QPushButton("Export Figure")
         self.intersection_export_figure_btn.clicked.connect(lambda: self._show_generic_figure_export_dialog('intersection'))
         self.intersection_export_figure_btn.setEnabled(False)
         self.intersection_export_figure_btn.setToolTip("Export high-resolution figure of intersection visualization")
@@ -3421,7 +3421,7 @@ class MeshItWorkflowGUI(QMainWindow):
         ag.addWidget(self.show_conforming_meshes_checkbox)
 
         # High-quality figure export button
-        self.refine_export_figure_btn = QPushButton("📸 Export Figure")
+        self.refine_export_figure_btn = QPushButton("Export Figure")
         self.refine_export_figure_btn.clicked.connect(lambda: self._show_generic_figure_export_dialog('refine_mesh'))
         self.refine_export_figure_btn.setEnabled(False)
         self.refine_export_figure_btn.setToolTip("Export high-resolution figure of refine mesh visualization")
@@ -4115,9 +4115,9 @@ class MeshItWorkflowGUI(QMainWindow):
                 logger.info(f"VERIFICATION: {visible_actors_for_surface} actors are actually visible for surface {target_surface_idx}")
                 
                 if visible_actors_for_surface != visible_count:
-                    logger.error(f"❌ VISIBILITY MISMATCH: Expected {visible_count} visible, but {visible_actors_for_surface} actors are actually visible!")
+                    logger.error(f"VISIBILITY MISMATCH: Expected {visible_count} visible, but {visible_actors_for_surface} actors are actually visible!")
                 else:
-                    logger.info(f"✅ VISIBILITY CONFIRMED: All {visible_count} actors are properly visible")
+                    logger.info(f"VISIBILITY CONFIRMED: All {visible_count} actors are properly visible")
                     
             else:
                 logger.warning(f"Could not find surface index for '{selected_surface}'")
@@ -4207,7 +4207,7 @@ class MeshItWorkflowGUI(QMainWindow):
                     start=True,
                     show=True
                 )
-                self.mouse_selection_enabled_btn.setText("🖱️ Mouse ON")
+                self.mouse_selection_enabled_btn.setText("Mouse ON")
                 logger.info("Constraint mouse selection enabled")
             except Exception as cell_error:
                 logger.warning(f"Cell picking failed: {cell_error}")
@@ -4220,7 +4220,7 @@ class MeshItWorkflowGUI(QMainWindow):
                         font_size=10,
                         color='yellow'
                     )
-                    self.mouse_selection_enabled_btn.setText("🖱️ Mouse ON")
+                    self.mouse_selection_enabled_btn.setText("Mouse ON")
                     logger.info("Constraint mouse selection enabled (edge picking fallback)")
                 except Exception as edge_error:
                     logger.warning(f"Edge picking failed: {edge_error}")
@@ -4231,7 +4231,7 @@ class MeshItWorkflowGUI(QMainWindow):
                             font_size=10,
                             color='yellow'
                         )
-                        self.mouse_selection_enabled_btn.setText("🖱️ Mouse ON")
+                        self.mouse_selection_enabled_btn.setText("Mouse ON")
                         logger.info("Constraint mouse selection enabled (mesh picking fallback)")
                     except Exception as mesh_error:
                         logger.error(f"All picking methods failed: {mesh_error}")
@@ -4242,7 +4242,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 plotter.disable_picking()
             except Exception:
                 pass
-            self.mouse_selection_enabled_btn.setText("🖱️ Mouse Selection")
+            self.mouse_selection_enabled_btn.setText("Mouse Selection")
             try:
                 self._update_refined_visualization()
             except Exception:
@@ -4260,16 +4260,16 @@ class MeshItWorkflowGUI(QMainWindow):
         mode_id = self.selection_mode_group.id(button)
         if mode_id == 0:  # Select mode
             self.current_selection_mode = "select"
-            logger.info("🔵 Selection mode: SELECT - Rectangle drag will select constraints")
+            logger.info("Selection mode: SELECT - Rectangle drag will select constraints")
             # Update button styles to show active mode
-            self.selection_mode_btn.setText("✅ Select Mode (Active)")
-            self.deselection_mode_btn.setText("❌ Deselect Mode")
+            self.selection_mode_btn.setText("Select Mode (Active)")
+            self.deselection_mode_btn.setText("Deselect Mode")
         elif mode_id == 1:  # Deselect mode
             self.current_selection_mode = "deselect"
-            logger.info("🔴 Selection mode: DESELECT - Rectangle drag will deselect constraints")
+            logger.info("Selection mode: DESELECT - Rectangle drag will deselect constraints")
             # Update button styles to show active mode
-            self.selection_mode_btn.setText("✅ Select Mode")
-            self.deselection_mode_btn.setText("❌ Deselect Mode (Active)")
+            self.selection_mode_btn.setText("Select Mode")
+            self.deselection_mode_btn.setText("Deselect Mode (Active)")
         
         # Store the current mode for use in cell clicking callback
         self.current_selection_mode = "select" if mode_id == 0 else "deselect"
@@ -4291,26 +4291,26 @@ class MeshItWorkflowGUI(QMainWindow):
                     # Method 1: Clear pick selection if available
                     if hasattr(plotter, 'clear_pick_selection'):
                         plotter.clear_pick_selection()
-                        logger.debug("🔄 Cleared using clear_pick_selection()")
+                        logger.debug("Cleared using clear_pick_selection()")
                     
                     # Method 2: Clear cell picking highlight
                     elif hasattr(plotter, 'picked_cell') and plotter.picked_cell is not None:
                         plotter.picked_cell = None
-                        logger.debug("🔄 Cleared picked_cell")
+                        logger.debug("Cleared picked_cell")
                     
                     # Method 3: Clear mesh picking highlight  
                     elif hasattr(plotter, 'picked_mesh') and plotter.picked_mesh is not None:
                         plotter.picked_mesh = None
-                        logger.debug("🔄 Cleared picked_mesh")
+                        logger.debug("Cleared picked_mesh")
                     
                     # Method 4: Force render to clear any visual artifacts
                     plotter.render()
-                    logger.debug("🔄 Cleared selection highlighting with render")
+                    logger.debug("Cleared selection highlighting with render")
                     
                 except AttributeError as ae:
                     # Just render if specific clearing methods don't exist
                     plotter.render()
-                    logger.debug(f"🔄 Used render fallback: {ae}")
+                    logger.debug(f"Used render fallback: {ae}")
                     
         except Exception as e:
             logger.warning(f"Error clearing selection highlight: {e}")
@@ -4334,7 +4334,7 @@ class MeshItWorkflowGUI(QMainWindow):
             if not tree:
                 return
                 
-            logger.debug("🎨 Updating constraint visualization colors based on selection state")
+            logger.debug("Updating constraint visualization colors based on selection state")
             
             # Build a map of selection states for fast lookup
             selection_states = {}  # {(surf_idx, seg_uid): is_selected}
@@ -4377,7 +4377,7 @@ class MeshItWorkflowGUI(QMainWindow):
             
             # Force render to show color changes
             plotter.render()
-            logger.debug(f"🎨 Updated colors for {updated_count} constraint actors")
+            logger.debug(f"Updated colors for {updated_count} constraint actors")
             
         except Exception as e:
             logger.warning(f"Error updating constraint visualization colors: {e}")
@@ -4399,7 +4399,7 @@ class MeshItWorkflowGUI(QMainWindow):
             # Get current selection mode
             mode = getattr(self, 'current_selection_mode', 'select')
             
-            logger.debug(f"🔄 Synchronizing {len(selected_segments)} segments across surfaces (mode: {mode})")
+            logger.debug(f"Synchronizing {len(selected_segments)} segments across surfaces (mode: {mode})")
             
             # Block signals to prevent recursion during synchronization
             tree.blockSignals(True)
@@ -4460,7 +4460,7 @@ class MeshItWorkflowGUI(QMainWindow):
                             new_state = Qt.Checked if current_state else Qt.Unchecked
                             if other_segment_item.checkState(0) != new_state:
                                 other_segment_item.setCheckState(0, new_state)
-                                logger.debug(f"✅ Synced segment {seg_uid} on surface {other_surface_idx} to {current_state}")
+                                logger.debug(f"Synced segment {seg_uid} on surface {other_surface_idx} to {current_state}")
                 
             finally:
                 # Re-enable signals and update visualization
@@ -4471,7 +4471,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 # Update colors again to reflect synchronized changes
                 self._update_constraint_visualization_colors()
                 
-            logger.debug("🔄 Cross-surface synchronization complete")
+            logger.debug("Cross-surface synchronization complete")
             
         except Exception as e:
             logger.warning(f"Error synchronizing shared intersection segments: {e}")
@@ -4495,7 +4495,7 @@ class MeshItWorkflowGUI(QMainWindow):
             if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
                 current_surface_filter = self.refine_surface_selector.currentText()
                 
-            logger.debug(f"🔄 Background sync: {len(selected_segments)} segments (mode: {mode}, filter: {current_surface_filter})")
+            logger.debug(f"Background sync: {len(selected_segments)} segments (mode: {mode}, filter: {current_surface_filter})")
             
             # Block signals to prevent visual updates during background sync
             tree.blockSignals(True)
@@ -4565,7 +4565,7 @@ class MeshItWorkflowGUI(QMainWindow):
                             new_state = Qt.Checked if current_state else Qt.Unchecked
                             if other_segment_item.checkState(0) != new_state:
                                 other_segment_item.setCheckState(0, new_state)
-                                logger.debug(f"📋 Background sync: segment {seg_uid} on surface {other_surface_idx} → {current_state}")
+                                logger.debug(f"Background sync: segment {seg_uid} on surface {other_surface_idx} → {current_state}")
                 
             finally:
                 # Re-enable signals but DON'T trigger visual updates
@@ -4574,7 +4574,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 # NOTE: We deliberately don't call _update_constraint_visualization_colors() here
                 # This keeps the background sync invisible to the user interface
                 
-            logger.debug("🔄 Background synchronization complete (no visual changes)")
+            logger.debug("Background synchronization complete (no visual changes)")
             
         except Exception as e:
             logger.warning(f"Error in background synchronization: {e}")
@@ -4753,16 +4753,16 @@ class MeshItWorkflowGUI(QMainWindow):
                             # Check if the actor is actually visible
                             if self._is_constraint_actor_visible(surf_idx, seg_uid):
                                 filtered_meshes.append(mesh)
-                                logger.debug(f"✅ Including mesh for segment ({surf_idx}, {seg_uid})")
+                                logger.debug(f"Including mesh for segment ({surf_idx}, {seg_uid})")
                             else:
                                 skipped_count += 1
-                                logger.debug(f"❌ Skipping mesh for segment ({surf_idx}, {seg_uid}) - actor not visible")
+                                logger.debug(f"Skipping mesh for segment ({surf_idx}, {seg_uid}) - actor not visible")
                         else:
                             skipped_count += 1
-                            logger.debug(f"❌ Skipping mesh for segment ({surf_idx}, {seg_uid}) - surface not selected")
+                            logger.debug(f"Skipping mesh for segment ({surf_idx}, {seg_uid}) - surface not selected")
                     else:
                         skipped_count += 1
-                        logger.debug("❌ Skipping mesh - could not identify segment")
+                        logger.debug("Skipping mesh - could not identify segment")
                 
                 logger.info(f"PRE-FILTER: {len(filtered_meshes)} valid, {skipped_count} skipped from {len(meshes_to_process)} total meshes")
                 
@@ -4776,7 +4776,7 @@ class MeshItWorkflowGUI(QMainWindow):
                     if clicked_segment:
                         surf_idx, seg_uid = clicked_segment
                         valid_segments.append((surf_idx, seg_uid))
-                        # logger.debug(f"✅ Will toggle segment ({surf_idx}, {seg_uid})")  # Removed for speed
+                        # logger.debug(f"Will toggle segment ({surf_idx}, {seg_uid})")  # Removed for speed
                 
                 # Report results
                 if valid_segments:
@@ -4800,7 +4800,7 @@ class MeshItWorkflowGUI(QMainWindow):
                             if self._apply_selection_mode_to_segment_fast(surf_idx, seg_uid):
                                 success_count += 1
                         
-                        logger.info(f"🎯 {operation}: {mode_text} {success_count}/{len(valid_segments)} segments")
+                        logger.info(f"{operation}: {mode_text} {success_count}/{len(valid_segments)} segments")
                         
                     finally:
                         # Re-enable tree signals after batch operation - THIS TRIGGERS THE VISUAL UPDATE
@@ -4831,11 +4831,11 @@ class MeshItWorkflowGUI(QMainWindow):
                             self._clear_selection_highlight()
                     
                 else:
-                    logger.warning("❌ No valid segments found for current surface filter")
+                    logger.warning("No valid segments found for current surface filter")
                     if skipped_count > 0:
-                        logger.info(f"💡 All {skipped_count} picked meshes were filtered out due to surface selection")
-                        logger.info(f"💡 Current filter: '{selected_surface}' - ensure you're clicking on visible constraints")
-                        logger.info(f"💡 Switch to 'All Surfaces' to interact with all constraints")
+                        logger.info(f"All {skipped_count} picked meshes were filtered out due to surface selection")
+                        logger.info(f"Current filter: '{selected_surface}' - ensure you're clicking on visible constraints")
+                        logger.info(f"Switch to 'All Surfaces' to interact with all constraints")
                 
             else:
                 logger.warning("No data received in cell picking callback")
@@ -5157,7 +5157,7 @@ class MeshItWorkflowGUI(QMainWindow):
             return None
             
         surf_idx, seg_uid = clicked_segment
-        logger.debug(f"✅ Found segment: surface {surf_idx}, segment {seg_uid}")
+        logger.debug(f"Found segment: surface {surf_idx}, segment {seg_uid}")
         
         return clicked_segment
 
@@ -5678,7 +5678,7 @@ class MeshItWorkflowGUI(QMainWindow):
                     tree.scrollToItem(item)
                     tree.setCurrentItem(item)
                     
-                    logger.info(f"✅ Toggled segment {seg_uid} to {'selected' if new_state == Qt.Checked else 'deselected'}")
+                    logger.info(f"Toggled segment {seg_uid} to {'selected' if new_state == Qt.Checked else 'deselected'}")
                     return True
                     
             # Check children
@@ -5692,7 +5692,7 @@ class MeshItWorkflowGUI(QMainWindow):
             if find_and_toggle_segment(tree.topLevelItem(i)):
                 return True
         
-        logger.warning(f"❌ Could not find tree item for segment: surface {surf_idx}, segment {seg_uid}")
+        logger.warning(f"Could not find tree item for segment: surface {surf_idx}, segment {seg_uid}")
         return False
 
     def _on_constraint_clicked_single(self, mesh):
@@ -5715,11 +5715,11 @@ class MeshItWorkflowGUI(QMainWindow):
         if self._is_surface_visible_in_filter(surf_idx, selected_surface):
             success = self._toggle_segment_selection_in_tree(surf_idx, seg_uid)
             if success:
-                logger.info(f"🎯 Successfully toggled single constraint selection")
+                logger.info(f"Successfully toggled single constraint selection")
             else:
-                logger.warning(f"❌ Failed to toggle constraint in tree")
+                logger.warning(f"Failed to toggle constraint in tree")
         else:
-            logger.warning(f"❌ Clicked segment not visible in current filter: '{selected_surface}'")
+            logger.warning(f"Clicked segment not visible in current filter: '{selected_surface}'")
 
     def _highlight_surface_in_constraint_tree(self, surface_name):
         """
@@ -5814,7 +5814,7 @@ class MeshItWorkflowGUI(QMainWindow):
             density_desc = "Very Coarse (Fastest)"
             color = "#9C27B0"  # Purple
         
-        self.target_size_info.setText(f"🎯 UNIFIED: {density_desc} | Target Size: {value}")
+        self.target_size_info.setText(f"UNIFIED: {density_desc} | Target Size: {value}")
         self.target_size_info.setStyleSheet(f"color: {color}; font-style: italic; font-weight: bold;")
     def _setup_pre_tetramesh_tab(self):
             """Sets up the Pre-Tetrahedral Mesh tab for surface selection and validation."""
@@ -5830,7 +5830,7 @@ class MeshItWorkflowGUI(QMainWindow):
             surface_group = QGroupBox("Conforming Surface Selection")
             surface_layout = QVBoxLayout(surface_group)
 
-            self.load_conforming_meshes_btn = QPushButton("📥 Load Conforming Meshes from Refine Tab")
+            self.load_conforming_meshes_btn = QPushButton("Load Conforming Meshes from Refine Tab")
             self.load_conforming_meshes_btn.setToolTip(
                 "Load pre-computed conforming surface meshes from the refine mesh tab.\n"
                 "Follows C++ core.cpp workflow: surfaces → conforming meshes → selection → tetgen"
@@ -5848,7 +5848,7 @@ class MeshItWorkflowGUI(QMainWindow):
             surface_layout.addWidget(self.conforming_mesh_status_label)
             
             # Add tetgen validation button
-            self.validate_for_tetgen_btn = QPushButton("✅ Validate Conforming Meshes for TetGen")
+            self.validate_for_tetgen_btn = QPushButton("Validate Conforming Meshes for TetGen")
             self.validate_for_tetgen_btn.setToolTip(
                 "Check if selected conforming surface meshes are ready for tetgen tetrahedralization.\n"
                 "Validates mesh quality, topology, and surface intersections for manifold geometry."
@@ -6029,7 +6029,7 @@ class MeshItWorkflowGUI(QMainWindow):
         # Update visualization
         self._update_conforming_surface_visualization()
         
-        self.statusBar().showMessage(f"✓ Loaded {conforming_surfaces_found} conforming surface meshes")
+        self.statusBar().showMessage(f"Loaded {conforming_surfaces_found} conforming surface meshes")
         logger.info(f"Successfully loaded {conforming_surfaces_found} conforming surface meshes")
 
     def _populate_conforming_surface_tree(self):
@@ -6045,7 +6045,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
         # Add header info
         header_item = QTreeWidgetItem(self.conforming_surface_tree)
-        header_item.setText(0, f"📋 {len(self.conforming_mesh_data)} Conforming Surfaces Available")
+        header_item.setText(0, f"{len(self.conforming_mesh_data)} Conforming Surfaces Available")
         header_item.setText(1, "Select")
         header_item.setText(2, "for")  
         header_item.setText(3, "TetGen")
@@ -6054,7 +6054,7 @@ class MeshItWorkflowGUI(QMainWindow):
         # Add each conforming surface
         for surface_idx, mesh_data in self.conforming_mesh_data.items():
             surface_item = QTreeWidgetItem(self.conforming_surface_tree)
-            surface_item.setText(0, f"🔺 {mesh_data['name']}")
+            surface_item.setText(0, f"{mesh_data['name']}")
             surface_item.setText(1, str(len(mesh_data['vertices'])))
             surface_item.setText(2, str(len(mesh_data['triangles'])))
             surface_item.setText(3, "Ready")
@@ -6267,7 +6267,7 @@ class MeshItWorkflowGUI(QMainWindow):
             
             # Update status based on results
             if validation_results['ready_for_tetgen']:
-                self.statusBar().showMessage(f"✓ All {len(selected_datasets)} conforming surfaces are ready for TetGen!")
+                self.statusBar().showMessage(f"All {len(selected_datasets)} conforming surfaces are ready for TetGen!")
                 QMessageBox.information(self, "Validation Success", 
                                       f"All {len(selected_datasets)} selected conforming surfaces are ready for TetGen!\n\n"
                                       f"You can now proceed to the Tetra Mesh tab to load these surfaces.")
@@ -6733,7 +6733,7 @@ class MeshItWorkflowGUI(QMainWindow):
             # Use magenta for wells (C++ MeshIt uses LightMagenta for wells)
             well_color = (1.0, 0.0, 1.0)  # Magenta
             plotter.add_mesh(poly, color=well_color, line_width=4, opacity=0.95, 
-                           label=f"🔵 {ds.get('name', 'Well')}", render_lines_as_tubes=True)
+                           label=f"{ds.get('name', 'Well')}", render_lines_as_tubes=True)
             
             # Show special points if requested
             if show_intersection_points:
@@ -7274,7 +7274,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 ds["conforming_mesh"]["holes"] = [[h.x, h.y, h.z] for h in holes] if holes else []
 
                 ok += 1
-                logger.info(f"✓ Conforming mesh generated for '{name}': {len(v3d)} vertices, {len(tris)} triangles")
+                logger.info(f"Conforming mesh generated for '{name}': {len(v3d)} vertices, {len(tris)} triangles")
             except Exception as e:
                 fails.append((name, str(e)))
                 logger.error(f"Conforming mesh generation FAILED for '{name}': {e}")
@@ -7800,7 +7800,7 @@ class MeshItWorkflowGUI(QMainWindow):
             
             # Build summary HTML
             summary_html = f"""
-            <h3>🏗️ Conforming Surface Mesh Generation Results</h3>
+            <h3>Conforming Surface Mesh Generation Results</h3>
             <p><b>Processing Status:</b> {successful_surfaces}/{total_surfaces} surfaces processed successfully</p>
             <p><b>Total Mesh Statistics:</b></p>
             <ul>
@@ -7817,13 +7817,13 @@ class MeshItWorkflowGUI(QMainWindow):
                 summary_html += "</ul>"
             
             if failed_surfaces:
-                summary_html += "<p><b>⚠️ Failed Surfaces:</b></p><ul>"
+                summary_html += "<p><b>Failed Surfaces:</b></p><ul>"
                 for idx, name, error in failed_surfaces:
                     summary_html += f"<li><b>{name}</b>: {error}</li>"
                 summary_html += "</ul>"
             
             summary_html += """
-            <p><b>📋 Next Steps:</b></p>
+            <p><b>Next Steps:</b></p>
             <ul>
                 <li>Review surface meshes in the visualization</li>
                 <li>Proceed to Pre-Tetra Mesh tab to select surfaces for 3D meshing</li>
@@ -11190,7 +11190,7 @@ segmentation, triangulation, and visualization.
         
         # Add datasets to list
         for dataset in self.datasets:
-            visibility = "✓" if dataset.get('visible', True) else "✗"
+            visibility = "Yes" if dataset.get('visible', True) else "No"
             color_square = "■ "
             item_text = f"{color_square}{visibility} {dataset['name']}"
             
@@ -15189,13 +15189,13 @@ segmentation, triangulation, and visualization.
             
             # Update status bar based on results
             if validation_results['ready_for_tetgen']:
-                self.statusBar().showMessage(f"✓ All {validation_results['surface_count']} surfaces are ready for tetgen!")
+                self.statusBar().showMessage(f"All {validation_results['surface_count']} surfaces are ready for tetgen!")
             elif validation_results['overall_status'] == 'PARTIAL':
                 ready_count = validation_results['statistics']['valid_surfaces']
                 total_count = validation_results['surface_count']
                 self.statusBar().showMessage(f"⚠ {ready_count}/{total_count} surfaces ready for tetgen")
             else:
-                self.statusBar().showMessage("✗ Surfaces not ready for tetgen - check validation report")
+                self.statusBar().showMessage("Surfaces not ready for tetgen - check validation report")
                 
         except Exception as e:
             logger.error(f"Validation failed: {str(e)}")
@@ -15228,7 +15228,7 @@ segmentation, triangulation, and visualization.
         transfer_layout.setContentsMargins(6, 8, 6, 6)
         transfer_layout.setSpacing(4)
         
-        self.load_surfaces_btn = QPushButton("📥 Load Surfaces")
+        self.load_surfaces_btn = QPushButton("Load Surfaces")
         self.load_surfaces_btn.setToolTip("Load conforming surface meshes from Refine & Mesh tab")
         self.load_surfaces_btn.clicked.connect(self._load_conforming_meshes_for_tetgen)
         transfer_layout.addWidget(self.load_surfaces_btn)
@@ -15319,25 +15319,25 @@ segmentation, triangulation, and visualization.
         tetgen_options_layout.addWidget(self.tetgen_switches_input)
         generate_layout.addLayout(tetgen_options_layout)
         
-        self.generate_tetra_mesh_btn = QPushButton("🔧 Generate Tetrahedral Mesh")
+        self.generate_tetra_mesh_btn = QPushButton("Generate Tetrahedral Mesh")
         self.generate_tetra_mesh_btn.clicked.connect(self._generate_tetrahedral_mesh_action)
         self.generate_tetra_mesh_btn.setEnabled(False)  # Enable after loading surfaces
         generate_layout.addWidget(self.generate_tetra_mesh_btn)
         
-        self.export_mesh_btn = QPushButton("💾 Export Mesh")
+        self.export_mesh_btn = QPushButton("Export Mesh")
         self.export_mesh_btn.clicked.connect(self._export_tetrahedral_mesh)
         self.export_mesh_btn.setEnabled(False)
         generate_layout.addWidget(self.export_mesh_btn)
         
         # Statistics button
-        self.mesh_statistics_btn = QPushButton("📊 Mesh Statistics")
+        self.mesh_statistics_btn = QPushButton("Mesh Statistics")
         self.mesh_statistics_btn.clicked.connect(self._show_mesh_statistics_dialog)
         self.mesh_statistics_btn.setEnabled(False)
         self.mesh_statistics_btn.setToolTip("Show detailed statistics about the generated mesh")
         generate_layout.addWidget(self.mesh_statistics_btn)
         
         # High-quality figure export button
-        self.export_figure_btn = QPushButton("📸 Export Figure")
+        self.export_figure_btn = QPushButton("Export Figure")
         self.export_figure_btn.clicked.connect(self._show_figure_export_dialog)
         self.export_figure_btn.setEnabled(False)
         self.export_figure_btn.setToolTip("Export high-resolution figures with colorbar and annotations")
@@ -15386,8 +15386,8 @@ segmentation, triangulation, and visualization.
         toolbar = QHBoxLayout()
         
         # Basic controls
-        self.tetra_reset_view_btn = QPushButton("🔄 Reset View")
-        self.tetra_fit_view_btn = QPushButton("📐 Fit View")
+        self.tetra_reset_view_btn = QPushButton("Reset View")
+        self.tetra_fit_view_btn = QPushButton("Fit View")
         
         # Visualization modes
         self.tetra_wireframe_check = QCheckBox("Wireframe")
@@ -15818,7 +15818,7 @@ segmentation, triangulation, and visualization.
                 continue
             
             well_name = ds.get('name', f'Well_{idx}')
-            item = QListWidgetItem(f"🔵 {well_name}")
+            item = QListWidgetItem(f"{well_name}")
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setData(Qt.UserRole, idx)  # Store dataset index
             
@@ -16049,12 +16049,12 @@ segmentation, triangulation, and visualization.
                 }
                 
                 self.tetra_materials.append(fault_material)
-                logger.info(f"✓ Extracted fault from TetGen: {fault_material['name']} "
+                logger.info(f"Extracted fault from TetGen: {fault_material['name']} "
                            f"(ID {next_attr}, marker {marker}, {fault_face_count} faces)")
                 next_attr += 1
             
             extracted_count = sum(1 for m in self.tetra_materials if m.get('type') == 'FAULT')
-            logger.info(f"✓ Extracted {extracted_count} fault materials from TetGen triface_markers")
+            logger.info(f"Extracted {extracted_count} fault materials from TetGen triface_markers")
             
             # Refresh the material list UI to show fault materials
             self._refresh_material_list()
@@ -16246,7 +16246,7 @@ segmentation, triangulation, and visualization.
             selected_well_idx = None
             
             if not show_all and "Well ID" in material_name:
-                # Extract well ID from dropdown (format: "🔵 WellName (Well ID X)")
+                # Extract well ID from dropdown (format: "WellName (Well ID X)")
                 import re
                 match = re.search(r'Well ID (\d+)', material_name)
                 if match:
@@ -16435,7 +16435,7 @@ segmentation, triangulation, and visualization.
                     logger.info("MaterialID contains only zeros - applying manual material assignment")
                     self._assign_materials_to_mesh(grid)
                 else:
-                    # ✅ CRITICAL FIX: Only count FORMATION materials that TetGen actually processes
+                    # CRITICAL FIX: Only count FORMATION materials that TetGen actually processes
                     # Faults are surface constraints only, NOT volumetric regions
                     formation_materials = [m for m in self.tetra_materials if m.get('type', 'FORMATION') != 'FAULT']
                     expected_materials = len(formation_materials)
@@ -16444,7 +16444,7 @@ segmentation, triangulation, and visualization.
                         logger.info(f"MaterialID has {len(unique_materials)} unique values but we need {expected_materials} formations - applying manual assignment")
                         self._assign_materials_to_mesh(grid)
                     else:
-                        logger.info(f"✅ TetGen material assignment successful: {len(unique_materials)} materials match {expected_materials} formations")
+                        logger.info(f"TetGen material assignment successful: {len(unique_materials)} materials match {expected_materials} formations")
             
             QMessageBox.information(self, "Success", "Tetrahedral mesh generated successfully!")
             self.export_mesh_btn.setEnabled(True)
@@ -16529,7 +16529,7 @@ segmentation, triangulation, and visualization.
                             logger.info(f"Collected hole from constraint tree: '{surface_name}' intersection {intersection_idx} at ({hole_center[0]:.3f}, {hole_center[1]:.3f}, {hole_center[2]:.3f})")
         
         if holes:
-            logger.info(f"✓ Collected {len(holes)} holes from constraint tree")
+            logger.info(f"Collected {len(holes)} holes from constraint tree")
         else:
             logger.info("No holes marked in constraint tree")
             
@@ -16583,7 +16583,7 @@ segmentation, triangulation, and visualization.
             
             logger.info(f"  Well '{well_name}': {len(well_pts)} points, marker={well_marker}")
         
-        logger.info(f"✓ Collected {len(well_data)} wells for TetGen export")
+        logger.info(f"Collected {len(well_data)} wells for TetGen export")
         return well_data
     
     def _calculate_intersection_hole_center(self, surface_idx, intersection_idx):
@@ -17311,7 +17311,7 @@ segmentation, triangulation, and visualization.
             
             # Create dialog
             dialog = QDialog(self)
-            dialog.setWindowTitle("📊 Mesh Statistics")
+            dialog.setWindowTitle("Mesh Statistics")
             dialog.setMinimumSize(700, 600)
             dialog.setModal(False)  # Allow interaction with main window
             
@@ -17395,11 +17395,11 @@ segmentation, triangulation, and visualization.
             # === Buttons ===
             button_layout = QHBoxLayout()
             
-            save_btn = QPushButton("💾 Save Statistics")
+            save_btn = QPushButton("Save Statistics")
             save_btn.clicked.connect(lambda: self._save_mesh_statistics(stats, summary))
             button_layout.addWidget(save_btn)
             
-            copy_btn = QPushButton("📋 Copy to Clipboard")
+            copy_btn = QPushButton("Copy to Clipboard")
             copy_btn.clicked.connect(lambda: self._copy_statistics_to_clipboard(stats, summary))
             button_layout.addWidget(copy_btn)
             
@@ -17677,7 +17677,7 @@ segmentation, triangulation, and visualization.
                     logger.warning(f"Could not capture camera position: {e}")
             
             dialog = QDialog(self)
-            dialog.setWindowTitle("📸 Export High-Quality Figure")
+            dialog.setWindowTitle("Export High-Quality Figure")
             dialog.setMinimumSize(600, 700)
             
             main_layout = QVBoxLayout(dialog)
@@ -17748,7 +17748,7 @@ segmentation, triangulation, and visualization.
             image_layout.addWidget(format_group)
             image_layout.addStretch()
             
-            tabs.addTab(image_tab, "📐 Image")
+            tabs.addTab(image_tab, "Image")
             
             # === TAB 2: Visualization Settings ===
             viz_tab = QWidget()
@@ -17840,7 +17840,7 @@ segmentation, triangulation, and visualization.
             viz_layout.addWidget(light_group)
             viz_layout.addStretch()
             
-            tabs.addTab(viz_tab, "🎨 Visualization")
+            tabs.addTab(viz_tab, "Visualization")
             
             # === TAB 3: Annotations ===
             annot_tab = QWidget()
@@ -17931,7 +17931,7 @@ segmentation, triangulation, and visualization.
             labels_form.addRow("", self.fig_label_bg)
             
             # Button to customize label names
-            self.fig_edit_labels_btn = QPushButton("✏️ Edit Label Names...")
+            self.fig_edit_labels_btn = QPushButton("Edit Label Names...")
             self.fig_edit_labels_btn.clicked.connect(self._show_label_editor_dialog)
             self.fig_edit_labels_btn.setToolTip("Customize the display names for materials and faults")
             labels_form.addRow("", self.fig_edit_labels_btn)
@@ -17942,7 +17942,7 @@ segmentation, triangulation, and visualization.
             annot_layout.addWidget(labels_group)
             annot_layout.addStretch()
             
-            tabs.addTab(annot_tab, "📝 Annotations")
+            tabs.addTab(annot_tab, "Annotations")
             
             # === TAB 4: Advanced ===
             adv_tab = QWidget()
@@ -17988,20 +17988,20 @@ segmentation, triangulation, and visualization.
             adv_layout.addWidget(aa_group)
             adv_layout.addStretch()
             
-            tabs.addTab(adv_tab, "⚙️ Advanced")
+            tabs.addTab(adv_tab, "Advanced")
             
             main_layout.addWidget(tabs)
             
             # === Preview & Export Buttons ===
             button_layout = QHBoxLayout()
             
-            preview_btn = QPushButton("👁️ Preview")
+            preview_btn = QPushButton("Preview")
             preview_btn.clicked.connect(lambda: self._preview_publication_figure(dialog))
             button_layout.addWidget(preview_btn)
             
             button_layout.addStretch()
             
-            export_btn = QPushButton("📸 Export Figure")
+            export_btn = QPushButton("Export Figure")
             export_btn.setStyleSheet("background-color: #1565C0; color: white; font-weight: bold; padding: 8px 16px;")
             export_btn.clicked.connect(lambda: self._export_publication_figure(dialog))
             button_layout.addWidget(export_btn)
@@ -18057,7 +18057,7 @@ segmentation, triangulation, and visualization.
                 'intersection': 'Intersection',
                 'refine_mesh': 'Refine & Mesh'
             }
-            dialog.setWindowTitle(f"📸 Export {view_names.get(view_type, view_type)} Figure")
+            dialog.setWindowTitle(f"Export {view_names.get(view_type, view_type)} Figure")
             dialog.setMinimumSize(500, 550)
             
             main_layout = QVBoxLayout(dialog)
@@ -18218,13 +18218,13 @@ segmentation, triangulation, and visualization.
             # === Buttons ===
             button_layout = QHBoxLayout()
             
-            preview_btn = QPushButton("👁️ Preview")
+            preview_btn = QPushButton("Preview")
             preview_btn.clicked.connect(lambda: self._preview_generic_figure(dialog, view_type))
             button_layout.addWidget(preview_btn)
             
             button_layout.addStretch()
             
-            export_btn = QPushButton("📸 Export Figure")
+            export_btn = QPushButton("Export Figure")
             export_btn.setStyleSheet("background-color: #1565C0; color: white; font-weight: bold; padding: 8px 16px;")
             export_btn.clicked.connect(lambda: self._export_generic_figure(dialog, view_type))
             button_layout.addWidget(export_btn)
@@ -18607,7 +18607,7 @@ segmentation, triangulation, and visualization.
         from PySide6.QtCore import Qt
         
         dialog = QDialog(self)
-        dialog.setWindowTitle("✏️ Edit Label Names")
+        dialog.setWindowTitle("Edit Label Names")
         dialog.setMinimumSize(500, 400)
         
         layout = QVBoxLayout(dialog)
@@ -18641,7 +18641,7 @@ segmentation, triangulation, and visualization.
         
         for row, (mat_id, mat_name, mat_type) in enumerate(materials_data):
             # Type column (read-only)
-            type_item = QTableWidgetItem("⚡ Fault" if mat_type == 'FAULT' else "🏔️ Formation")
+            type_item = QTableWidgetItem("Fault" if mat_type == 'FAULT' else "Formation")
             type_item.setFlags(type_item.flags() & ~Qt.ItemIsEditable)
             table.setItem(row, 0, type_item)
             
@@ -18667,7 +18667,7 @@ segmentation, triangulation, and visualization.
         
         btn_layout.addStretch()
         
-        save_btn = QPushButton("💾 Save")
+        save_btn = QPushButton("Save")
         save_btn.clicked.connect(lambda: self._save_custom_names(dialog, table))
         save_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         btn_layout.addWidget(save_btn)
@@ -19143,7 +19143,7 @@ segmentation, triangulation, and visualization.
                         specular=0.5,
                     )
                 
-                logger.info(f"  ✓ Added fault mesh: {fault_name}")
+                logger.info(f"  Added fault mesh: {fault_name}")
                 
             except Exception as e:
                 logger.warning(f"Failed to create fault mesh for marker {marker}: {e}")
@@ -19184,7 +19184,7 @@ segmentation, triangulation, and visualization.
                 else:
                     # Add type indicator for clarity
                     if mat_type == 'FAULT':
-                        display_name = f"⚡ {mat_name}"  # Fault indicator
+                        display_name = f"{mat_name}"  # Fault indicator
                     else:
                         display_name = mat_name
                 
@@ -19207,7 +19207,7 @@ segmentation, triangulation, and visualization.
                         if mat_id in custom_names and custom_names[mat_id]:
                             display_name = custom_names[mat_id]
                         else:
-                            display_name = f"⚡ {fault_name}"
+                            display_name = f"{fault_name}"
                         if len(display_name) > 30:
                             display_name = display_name[:27] + "..."
                         material_names[mat_id] = display_name
@@ -19257,7 +19257,7 @@ segmentation, triangulation, and visualization.
                         if mat_id in custom_names and custom_names[mat_id]:
                             display_name = custom_names[mat_id]
                         else:
-                            display_name = f"⚡ {fault_name}"
+                            display_name = f"{fault_name}"
                     
                     # Use stored location as centroid
                     locations = mat.get('locations', [])
@@ -19279,7 +19279,7 @@ segmentation, triangulation, and visualization.
                             if mat_id in custom_names and custom_names[mat_id]:
                                 all_names[mat_id] = custom_names[mat_id]
                             else:
-                                all_names[mat_id] = f"⚡ {fault_name}"
+                                all_names[mat_id] = f"{fault_name}"
             
             # Get all unique IDs including faults
             all_ids = set(unique_materials)
@@ -20319,7 +20319,7 @@ segmentation, triangulation, and visualization.
                         well_name = ds.get('name', f'Well_{well_idx}')
                         # Well marker = well_idx + 2 (C++ style: 0,1 reserved, polylines start at 2)
                         well_marker = well_idx + 2
-                        dropdown_name = f"🔵 {well_name} (Well ID {well_marker})"
+                        dropdown_name = f"{well_name} (Well ID {well_marker})"
                         self.tetra_material_combo.addItem(dropdown_name)
                         logger.debug(f"Added well to dropdown: {dropdown_name}")
                         
@@ -20402,7 +20402,7 @@ segmentation, triangulation, and visualization.
                 color = [0.5, 0.5, 0.5]  # Gray fallback
             
             # Add type indicator
-            type_prefix = "⚡" if mat_type == 'FAULT' else "🏔️"
+            type_prefix = "" if mat_type == 'FAULT' else ""
             display_name = f"{type_prefix} {mat_name}"
             
             legend_entries.append([display_name, color])
@@ -20747,7 +20747,7 @@ segmentation, triangulation, and visualization.
             material_type = self._get_material_type_by_id(material_id)
             
             if material_type == "FAULT":
-                # ✅ FAULT: Use TetGen constraint surface triangles (C++ MeshIt style)
+                # FAULT: Use TetGen constraint surface triangles (C++ MeshIt style)
                 fault_mesh = self._extract_fault_surface_from_tetgen(material_id)
                 if fault_mesh is not None and fault_mesh.n_cells > 0:
                     # *** FIX: Add MaterialID to fault mesh for consistent coloring ***
