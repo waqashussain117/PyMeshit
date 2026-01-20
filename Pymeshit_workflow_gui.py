@@ -2540,10 +2540,7 @@ class MeshItWorkflowGUI(QMainWindow):
         load_well_action.triggered.connect(self.load_well_file)
         file_menu.addAction(load_well_action)
 
-        load_multiple_wells_action = QAction("Load Multiple &Wells...", self)
-        load_multiple_wells_action.setStatusTip("Load multiple well (polyline) files")
-        load_multiple_wells_action.triggered.connect(self.load_multiple_well_files)
-        file_menu.addAction(load_multiple_wells_action)
+
 
         
         file_menu.addSeparator()
@@ -2686,10 +2683,16 @@ class MeshItWorkflowGUI(QMainWindow):
         file_layout = QVBoxLayout(file_group)
         
         # Button for loading multiple files
-        load_multiple_btn = QPushButton("Load Multiple Files...")
+        load_multiple_btn = QPushButton("Load Surfaces and Borders")
         load_multiple_btn.setToolTip("Load points from multiple files as separate datasets")
         load_multiple_btn.clicked.connect(self.load_multiple_files)
         file_layout.addWidget(load_multiple_btn)
+
+        # Button for loading wells (moved from File menu)
+        load_wells_btn = QPushButton("Load Wells")
+        load_wells_btn.setToolTip("Load multiple well (polyline) files as separate datasets")
+        load_wells_btn.clicked.connect(self.load_multiple_well_files)
+        file_layout.addWidget(load_wells_btn)
         
         # Button for deleting selected dataset
         delete_dataset_btn = QPushButton("Delete Selected Dataset")
