@@ -24,6 +24,8 @@ def main():
     splash_path = os.path.join(os.path.dirname(__file__), 'resources', 'images', 'app_logo.png')
     if os.path.exists(splash_path):
         pixmap = QPixmap(splash_path)
+        # Resize the logo
+        pixmap = pixmap.scaled(600, 600, Qt.KeepAspectRatio)
         splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
     else:
         # fallback small transparent pixmap

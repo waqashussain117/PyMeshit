@@ -2836,23 +2836,7 @@ class MeshItWorkflowGUI(QMainWindow):
             "area, perimeter ratio, computation time, and more."
         )
         self.hull_stats_btn.clicked.connect(self._generate_hull_comparison_statistics)
-        self.hull_stats_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #7B1FA2;
-                color: white;
-                font-weight: bold;
-                padding: 8px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #9C27B0;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
-            }
-        """)
+
         control_layout.addWidget(self.hull_stats_btn)
         
         # High-quality figure export button
@@ -3136,23 +3120,7 @@ class MeshItWorkflowGUI(QMainWindow):
             "R², computation time using cross-validation."
         )
         self.interp_stats_btn.clicked.connect(self._generate_interpolation_comparison_statistics)
-        self.interp_stats_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #7B1FA2;
-                color: white;
-                font-weight: bold;
-                padding: 8px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #9C27B0;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
-            }
-        """)
+
         control_layout.addWidget(self.interp_stats_btn)
 
         # Export button (remain the same)
@@ -3191,6 +3159,10 @@ class MeshItWorkflowGUI(QMainWindow):
         prev_btn = QPushButton("← Previous") # Added for completeness
         prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(2)) # Added for completeness
         nav_layout.addWidget(prev_btn) # Added for completeness
+        
+        next_btn = QPushButton("Next →")
+        next_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(4))
+        nav_layout.addWidget(next_btn)
         control_layout.addLayout(nav_layout) # Added for completeness
         control_layout.addStretch() # Added for completeness
 
@@ -3303,6 +3275,19 @@ class MeshItWorkflowGUI(QMainWindow):
         intersection_layout.addWidget(self.intersection_list)
         
         left_layout.addWidget(intersection_group, 1)  # Add stretch
+        
+        # Navigation buttons
+        nav_layout = QHBoxLayout()
+        
+        prev_btn = QPushButton("← Previous")
+        prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(3))
+        nav_layout.addWidget(prev_btn)
+        
+        next_btn = QPushButton("Next →")
+        next_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(5))
+        nav_layout.addWidget(next_btn)
+        
+        left_layout.addLayout(nav_layout)
         
         # Right panel for visualization
         right_panel = QWidget()
@@ -3514,6 +3499,19 @@ class MeshItWorkflowGUI(QMainWindow):
         left_splitter.setSizes([180, 200, 280, 180])
 
         left_layout.addWidget(left_splitter)
+        
+        # Navigation buttons
+        nav_layout = QHBoxLayout()
+        
+        prev_btn = QPushButton("← Previous")
+        prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(4))
+        nav_layout.addWidget(prev_btn)
+        
+        next_btn = QPushButton("Next →")
+        next_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(6))
+        nav_layout.addWidget(next_btn)
+        
+        left_layout.addLayout(nav_layout)
 
         # ── CENTER: Visualization ────────────────────────────────────────────────
         center_panel = QWidget()
@@ -5910,6 +5908,19 @@ class MeshItWorkflowGUI(QMainWindow):
             control_layout.addWidget(surface_group) # Add surface selection group
             control_layout.addWidget(selection_group) # Add surface selection group
             control_layout.addStretch()
+            
+            # Navigation buttons
+            nav_layout = QHBoxLayout()
+            
+            prev_btn = QPushButton("← Previous")
+            prev_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(5))
+            nav_layout.addWidget(prev_btn)
+            
+            next_btn = QPushButton("Next →")
+            next_btn.clicked.connect(lambda: self.notebook.setCurrentIndex(7))
+            nav_layout.addWidget(next_btn)
+            
+            control_layout.addLayout(nav_layout)
             
             # Add the control_panel to the main tab_layout
             tab_layout.addWidget(control_panel)
