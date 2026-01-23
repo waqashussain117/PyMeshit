@@ -92,6 +92,14 @@ def build_exe(use_clean=True, debug=False):
         print("Install it with: pip install netCDF4")
         return False
 
+    # Determine executable name based on OS
+    import platform
+    system = platform.system()
+    exe_name = "PyMeshIt.exe" if system == "Windows" else "PyMeshIt"
+    
+    print(f"Building for system: {system}")
+    print(f"Expected executable: {exe_name}")
+
     # PyInstaller command for PySide6 application
     cmd = [
         pyinstaller_exe,
@@ -111,8 +119,8 @@ def build_exe(use_clean=True, debug=False):
         # Main script
         "main.py",
         # Include data files
-        "--add-data=resources;resources",
-        "--add-data=Pymeshit;Pymeshit",
+        "--add-data=resources;resources" if system == "Windows" else "--add-data=resources:resources",
+        "--add-data=Pymeshit;Pymeshit" if system == "Windows" else "--add-data=Pymeshit:Pymeshit",
         # Hidden imports for PySide6
         "--hidden-import=PySide6.QtCore",
         "--hidden-import=PySide6.QtGui",
@@ -236,7 +244,7 @@ def build_exe(use_clean=True, debug=False):
             print("STDERR:", result.stderr)
 
         # Check if exe was created (with --onefile, PyInstaller creates a single executable)
-        exe_path = project_root / "release" / "PyMeshIt.exe"
+        exe_path = project_root / "release" / exe_name
         if exe_path.exists():
             print(f"\nExecutable created: {exe_path}")
             print(f"File size: {exe_path.stat().st_size / (1024*1024):.2f} MB")
