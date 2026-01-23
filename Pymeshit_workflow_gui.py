@@ -1,7 +1,7 @@
 """
-MeshIt Workflow GUI
+PyMeshIt Workflow GUI
 
-This application provides a graphical interface for the complete MeshIt workflow,
+This application provides a graphical interface for the complete PyMeshIt workflow,
 including file loading, convex hull computation, segmentation, triangulation, and visualization.
 """
 
@@ -52,10 +52,10 @@ from pyvista import examples
 # Configure logging to show ALL messages at INFO level
 logging.basicConfig(level=logging.INFO, 
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("MeshIt-Workflow")
+logger = logging.getLogger("PyMeshIt-Workflow")
 
-# Also ensure meshit module logs are visible
-logging.getLogger("meshit").setLevel(logging.INFO)
+# Also ensure pymeshit module logs are visible
+logging.getLogger("pymeshit").setLevel(logging.INFO)
 
 logger.setLevel(logging.INFO)
 
@@ -2486,14 +2486,6 @@ class MeshItWorkflowGUI(QMainWindow):
         clear_all_action.setStatusTip("Remove all loaded datasets")
         clear_all_action.triggered.connect(self.clear_all_datasets)
 
-
-        # --- Visualization Menu ---
-        viz_menu = menu_bar.addMenu("&Visualization")
-
-
-
-
-
         # --- Help Menu ---
         help_menu = menu_bar.addMenu("&Help")
         about_action = help_menu.addAction("&About")
@@ -2756,23 +2748,6 @@ class MeshItWorkflowGUI(QMainWindow):
         self.hull_export_figure_btn.clicked.connect(lambda: self._show_generic_figure_export_dialog('hulls'))
         self.hull_export_figure_btn.setEnabled(False)
         self.hull_export_figure_btn.setToolTip("Export high-resolution figure of convex hull visualization")
-        self.hull_export_figure_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1565C0;
-                color: white;
-                font-weight: bold;
-                padding: 6px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
-            }
-        """)
         control_layout.addWidget(self.hull_export_figure_btn)
         
         # Navigation buttons
@@ -2888,23 +2863,6 @@ class MeshItWorkflowGUI(QMainWindow):
         self.segment_export_figure_btn.clicked.connect(lambda: self._show_generic_figure_export_dialog('segments'))
         self.segment_export_figure_btn.setEnabled(False)
         self.segment_export_figure_btn.setToolTip("Export high-resolution figure of segmentation visualization")
-        self.segment_export_figure_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1565C0;
-                color: white;
-                font-weight: bold;
-                padding: 6px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
-            }
-        """)
         control_layout.addWidget(self.segment_export_figure_btn)
 
         # Navigation buttons
@@ -3046,23 +3004,6 @@ class MeshItWorkflowGUI(QMainWindow):
         self.tri_export_figure_btn.clicked.connect(lambda: self._show_generic_figure_export_dialog('triangulation'))
         self.tri_export_figure_btn.setEnabled(False)
         self.tri_export_figure_btn.setToolTip("Export high-resolution figure of triangulation visualization")
-        self.tri_export_figure_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1565C0;
-                color: white;
-                font-weight: bold;
-                padding: 6px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
-            }
-        """)
         control_layout.addWidget(self.tri_export_figure_btn)
 
         # Navigation buttons (remain the same)
@@ -3131,23 +3072,6 @@ class MeshItWorkflowGUI(QMainWindow):
         self.intersection_export_figure_btn.clicked.connect(lambda: self._show_generic_figure_export_dialog('intersection'))
         self.intersection_export_figure_btn.setEnabled(False)
         self.intersection_export_figure_btn.setToolTip("Export high-resolution figure of intersection visualization")
-        self.intersection_export_figure_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1565C0;
-                color: white;
-                font-weight: bold;
-                padding: 6px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
-            }
-        """)
         controls_layout.addWidget(self.intersection_export_figure_btn)
         
         controls_layout.addStretch()
@@ -3325,23 +3249,6 @@ class MeshItWorkflowGUI(QMainWindow):
         self.refine_export_figure_btn.clicked.connect(lambda: self._show_generic_figure_export_dialog('refine_mesh'))
         self.refine_export_figure_btn.setEnabled(False)
         self.refine_export_figure_btn.setToolTip("Export high-resolution figure of refine mesh visualization")
-        self.refine_export_figure_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1565C0;
-                color: white;
-                font-weight: bold;
-                padding: 6px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
-            }
-        """)
         ag.addWidget(self.refine_export_figure_btn)
 
         # Mesh settings (compact form)
@@ -5768,23 +5675,6 @@ class MeshItWorkflowGUI(QMainWindow):
             )
             self.validate_for_tetgen_btn.clicked.connect(self._validate_conforming_meshes_for_tetgen)
             self.validate_for_tetgen_btn.setEnabled(False)
-            self.validate_for_tetgen_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #4CAF50;
-                    color: white;
-                    font-weight: bold;
-                    padding: 8px;
-                    border: none;
-                    border-radius: 4px;
-                }
-                QPushButton:hover {
-                    background-color: #45a049;
-                }
-                QPushButton:disabled {
-                    background-color: #cccccc;
-                    color: #666666;
-                }
-            """)
             surface_layout.addWidget(self.validate_for_tetgen_btn)
 
             # --- Surface Selection Group ---
@@ -9332,14 +9222,14 @@ class MeshItWorkflowGUI(QMainWindow):
     def _show_about(self):
         """Show about dialog"""
         about_text = """
-MeshIt Workflow GUI
+        PyMeshIt Workflow GUI
 
-A graphical interface for the complete MeshIt workflow,
-including file loading, convex hull computation, 
-segmentation, triangulation, and visualization.
+        A graphical interface for the complete PyMeshIt workflow,
+        including file loading, convex hull computation, 
+        segmentation, triangulation, and visualization.
 
-3D Visualization: {status}
-"""
+        3D Visualization: {status}
+        """
         
         status = "Enabled" if self.view_3d_enabled else "Disabled (Install PyVista)"
         about_text = about_text.format(status=status)
@@ -15267,23 +15157,6 @@ segmentation, triangulation, and visualization.
         self.export_figure_btn.clicked.connect(self._show_figure_export_dialog)
         self.export_figure_btn.setEnabled(False)
         self.export_figure_btn.setToolTip("Export high-resolution figures with colorbar and annotations")
-        self.export_figure_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #1565C0;
-                color: white;
-                font-weight: bold;
-                padding: 6px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-                color: #666666;
-            }
-        """)
         generate_layout.addWidget(self.export_figure_btn)
         
         control_layout.addWidget(generate_group)

@@ -7,7 +7,7 @@ import pyvista as pv
 from typing import Dict, List, Tuple, Optional, Any, Union
 from Pymeshit.intersection_utils import Vector3D
 
-logger = logging.getLogger("MeshIt-Workflow")
+logger = logging.getLogger("PyMeshIt-Workflow")
 
 # Try to import netCDF4 for NetCDF export support
 try:

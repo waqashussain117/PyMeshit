@@ -1,8 +1,7 @@
 """
-DirectTriangleWrapper: Improved implementation of Triangle refinement with C callback.
+DirectTriangleWrapper: Improved implementation of Triangle refinement
 
-This module provides a direct wrapper for the Triangle library using the
-C++ extension module for the triunsuitable callback.
+This module provides a direct wrapper for the Triangle library.
 """
 
 import numpy as np

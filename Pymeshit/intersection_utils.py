@@ -1,8 +1,8 @@
 """
-MeshIt Intersection Utilities
+PyMeshIt Intersection Utilities
 
 This module provides functionality for computing intersections between 
-surfaces and polylines, following the MeshIt workflow.
+surfaces and polylines, following the PyMeshIt workflow.
 """
 
 import numpy as np
