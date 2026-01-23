@@ -32,7 +32,12 @@ PyMeshIt provides standalone executables for **Windows 10/11** and **Ubuntu (22.
 2. Download the appropriate file for your OS:
    - **Windows**: `MeshIt-vX.X.X-win64.zip`
    - **Ubuntu**: `MeshIt-vX.X.X-linux.zip`
-3. Extract the archive and run the executable (`PyMeshIt.exe` on Windows, `PyMeshIt` on Linux).
+3. Extract the archive.
+4. On Linux, you may need to make the file executable:
+   ```bash
+   chmod +x PyMeshIt
+   ```
+5. Run the executable (`./PyMeshIt` on Linux, double-click `PyMeshIt.exe` on Windows).
 
 > **Note**: macOS support is planned for future releases.
 
@@ -66,6 +71,11 @@ The package will automatically install all required dependencies:
 - tetgen
 - triangle (optional)
 
+**Linux Users**: You may need to install system libraries for Qt. On Ubuntu:
+```bash
+sudo apt-get install libxcb-cursor0 libxkbcommon-x11-0 libegl1 libopengl0 libgl1
+```
+
 
 ## Quick start (GUI)
 
@@ -98,6 +108,26 @@ Typical workflow:
 ## Programmatic Usage
 
 
+
+## Troubleshooting
+
+### Linux / Virtual Machine Issues
+
+If you encounter an error like `X Error of failed request: BadWindow` or the application crashes on startup, it is likely due to graphics driver compatibility, especially in Virtual Machines (VirtualBox, VMware).
+
+Try running the application with software rendering forced:
+
+```bash
+export LIBGL_ALWAYS_SOFTWARE=1
+./PyMeshIt
+```
+
+Or force the Qt platform to X11:
+
+```bash
+export QT_QPA_PLATFORM=xcb
+./PyMeshIt
+```
 
 ## Contributing
 
