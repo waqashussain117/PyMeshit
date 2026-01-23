@@ -25,15 +25,24 @@ The included GUI (main.py) implements a full MeshIt workflow with the following 
 ## Installation
 
 ### From Release (Recommended)
+        
+PyMeshIt provides standalone executables for **Windows 10/11** and **Ubuntu (22.04+)**. These do not require Python to be installed.
+        
+1. Go to the [Releases page](https://github.com/waqashussain117/PyMeshit/releases).
+2. Download the appropriate file for your OS:
+   - **Windows**: `MeshIt-vX.X.X-win64.zip`
+   - **Ubuntu**: `MeshIt-vX.X.X-linux.zip`
+3. Extract the archive and run the executable (`PyMeshIt.exe` on Windows, `PyMeshIt` on Linux).
 
-For quick installation, download the exe. file from Releases 
+> **Note**: macOS support is planned for future releases.
 
+### From PyPI (Cross-Platform)
 
-### From PyPI 
+If you prefer to run from source or use the Python API, you can install via pip:
 
 ```bash
 pip install triangle
-pip install pymeshit # Needs to be fixed
+pip install pymeshit
 ```
 
 ### From Source
