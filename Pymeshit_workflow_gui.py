@@ -12,42 +12,42 @@ import sys
 import time
 import re
 import pickle
-
-# import List
-from typing import List, Dict, Tuple, Optional, Any
-# Import PySide6
-from PySide6.QtWidgets import QAbstractItemView
-from Pymeshit.intersection_utils import align_intersections_to_convex_hull, Vector3D, Intersection, refine_intersection_line_by_length, insert_triple_points, refine_hull_with_interpolation
-from Pymeshit.intersection_utils import prepare_plc_for_surface_triangulation, run_constrained_triangulation_py, calculate_triple_points, TriplePoint
-from Pymeshit.intersection_utils import make_corners_special, Vector3D
-from PySide6.QtWidgets import QMenu, QTreeWidgetItemIterator
-import tetgen
-from Pymeshit.tetra_mesh_utils import TetrahedralMeshGenerator
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
-                            QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QTabWidget,
-                            QFileDialog, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox,
-                            QCheckBox, QGroupBox, QRadioButton, QSlider, QLineEdit,
-                            QSplitter, QDialog, QFormLayout, QButtonGroup, QMenu,
-                            QListWidget, QColorDialog, QListWidgetItem, QProgressDialog,
-                            QSpacerItem, QTableWidget, QTableWidgetItem,
-                            QTreeWidget, QTreeWidgetItem, QScrollArea)
-from PySide6.QtGui import QFont, QIcon, QColor, QPalette, QPixmap, QAction, QActionGroup
-from PySide6.QtCore import Qt, QSize, Signal, QObject, QThread, QTimer, QSettings
-# Add these imports at the top of meshit_workflow_gui.py
-from Pymeshit.intersection_utils import run_constrained_triangulation_py
-from scipy.spatial.distance import pdist, squareform
 import itertools
 import gc
 import atexit
-from PySide6.QtWidgets import (QDockWidget, QListWidget, QListWidgetItem,
-                             QTableWidget, QTableWidgetItem, QPushButton,
-                             QVBoxLayout, QHBoxLayout, QLabel, QSlider,
-                             QDoubleSpinBox, QWidget, QGroupBox, QGridLayout)
-from PySide6.QtCore import Qt, Slot
-# Import PyVista for 3D visualization (required)
+from typing import List, Dict, Tuple, Optional, Any
+
+# PySide6 Imports
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QTabWidget,
+    QFileDialog, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox,
+    QCheckBox, QGroupBox, QRadioButton, QSlider, QLineEdit,
+    QSplitter, QDialog, QFormLayout, QButtonGroup, QMenu,
+    QListWidget, QListWidgetItem, QProgressDialog,
+    QSpacerItem, QTableWidget, QTableWidgetItem,
+    QTreeWidget, QTreeWidgetItem, QScrollArea, QDockWidget,
+    QAbstractItemView, QHeaderView, QSizePolicy, QInputDialog
+)
+from PySide6.QtGui import QFont, QIcon, QColor, QPalette, QPixmap, QAction, QActionGroup
+from PySide6.QtCore import Qt, QSize, Signal, QObject, QThread, QTimer, QSettings, Slot
+
+# PyMeshIt Imports
+import tetgen
+from Pymeshit.intersection_utils import (
+    align_intersections_to_convex_hull, Vector3D, Intersection, 
+    refine_intersection_line_by_length, insert_triple_points, 
+    refine_hull_with_interpolation, prepare_plc_for_surface_triangulation, 
+    run_constrained_triangulation_py, calculate_triple_points, TriplePoint,
+    make_corners_special, refine_well_by_length
+)
+from Pymeshit.tetra_mesh_utils import TetrahedralMeshGenerator
+
+# Scientific & Visualization Imports
+from scipy.spatial.distance import pdist, squareform
+from scipy.interpolate import griddata
 import pyvista as pv
 from pyvista import examples
-logging.info("Successfully imported PyVista for 3D visualization")
 
 # Configure logging to show ALL messages at INFO level
 logging.basicConfig(level=logging.INFO, 
@@ -897,16 +897,7 @@ class MeshItWorkflowGUI(QMainWindow):
             coord_layout.addWidget(w)
 
         # Hidden sliders (keep for compatibility but don't show)
-        self.locX_slider = QSlider(Qt.Horizontal)
-        self.locY_slider = QSlider(Qt.Horizontal)
-        self.locZ_slider = QSlider(Qt.Horizontal)
-        for s, lbl in [(self.locX_slider, "X"), (self.locY_slider, "Y"), (self.locZ_slider, "Z")]:
-            s.setRange(-1000000, 1000000)
-            s.setSingleStep(500)
-            s.setPageStep(5000)
-            s.setProperty("axis", lbl)
-            s.valueChanged.connect(self._coord_slider_changed)
-            s.setVisible(False)  # Hide sliders for cleaner UI
+
 
         v_main.addWidget(gb_coord)
         return material_group
@@ -915,7 +906,7 @@ class MeshItWorkflowGUI(QMainWindow):
     def _init_seg_refine_table(self):
         # Table for Segmentation per-surface RefineByLength
         # Uses dataset index as stable key; stores it in Qt.UserRole per row
-        from PySide6.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem
+
         if not hasattr(self, 'seg_length_by_surface'):
             self.seg_length_by_surface = {}
         self._seg_table_updating = False
@@ -937,8 +928,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _refresh_seg_refine_table(self):
         # Populate rows for all non-WELL datasets
-        from PySide6.QtWidgets import QTableWidgetItem
-        from PySide6.QtCore import Qt
+
         if not hasattr(self, 'seg_refine_table'):
             return
         self._seg_table_updating = True
@@ -968,7 +958,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _on_seg_refine_cell_changed(self, row, col):
         # Persist edits into self.seg_length_by_surface
-        from PySide6.QtCore import Qt
+
         if self._seg_table_updating or col != 1:
             return
         item_name = self.seg_refine_table.item(row, 0)
@@ -1150,7 +1140,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
             # Try to read from the table directly
             if hasattr(self, 'seg_refine_table') and self.seg_refine_table is not None:
-                from PySide6.QtCore import Qt
+
                 rows = self.seg_refine_table.rowCount()
                 for r in range(rows):
                     item_name = self.seg_refine_table.item(r, 0)
@@ -1185,7 +1175,7 @@ class MeshItWorkflowGUI(QMainWindow):
         Initialize table for per-well RefineByLength settings.
         Wells are 1D polylines that get refined but NOT triangulated (C++ behavior).
         """
-        from PySide6.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView
+
         if not hasattr(self, 'well_length_by_index'):
             self.well_length_by_index = {}
         self._well_table_updating = False
@@ -1207,8 +1197,7 @@ class MeshItWorkflowGUI(QMainWindow):
     
     def _refresh_well_refine_table(self):
         """Populate rows for all WELL datasets."""
-        from PySide6.QtWidgets import QTableWidgetItem
-        from PySide6.QtCore import Qt
+
         if not hasattr(self, 'well_refine_table'):
             return
         self._well_table_updating = True
@@ -1239,7 +1228,7 @@ class MeshItWorkflowGUI(QMainWindow):
     
     def _on_well_refine_cell_changed(self, row, col):
         """Handle changes to well refinement values."""
-        from PySide6.QtCore import Qt
+
         if self._well_table_updating or col != 1:
             return
         item_name = self.well_refine_table.item(row, 0)
@@ -1274,7 +1263,7 @@ class MeshItWorkflowGUI(QMainWindow):
         Returns True if successful, False otherwise.
         """
         try:
-            from Pymeshit.intersection_utils import refine_well_by_length, Vector3D
+
             
             ds = self.datasets[dataset_index]
             if ds.get('type') != 'WELL':
@@ -1335,7 +1324,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _init_mesh_refine_table(self):
         # Table for Refine & Mesh per-surface mesh target size
-        from PySide6.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem
+
         if not hasattr(self, 'mesh_length_by_surface'):
             self.mesh_length_by_surface = {}
         self._mesh_table_updating = False
@@ -1358,8 +1347,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _refresh_mesh_refine_table(self):
         # Populate rows for all non-WELL datasets
-        from PySide6.QtWidgets import QTableWidgetItem
-        from PySide6.QtCore import Qt
+
         if not hasattr(self, 'mesh_refine_table'):
             return
         self._mesh_table_updating = True
@@ -1398,7 +1386,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _on_mesh_refine_cell_changed(self, row, col):
         # Persist edits into self.mesh_length_by_surface
-        from PySide6.QtCore import Qt
+
         if self._mesh_table_updating or col != 1:
             return
         item_name = self.mesh_refine_table.item(row, 0)
@@ -1427,7 +1415,7 @@ class MeshItWorkflowGUI(QMainWindow):
         Initialize table for per-well RefineByLength settings in the Refine & Mesh tab.
         This mirrors the well_refine_table in the Segmentation tab.
         """
-        from PySide6.QtWidgets import QGroupBox, QVBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy
+
         
         self._mesh_well_table_updating = False
         
@@ -1455,8 +1443,7 @@ class MeshItWorkflowGUI(QMainWindow):
     
     def _refresh_mesh_well_refine_table(self):
         """Populate rows for all WELL datasets in the Refine & Mesh tab."""
-        from PySide6.QtWidgets import QTableWidgetItem
-        from PySide6.QtCore import Qt
+
         if not hasattr(self, 'mesh_well_refine_table'):
             return
         self._mesh_well_table_updating = True
@@ -1488,7 +1475,7 @@ class MeshItWorkflowGUI(QMainWindow):
     
     def _on_mesh_well_refine_cell_changed(self, row, col):
         """Handle changes to well refinement values in Refine & Mesh tab."""
-        from PySide6.QtCore import Qt
+
         if self._mesh_well_table_updating or col != 1:
             return
         item_name = self.mesh_well_refine_table.item(row, 0)
@@ -1540,8 +1527,7 @@ class MeshItWorkflowGUI(QMainWindow):
         Accepts:
         vtu_source: a PyVista dataset or a file path (.vtu/.vtk/.vtp/.stl etc.)
         """
-        import numpy as np
-        import pyvista as pv
+
 
         # Load mesh
         mesh = vtu_source if hasattr(vtu_source, "extract_surface") else pv.read(str(vtu_source))
@@ -1912,21 +1898,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
         return (x_range, y_range, z_range)
     
-    def _value_to_slider(self, value: float, min_val: float, max_val: float) -> int:
-        """Convert a coordinate value to slider position (0-1000000)."""
-        if max_val == min_val:
-            return 500000  # Center position
-        # Map value to slider range [0, 1000000]
-        normalized = (value - min_val) / (max_val - min_val)
-        return int(normalized * 1000000)
-    
-    def _slider_to_value(self, slider_pos: int, min_val: float, max_val: float) -> float:
-        """Convert slider position (0-1000000) to coordinate value."""
-        if max_val == min_val:
-            return min_val
-        # Map slider range [0, 1000000] to value range
-        normalized = slider_pos / 1000000.0
-        return min_val + normalized * (max_val - min_val)
+
 
     def _update_coordinate_editors(self)->None:
         m=self.material_list.currentRow(); l=self.material_location_list.currentRow()
@@ -1936,9 +1908,7 @@ class MeshItWorkflowGUI(QMainWindow):
         self.locX_val.blockSignals(True)
         self.locY_val.blockSignals(True)
         self.locZ_val.blockSignals(True)
-        self.locX_slider.blockSignals(True)
-        self.locY_slider.blockSignals(True)
-        self.locZ_slider.blockSignals(True)
+
 
         if editing:
             x,y,z=self.tetra_materials[m]["locations"][l]
@@ -1946,55 +1916,16 @@ class MeshItWorkflowGUI(QMainWindow):
             x, y, z = float(x), float(y), float(z)
             self.locX_val.setValue(x); self.locY_val.setValue(y); self.locZ_val.setValue(z)
             
-            # Calculate dynamic slider ranges based on all material coordinates
-            x_range, y_range, z_range = self._calculate_slider_ranges()
-            
-            # Update slider ranges
-            self.locX_slider.setRange(0, 1000000)
-            self.locY_slider.setRange(0, 1000000)
-            self.locZ_slider.setRange(0, 1000000)
-            
-            # Calculate step sizes proportional to range (1% of range)
-            x_step = max(1, int((x_range[1] - x_range[0]) * 0.01))
-            y_step = max(1, int((y_range[1] - y_range[0]) * 0.01))
-            z_step = max(1, int((z_range[1] - z_range[0]) * 0.01))
-            
-            self.locX_slider.setSingleStep(max(1, x_step // 100))
-            self.locY_slider.setSingleStep(max(1, y_step // 100))
-            self.locZ_slider.setSingleStep(max(1, z_step // 100))
-            
-            self.locX_slider.setPageStep(max(10, x_step // 10))
-            self.locY_slider.setPageStep(max(10, y_step // 10))
-            self.locZ_slider.setPageStep(max(10, z_step // 10))
-            
-            # Map coordinate values to slider positions
-            slider_x = self._value_to_slider(x, x_range[0], x_range[1])
-            slider_y = self._value_to_slider(y, y_range[0], y_range[1])
-            slider_z = self._value_to_slider(z, z_range[0], z_range[1])
-            
-            # Store ranges for reverse mapping in slider change handler
-            self._slider_x_range = x_range
-            self._slider_y_range = y_range
-            self._slider_z_range = z_range
-            
-            self.locX_slider.setValue(slider_x)
-            self.locY_slider.setValue(slider_y)
-            self.locZ_slider.setValue(slider_z)
+
         else:
             self.locX_val.setValue(0); self.locY_val.setValue(0); self.locZ_val.setValue(0)
-            self.locX_slider.setValue(500000); self.locY_slider.setValue(500000); self.locZ_slider.setValue(500000)
-            # Reset ranges to default
-            self._slider_x_range = (-100.0, 100.0, 0.0)
-            self._slider_y_range = (-100.0, 100.0, 0.0)
-            self._slider_z_range = (-100.0, 100.0, 0.0)
+
 
         # Unblock signals after programmatic updates
         self.locX_val.blockSignals(False)
         self.locY_val.blockSignals(False)
         self.locZ_val.blockSignals(False)
-        self.locX_slider.blockSignals(False)
-        self.locY_slider.blockSignals(False)
-        self.locZ_slider.blockSignals(False)
+
 
     @Slot(float)
     def _coord_spin_changed(self,val:float)->None:
@@ -2002,26 +1933,7 @@ class MeshItWorkflowGUI(QMainWindow):
             return
         axis=self.sender().property("axis"); self._apply_coord_change(axis,val)
 
-    def _coord_slider_changed(self,val:int)->None:
-        if self._updating_coordinates:
-            return
-        axis=self.sender().property("axis")
-        
-        # Get the appropriate range for this axis
-        if axis == "X" and hasattr(self, '_slider_x_range'):
-            min_val, max_val, _ = self._slider_x_range
-            value = self._slider_to_value(val, min_val, max_val)
-        elif axis == "Y" and hasattr(self, '_slider_y_range'):
-            min_val, max_val, _ = self._slider_y_range
-            value = self._slider_to_value(val, min_val, max_val)
-        elif axis == "Z" and hasattr(self, '_slider_z_range'):
-            min_val, max_val, _ = self._slider_z_range
-            value = self._slider_to_value(val, min_val, max_val)
-        else:
-            # Fallback to old method if ranges not set
-            value = val / 1000.0
-        
-        self._apply_coord_change(axis, value)
+
 
     def _apply_coord_change(self,axis:str,value:float)->None:
         m=self.material_list.currentRow(); l=self.material_location_list.currentRow()
@@ -2061,7 +1973,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 plotter.remove_actor(actor_name)
 
         colours = ['red','blue','green','yellow','purple','cyan','orange','magenta']
-        import pyvista as pv
+
         for midx, mat in enumerate(self.tetra_materials):
             colour = colours[midx % len(colours)]
             for lidx, xyz in enumerate(mat["locations"]):
@@ -2396,7 +2308,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
         # Try to extract the center point of the clicked cell
         try:
-            import numpy as np
+
             if hasattr(cell_data, 'center'):
                 point = cell_data.center
             elif hasattr(cell_data, 'points'):
@@ -6161,7 +6073,7 @@ class MeshItWorkflowGUI(QMainWindow):
             
             # Visualize only selected conforming surfaces
             import pyvista as pv
-            import numpy as np
+
             
             colors = ['lightblue', 'lightgreen', 'lightcoral', 'lightyellow', 
                      'lightpink', 'lightcyan', 'wheat', 'lightgray']
@@ -6703,7 +6615,7 @@ class MeshItWorkflowGUI(QMainWindow):
         - Start/End points as cyan/blue spheres
         """
         try:
-            import numpy as np
+
             import pyvista as pv
         except Exception:
             return
@@ -7101,7 +7013,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 self.datasets_intersections[primary_key_ds] = []
 
             def _same_intersection(inter1: dict, inter2: dict, tol: float = 1e-6) -> bool:
-                import numpy as np
+    
 
                 def to_xyz_array(pts) -> np.ndarray:
                     xyz = []
@@ -9844,7 +9756,7 @@ segmentation, triangulation, and visualization.
         smoothing = float(self.interp_smoothing_input.value()) if hasattr(self, "interp_smoothing_input") else 0.0
 
         try:
-            import numpy as np
+
             from scipy.spatial import Delaunay, cKDTree
             from scipy.interpolate import RBFInterpolator, CloughTocher2DInterpolator
             from Pymeshit.triangle_direct import DirectTriangleWrapper
@@ -12873,7 +12785,7 @@ segmentation, triangulation, and visualization.
                     if hasattr(p, "x") and hasattr(p, "y") and hasattr(p, "z"):
                         return float(p.x), float(p.y), float(p.z)
                     try:
-                        import numpy as np
+            
                         if isinstance(p, np.ndarray) and p.size >= 3:
                             return float(p[0]), float(p[1]), float(p[2])
                     except Exception:
@@ -12890,7 +12802,7 @@ segmentation, triangulation, and visualization.
                 if len(xyz_pts) < 2:
                     continue
 
-                import numpy as np, pyvista as pv
+
                 # Create polyline through all points
                 poly = pv.PolyData(np.array(xyz_pts, dtype=float))
                 # Create line connectivity for all points
@@ -13666,7 +13578,7 @@ segmentation, triangulation, and visualization.
         """Add a surface with the specified display mode."""
         try:
             import pyvista as pv
-            import numpy as np
+
             
             vertices_array = np.array(vertices)
             triangles_array = np.array(triangles)
@@ -15914,7 +15826,7 @@ segmentation, triangulation, and visualization.
         
         try:
             import pyvista as pv
-            import numpy as np
+
             
             # Remove existing well actors
             actors_to_remove = [name for name in self.tetra_plotter.actors.keys() if 'well_' in name.lower()]
@@ -16091,7 +16003,7 @@ segmentation, triangulation, and visualization.
         
         try:
             import pyvista as pv
-            import numpy as np
+
             
             # Color palette for different surfaces
             colors = [
@@ -16248,7 +16160,7 @@ segmentation, triangulation, and visualization.
         
         try:
             import pyvista as pv
-            import numpy as np
+
             
             # Check what's selected in the material dropdown
             material_name = ""
@@ -16439,7 +16351,7 @@ segmentation, triangulation, and visualization.
                 self._assign_materials_to_mesh(grid)
             else:
                 # Debug: Check if MaterialID actually has meaningful data
-                import numpy as np
+    
                 material_ids = grid.cell_data['MaterialID']
                 unique_materials = np.unique(material_ids)
                 logger.info(f"Found MaterialID in mesh: unique values = {unique_materials}")
@@ -16630,7 +16542,7 @@ segmentation, triangulation, and visualization.
                 return None
                 
             # Calculate centroid
-            import numpy as np
+
             coords_array = np.array(all_points)
             center = np.mean(coords_array, axis=0)
             return [float(center[0]), float(center[1]), float(center[2])]
@@ -16658,7 +16570,7 @@ segmentation, triangulation, and visualization.
             
         try:
             import pyvista as pv
-            import numpy as np
+
             
             self.tetra_plotter.clear()
             
@@ -17312,7 +17224,7 @@ segmentation, triangulation, and visualization.
             return
         
         try:
-            import numpy as np
+
             from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, 
                                           QTableWidgetItem, QPushButton, QLabel, QTextEdit,
                                           QHeaderView, QFileDialog, QGroupBox)
@@ -18295,7 +18207,7 @@ segmentation, triangulation, and visualization.
         """Show a preview of the generic figure."""
         try:
             import pyvista as pv
-            import numpy as np
+
             
             # Create an offscreen plotter for preview
             plotter = pv.Plotter(off_screen=True, window_size=[800, 600])
@@ -18336,8 +18248,7 @@ segmentation, triangulation, and visualization.
     
     def _export_generic_figure(self, dialog, view_type: str):
         """Export the high-quality figure from any tab."""
-        from PySide6.QtWidgets import QFileDialog
-        import pyvista as pv
+
         
         # Get format and extension
         format_text = self.generic_fig_format.currentText()
@@ -18716,7 +18627,7 @@ segmentation, triangulation, and visualization.
         """Show a preview of the figure."""
         try:
             import pyvista as pv
-            import numpy as np
+
             
             # Create an offscreen plotter for preview
             plotter = pv.Plotter(off_screen=True, window_size=[800, 600])
@@ -19413,8 +19324,7 @@ segmentation, triangulation, and visualization.
     
     def _export_publication_figure(self, dialog):
         """Export the high-quality figure."""
-        from PySide6.QtWidgets import QFileDialog
-        import pyvista as pv
+
         
         # Get format and extension
         format_text = self.fig_format.currentText()
@@ -19566,7 +19476,7 @@ segmentation, triangulation, and visualization.
                     all_points.extend(vertices)
         
         if all_points:
-            import numpy as np
+
             all_points = np.array(all_points)
             if all_points.shape[1] >= 3:
                 center = np.mean(all_points[:, :3], axis=0)
@@ -19581,7 +19491,7 @@ segmentation, triangulation, and visualization.
             if hasattr(grid, 'cell_data') and 'MaterialID' in grid.cell_data:
                 material_ids = grid.cell_data['MaterialID']
                 # Check if materials are properly distributed (not all default)
-                import numpy as np
+    
                 unique_materials = np.unique(material_ids)
                 if len(unique_materials) >= len(self.tetra_materials) and not np.all(material_ids == 0):
                     return True
@@ -19596,7 +19506,7 @@ segmentation, triangulation, and visualization.
         approach but applied as post-processing when TetGen fails.
         """
         try:
-            import numpy as np
+
             import pyvista as pv
             
             if not self.tetra_materials:
@@ -20315,7 +20225,7 @@ segmentation, triangulation, and visualization.
                     mesh = mesh.get('pyvista_grid')
                 
                 if mesh and hasattr(mesh, 'cell_data') and 'MaterialID' in mesh.cell_data:
-                    import numpy as np
+        
                     material_ids = mesh.cell_data['MaterialID']
                     unique_materials = np.unique(material_ids)
                     
@@ -20750,7 +20660,7 @@ segmentation, triangulation, and visualization.
         *** CRITICAL: Different visualization for faults vs formations like C++ MeshIt ***
         """
         try:
-            import numpy as np
+
             import pyvista as pv
             
             if not hasattr(mesh, 'cell_data') or 'MaterialID' not in mesh.cell_data:
@@ -21005,7 +20915,7 @@ segmentation, triangulation, and visualization.
                 return False
             
             # For object or string arrays, we need to check if they can be converted
-            import numpy as np
+
             arr = np.array(data)
             
             # If it's already numeric, check normally
@@ -21107,7 +21017,7 @@ segmentation, triangulation, and visualization.
     def _validate_and_convert_points(self, points, name="points"):
         """Validate and convert points to proper numeric numpy array format."""
         try:
-            import numpy as np
+
             import ast
             import re
             
@@ -21307,7 +21217,7 @@ segmentation, triangulation, and visualization.
         """Add convex hulls using the simple approach from pre-tetra mesh tab."""
         try:
             import pyvista as pv
-            import numpy as np
+
             
             for i in surface_indices:
                 dataset = self.datasets[i]
@@ -21378,7 +21288,7 @@ segmentation, triangulation, and visualization.
         """Add an intersection line to the plotter with proper validation."""
         try:
             import pyvista as pv
-            import numpy as np
+
             
             # Validate and convert points
             validated_points = self._validate_and_convert_points(points, f"intersection_line_{surface_index}_{line_idx}")
@@ -21521,7 +21431,7 @@ segmentation, triangulation, and visualization.
             return
 
         try:
-            import numpy as np
+
 
             # Fresh start
             self.tetra_materials.clear()
@@ -22083,8 +21993,7 @@ segmentation, triangulation, and visualization.
 
     def _show_validation_results_dialog(self, validation_results):
         """Show validation results in a dialog."""
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton, QLabel
-        from PySide6.QtCore import Qt
+
         
         dialog = QDialog(self)
         dialog.setWindowTitle("Surface Validation Results")
@@ -22264,7 +22173,7 @@ segmentation, triangulation, and visualization.
         
         # Force garbage collection to help clean up VTK objects
         try:
-            import gc
+
             gc.collect()
             logger.debug("Forced garbage collection after plotter cleanup")
         except Exception as e:
@@ -22283,7 +22192,7 @@ segmentation, triangulation, and visualization.
     
     def _ensure_vtk_cleanup_on_exit(self):
         """Ensure VTK cleanup is performed when Python exits."""
-        import atexit
+
         
         def vtk_cleanup():
             try:
@@ -22480,8 +22389,7 @@ segmentation, triangulation, and visualization.
         if plotter is None:
             return
 
-        import pyvista as pv
-        import numpy as np
+
 
         # Palette from the original working code for consistency
         palette = [
