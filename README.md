@@ -30,8 +30,8 @@ PyMeshIt provides standalone executables for **Windows 10/11** and **Ubuntu (22.
         
 1. Go to the [Releases page](https://github.com/waqashussain117/PyMeshit/releases).
 2. Download the appropriate file for your OS:
-   - **Windows**: `MeshIt-vX.X.X-win64.zip`
-   - **Ubuntu**: `MeshIt-vX.X.X-linux.zip`
+   - **Windows**: `PyMeshit-vX.X.X-win64.zip`
+   - **Ubuntu**: `PyMeshit-vX.X.X-linux.zip`
 3. Extract the archive.
 4. On Linux, you may need to make the file executable:
    ```bash

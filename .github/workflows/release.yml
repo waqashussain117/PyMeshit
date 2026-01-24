@@ -89,14 +89,14 @@ jobs:
           VER="${{ steps.get_version.outputs.version }}"
           echo "Creating ZIP for version $VER"
           cd release
-          zip -r MeshIt-$VER-linux.zip PyMeshIt
+          zip -r PyMeshit-$VER-linux.zip PyMeshIt
           cd ..
 
       - name: Upload ZIP to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/MeshIt-${{ steps.get_version.outputs.version }}-linux.zip
+            release/PyMeshit-${{ steps.get_version.outputs.version }}-linux.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -217,10 +217,10 @@ jobs:
             Write-Host "ERROR: PyMeshIt directory not found!"
             exit 1
           }
-          Write-Host "Creating ZIP archive: MeshIt-$ver-win64.zip"
-          Compress-Archive -Path "release/PyMeshIt" -DestinationPath "release/MeshIt-$ver-win64.zip" -Force
+          Write-Host "Creating ZIP archive: PyMeshit-$ver-win64.zip"
+          Compress-Archive -Path "release/PyMeshIt" -DestinationPath "release/PyMeshit-$ver-win64.zip" -Force
           Write-Host "ZIP archive created successfully"
-          $zipSize = (Get-Item "release/MeshIt-$ver-win64.zip").Length / 1MB
+          $zipSize = (Get-Item "release/PyMeshit-$ver-win64.zip").Length / 1MB
           Write-Host "ZIP size: $($zipSize.ToString('F2')) MB"
 
       - name: List release files before upload
@@ -228,13 +228,13 @@ jobs:
         run: |
           Write-Host "Files in release directory:"
           Get-ChildItem release -ErrorAction SilentlyContinue
-          Write-Host "Looking for: MeshIt-${{ steps.get_version.outputs.version }}-win64.zip"
+          Write-Host "Looking for: PyMeshit-${{ steps.get_version.outputs.version }}-win64.zip"
 
       - name: Upload ZIP to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/MeshIt-${{ steps.get_version.outputs.version }}-win64.zip
+            release/PyMeshit-${{ steps.get_version.outputs.version }}-win64.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
