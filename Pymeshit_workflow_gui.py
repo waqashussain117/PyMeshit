@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QHeaderView, QSizePolicy, QInputDialog
 )
 from PySide6.QtGui import QFont, QIcon, QColor, QPalette, QPixmap, QAction, QActionGroup
-from PySide6.QtCore import Qt, QSize, Signal, QObject, QThread, QTimer, QSettings, Slot
+from PySide6.QtCore import Qt, QSize, Signal, QObject, QThread, QTimer, QSettings, Slot, QMetaObject
 
 # PyMeshIt Imports
 import tetgen
@@ -47,7 +47,6 @@ from Pymeshit.tetra_mesh_utils import TetrahedralMeshGenerator
 from scipy.spatial.distance import pdist, squareform
 from scipy.interpolate import griddata
 import pyvista as pv
-from pyvista import examples
 
 # Configure logging to show ALL messages at INFO level
 logging.basicConfig(level=logging.INFO, 
@@ -3106,8 +3105,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
         self.intersection_list = QListWidget()
         self.intersection_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        # Defer connecting selection change until plotter is ready
-        # self.intersection_list.itemSelectionChanged.connect(self._on_intersection_selection_changed)
+        self.intersection_list.itemSelectionChanged.connect(self._on_intersection_selection_changed)
         intersection_layout.addWidget(self.intersection_list)
         
         left_layout.addWidget(intersection_group, 1)  # Add stretch
@@ -3137,19 +3135,11 @@ class MeshItWorkflowGUI(QMainWindow):
         self.intersection_plot_layout = QVBoxLayout(self.intersection_view_frame)
         self.intersection_plot_layout.setContentsMargins(0, 0, 0, 0)
         
-        if True:
-            from pyvistaqt import QtInteractor
-            self.intersection_plotter = QtInteractor(self.intersection_view_frame)
-            self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
-            self.intersection_plotter.set_background('white')
-            # Connect selection change now that plotter exists
-            self.intersection_list.itemSelectionChanged.connect(self._on_intersection_selection_changed)
-        else:
-            # Placeholder if PyVista is not available
-            placeholder = QLabel("PyVista is required for 3D intersection visualization.")
-            placeholder.setAlignment(Qt.AlignCenter)
-            self.intersection_plot_layout.addWidget(placeholder)
-            self.intersection_plotter = None # Ensure plotter is None
+        placeholder_text = "Compute intersections to visualize in 3D"
+        self.intersection_viz_placeholder = QLabel(placeholder_text)
+        self.intersection_viz_placeholder.setAlignment(Qt.AlignCenter)
+        self.intersection_plot_layout.addWidget(self.intersection_viz_placeholder)
+        self.intersection_plotter = None
         
         right_layout.addWidget(self.intersection_view_frame, 1)  # Add frame with stretch
         # --- End PyVista Embedding ---
@@ -14093,12 +14083,29 @@ class MeshItWorkflowGUI(QMainWindow):
 
         logger.info(f"Stored {found_intersections_count} intersections across datasets and {len(self.triple_points)} triple points.")
 
-        QTimer.singleShot(0, self._update_statistics)
-        QTimer.singleShot(0, self._update_intersection_list)
-        QTimer.singleShot(0, self._visualize_intersections)
+        # Ensure UI updates happen on the GUI thread
+        self._schedule_intersection_ui_refresh()
 
         logger.info("Global intersection computation successful.")
         return True
+
+    @Slot()
+    def _refresh_intersection_ui(self):
+        """Refresh intersection UI elements on the GUI thread."""
+        self._update_statistics()
+        self._update_intersection_list()
+        self._visualize_intersections()
+
+    def _schedule_intersection_ui_refresh(self):
+        """Schedule intersection UI refresh on the GUI thread."""
+        try:
+            gui_thread = QObject.thread(self)
+            if QThread.currentThread() == gui_thread:
+                self._refresh_intersection_ui()
+            else:
+                QMetaObject.invokeMethod(self, "_refresh_intersection_ui", Qt.QueuedConnection)
+        except Exception as e:
+            logger.warning(f"Failed to schedule intersection UI refresh: {e}")
     def _clear_intersection_results(self):
         """Clear all intersection results"""
         # Clear intersection data
@@ -14114,20 +14121,28 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _clear_intersection_plot(self):
         """Clear the embedded intersection PyVista plotter."""
+        if hasattr(self, 'intersection_plot_layout'):
+            while self.intersection_plot_layout.count():
+                item = self.intersection_plot_layout.takeAt(0)
+                widget = item.widget()
+                if widget:
+                    widget.setParent(None)
+                    widget.deleteLater()
+            QApplication.processEvents()
+
         if hasattr(self, 'intersection_plotter') and self.intersection_plotter:
             try:
-                # Check if renderer is valid before clearing
-                if hasattr(self.intersection_plotter, 'renderer') and self.intersection_plotter.renderer is not None:
-                    self.intersection_plotter.clear()
-                    # Optionally add placeholder text back if desired
-                    # self.intersection_plotter.add_text("Compute intersections or select one from the list.", position='upper_edge')
-                    self.intersection_plotter.reset_camera()
-                else:
-                    logger.debug("Skipping clear for intersection_plotter - renderer not initialized")
-            except AttributeError as e:
-                logger.debug(f"Skipping clear for intersection_plotter - {e}")
+                if hasattr(self.intersection_plotter, 'close'):
+                    self.intersection_plotter.close()
             except Exception as e:
-                logger.warning(f"Error clearing intersection_plotter: {e}")
+                logger.debug(f"Error closing intersection_plotter: {e}")
+        self.intersection_plotter = None
+
+        placeholder_text = "Compute intersections to visualize in 3D"
+        if hasattr(self, 'intersection_plot_layout'):
+            self.intersection_viz_placeholder = QLabel(placeholder_text)
+            self.intersection_viz_placeholder.setAlignment(Qt.AlignCenter)
+            self.intersection_plot_layout.addWidget(self.intersection_viz_placeholder)
         
         # Disable export figure button
         if hasattr(self, 'intersection_export_figure_btn'):
@@ -14317,60 +14332,57 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _ensure_intersection_plotter_valid(self):
         """Ensure intersection plotter exists and is valid, recreate if necessary."""
-        if not hasattr(self, 'intersection_plotter') or self.intersection_plotter is None:
-            # Plotter doesn't exist, create it
+        if not hasattr(self, 'intersection_plot_layout') or not hasattr(self, 'intersection_view_frame'):
+            return False
+
+        def _restore_placeholder(message):
+            while self.intersection_plot_layout.count():
+                item = self.intersection_plot_layout.takeAt(0)
+                widget = item.widget()
+                if widget:
+                    widget.setParent(None)
+                    widget.deleteLater()
+            self.intersection_viz_placeholder = QLabel(message)
+            self.intersection_viz_placeholder.setAlignment(Qt.AlignCenter)
+            self.intersection_plot_layout.addWidget(self.intersection_viz_placeholder)
+
+        def _create_plotter():
             logger.info("Creating intersection plotter")
-            from pyvistaqt import QtInteractor
-            if hasattr(self, 'intersection_plot_layout'):
-                self.intersection_plotter = QtInteractor(self.intersection_view_frame)
-                self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
-                self.intersection_plotter.set_background('white')
-            return self.intersection_plotter is not None
-        
-        # Check if the Qt widget is still valid
+            while self.intersection_plot_layout.count():
+                item = self.intersection_plot_layout.takeAt(0)
+                widget = item.widget()
+                if widget:
+                    widget.setParent(None)
+                    widget.deleteLater()
+            QApplication.processEvents()
+            plotter = self._safe_create_pyvista_plotter(
+                self.intersection_view_frame,
+                background_color=[0.318, 0.341, 0.431]
+            )
+            if plotter is None:
+                _restore_placeholder("PyVista is required for 3D intersection visualization.")
+                self.intersection_plotter = None
+                return False
+            self.intersection_plotter = plotter
+            self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
+            return True
+
+        if not getattr(self, 'intersection_plotter', None):
+            return _create_plotter()
+
         try:
-            if hasattr(self.intersection_plotter, 'interactor') and self.intersection_plotter.interactor is not None:
-                # Try to access a property to see if Qt object is still alive
-                _ = self.intersection_plotter.interactor.isVisible()
-                return True
-            else:
-                # Qt widget was deleted, need to recreate
-                logger.info("Intersection plotter Qt widget deleted, recreating")
-                from pyvistaqt import QtInteractor
-                if hasattr(self, 'intersection_plot_layout'):
-                    # Clear old widget from layout
-                    while self.intersection_plot_layout.count():
-                        item = self.intersection_plot_layout.takeAt(0)
-                        widget = item.widget()
-                        if widget:
-                            widget.setParent(None)
-                            widget.deleteLater()
-                    QApplication.processEvents()
-                    
-                    self.intersection_plotter = QtInteractor(self.intersection_view_frame)
-                    self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
-                    self.intersection_plotter.set_background('white')
-                return self.intersection_plotter is not None
+            interactor = getattr(self.intersection_plotter, 'interactor', None)
+            if interactor is None:
+                logger.info("Intersection plotter interactor missing, recreating")
+                return _create_plotter()
+            _ = interactor.isVisible()
+            return True
         except RuntimeError as e:
-            # Qt object was deleted
             logger.info(f"Intersection plotter Qt object deleted, recreating: {e}")
-            from pyvistaqt import QtInteractor
-            if hasattr(self, 'intersection_plot_layout'):
-                # Clear old widget from layout
-                while self.intersection_plot_layout.count():
-                    item = self.intersection_plot_layout.takeAt(0)
-                    widget = item.widget()
-                    if widget:
-                        widget.setParent(None)
-                        widget.deleteLater()
-                QApplication.processEvents()
-                import time
-                time.sleep(0.05)
-                
-                self.intersection_plotter = QtInteractor(self.intersection_view_frame)
-                self.intersection_plot_layout.addWidget(self.intersection_plotter.interactor)
-                self.intersection_plotter.set_background('white')
-            return self.intersection_plotter is not None
+            return _create_plotter()
+        except Exception as e:
+            logger.debug(f"Error validating intersection plotter, recreating: {e}")
+            return _create_plotter()
     
     def _visualize_intersections(self):
         """Visualize all intersections in the embedded PyVista plotter, matching triangulation style."""
