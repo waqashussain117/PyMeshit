@@ -16214,73 +16214,107 @@ class MeshItWorkflowGUI(QMainWindow):
         if not self.tetra_surface_data:
              QMessageBox.critical(self, "Data Error", "No conforming mesh data is loaded in the Tetra Mesh tab.")
              return
-        
-        # Collect hole information from constraint tree
-        holes = self._collect_holes_from_constraint_tree()
-        
-        # Collect selected well data for 1D materials (C++ style: edgelist/edgemarkerlist)
-        well_data = self._collect_well_data_for_tetgen()
-        
-        self.tetra_mesh_generator = TetrahedralMeshGenerator(
-            datasets=self.datasets,
-            selected_surfaces=self.tetra_selected_surfaces,
-            border_surface_indices=border_indices,
-            unit_surface_indices=unit_indices,
-            fault_surface_indices=fault_indices,
-            materials=self.tetra_materials,
-            surface_data=self.tetra_surface_data,  # <-- PASS THE CORRECT DATA
-            holes=holes,  # <-- PASS HOLE INFORMATION
-            well_data=well_data  # <-- PASS WELL DATA FOR 1D MATERIALS (C++ style)
-        )
 
+        progress = QProgressDialog("Preparing tetrahedral meshing...", "", 0, 7, self)
+        progress.setWindowTitle("Generating Tetrahedral Mesh")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+
+        def _progress_step(step: int, text: str) -> None:
+            progress.setLabelText(text)
+            progress.setValue(step)
+            QApplication.processEvents()
+
+        self.generate_tetra_mesh_btn.setEnabled(False)
         self.statusBar().showMessage("Generating 3D tetrahedral mesh... This may take a while.")
+        progress.show()
         QApplication.processEvents()
 
-        grid = self.tetra_mesh_generator.generate_tetrahedral_mesh(tetgen_switches)
-        
-        if grid:
-            self.tetrahedral_mesh = grid
-            
-            # *** C++ STYLE: Extract fault materials from TetGen output triface_markers ***
-            self._extract_fault_materials_from_tetgen_output(fault_indices)
-            
-            # MATERIAL ASSIGNMENT: Apply manual material assignment if needed
-            if not hasattr(grid, 'cell_data') or 'MaterialID' not in grid.cell_data:
-                logger.info("No MaterialID found in mesh - applying manual material assignment")
-                self._assign_materials_to_mesh(grid)
-            else:
-                # Debug: Check if MaterialID actually has meaningful data
-    
-                material_ids = grid.cell_data['MaterialID']
-                unique_materials = np.unique(material_ids)
-                logger.info(f"Found MaterialID in mesh: unique values = {unique_materials}")
-                
-                # If all materials are 0 or there's only one material, force manual assignment
-                if len(unique_materials) == 1 and unique_materials[0] == 0:
-                    logger.info("MaterialID contains only zeros - applying manual material assignment")
+        try:
+            _progress_step(1, "Collecting hole constraints...")
+            holes = self._collect_holes_from_constraint_tree()
+
+            _progress_step(2, "Collecting well edge constraints...")
+            well_data = self._collect_well_data_for_tetgen()
+
+            _progress_step(3, "Building TetGen input model...")
+            self.tetra_mesh_generator = TetrahedralMeshGenerator(
+                datasets=self.datasets,
+                selected_surfaces=self.tetra_selected_surfaces,
+                border_surface_indices=border_indices,
+                unit_surface_indices=unit_indices,
+                fault_surface_indices=fault_indices,
+                materials=self.tetra_materials,
+                surface_data=self.tetra_surface_data,  # <-- PASS THE CORRECT DATA
+                holes=holes,  # <-- PASS HOLE INFORMATION
+                well_data=well_data  # <-- PASS WELL DATA FOR 1D MATERIALS (C++ style)
+            )
+
+            # Unknown duration while TetGen is running: switch to indeterminate mode.
+            progress.setLabelText("Running TetGen tetrahedralization... (this can take several minutes)")
+            progress.setRange(0, 0)
+            QApplication.processEvents()
+            grid = self.tetra_mesh_generator.generate_tetrahedral_mesh(tetgen_switches)
+
+            # Back to determinate mode for post-processing.
+            progress.setRange(0, 7)
+            _progress_step(5, "Post-processing tetrahedral mesh...")
+
+            if grid:
+                self.tetrahedral_mesh = grid
+
+                # *** C++ STYLE: Extract fault materials from TetGen output triface_markers ***
+                self._extract_fault_materials_from_tetgen_output(fault_indices)
+
+                # MATERIAL ASSIGNMENT: Apply manual material assignment if needed
+                if not hasattr(grid, 'cell_data') or 'MaterialID' not in grid.cell_data:
+                    logger.info("No MaterialID found in mesh - applying manual material assignment")
                     self._assign_materials_to_mesh(grid)
                 else:
-                    # CRITICAL FIX: Only count FORMATION materials that TetGen actually processes
-                    # Faults are surface constraints only, NOT volumetric regions
-                    formation_materials = [m for m in self.tetra_materials if m.get('type', 'FORMATION') != 'FAULT']
-                    expected_materials = len(formation_materials)
-                    
-                    if len(unique_materials) < expected_materials:
-                        logger.info(f"MaterialID has {len(unique_materials)} unique values but we need {expected_materials} formations - applying manual assignment")
+                    # Debug: Check if MaterialID actually has meaningful data
+                    material_ids = grid.cell_data['MaterialID']
+                    unique_materials = np.unique(material_ids)
+                    logger.info(f"Found MaterialID in mesh: unique values = {unique_materials}")
+
+                    # If all materials are 0 or there's only one material, force manual assignment
+                    if len(unique_materials) == 1 and unique_materials[0] == 0:
+                        logger.info("MaterialID contains only zeros - applying manual material assignment")
                         self._assign_materials_to_mesh(grid)
                     else:
-                        logger.info(f"TetGen material assignment successful: {len(unique_materials)} materials match {expected_materials} formations")
-            
-            QMessageBox.information(self, "Success", "Tetrahedral mesh generated successfully!")
-            self.export_mesh_btn.setEnabled(True)
-            self.mesh_statistics_btn.setEnabled(True)  # Enable statistics button
-            self.export_figure_btn.setEnabled(True)  # Enable figure export button
-            self._visualize_tetrahedral_mesh_in_tetra_tab()
-            self._update_tetra_stats()
-        else:
-            QMessageBox.critical(self, "TetGen Failure", "Failed to generate tetrahedral mesh. Check the logs and the exported debug_plc.vtm file for details.")
+                        # CRITICAL FIX: Only count FORMATION materials that TetGen actually processes
+                        # Faults are surface constraints only, NOT volumetric regions
+                        formation_materials = [m for m in self.tetra_materials if m.get('type', 'FORMATION') != 'FAULT']
+                        expected_materials = len(formation_materials)
 
-        self.statusBar().showMessage("Tetrahedral meshing complete.")
+                        if len(unique_materials) < expected_materials:
+                            logger.info(f"MaterialID has {len(unique_materials)} unique values but we need {expected_materials} formations - applying manual assignment")
+                            self._assign_materials_to_mesh(grid)
+                        else:
+                            logger.info(f"TetGen material assignment successful: {len(unique_materials)} materials match {expected_materials} formations")
+
+                _progress_step(6, "Rendering tetrahedral mesh in 3D view...")
+                self.export_mesh_btn.setEnabled(True)
+                self.mesh_statistics_btn.setEnabled(True)  # Enable statistics button
+                self.export_figure_btn.setEnabled(True)  # Enable figure export button
+                self._visualize_tetrahedral_mesh_in_tetra_tab()
+                self._update_tetra_stats()
+
+                _progress_step(7, "Finalizing...")
+                QMessageBox.information(self, "Success", "Tetrahedral mesh generated successfully!")
+                self.statusBar().showMessage("Tetrahedral meshing complete.", 5000)
+            else:
+                QMessageBox.critical(self, "TetGen Failure", "Failed to generate tetrahedral mesh. Check the logs and the exported debug_plc.vtm file for details.")
+                self.statusBar().showMessage("Tetrahedral meshing failed.", 7000)
+        except Exception as e:
+            logger.error(f"Tetrahedral mesh generation failed: {e}", exc_info=True)
+            QMessageBox.critical(self, "Meshing Error", f"Tetrahedral meshing failed:\n{e}")
+            self.statusBar().showMessage("Tetrahedral meshing failed due to an error.", 7000)
+        finally:
+            progress.close()
+            self.generate_tetra_mesh_btn.setEnabled(True)
 
     def _collect_holes_from_constraint_tree(self):
         """
