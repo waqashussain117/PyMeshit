@@ -17638,6 +17638,14 @@ class MeshItWorkflowGUI(QMainWindow):
             self.fig_render_style = QComboBox()
             self.fig_render_style.addItems(["Surface", "Wireframe", "Surface + Wireframe", "Points"])
             cmap_form.addRow("Render Style:", self.fig_render_style)
+
+            self.fig_line_width = QDoubleSpinBox()
+            self.fig_line_width.setRange(0.5, 20.0)
+            self.fig_line_width.setValue(2.0)
+            self.fig_line_width.setSingleStep(0.5)
+            self.fig_line_width.setSuffix(" px")
+            self.fig_line_width.setToolTip("Line width used for wireframe/edges in exported figure.")
+            cmap_form.addRow("Line Width:", self.fig_line_width)
             
             self.fig_show_edges = QCheckBox("Show mesh edges")
             self.fig_show_edges.setChecked(False)
@@ -18678,6 +18686,7 @@ class MeshItWorkflowGUI(QMainWindow):
         # Render style
         render_style = self.fig_render_style.currentText()
         show_edges = self.fig_show_edges.isChecked()
+        line_width = self.fig_line_width.value() if hasattr(self, 'fig_line_width') else 2.0
         
         # Determine style parameter
         if render_style == "Wireframe":
@@ -18712,7 +18721,7 @@ class MeshItWorkflowGUI(QMainWindow):
                     rgb=True,  # Interpret as RGB colors
                     style=style,
                     edge_color=self._fig_edge_color,
-                    line_width=1.0 if show_edges or render_style == "Wireframe" else 0,
+                    line_width=line_width if show_edges or render_style == "Wireframe" else 0,
                     ambient=self.fig_ambient.value(),
                     specular=self.fig_specular.value(),
                     show_edges=show_edges and style == 'surface',
@@ -18732,7 +18741,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 'cmap': cmap,
                 'style': style,
                 'edge_color': self._fig_edge_color,
-                'line_width': 1.0 if show_edges or render_style == "Wireframe" else 0,
+                'line_width': line_width if show_edges or render_style == "Wireframe" else 0,
                 'ambient': self.fig_ambient.value(),
                 'specular': self.fig_specular.value(),
                 'show_edges': show_edges and style == 'surface',
@@ -18762,7 +18771,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 mesh,
                 style='wireframe',
                 color=self._fig_edge_color,
-                line_width=0.5,
+                line_width=line_width,
                 opacity=0.3,
             )
         
@@ -18775,7 +18784,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 'value': self.fig_clip_value.value(),
                 'mesh_center': self.tetrahedral_mesh.center
             }
-        self._add_fault_surfaces_to_plotter(plotter, render_style, cmap, clip_info)
+        self._add_fault_surfaces_to_plotter(plotter, render_style, cmap, clip_info, line_width)
         
         # Camera view
         view_preset = self.fig_view_preset.currentText()
@@ -18835,7 +18844,7 @@ class MeshItWorkflowGUI(QMainWindow):
         if self.fig_show_labels.isChecked():
             self._add_material_labels_to_plotter(plotter, mesh, text_color)
     
-    def _add_fault_surfaces_to_plotter(self, plotter, render_style, cmap, clip_info=None):
+    def _add_fault_surfaces_to_plotter(self, plotter, render_style, cmap, clip_info=None, line_width=2.0):
         """Add fault surfaces as separate meshes to make them visible in the figure."""
         import numpy as np
         import pyvista as pv
@@ -18976,7 +18985,7 @@ class MeshItWorkflowGUI(QMainWindow):
                         opacity=0.9,
                         show_edges=True,
                         edge_color=fault_color,
-                        line_width=1.5,
+                        line_width=line_width,
                     )
                 elif render_style == "Surface + Wireframe":
                     # Surface with edges
@@ -18987,7 +18996,7 @@ class MeshItWorkflowGUI(QMainWindow):
                         opacity=0.9,
                         show_edges=True,
                         edge_color=[c * 0.7 for c in fault_color],  # Darker edges
-                        line_width=1.0,
+                        line_width=line_width,
                     )
                 else:
                     # Normal surface mode

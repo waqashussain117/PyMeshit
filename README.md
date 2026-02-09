@@ -4,6 +4,10 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
+<p align="center">
+   <img src="images/pymeshit_logo.png"/>
+</p>
+
 PyMeshIt is a complete Python package for mesh generation and manipulation with a full-featured Qt-based GUI. It provides a comprehensive workflow to process point clouds and polylines into conforming surface meshes and tetrahedral meshes.
 
 **Note:** This version runs entirely in Python without C++ dependencies, making it easier to install and deploy.

@@ -21,11 +21,11 @@ def main():
         app.setWindowIcon(QIcon(icon_path))
 
     # show splash screen if image available
-    splash_path = os.path.join(os.path.dirname(__file__), 'resources', 'images', 'app_logo.png')
+    splash_path = os.path.join(os.path.dirname(__file__), 'resources', 'images', 'pymeshit_logo.png')
     if os.path.exists(splash_path):
         pixmap = QPixmap(splash_path)
         # Resize the logo
-        pixmap = pixmap.scaled(600, 600, Qt.KeepAspectRatio)
+        pixmap = pixmap.scaled(1000, 1000, Qt.KeepAspectRatio)
         splash = QSplashScreen(pixmap, Qt.WindowStaysOnTopHint)
     else:
         # fallback small transparent pixmap
