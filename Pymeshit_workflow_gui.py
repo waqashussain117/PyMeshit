@@ -6595,6 +6595,20 @@ class MeshItWorkflowGUI(QMainWindow):
             self.statusBar().showMessage("Refinement skipped: No intersections found.", 5000)
             return
 
+        if self._has_custom_refine_constraint_selection():
+            reply = QMessageBox.question(
+                self,
+                "Reset Intersection Selections?",
+                "You have customized intersection selections in Step 6.\n\n"
+                "Re-running refinement may reset some intersections and their selection state.\n"
+                "Do you really want to reset the intersections and their selection state?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                self.statusBar().showMessage("Refinement canceled: kept current intersection selections.", 5000)
+                return
+
         import copy
         self.original_intersections_backup = copy.deepcopy(self.datasets_intersections)
 
@@ -22676,6 +22690,7 @@ class MeshItWorkflowGUI(QMainWindow):
             return
 
         tree: QTreeWidget = self.refine_constraint_tree
+        state_snapshot = self._capture_refine_constraint_state_snapshot()
         tree.clear()
         tree.blockSignals(True)
 
@@ -22838,7 +22853,8 @@ class MeshItWorkflowGUI(QMainWindow):
             surf_item = QTreeWidgetItem(tree)
             surf_item.setText(0, ds.get("name", f"Surface {s_idx}"))
             surf_item.setFlags(surf_item.flags() | Qt.ItemIsUserCheckable)
-            surf_item.setCheckState(0, Qt.Checked)
+            surf_state = state_snapshot.get("surface", {}).get(s_idx, Qt.Checked)
+            surf_item.setCheckState(0, surf_state)
             surf_item.setData(0, Qt.UserRole, {"type": "surface", "surface_idx": s_idx})
 
             # ----------------------- hull ---------------------------------------
@@ -22854,9 +22870,10 @@ class MeshItWorkflowGUI(QMainWindow):
                 hull_item = QTreeWidgetItem(surf_item)
                 hull_item.setText(0, "Hull segments")
                 hull_item.setFlags(hull_item.flags() | Qt.ItemIsUserCheckable)
-                hull_item.setCheckState(0, Qt.Checked)
+                hull_group_state = state_snapshot.get("hull_group", {}).get(s_idx, {})
+                hull_item.setCheckState(0, hull_group_state.get("selected", Qt.Checked))
                 # Add hole checkbox for hull group
-                hull_item.setCheckState(4, Qt.Unchecked)
+                hull_item.setCheckState(4, hull_group_state.get("hole", Qt.Unchecked))
                 hull_item.setData(0, Qt.UserRole, {"type": "hull_group", "surface_idx": s_idx})
 
                 # Segment hull by special points (CORNER and COMMON_INTERSECTION_CONVEXHULL_POINT)
@@ -22879,10 +22896,13 @@ class MeshItWorkflowGUI(QMainWindow):
                     seg_item.setText(0, f"Seg {k} ({short_type(start_type)}→{short_type(end_type)})")
                     seg_item.setText(1, "HULL")  # Set type column
                     seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
-                    seg_item.setCheckState(0, Qt.Checked)
+                    hull_seg_state = state_snapshot.get("hull_segments", {}).get(s_idx, [])
+                    seg_selected = hull_seg_state[k]["selected"] if k < len(hull_seg_state) else Qt.Checked
+                    seg_hole = hull_seg_state[k]["hole"] if k < len(hull_seg_state) else Qt.Unchecked
+                    seg_item.setCheckState(0, seg_selected)
                     # Add hole checkbox in column 4
                     seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
-                    seg_item.setCheckState(4, Qt.Unchecked)  # Default: not a hole
+                    seg_item.setCheckState(4, seg_hole)
                     seg_item.setData(0, Qt.UserRole, {
                         "type": "constraint",
                         "surface_idx": s_idx,
@@ -22892,8 +22912,8 @@ class MeshItWorkflowGUI(QMainWindow):
                         "points": seg_pts,  # Store all points in the segment, not just pairs
                         "type": "HULL",     # normalized
                         "ctype": "HULL",    # keep for compatibility
-                        "is_hole": False,
-                        "selected": True,
+                        "is_hole": (seg_hole == Qt.Checked),
+                        "selected": (seg_selected == Qt.Checked),
                     }
                     seg_uid += 1
 
@@ -22912,9 +22932,10 @@ class MeshItWorkflowGUI(QMainWindow):
                 line_item = QTreeWidgetItem(surf_item)
                 line_item.setText(0, f"Intersection {line_id}")
                 line_item.setFlags(line_item.flags() | Qt.ItemIsUserCheckable)
-                line_item.setCheckState(0, Qt.Checked)
+                line_group_state = state_snapshot.get("intersection_groups", {}).get((s_idx, line_id), {})
+                line_item.setCheckState(0, line_group_state.get("selected", Qt.Checked))
                 # Add hole checkbox for intersection group
-                line_item.setCheckState(4, Qt.Unchecked)
+                line_item.setCheckState(4, line_group_state.get("hole", Qt.Unchecked))
                 line_item.setData(0, Qt.UserRole, {"type": "intersection_group", "surface_idx": s_idx})
 
                 for k, seg_pts in enumerate(seg_lists):
@@ -22922,10 +22943,13 @@ class MeshItWorkflowGUI(QMainWindow):
                     seg_item.setText(0, f"Seg {k}")
                     seg_item.setText(1, "INTERSECTION")  # Set type column
                     seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
-                    seg_item.setCheckState(0, Qt.Checked)
+                    inter_seg_state = state_snapshot.get("intersection_segments", {}).get((s_idx, line_id), [])
+                    seg_selected = inter_seg_state[k]["selected"] if k < len(inter_seg_state) else Qt.Checked
+                    seg_hole = inter_seg_state[k]["hole"] if k < len(inter_seg_state) else Qt.Unchecked
+                    seg_item.setCheckState(0, seg_selected)
                     # Add hole checkbox in column 4
                     seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
-                    seg_item.setCheckState(4, Qt.Unchecked)  # Default: not a hole
+                    seg_item.setCheckState(4, seg_hole)
                     seg_item.setData(0, Qt.UserRole, {
                         "type": "constraint",
                         "surface_idx": s_idx,
@@ -22936,8 +22960,8 @@ class MeshItWorkflowGUI(QMainWindow):
                         "points": seg_pts,           # full block (not pairwise)
                         "type": "INTERSECTION",      # normalized
                         "ctype": "INT",              # keep for compatibility
-                        "is_hole": False,
-                        "selected": True,
+                        "is_hole": (seg_hole == Qt.Checked),
+                        "selected": (seg_selected == Qt.Checked),
                         "line_id": line_id,
                     }
                     seg_uid += 1
@@ -22971,7 +22995,8 @@ class MeshItWorkflowGUI(QMainWindow):
             well_item.setText(1, "WELL")
             well_item.setText(2, str(len(well_pts) - 1))  # Number of segments
             well_item.setFlags(well_item.flags() | Qt.ItemIsUserCheckable)
-            well_item.setCheckState(0, Qt.Checked)
+            well_state = state_snapshot.get("well", {}).get(w_idx, Qt.Checked)
+            well_item.setCheckState(0, well_state)
             well_item.setData(0, Qt.UserRole, {"type": "well", "well_idx": w_idx, "dataset_idx": w_idx})
             
             # Convert points to Vector3D for consistency
@@ -23012,7 +23037,9 @@ class MeshItWorkflowGUI(QMainWindow):
                 seg_item.setText(1, "WELL")
                 seg_item.setText(2, str(len(seg_pts) - 1))  # Edges in segment
                 seg_item.setFlags(seg_item.flags() | Qt.ItemIsUserCheckable)
-                seg_item.setCheckState(0, Qt.Checked)
+                well_seg_state = state_snapshot.get("well_segments", {}).get(w_idx, [])
+                seg_selected = well_seg_state[k] if k < len(well_seg_state) else Qt.Checked
+                seg_item.setCheckState(0, seg_selected)
                 seg_item.setData(0, Qt.UserRole, {
                     "type": "well_constraint",
                     "well_idx": w_idx,
@@ -23027,7 +23054,7 @@ class MeshItWorkflowGUI(QMainWindow):
                     "type": "WELL",
                     "ctype": "WELL",
                     "is_hole": False,
-                    "selected": True,
+                    "selected": (seg_selected == Qt.Checked),
                     "well_idx": w_idx,
                 }
                 seg_uid += 1
@@ -23035,9 +23062,156 @@ class MeshItWorkflowGUI(QMainWindow):
         if well_count > 0:
             logger.info(f"Added {well_count} wells to constraint tree")
 
+        self._sync_refine_tree_parent_states_from_children()
         tree.expandAll()
         tree.blockSignals(False)
         logger.info("Segment-level constraint tree populated (intersection segments between TRIPLE_POINTs and endpoints, wells included).")
+
+    def _has_custom_refine_constraint_selection(self) -> bool:
+        """Return True when user changed default selection/hole states in Step 6 tree."""
+        tree = getattr(self, "refine_constraint_tree", None)
+        if not tree:
+            return False
+
+        def walk(item):
+            data = item.data(0, Qt.UserRole) or {}
+            item_type = data.get("type")
+            if item_type in ("constraint", "well_constraint"):
+                if item.checkState(0) != Qt.Checked:
+                    return True
+                if item_type == "constraint" and item.checkState(4) == Qt.Checked:
+                    return True
+            for i in range(item.childCount()):
+                if walk(item.child(i)):
+                    return True
+            return False
+
+        for i in range(tree.topLevelItemCount()):
+            if walk(tree.topLevelItem(i)):
+                return True
+        return False
+
+    def _capture_refine_constraint_state_snapshot(self) -> Dict[str, Dict]:
+        """
+        Capture current Step 6 tree states so they can be restored after rebuild.
+        Uses stable structural keys (surface/line/segment order).
+        """
+        snapshot = {
+            "surface": {},
+            "hull_group": {},
+            "hull_segments": {},
+            "intersection_groups": {},
+            "intersection_segments": {},
+            "well": {},
+            "well_segments": {},
+        }
+        tree = getattr(self, "refine_constraint_tree", None)
+        if not tree:
+            return snapshot
+
+        for i in range(tree.topLevelItemCount()):
+            top_item = tree.topLevelItem(i)
+            top_data = top_item.data(0, Qt.UserRole) or {}
+            top_type = top_data.get("type")
+
+            if top_type == "surface":
+                s_idx = top_data.get("surface_idx")
+                if s_idx is None:
+                    continue
+                snapshot["surface"][s_idx] = top_item.checkState(0)
+
+                for j in range(top_item.childCount()):
+                    group_item = top_item.child(j)
+                    group_data = group_item.data(0, Qt.UserRole) or {}
+                    group_type = group_data.get("type")
+
+                    if group_type == "hull_group":
+                        snapshot["hull_group"][s_idx] = {
+                            "selected": group_item.checkState(0),
+                            "hole": group_item.checkState(4),
+                        }
+                        seg_states = []
+                        for k in range(group_item.childCount()):
+                            seg_item = group_item.child(k)
+                            seg_data = seg_item.data(0, Qt.UserRole) or {}
+                            if seg_data.get("type") == "constraint":
+                                seg_states.append({
+                                    "selected": seg_item.checkState(0),
+                                    "hole": seg_item.checkState(4),
+                                })
+                        snapshot["hull_segments"][s_idx] = seg_states
+
+                    elif group_type == "intersection_group":
+                        line_id = None
+                        try:
+                            line_id = int(group_item.text(0).split(" ")[-1])
+                        except (ValueError, IndexError):
+                            pass
+                        if line_id is None:
+                            continue
+
+                        snapshot["intersection_groups"][(s_idx, line_id)] = {
+                            "selected": group_item.checkState(0),
+                            "hole": group_item.checkState(4),
+                        }
+                        seg_states = []
+                        for k in range(group_item.childCount()):
+                            seg_item = group_item.child(k)
+                            seg_data = seg_item.data(0, Qt.UserRole) or {}
+                            if seg_data.get("type") == "constraint":
+                                seg_states.append({
+                                    "selected": seg_item.checkState(0),
+                                    "hole": seg_item.checkState(4),
+                                })
+                        snapshot["intersection_segments"][(s_idx, line_id)] = seg_states
+
+            elif top_type == "well":
+                w_idx = top_data.get("well_idx")
+                if w_idx is None:
+                    continue
+                snapshot["well"][w_idx] = top_item.checkState(0)
+                seg_states = []
+                for j in range(top_item.childCount()):
+                    seg_item = top_item.child(j)
+                    seg_data = seg_item.data(0, Qt.UserRole) or {}
+                    if seg_data.get("type") == "well_constraint":
+                        seg_states.append(seg_item.checkState(0))
+                snapshot["well_segments"][w_idx] = seg_states
+
+        return snapshot
+
+    def _sync_refine_tree_parent_states_from_children(self):
+        """Recompute parent check states after rebuilding the Step 6 tree."""
+        tree = getattr(self, "refine_constraint_tree", None)
+        if not tree:
+            return
+
+        def merge_states(states):
+            if not states:
+                return Qt.Unchecked
+            if all(s == Qt.Checked for s in states):
+                return Qt.Checked
+            if all(s == Qt.Unchecked for s in states):
+                return Qt.Unchecked
+            return Qt.PartiallyChecked
+
+        def walk(item):
+            if item.childCount() == 0:
+                return
+
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+            child_sel = [item.child(i).checkState(0) for i in range(item.childCount())]
+            item.setCheckState(0, merge_states(child_sel))
+
+            data = item.data(0, Qt.UserRole) or {}
+            if data.get("type") in ("hull_group", "intersection_group"):
+                child_hole = [item.child(i).checkState(4) for i in range(item.childCount())]
+                item.setCheckState(4, merge_states(child_hole))
+
+        for i in range(tree.topLevelItemCount()):
+            walk(tree.topLevelItem(i))
     def _collect_selected_refine_segments(self, surface_idx: int) -> List[List]:
         """Return list of point-pairs [p1, p2] for all checked segments."""
         if not hasattr(self, "refine_constraint_tree"):
