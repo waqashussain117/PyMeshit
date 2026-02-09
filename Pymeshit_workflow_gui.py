@@ -756,7 +756,7 @@ class MeshItWorkflowGUI(QMainWindow):
         self.notebook.currentChanged.connect(self._on_tab_changed)
     
         # Show ready message
-        self.statusBar().showMessage("MeshIt GUI Ready")
+        self.statusBar().showMessage("PyMeshIt GUI Ready")
         
         # Initialize plot axes (will be properly set up in _setup_..._tab methods)
         
