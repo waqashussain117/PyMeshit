@@ -92,13 +92,41 @@ def build_exe(use_clean=True, debug=False):
         print("Install it with: pip install netCDF4")
         return False
 
-    # Determine executable name based on OS
+    # Determine executable output based on OS
     import platform
     system = platform.system()
-    exe_name = "PyMeshIt.exe" if system == "Windows" else "PyMeshIt"
-    
+    if system == "Windows":
+        expected_outputs = [
+            project_root / "release" / "PyMeshIt" / "PyMeshIt.exe",
+            project_root / "release" / "PyMeshIt.exe",
+        ]
+    elif system == "Darwin":
+        expected_outputs = [
+            project_root / "release" / "PyMeshIt.app",
+            project_root / "release" / "PyMeshIt",
+        ]
+    else:
+        expected_outputs = [
+            project_root / "release" / "PyMeshIt" / "PyMeshIt",
+            project_root / "release" / "PyMeshIt",
+        ]
+
     print(f"Building for system: {system}")
-    print(f"Expected executable: {exe_name}")
+    print("Expected output(s):")
+    for output in expected_outputs:
+        print(f"  - {output}")
+
+    # On macOS, PyInstaller expects an .icns icon; skip icon if none is available.
+    icon_args = []
+    icon_png = Path("resources/images/app_logo_small.png")
+    icon_icns = Path("resources/images/app_logo_small.icns")
+    if system == "Darwin":
+        if icon_icns.exists():
+            icon_args = [f"--icon={icon_icns}"]
+        else:
+            print("No macOS .icns icon found. Building without a custom icon.")
+    elif icon_png.exists():
+        icon_args = [f"--icon={icon_png}"]
 
     # PyInstaller command for PySide6 application
     cmd = [
@@ -255,8 +283,8 @@ def build_exe(use_clean=True, debug=False):
         "--exclude-module=PySide6.QtWebEngineCore",
         "--exclude-module=PySide6.QtWebEngineWidgets",
         "--exclude-module=PySide6.QtWebEngineWidgets",
-        # Icon (if available)
-        *(["--icon=resources/images/app_logo_small.png"] if os.path.exists("resources/images/app_logo_small.png") else []),
+        # Icon (if available and compatible with platform)
+        *icon_args,
         # Output directory
         "--distpath=release",
         "--workpath=build",
@@ -273,14 +301,21 @@ def build_exe(use_clean=True, debug=False):
         if result.stderr:
             print("STDERR:", result.stderr)
 
-        # Check if exe was created (with --onefile, PyInstaller creates a single executable)
-        exe_path = project_root / "release" / exe_name
-        if exe_path.exists():
-            print(f"\nExecutable created: {exe_path}")
-            print(f"File size: {exe_path.stat().st_size / (1024*1024):.2f} MB")
+        # Check for expected output
+        built_output = next((path for path in expected_outputs if path.exists()), None)
+        if built_output is not None:
+            print(f"\nBuild output created: {built_output}")
+            if built_output.is_file():
+                print(f"File size: {built_output.stat().st_size / (1024*1024):.2f} MB")
+            elif built_output.is_dir():
+                size_bytes = sum(
+                    file.stat().st_size for file in built_output.rglob("*") if file.is_file()
+                )
+                print(f"Directory size: {size_bytes / (1024*1024):.2f} MB")
         else:
             print("\nWarning: Executable not found in expected location")
-            print(f"Looking for: {exe_path}")
+            for output in expected_outputs:
+                print(f"Looked for: {output}")
             # List contents of release directory to debug
             release_dir = project_root / "release"
             if release_dir.exists():
@@ -301,7 +336,7 @@ def clean_build():
     import shutil
     import time
 
-    dirs_to_remove = ["build", "MeshIt.spec"]
+    dirs_to_remove = ["build", "MeshIt.spec", "PyMeshIt.spec"]
     for item in dirs_to_remove:
         if os.path.exists(item):
             try:
