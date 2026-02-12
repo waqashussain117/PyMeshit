@@ -6651,6 +6651,10 @@ class MeshItWorkflowGUI(QMainWindow):
                 self.is_polyline = {}
                 self.surface_original_to_temp_idx_map = {}
                 self.polyline_original_to_temp_idx_map = {}
+                # Maps list indices (surfaces/polylines arrays) to combined temp ids
+                # used by Intersection.id1/id2.
+                self.surface_list_to_combined_idx_map = {}
+                self.polyline_list_to_combined_idx_map = {}
 
         temp_model = TempModelWrapper()
 
@@ -6674,6 +6678,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
             data_wrapper = TempDataWrapper()
             data_wrapper.name = dataset_content.get('name', f"Dataset_{original_idx}")
+            data_wrapper.size = _get_target_for_surface(original_idx)
 
             hull_points_obj_array = dataset_content.get('hull_points')
             if hull_points_obj_array is not None and len(hull_points_obj_array) > 0:
@@ -6695,10 +6700,14 @@ class MeshItWorkflowGUI(QMainWindow):
             temp_model.is_polyline[temp_data_idx_counter] = is_p
 
             if is_p:
-                temp_model.polyline_original_to_temp_idx_map[original_idx] = len(temp_model.polylines)
+                poly_list_idx = len(temp_model.polylines)
+                temp_model.polyline_original_to_temp_idx_map[original_idx] = poly_list_idx
+                temp_model.polyline_list_to_combined_idx_map[poly_list_idx] = temp_data_idx_counter
                 temp_model.polylines.append(data_wrapper)
             else:
-                temp_model.surface_original_to_temp_idx_map[original_idx] = len(temp_model.surfaces)
+                surface_list_idx = len(temp_model.surfaces)
+                temp_model.surface_original_to_temp_idx_map[original_idx] = surface_list_idx
+                temp_model.surface_list_to_combined_idx_map[surface_list_idx] = temp_data_idx_counter
                 temp_model.surfaces.append(data_wrapper)
 
             temp_data_idx_counter += 1
@@ -6761,7 +6770,11 @@ class MeshItWorkflowGUI(QMainWindow):
                     class _HullLine:
                         def __init__(self, pts): self.points = [Vector3D(p.x, p.y, p.z, point_type=getattr(p, "point_type", "DEFAULT")) for p in pts]
                     refined = refine_intersection_line_by_length(
-                        _HullLine(temp_surface.convex_hull), float(eff_target_length), min_angle_deg, uniform_meshing
+                        _HullLine(temp_surface.convex_hull),
+                        float(eff_target_length),
+                        min_angle_deg,
+                        uniform_meshing,
+                        tag_endpoints=False
                     )
                     if len(refined) >= 2 and (refined[0] - refined[-1]).length_squared() < 1e-24:
                         refined = refined[:-1]
@@ -6793,12 +6806,12 @@ class MeshItWorkflowGUI(QMainWindow):
                 'interp': self.mesh_interp_combo.currentText(),
                 'smoothing': float(self.mesh_smoothing_input.value())
             }
+            reverse_surface_map = {v: k for k, v in temp_model.surface_original_to_temp_idx_map.items()}
             for temp_surface_idx, temp_surface in enumerate(temp_model.surfaces):
                 if hasattr(temp_surface, 'convex_hull') and len(temp_surface.convex_hull) >= 3:
                     raw_hull_points = [Vector3D(p.x, p.y, p.z, point_type=getattr(p, "point_type", "DEFAULT")) for p in temp_surface.convex_hull]
-                    original_idx = temp_model.original_indices_map.get(
-                        next((k for k, v in temp_model.surface_original_to_temp_idx_map.items() if v == temp_surface_idx), None)
-                    )
+                    original_idx = reverse_surface_map.get(temp_surface_idx)
+                    refined_hull_3d = raw_hull_points
                     if original_idx is not None and 'points' in self.datasets[original_idx]:
                         scattered_points = [Vector3D(p[0], p[1], p[2]) for p in self.datasets[original_idx]['points']]
                         refined_hull_3d = refine_hull_with_interpolation(
