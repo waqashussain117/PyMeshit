@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple, Union
 from matplotlib.path import Path
 from scipy.spatial.distance import pdist
 
-# Try to import the C++ extension module (fallback if not available)
+# Try to import triunsuitable bridge helpers.
 try:
     from . import triangle_callback
     HAS_TRIANGLE_CALLBACK = True
@@ -51,6 +51,7 @@ class DirectTriangleWrapper:
         self.feature_sizes = None
         self.logger = logging.getLogger("MeshIt-Workflow")
         self.triangle_opts = None  # Will store custom triangle options if set
+        self.use_cpp_switches = False
         
     def set_feature_points(self, points: np.ndarray, sizes: np.ndarray):
         """
@@ -63,8 +64,23 @@ class DirectTriangleWrapper:
             points: Array of feature points (N, 2)
             sizes: Array of sizes for each feature point (N,)
         """
-        self.feature_points = np.asarray(points, dtype=np.float64)
-        self.feature_sizes = np.asarray(sizes, dtype=np.float64)
+        pts = np.asarray(points, dtype=np.float64)
+        sz = np.asarray(sizes, dtype=np.float64).reshape(-1)
+        if pts.ndim == 1:
+            pts = pts.reshape(1, -1)
+        if pts.ndim != 2 or pts.shape[1] != 2:
+            raise ValueError("Feature points must have shape (N, 2)")
+        if sz.size == 0:
+            sz = np.full((pts.shape[0],), float(self.base_size if self.base_size else 1.0))
+        elif sz.size == 1 and pts.shape[0] > 1:
+            sz = np.full((pts.shape[0],), float(sz[0]))
+        elif sz.size != pts.shape[0]:
+            n = min(pts.shape[0], sz.size)
+            pts = pts[:n]
+            sz = sz[:n]
+
+        self.feature_points = pts
+        self.feature_sizes = np.clip(sz, 1e-12, np.inf)
         
     def _create_boundary_feature_points(self, hull_points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -472,7 +488,35 @@ class DirectTriangleWrapper:
         
         # PERFORMANCE: Direct Triangle call with error handling and C++ fallback
         try:
-            result = tr.triangulate(tri_input, tri_options)
+            use_cpp_switches = getattr(self, 'use_cpp_switches', False)
+            use_triunsuitable_bridge = (
+                use_cpp_switches and
+                self.feature_points is not None and
+                self.feature_sizes is not None and
+                len(self.feature_points) > 0
+            )
+
+            if use_triunsuitable_bridge and HAS_TRIANGLE_CALLBACK and hasattr(triangle_callback, "triangulate_with_cpp_triunsuitable"):
+                self.logger.info(
+                    "Using C++ triunsuitable bridge with %d feature point(s)",
+                    len(self.feature_points),
+                )
+                result = triangle_callback.triangulate_with_cpp_triunsuitable(
+                    tri_input=tri_input,
+                    tri_options=tri_options,
+                    gradient=float(self.gradient),
+                    mesh_size=float(self.base_size),
+                    feature_points=self.feature_points,
+                    feature_sizes=self.feature_sizes,
+                    logger=self.logger,
+                )
+            else:
+                if use_triunsuitable_bridge and not HAS_TRIANGLE_CALLBACK:
+                    self.logger.warning(
+                        "Feature points are set but triunsuitable bridge module is unavailable; "
+                        "falling back to standard Triangle call"
+                    )
+                result = tr.triangulate(tri_input, tri_options)
             
             if 'triangles' in result and len(result['triangles']) > 0:
                 self.logger.info(f"FAST triangulation complete: {len(result['triangles'])} triangles, {len(result['vertices'])} vertices")
@@ -667,7 +711,8 @@ class DirectTriangleWrapper:
         """
         Enable or disable C++ MeshIt compatible Triangle switches.
         
-        When enabled, uses "pzYYu" switches similar to C++ MeshIt instead of "pzq" switches.
+        When enabled, uses C++-compatible Triangle switches and (if feature points
+        are provided) the triunsuitable bridge that emulates MeshIt's `-u` grading.
         This can produce denser, higher quality meshes that are more compatible with TetGen.
         
         Args:
@@ -675,7 +720,7 @@ class DirectTriangleWrapper:
         """
         self.use_cpp_switches = enable
         if enable:
-            self.logger.info("Enabled C++ MeshIt compatible Triangle switches (pzYYu)")
+            self.logger.info("Enabled C++ MeshIt compatible Triangle switches")
         else:
             self.logger.info("Disabled C++ MeshIt compatible mode, using standard switches")
 

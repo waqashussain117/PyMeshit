@@ -2971,6 +2971,14 @@ def run_constrained_triangulation_py(
     target_sz = float(config.get('target_size', 20.0))
     interp    = str(config.get('interp', 'Thin Plate Spline (TPS)'))
     smoothing = float(config.get('smoothing', 0.0))
+    feature_points_2d = np.asarray(
+        config.get("triunsuitable_feature_points_2d", np.empty((0, 2))),
+        dtype=float,
+    )
+    feature_sizes = np.asarray(
+        config.get("triunsuitable_feature_sizes", np.empty((0,))),
+        dtype=float,
+    ).reshape(-1)
 
     # clamp target size
     bb_min = np.min(plc_points_2d, axis=0); bb_max = np.max(plc_points_2d, axis=0)
@@ -2979,6 +2987,28 @@ def run_constrained_triangulation_py(
 
     tri = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=target_sz)
     tri.set_cpp_compatible_mode(True)
+
+    # Optional C++ triunsuitable bridge inputs (well/fracture feature points).
+    if feature_points_2d.size > 0:
+        if feature_points_2d.ndim == 1:
+            feature_points_2d = feature_points_2d.reshape(1, -1)
+        if feature_points_2d.ndim == 2 and feature_points_2d.shape[1] == 2:
+            if feature_sizes.size == 0:
+                feature_sizes = np.full((feature_points_2d.shape[0],), target_sz * 0.5, dtype=float)
+            elif feature_sizes.size == 1 and feature_points_2d.shape[0] > 1:
+                feature_sizes = np.full((feature_points_2d.shape[0],), float(feature_sizes[0]), dtype=float)
+            elif feature_sizes.size != feature_points_2d.shape[0]:
+                n = min(feature_points_2d.shape[0], feature_sizes.shape[0])
+                feature_points_2d = feature_points_2d[:n]
+                feature_sizes = feature_sizes[:n]
+
+            if feature_points_2d.shape[0] > 0:
+                tri.set_feature_points(feature_points_2d, feature_sizes)
+                logger.info(
+                    "Constrained triangulation: enabled C++ triunsuitable bridge with %d feature point(s)",
+                    feature_points_2d.shape[0],
+                )
+
     tri_res = tri.triangulate(points=plc_points_2d, segments=plc_segments_indices, holes=plc_holes_2d,
                               uniform=True, create_transition=False, create_feature_points=False)
     if tri_res is None or 'vertices' not in tri_res or 'triangles' not in tri_res:
