@@ -426,9 +426,22 @@ class DirectTriangleWrapper:
             else:
                 self.base_size = 1.0
             
-        # PERFORMANCE: Skip expensive feature point generation entirely
-        # The old implementation created thousands of interior points causing massive slowdowns
-        # For geological surfaces, good boundary conformity is more important than dense interiors
+        # Optional local feature points (e.g., well-intersection grading seeds).
+        if self.feature_points is not None and len(self.feature_points) > 0:
+            fp = np.asarray(self.feature_points, dtype=np.float64)
+            if fp.ndim == 2 and fp.shape[1] >= 2:
+                fp = fp[:, :2]
+                existing = {(round(float(p[0]), 10), round(float(p[1]), 10)) for p in points}
+                extra = []
+                for p in fp:
+                    key = (round(float(p[0]), 10), round(float(p[1]), 10))
+                    if key in existing:
+                        continue
+                    existing.add(key)
+                    extra.append([float(p[0]), float(p[1])])
+                if extra:
+                    points = np.vstack([points, np.asarray(extra, dtype=np.float64)])
+                    self.logger.info(f"Added {len(extra)} local feature point(s) to triangulation input")
         
         # Set up Triangle input (minimal and fast)
         tri_input = {'vertices': points}
