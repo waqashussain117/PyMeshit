@@ -6,9 +6,16 @@ Build script for creating MeshIt executable using PyInstaller
 import os
 import sys
 import subprocess
+import argparse
 from pathlib import Path
 
-def build_exe(use_clean=True, debug=False):
+def build_exe(
+    use_clean=True,
+    debug=False,
+    target_arch=None,
+    app_name="PyMeshIt",
+    entry_script="main.py",
+):
     """Build standalone executable for MeshIt GUI"""
 
     # Ensure we're in the project root
@@ -25,7 +32,6 @@ def build_exe(use_clean=True, debug=False):
         print("   Continuing anyway...\n")
 
     # Check if we're using the correct conda environment
-    import sys
     python_path = sys.executable
     if "conda" not in python_path.lower():
         print("WARNING: You're not using a conda environment Python!")
@@ -97,18 +103,18 @@ def build_exe(use_clean=True, debug=False):
     system = platform.system()
     if system == "Windows":
         expected_outputs = [
-            project_root / "release" / "PyMeshIt" / "PyMeshIt.exe",
-            project_root / "release" / "PyMeshIt.exe",
+            project_root / "release" / app_name / f"{app_name}.exe",
+            project_root / "release" / f"{app_name}.exe",
         ]
     elif system == "Darwin":
         expected_outputs = [
-            project_root / "release" / "PyMeshIt.app",
-            project_root / "release" / "PyMeshIt",
+            project_root / "release" / f"{app_name}.app",
+            project_root / "release" / app_name,
         ]
     else:
         expected_outputs = [
-            project_root / "release" / "PyMeshIt" / "PyMeshIt",
-            project_root / "release" / "PyMeshIt",
+            project_root / "release" / app_name / app_name,
+            project_root / "release" / app_name,
         ]
 
     print(f"Building for system: {system}")
@@ -128,10 +134,23 @@ def build_exe(use_clean=True, debug=False):
     elif icon_png.exists():
         icon_args = [f"--icon={icon_png}"]
 
+    entry_script_path = Path(entry_script)
+    if not entry_script_path.exists():
+        print(f"Error: Entry script not found: {entry_script}")
+        return False
+
+    mac_target_arch_args = []
+    if system == "Darwin" and target_arch:
+        if target_arch not in {"x86_64", "arm64", "universal2"}:
+            print(f"Error: Unsupported macOS target arch '{target_arch}'")
+            print("Supported values: x86_64, arm64, universal2")
+            return False
+        mac_target_arch_args = [f"--target-arch={target_arch}"]
+
     # PyInstaller command for PySide6 application
     cmd = [
         pyinstaller_exe,
-        "--name=PyMeshIt",
+        f"--name={app_name}",
         "--windowed",  # No console window
         # "--onefile",  # Removed: causes AV false positives
         "--onedir",   # Directory-based: less likely to trigger AV
@@ -145,7 +164,7 @@ def build_exe(use_clean=True, debug=False):
         "--hidden-import=importlib.util",
         "--hidden-import=inspect",
         # Main script
-        "main.py",
+        str(entry_script_path),
         # Include data files
         "--add-data=resources;resources" if system == "Windows" else "--add-data=resources:resources",
         "--add-data=Pymeshit;Pymeshit" if system == "Windows" else "--add-data=Pymeshit:Pymeshit",
@@ -285,6 +304,8 @@ def build_exe(use_clean=True, debug=False):
         "--exclude-module=PySide6.QtWebEngineWidgets",
         # Icon (if available and compatible with platform)
         *icon_args,
+        # macOS target architecture if requested
+        *mac_target_arch_args,
         # Output directory
         "--distpath=release",
         "--workpath=build",
@@ -337,6 +358,7 @@ def clean_build():
     import time
 
     dirs_to_remove = ["build", "MeshIt.spec", "PyMeshIt.spec"]
+    dirs_to_remove.extend(str(spec_file) for spec_file in Path(".").glob("*.spec"))
     for item in dirs_to_remove:
         if os.path.exists(item):
             try:
@@ -359,27 +381,84 @@ def clean_build():
                     except:
                         pass
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Build MeshIt executable with PyInstaller")
+    parser.add_argument("command", nargs="?", default="build", choices=["build", "clean"])
+    parser.add_argument("--no-clean", action="store_true", dest="no_clean")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--target-arch",
+        choices=["x86_64", "arm64", "universal2"],
+        default=None,
+        help="macOS target architecture for PyInstaller",
+    )
+    parser.add_argument(
+        "--name",
+        default="PyMeshIt",
+        help="Output application name used by PyInstaller --name",
+    )
+    parser.add_argument(
+        "--entry-script",
+        default="main.py",
+        help="Entry script passed to PyInstaller",
+    )
+    return parser.parse_args()
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "clean":
+    args = parse_args()
+
+    if args.command == "clean":
         clean_build()
-    elif len(sys.argv) > 1 and sys.argv[1] == "--no-clean":
-        print("Building without --clean flag to avoid permission issues...")
-        success = build_exe(use_clean=False)
+    elif args.no_clean and args.debug:
+        print("Building without --clean flag with debug analysis...")
+        success = build_exe(
+            use_clean=False,
+            debug=True,
+            target_arch=args.target_arch,
+            app_name=args.name,
+            entry_script=args.entry_script,
+        )
         if success:
             print("You can find the executable in the 'release' folder")
         else:
             print("Build failed!")
             sys.exit(1)
-    elif len(sys.argv) > 1 and sys.argv[1] == "--debug":
+    elif args.no_clean:
+        print("Building without --clean flag to avoid permission issues...")
+        success = build_exe(
+            use_clean=False,
+            debug=False,
+            target_arch=args.target_arch,
+            app_name=args.name,
+            entry_script=args.entry_script,
+        )
+        if success:
+            print("You can find the executable in the 'release' folder")
+        else:
+            print("Build failed!")
+            sys.exit(1)
+    elif args.debug:
         print("Building with debug analysis to identify missing imports...")
-        success = build_exe(use_clean=False, debug=True)
+        success = build_exe(
+            use_clean=False,
+            debug=True,
+            target_arch=args.target_arch,
+            app_name=args.name,
+            entry_script=args.entry_script,
+        )
         if success:
             print("You can find the executable in the 'release' folder")
         else:
             print("Build failed!")
             sys.exit(1)
     else:
-        success = build_exe(use_clean=True, debug=False)
+        success = build_exe(
+            use_clean=True,
+            debug=False,
+            target_arch=args.target_arch,
+            app_name=args.name,
+            entry_script=args.entry_script,
+        )
         if success:
             print("You can find the executable in the 'release' folder")
         else:
