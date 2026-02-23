@@ -233,7 +233,7 @@ class TetrahedralMeshGenerator:
             if self.plc_vertices is None or len(self.plc_vertices) == 0:
                 logger.error("PLC assembly failed: No vertices found.")
                 return None
-            
+
             # Step 2: Create a TetGen object.
             # Pass per-facet markers into TetGen so trifacemarkerlist mirrors C++
             tet = tetgen.TetGen(self.plc_vertices, self.plc_facets, self.plc_facet_markers)
@@ -254,7 +254,7 @@ class TetrahedralMeshGenerator:
                     # Try the old API first (may work if attributes are set directly)
                     tet.edge_list = self.plc_edge_constraints.tolist()
                     tet.edge_marker_list = self.plc_edge_markers.tolist()
-                    logger.info(f"Added {len(self.plc_edge_constraints)} intersection edge constraints to TetGen.")
+                    logger.info(f"Added {len(self.plc_edge_constraints)} edge constraints to TetGen.")
                 except AttributeError as e:
                     # If old API doesn't work, edges might need to be passed differently
                     logger.warning(f"Could not set edge constraints using old API: {e}")
@@ -359,7 +359,7 @@ class TetrahedralMeshGenerator:
                     logger.warning("TetGen detected geometric issues. Attempting C++ style recovery...")
                     # C++ style: Try with detection switches first
                     try:
-                        detection_switches = tetgen_switches.replace('Y', '') + 'd'  # Add detection, remove Y
+                        detection_switches = tetgen_switches if 'd' in tetgen_switches else tetgen_switches + 'd'
                         logger.info(f"Trying TetGen with geometric detection: '{detection_switches}'")
                         tet.tetrahedralize(switches=detection_switches)
                         grid = tet.grid
@@ -469,6 +469,10 @@ class TetrahedralMeshGenerator:
                 global_holes.append(hole)
             logger.info(f"Added {len(self.external_holes)} external holes from GUI")
 
+        # C++ MeshIt behavior: only wells are exported as TetGen edge constraints.
+        # Surface intersections are encoded by matching surface facets, not by extra 3D edges.
+        cpp_well_only_edges = True
+
         # 1) Use precomputed conforming meshes
         surfaces_with_precomputed = set()
         for s_idx in boundary_surfaces | fault_surfaces:
@@ -514,7 +518,7 @@ class TetrahedralMeshGenerator:
                         else:
                             # Use 1-based markers to avoid collision with TetGen's internal marker 0
                             global_facet_markers.append(s_idx + 1)
-                        if s_idx in fault_surfaces:
+                        if s_idx in fault_surfaces and not cpp_well_only_edges:
                             for k in range(3):
                                 e = tuple(sorted((gtri[k], gtri[(k + 1) % 3])))
                                 if e[0] != e[1]:
@@ -614,24 +618,12 @@ class TetrahedralMeshGenerator:
 
                 logger.info(f"✓ Fallback triangulation successful for '{surface_name}': {len(local_tris)} triangles")
 
-        # 3) Add intersection line constraints (existing logic, kept permissive)
-        validated_edge_constraints = set()
-        for s_idx in self.selected_surfaces:
-            if s_idx >= len(self.datasets):
-                continue
-            dataset = self.datasets[s_idx]
-            for constraint in dataset.get("stored_constraints", []):
-                if constraint.get("type") == "intersection_line":
-                    pts = constraint.get("points", [])
-                    if len(pts) < 2:
-                        continue
-                    for i in range(len(pts) - 1):
-                        k1 = (round(pts[i][0], 9), round(pts[i][1], 9), round(pts[i][2], 9))
-                        k2 = (round(pts[i+1][0], 9), round(pts[i+1][1], 9), round(pts[i+1][2], 9))
-                        g1, g2 = key_to_global_idx.get(k1), key_to_global_idx.get(k2)
-                        if g1 is not None and g2 is not None and g1 != g2:
-                            e = tuple(sorted((g1, g2)))
-                            validated_edge_constraints.add(e)
+        # 3) Edge constraints initialization.
+        # Keep any facet-derived edges only if explicitly enabled above.
+        validated_edge_constraints = set(edge_constraints)
+
+        if cpp_well_only_edges:
+            logger.info("C++ style: skipping extra surface/intersection edge constraints; exporting wells as TetGen edges only")
 
         # 4) NEW: Add WELL polylines as edge constraints (no triangulation)
         well_edges_added = 0
@@ -1195,14 +1187,17 @@ class TetrahedralMeshGenerator:
         logger.warning("Initial TetGen failed. Trying C++ style fallback strategies...")
         
         # C++ inspired fallback sequence - progressively more relaxed
+        large_plc = self.plc_facets is not None and len(self.plc_facets) > 30000
         fallback_switches = [
-            original_switches.replace('Y', '') + 'd',  # Detection without boundary Steiner points
-            "pq1.2aA",   # C++ command line style with materials
+            original_switches if 'd' in original_switches else original_switches + 'd',  # C++ style: keep switches, append detection
             "pAd",       # Basic with materials and detection
             "pA",        # Basic with materials only
+            *([] if large_plc else ["pq1.2aA"]),   # Can be expensive on large PLCs
             "pd",        # Detection only
             "pzQ"        # Last resort (no refinement, no materials)
         ]
+        if large_plc:
+            logger.warning("Skipping heavy fallback 'pq1.2aA' because PLC is large (%d facets)", len(self.plc_facets))
         
         for switches in fallback_switches:
             try:

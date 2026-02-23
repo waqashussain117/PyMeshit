@@ -7129,9 +7129,20 @@ class MeshItWorkflowGUI(QMainWindow):
                     wf3d = np.array([[p.x, p.y, p.z] for p in well_feature_points], dtype=float)
                     wf2d = (wf3d - centroid) @ basis.T
                     wf2d = wf2d[:, :2]
+                    wf_sizes = np.asarray(well_feature_sizes, dtype=float)
+                    cfg_for_triangulation["triunsuitable_feature_points_2d"] = wf2d
+                    cfg_for_triangulation["triunsuitable_feature_sizes"] = wf_sizes
+                    # Backward-compatible aliases for older call sites.
                     cfg_for_triangulation["constraint_feature_points_2d"] = wf2d
-                    cfg_for_triangulation["constraint_feature_sizes"] = np.asarray(well_feature_sizes, dtype=float)
+                    cfg_for_triangulation["constraint_feature_sizes"] = wf_sizes
                     cfg_for_triangulation["enable_well_gradient_refinement"] = True
+                    # Prefer C++-like stronger local grading around well-cut points.
+                    cfg_for_triangulation["triunsuitable_max_iterations"] = 8
+                    cfg_for_triangulation["triunsuitable_max_new_points"] = int(
+                        min(2500, max(900, 600 + 8 * len(well_feature_points)))
+                    )
+                    cfg_for_triangulation["triunsuitable_max_feature_points"] = 800
+                    cfg_for_triangulation["triunsuitable_min_local_size_ratio"] = 0.0
 
                 # Provide projected hull for filtering generated local feature points.
                 hull_pts = surf_data.get("hull_points") or []
@@ -22953,7 +22964,8 @@ class MeshItWorkflowGUI(QMainWindow):
             return segments
 
         for s_idx, ds in enumerate(self.datasets):
-            if ds.get("type") == "polyline":
+            ds_type_upper = str(ds.get("type", "")).upper()
+            if ds_type_upper in ("POLYLINE", "WELL"):
                 continue
 
             surf_item = QTreeWidgetItem(tree)
@@ -23033,17 +23045,57 @@ class MeshItWorkflowGUI(QMainWindow):
                 if len(raw_pts) < 1:
                     continue
 
-                if len(raw_pts) == 1:
-                    # Preserve point-like polyline-surface intersections (well cuts).
-                    seg_lists = [raw_pts]
+                is_well_intersection = bool(inter_d.get("is_polyline_mesh", False))
+                if is_well_intersection:
+                    # C++ behavior: polyline-surface intersections are point constraints,
+                    # not connected line segments on the surface.
+                    unique_points = []
+                    seen_keys = set()
+                    for p in raw_pts:
+                        try:
+                            if hasattr(p, "x") and hasattr(p, "y") and hasattr(p, "z"):
+                                key = (round(float(p.x), 9), round(float(p.y), 9), round(float(p.z), 9))
+                            else:
+                                key = (round(float(p[0]), 9), round(float(p[1]), 9), round(float(p[2]), 9))
+                        except Exception:
+                            continue
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                        unique_points.append(p)
+                    seg_lists = [[p] for p in unique_points]
                 else:
-                    # DIRECTLY use raw_pts; no deduplication
-                    seg_lists = segment_by_triples(raw_pts)
+                    if len(raw_pts) == 1:
+                        seg_lists = [raw_pts]
+                    else:
+                        seg_lists = segment_by_triples(raw_pts)
                 if not seg_lists:
                     continue
 
                 inter_target_size = float(self._get_constraint_target_size_for_intersection(s_idx, inter_d))
-                is_well_intersection = bool(inter_d.get("is_polyline_mesh", False))
+                well_dataset_idx = None
+                well_target_size = inter_target_size
+                if is_well_intersection:
+                    for maybe_idx in (inter_d.get("dataset_id1"), inter_d.get("dataset_id2")):
+                        try:
+                            ds_idx = int(maybe_idx)
+                        except Exception:
+                            continue
+                        if ds_idx < 0 or ds_idx >= len(self.datasets):
+                            continue
+                        ds_type = str(self.datasets[ds_idx].get("type", "")).upper()
+                        if ds_type in ("WELL", "POLYLINE"):
+                            well_dataset_idx = ds_idx
+                            break
+                    if well_dataset_idx is not None:
+                        try:
+                            # Match C++ local-size logic (constraint size is the smaller one).
+                            well_target_size = min(
+                                inter_target_size,
+                                float(self._get_well_refine_length(well_dataset_idx)),
+                            )
+                        except Exception:
+                            well_target_size = inter_target_size
 
                 line_item = QTreeWidgetItem(surf_item)
                 line_item.setText(0, f"Intersection {line_id}")
@@ -23084,6 +23136,8 @@ class MeshItWorkflowGUI(QMainWindow):
                         "line_id": line_id,
                         "target_size": inter_target_size,
                         "is_well_intersection": is_well_intersection,
+                        "well_dataset_idx": well_dataset_idx,
+                        "well_target_size": well_target_size,
                     }
                     seg_uid += 1
 
@@ -23768,7 +23822,35 @@ class MeshItWorkflowGUI(QMainWindow):
         seg_idx: List[List[int]] = []
         hole_points: List[Vector3D] = []
         point_size_by_idx: Dict[int, float] = {}
-        well_feature_indices = set()
+        well_feature_sizes_by_idx: Dict[int, float] = {}
+
+        def _point_type_name(v) -> str:
+            if isinstance(v, Vector3D):
+                p_type = getattr(v, "point_type", getattr(v, "type", "DEFAULT"))
+            elif isinstance(v, (list, tuple, np.ndarray)) and len(v) > 3:
+                p_type = v[3]
+            else:
+                p_type = "DEFAULT"
+            if hasattr(p_type, "item"):
+                p_type = p_type.item()
+            return str(p_type) if p_type is not None else "DEFAULT"
+
+        def _is_well_cut_point(v) -> bool:
+            # Mirror C++ intent: well-local grading comes from polyline-surface cut points.
+            return _point_type_name(v).upper() == "INTERSECTION_POINT"
+
+        def _register_well_feature(idx: int, size_hint: Optional[float]) -> None:
+            try:
+                if size_hint is None:
+                    return
+                s_val = float(size_hint)
+                if s_val <= 1e-9:
+                    return
+                old_val = well_feature_sizes_by_idx.get(idx)
+                if old_val is None or s_val < old_val:
+                    well_feature_sizes_by_idx[idx] = s_val
+            except Exception:
+                return
 
         def add(v, target_size: Optional[float] = None, mark_well_feature: bool = False):
             if isinstance(v, Vector3D):
@@ -23796,7 +23878,7 @@ class MeshItWorkflowGUI(QMainWindow):
                     pass
 
             if mark_well_feature:
-                well_feature_indices.add(idx)
+                _register_well_feature(idx, target_size)
             return idx
 
         # Add selected constraints. Supports both segments and point-like constraints.
@@ -23806,17 +23888,36 @@ class MeshItWorkflowGUI(QMainWindow):
                 continue
             target_size = float(entry.get("target_size", surface_target_size))
             is_well_intersection = bool(entry.get("is_well_intersection", False))
+            well_target_size = float(entry.get("well_target_size", target_size))
 
             if len(seg_pts) == 1:
-                add(seg_pts[0], target_size=target_size, mark_well_feature=is_well_intersection)
+                point_idx = add(seg_pts[0], target_size=target_size, mark_well_feature=False)
+                if is_well_intersection:
+                    if _is_well_cut_point(seg_pts[0]):
+                        _register_well_feature(point_idx, well_target_size)
+                    else:
+                        # Fallback for legacy/non-tagged data: still apply one local
+                        # well feature point without propagating to full line segments.
+                        _register_well_feature(point_idx, well_target_size)
                 continue
 
+            entry_well_feature_count_before = len(well_feature_sizes_by_idx)
             for j in range(len(seg_pts) - 1):
                 p1, p2 = seg_pts[j], seg_pts[j + 1]
-                i1 = add(p1, target_size=target_size, mark_well_feature=is_well_intersection)
-                i2 = add(p2, target_size=target_size, mark_well_feature=is_well_intersection)
+                i1 = add(p1, target_size=target_size, mark_well_feature=False)
+                i2 = add(p2, target_size=target_size, mark_well_feature=False)
+                if is_well_intersection:
+                    if _is_well_cut_point(p1):
+                        _register_well_feature(i1, well_target_size)
+                    if _is_well_cut_point(p2):
+                        _register_well_feature(i2, well_target_size)
                 if i1 != i2:
                     seg_idx.append([i1, i2])
+            if is_well_intersection and len(well_feature_sizes_by_idx) == entry_well_feature_count_before:
+                # Conservative fallback: use one endpoint only (not whole segment),
+                # so grading remains well-local and does not refine complete lines.
+                first_idx = add(seg_pts[0], target_size=target_size, mark_well_feature=False)
+                _register_well_feature(first_idx, well_target_size)
 
         # Process hole segments - combine segments into closed loops and calculate centroids
         logger.debug(f"Processing {len(hole_segments)} hole segments for surface {surface_idx}")
@@ -23851,9 +23952,9 @@ class MeshItWorkflowGUI(QMainWindow):
                 logger.warning(f"Combined hole points ({len(all_hole_points)}) insufficient for hole center calculation")
 
         point_sizes = [float(point_size_by_idx.get(i, surface_target_size)) for i in range(len(pts))]
-        sorted_well_feature_indices = sorted(well_feature_indices)
+        sorted_well_feature_indices = sorted(well_feature_sizes_by_idx.keys())
         well_feature_points = [pts[i] for i in sorted_well_feature_indices]
-        well_feature_sizes = [point_sizes[i] for i in sorted_well_feature_indices]
+        well_feature_sizes = [float(well_feature_sizes_by_idx[i]) for i in sorted_well_feature_indices]
 
         plc_meta = {
             "point_sizes": point_sizes,

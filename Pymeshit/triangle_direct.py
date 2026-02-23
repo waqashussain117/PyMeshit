@@ -52,6 +52,10 @@ class DirectTriangleWrapper:
         self.logger = logging.getLogger("MeshIt-Workflow")
         self.triangle_opts = None  # Will store custom triangle options if set
         self.use_cpp_switches = False
+        # Guardrails for Python triunsuitable bridge cost on complex surfaces.
+        self.triunsuitable_max_iterations = 4
+        self.triunsuitable_max_new_points = 1000
+        self.triunsuitable_min_point_spacing = None
         
     def set_feature_points(self, points: np.ndarray, sizes: np.ndarray):
         """
@@ -508,6 +512,9 @@ class DirectTriangleWrapper:
                     mesh_size=float(self.base_size),
                     feature_points=self.feature_points,
                     feature_sizes=self.feature_sizes,
+                    max_iterations=int(self.triunsuitable_max_iterations),
+                    max_new_points=int(self.triunsuitable_max_new_points),
+                    min_point_spacing=self.triunsuitable_min_point_spacing,
                     logger=self.logger,
                 )
             else:
