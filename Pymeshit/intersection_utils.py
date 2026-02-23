@@ -2971,205 +2971,43 @@ def run_constrained_triangulation_py(
     target_sz = float(config.get('target_size', 20.0))
     interp    = str(config.get('interp', 'Thin Plate Spline (TPS)'))
     smoothing = float(config.get('smoothing', 0.0))
+    feature_points_2d = np.asarray(
+        config.get("triunsuitable_feature_points_2d", np.empty((0, 2))),
+        dtype=float,
+    )
+    feature_sizes = np.asarray(
+        config.get("triunsuitable_feature_sizes", np.empty((0,))),
+        dtype=float,
+    ).reshape(-1)
 
     # clamp target size
     bb_min = np.min(plc_points_2d, axis=0); bb_max = np.max(plc_points_2d, axis=0)
     diagonal = float(np.linalg.norm(bb_max - bb_min))
     if target_sz > diagonal/10.0: target_sz = diagonal/10.0
 
-    def _build_gradient_feature_cloud(seed_points_2d: np.ndarray,
-                                      seed_sizes: np.ndarray,
-                                      base_size: float,
-                                      grad: float,
-                                      max_seed_points: int = 400,
-                                      max_generated_points: int = 12000):
-        """
-        Approximate C++ triunsuitable() local sizing with a smooth, non-ring
-        feature cloud around seed constraints (e.g., well intersections).
-        """
-        if seed_points_2d is None or seed_sizes is None:
-            return np.empty((0, 2), dtype=float), np.empty((0,), dtype=float)
-        if len(seed_points_2d) == 0 or len(seed_sizes) == 0:
-            return np.empty((0, 2), dtype=float), np.empty((0,), dtype=float)
-
-        pts = np.asarray(seed_points_2d, dtype=float)
-        if pts.ndim != 2 or pts.shape[1] < 2:
-            return np.empty((0, 2), dtype=float), np.empty((0,), dtype=float)
-        pts = pts[:, :2]
-
-        sizes = np.asarray(seed_sizes, dtype=float).reshape(-1)
-        if len(sizes) != len(pts):
-            return np.empty((0, 2), dtype=float), np.empty((0,), dtype=float)
-
-        # Merge duplicate seeds and keep the smallest requested size.
-        merged = {}
-        for p, s in zip(pts, sizes):
-            if not np.isfinite(s):
-                continue
-            s = float(np.clip(s, 1e-6, base_size))
-            key = (round(float(p[0]), 8), round(float(p[1]), 8))
-            old = merged.get(key)
-            if old is None or s < old[2]:
-                merged[key] = (float(p[0]), float(p[1]), s)
-
-        seeds = list(merged.values())[:max_seed_points]
-        if not seeds:
-            return np.empty((0, 2), dtype=float), np.empty((0,), dtype=float)
-
-        out_pts: List[List[float]] = []
-        out_sizes: List[float] = []
-        min_seed_size = max(min(s[2] for s in seeds), 1e-6)
-
-        # Spatial hash to keep natural spacing and avoid artificial clustering.
-        cell_size = max(0.35 * min_seed_size, 0.015 * base_size, 1e-6)
-        grid: Dict[Tuple[int, int], List[int]] = {}
-
-        def _cell_key(x: float, y: float) -> Tuple[int, int]:
-            return (int(math.floor(x / cell_size)), int(math.floor(y / cell_size)))
-
-        def _can_place(x: float, y: float, spacing: float) -> bool:
-            cx, cy = _cell_key(x, y)
-            reach = int(math.ceil(spacing / cell_size)) + 1
-            sq = spacing * spacing
-            for gx in range(cx - reach, cx + reach + 1):
-                for gy in range(cy - reach, cy + reach + 1):
-                    for idx in grid.get((gx, gy), []):
-                        px, py = out_pts[idx]
-                        dx = px - x
-                        dy = py - y
-                        if dx * dx + dy * dy < sq:
-                            return False
-            return True
-
-        def add_point(x: float, y: float, size_val: float, force: bool = False) -> bool:
-            s = float(np.clip(size_val, 1e-6, base_size))
-            spacing = max(0.56 * s, 0.20 * min_seed_size)
-            if not force and not _can_place(x, y, spacing):
-                return False
-            idx = len(out_pts)
-            out_pts.append([x, y])
-            out_sizes.append(s)
-            ck = _cell_key(x, y)
-            if ck not in grid:
-                grid[ck] = []
-            grid[ck].append(idx)
-            return True
-
-        golden_angle = math.pi * (3.0 - math.sqrt(5.0))
-        active_seeds = []
-        for sx, sy, ss in seeds:
-            if len(out_pts) >= max_generated_points:
-                break
-            add_point(sx, sy, ss, force=True)
-            active_seeds.append((sx, sy, ss))
-
-        seed_specs = []
-        for sx, sy, ss in active_seeds:
-            delta = max(base_size * base_size - ss * ss, 0.0)
-            if delta <= 1e-12:
-                continue
-            # C++-like influence radius from triunsuitable inequality.
-            r_max = grad * math.sqrt(delta)
-            if r_max <= ss * 0.25:
-                continue
-            # Smaller well size should get stronger local densification.
-            ratio = max(base_size / max(ss, 1e-6), 1.0)
-            strength = ratio ** 1.5
-            seed_specs.append((sx, sy, ss, r_max, strength))
-
-        remaining_strength = sum(spec[4] for spec in seed_specs)
-        for seed_idx, (sx, sy, ss, r_max, strength) in enumerate(seed_specs):
-            if len(out_pts) >= max_generated_points:
-                break
-
-            # Estimate per-seed budget from affected area and weighted remaining capacity.
-            area = math.pi * r_max * r_max
-            nominal_count = int(np.clip(math.ceil(area / max(0.55 * ss * ss, 1e-10)), 80, 3200))
-            remaining = max_generated_points - len(out_pts)
-            if remaining <= 0:
-                break
-            seeds_left = max(len(seed_specs) - seed_idx, 1)
-            min_per_seed = 20
-            reserve_for_rest = min_per_seed * (seeds_left - 1)
-            available_for_this = max(remaining - reserve_for_rest, min_per_seed)
-            if remaining_strength > 1e-12:
-                weighted_budget = int(available_for_this * (strength / remaining_strength))
-            else:
-                weighted_budget = available_for_this // seeds_left
-            seed_budget = int(np.clip(weighted_budget, min_per_seed, available_for_this))
-            n_samples = min(nominal_count, seed_budget)
-            if n_samples <= 0:
-                remaining_strength -= strength
-                continue
-
-            # Deterministic phase from seed location to avoid global alignment.
-            phase = (math.sin(sx * 12.9898 + sy * 78.233) * 43758.5453) % (2.0 * math.pi)
-
-            # Sunflower sampling (no concentric rings) -> more natural gradual transition.
-            for i in range(1, n_samples + 1):
-                if len(out_pts) >= max_generated_points:
-                    break
-                t = i / (n_samples + 1.0)
-                r = r_max * math.sqrt(t)
-                theta = phase + i * golden_angle
-
-                local_size = min(base_size, math.sqrt((r * r) / (grad * grad) + ss * ss))
-                jitter_mag = 0.22 * local_size * (1.0 - 0.35 * t)
-                jitter_theta = phase * 0.5 + i * 1.73205080757
-
-                px = sx + r * math.cos(theta) + jitter_mag * math.cos(jitter_theta)
-                py = sy + r * math.sin(theta) + jitter_mag * math.sin(jitter_theta)
-                add_point(px, py, local_size)
-
-            remaining_strength -= strength
-
-        if not out_pts:
-            return np.empty((0, 2), dtype=float), np.empty((0,), dtype=float)
-        return np.asarray(out_pts, dtype=float), np.asarray(out_sizes, dtype=float)
-
-    feature_points_2d = np.asarray(config.get("constraint_feature_points_2d", []), dtype=float)
-    feature_sizes = np.asarray(config.get("constraint_feature_sizes", []), dtype=float)
-    has_feature_seed = (
-        feature_points_2d.ndim == 2 and
-        feature_points_2d.shape[1] >= 2 and
-        len(feature_points_2d) > 0 and
-        len(feature_sizes.reshape(-1)) == len(feature_points_2d)
-    )
-
     tri = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=target_sz)
     tri.set_cpp_compatible_mode(True)
-    if has_feature_seed:
-        generated_points, generated_sizes = _build_gradient_feature_cloud(
-            feature_points_2d[:, :2],
-            feature_sizes.reshape(-1),
-            target_sz,
-            gradient
-        )
 
-        # Keep generated local points inside the projected surface hull when available.
-        hull_polygon_2d = np.asarray(config.get("hull_polygon_2d", []), dtype=float)
-        if (generated_points.size > 0 and
-            hull_polygon_2d.ndim == 2 and
-            hull_polygon_2d.shape[0] >= 3 and
-            hull_polygon_2d.shape[1] >= 2):
-            try:
-                raw_points = generated_points
-                raw_sizes = generated_sizes
-                from matplotlib.path import Path
-                poly = Path(hull_polygon_2d[:, :2])
-                inside_mask = poly.contains_points(generated_points, radius=1e-12)
-                generated_points = generated_points[inside_mask]
-                generated_sizes = generated_sizes[inside_mask]
-                # Fallback for malformed hull ordering/projection: keep unfiltered cloud.
-                if len(generated_points) == 0 and len(raw_points) > 0:
-                    generated_points = raw_points
-                    generated_sizes = raw_sizes
-            except Exception:
-                pass
+    # Optional C++ triunsuitable bridge inputs (well/fracture feature points).
+    if feature_points_2d.size > 0:
+        if feature_points_2d.ndim == 1:
+            feature_points_2d = feature_points_2d.reshape(1, -1)
+        if feature_points_2d.ndim == 2 and feature_points_2d.shape[1] == 2:
+            if feature_sizes.size == 0:
+                feature_sizes = np.full((feature_points_2d.shape[0],), target_sz * 0.5, dtype=float)
+            elif feature_sizes.size == 1 and feature_points_2d.shape[0] > 1:
+                feature_sizes = np.full((feature_points_2d.shape[0],), float(feature_sizes[0]), dtype=float)
+            elif feature_sizes.size != feature_points_2d.shape[0]:
+                n = min(feature_points_2d.shape[0], feature_sizes.shape[0])
+                feature_points_2d = feature_points_2d[:n]
+                feature_sizes = feature_sizes[:n]
 
-        if generated_points.size > 0:
-            tri.set_feature_points(generated_points, generated_sizes)
-            logger.info(f"Added {len(generated_points)} graded local feature points for constrained triangulation")
+            if feature_points_2d.shape[0] > 0:
+                tri.set_feature_points(feature_points_2d, feature_sizes)
+                logger.info(
+                    "Constrained triangulation: enabled C++ triunsuitable bridge with %d feature point(s)",
+                    feature_points_2d.shape[0],
+                )
 
     tri_res = tri.triangulate(points=plc_points_2d, segments=plc_segments_indices, holes=plc_holes_2d,
                               uniform=True, create_transition=False, create_feature_points=False)
