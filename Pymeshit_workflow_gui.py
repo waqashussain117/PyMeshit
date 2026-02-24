@@ -16330,88 +16330,86 @@ class MeshItWorkflowGUI(QMainWindow):
     def _add_wells_to_tetra_visualization(self):
         """
         Add wells to the tetrahedral mesh visualization (C++ MeshIt style).
-        Wells are shown as 1D edge materials based on the material dropdown selection.
+        Only selected segments from the constraint tree are drawn, matching the
+        data actually passed to TetGen.
         """
         if not hasattr(self, 'tetra_plotter') or not self.tetra_plotter:
             return
-        
+
         try:
             import pyvista as pv
 
-            
-            # Check what's selected in the material dropdown
             material_name = ""
             if hasattr(self, 'tetra_material_combo') and self.tetra_material_combo:
                 material_name = self.tetra_material_combo.currentText()
-            
-            # Determine which wells to show
+
             show_all = material_name == "All Materials" or not material_name
             selected_well_idx = None
-            
+
             if not show_all and "Well ID" in material_name:
-                # Extract well ID from dropdown (format: "WellName (Well ID X)")
                 import re
                 match = re.search(r'Well ID (\d+)', material_name)
                 if match:
                     selected_well_marker = int(match.group(1))
-                    # Convert marker back to dataset index (marker = idx + 2)
                     selected_well_idx = selected_well_marker - 2
-            
-            # Get selected wells for export
-            selected_wells = self._get_selected_well_indices() if hasattr(self, '_get_selected_well_indices') else set()
-            
-            # Color palette for different wells
+
+            sel_wd = self._get_selected_well_viz_data()
+            if not sel_wd:
+                return
+
             well_colors = ['magenta', 'cyan', 'orange', 'lime', 'pink', 'yellow']
-            
             wells_drawn = 0
-            for i, well_idx in enumerate(sorted(selected_wells)):
-                # If specific well selected, only show that one
-                if selected_well_idx is not None and well_idx != selected_well_idx:
+
+            for color_i, (w_idx, info) in enumerate(sorted(sel_wd.items())):
+                if selected_well_idx is not None and w_idx != selected_well_idx:
                     continue
-                
-                if well_idx >= len(self.datasets):
+
+                edges = info.get('edges', [])
+                if not edges:
                     continue
-                    
-                ds = self.datasets[well_idx]
-                if ds.get('type') != 'WELL':
+
+                def _coord(pt):
+                    if hasattr(pt, 'x'):
+                        return [float(pt.x), float(pt.y), float(pt.z)]
+                    return [float(pt[0]), float(pt[1]), float(pt[2])]
+
+                pts_coords = []
+                pts_key_map = {}
+                lines_list = []
+                for edge in edges:
+                    idxs = []
+                    for ep in edge:
+                        c = _coord(ep)
+                        k = (round(c[0], 7), round(c[1], 7), round(c[2], 7))
+                        if k not in pts_key_map:
+                            pts_key_map[k] = len(pts_coords)
+                            pts_coords.append(c)
+                        idxs.append(pts_key_map[k])
+                    if len(idxs) == 2 and idxs[0] != idxs[1]:
+                        lines_list.append([2, idxs[0], idxs[1]])
+
+                if not pts_coords or not lines_list:
                     continue
-                
-                # Get refined or original points
-                pts = ds.get('refined_well_points') or ds.get('points')
-                if pts is None or len(pts) < 2:
-                    continue
-                
-                # Extract coordinates
-                coords = []
-                for p in pts:
-                    if hasattr(p, 'x'):
-                        coords.append([p.x, p.y, p.z])
-                    elif len(p) >= 3:
-                        coords.append([float(p[0]), float(p[1]), float(p[2])])
-                
-                if len(coords) < 2:
-                    continue
-                
-                pts_arr = np.array(coords)
-                n = len(pts_arr)
-                lines = np.hstack(([n], np.arange(n, dtype=np.int32))).astype(np.int32)
-                poly = pv.PolyData(pts_arr, lines=lines)
-                
-                well_name = ds.get('name', f'Well_{well_idx}')
-                color = well_colors[i % len(well_colors)]
-                
+
+                pts_arr = np.array(pts_coords, dtype=np.float64)
+                lines_arr = np.hstack(lines_list).astype(np.int32)
+                poly = pv.PolyData(pts_arr, lines=lines_arr)
+
+                well_name = info.get('name', f'Well_{w_idx}')
+                color = well_colors[color_i % len(well_colors)]
+
                 self.tetra_plotter.add_mesh(
                     poly,
                     color=color,
                     line_width=6,
                     render_lines_as_tubes=True,
-                    name=f"well_{well_idx}_{well_name}"
+                    name=f"well_{w_idx}_{well_name}"
                 )
                 wells_drawn += 1
-            
+
             if wells_drawn > 0:
                 logger.debug(f"Added {wells_drawn} wells to tetra visualization")
-                
+
         except Exception as e:
             logger.warning(f"Failed to add wells to tetra visualization: {e}")
 
@@ -16831,6 +16829,9 @@ class MeshItWorkflowGUI(QMainWindow):
             
             # Enhanced visualization like C++ version
             self._add_tetrahedral_mesh_visualization(mesh)
+            
+            # Add wells (only selected segments from constraint tree)
+            self._add_wells_to_tetra_visualization()
             
             # Update material dropdown with available materials
             self._update_material_dropdown()
