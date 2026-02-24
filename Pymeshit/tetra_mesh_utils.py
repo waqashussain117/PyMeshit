@@ -342,7 +342,6 @@ class TetrahedralMeshGenerator:
                     # Apply the material attributes to the grid
                     grid = tet.grid
                     if attributes is not None and len(attributes) > 0:
-                        import numpy as np
                         mapped_attributes = self._map_region_ids_to_materials(attributes)
                         grid.cell_data['MaterialID'] = mapped_attributes
                         unique_materials = np.unique(mapped_attributes)
@@ -619,35 +618,87 @@ class TetrahedralMeshGenerator:
                 logger.info(f"✓ Fallback triangulation successful for '{surface_name}': {len(local_tris)} triangles")
 
         # 3) Edge constraints initialization.
-        # Keep any facet-derived edges only if explicitly enabled above.
-        validated_edge_constraints = set(edge_constraints)
-
-        if cpp_well_only_edges:
+        # Use a dict (edge_tuple -> marker) so edges stay paired with markers.
+        edge_constraint_markers = {}
+        if not cpp_well_only_edges:
+            for e in edge_constraints:
+                edge_constraint_markers[e] = 1
+        else:
             logger.info("C++ style: skipping extra surface/intersection edge constraints; exporting wells as TetGen edges only")
 
-        # 4) NEW: Add WELL polylines as edge constraints (no triangulation)
+        # 4) Add WELL polylines as edge constraints (C++ style: merge into global
+        #    point list, use selected segments from self.well_data when available).
+        #
+        # C++ uses tetID to guarantee well intersection points share the exact
+        # same global vertex as the surface mesh.  Python stores coordinates
+        # independently, so tiny float differences can cause a well endpoint to
+        # miss the hash and create a new vertex *slightly* off the surface.
+        # That makes the well edge pierce a surface triangle -> TetGen fails.
+        #
+        # Fix: build a KDTree from existing (surface) vertices and snap any
+        # well point within SNAP_TOL to the nearest existing vertex.
+        SNAP_TOL = 1e-6
+        snap_tree = None
+        num_surface_verts = len(global_vertices)
+        if HAS_SCIPY_KDTREE and num_surface_verts > 0:
+            snap_tree = cKDTree(np.asarray(global_vertices, dtype=np.float64))
         well_edges_added = 0
-        for d in self.datasets:
-            if d.get('type') == 'WELL':
-                pts = d.get('refined_well_points') or d.get('points')  # prefer refined wells
+        well_snapped = 0
+
+        def _add_well_pts_as_edges(pts, marker: int):
+            """Merge well points into global PLC and create edges."""
+            nonlocal well_edges_added, well_snapped
+            gidxs = []
+            for p in pts:
+                if isinstance(p, Vector3D):
+                    coords = [float(p.x), float(p.y), float(p.z)]
+                else:
+                    coords = [float(p[0]), float(p[1]), float(p[2])]
+                key = (round(coords[0], 9), round(coords[1], 9), round(coords[2], 9))
+                g = key_to_global_idx.get(key)
+                if g is None and snap_tree is not None:
+                    dist, nearest_idx = snap_tree.query(coords, k=1)
+                    if dist <= SNAP_TOL:
+                        g = int(nearest_idx)
+                        key_to_global_idx[key] = g
+                        well_snapped += 1
+                if g is None:
+                    g = len(global_vertices)
+                    key_to_global_idx[key] = g
+                    global_vertices.append(coords)
+                gidxs.append(g)
+            for i in range(len(gidxs) - 1):
+                if gidxs[i] != gidxs[i + 1]:
+                    e = tuple(sorted((gidxs[i], gidxs[i + 1])))
+                    if e not in edge_constraint_markers:
+                        edge_constraint_markers[e] = marker
+                        well_edges_added += 1
+
+        if self.well_data:
+            for w_idx, well_info in self.well_data.items():
+                marker = well_info.get('marker', w_idx + 2)
+                well_edges = well_info.get('edges', [])
+                if well_edges:
+                    for edge_pts in well_edges:
+                        _add_well_pts_as_edges(edge_pts, marker)
+                else:
+                    well_pts = well_info.get('points', [])
+                    if well_pts and len(well_pts) >= 2:
+                        _add_well_pts_as_edges(well_pts, marker)
+                logger.info(f"  Well '{well_info.get('name', w_idx)}': added edges to PLC (marker={marker})")
+        else:
+            for d_idx, d in enumerate(self.datasets):
+                if d.get('type') != 'WELL':
+                    continue
+                pts = d.get('refined_well_points') or d.get('points')
                 if pts is None or len(pts) < 2:
                     continue
-                gidxs = []
-                for p in pts:
-                    key = (round(float(p[0]), 9), round(float(p[1]), 9), round(float(p[2]), 9))
-                    g = key_to_global_idx.get(key)
-                    if g is None:
-                        g = len(global_vertices)
-                        key_to_global_idx[key] = g
-                        global_vertices.append(_xyz(p))
-                    gidxs.append(g)
-                for i in range(len(gidxs) - 1):
-                    if gidxs[i] != gidxs[i + 1]:
-                        e = tuple(sorted((gidxs[i], gidxs[i + 1])))
-                        validated_edge_constraints.add(e)
-                        well_edges_added += 1
+                _add_well_pts_as_edges(pts, d_idx + 2)
+
         if well_edges_added > 0:
-            logger.info(f"✓ Added {well_edges_added} well edge constraints")
+            logger.info(f"✓ Added {well_edges_added} well edge constraints (from {'constraint tree' if self.well_data else 'all wells'})")
+        if well_snapped > 0:
+            logger.info(f"✓ Snapped {well_snapped} well points to existing surface mesh vertices (tol={SNAP_TOL})")
 
         # 5) Validate triangles (light cleanup)
         validated_facets = []
@@ -669,8 +720,14 @@ class TetrahedralMeshGenerator:
         self.plc_vertices = np.asarray(global_vertices, dtype=np.float64)
         self.plc_facets = np.asarray(validated_facets, dtype=np.int32)
         self.plc_facet_markers = np.asarray(validated_facet_markers, dtype=np.int32)
-        self.plc_edge_constraints = np.asarray(list(validated_edge_constraints), dtype=np.int32) if validated_edge_constraints else np.empty((0, 2), dtype=np.int32)
-        self.plc_edge_markers = np.arange(1, len(self.plc_edge_constraints) + 1, dtype=np.int32)
+        if edge_constraint_markers:
+            edge_list = list(edge_constraint_markers.keys())
+            marker_list = [edge_constraint_markers[e] for e in edge_list]
+            self.plc_edge_constraints = np.asarray(edge_list, dtype=np.int32)
+            self.plc_edge_markers = np.asarray(marker_list, dtype=np.int32)
+        else:
+            self.plc_edge_constraints = np.empty((0, 2), dtype=np.int32)
+            self.plc_edge_markers = np.empty(0, dtype=np.int32)
         # Map: facet marker -> dataset surface index (only for faults)
         self.fault_surface_markers = fault_marker_map
         self.plc_holes = np.asarray(global_holes, dtype=np.float64) if global_holes else np.empty((0, 3), dtype=np.float64)
@@ -1225,7 +1282,6 @@ class TetrahedralMeshGenerator:
                     grid = tet.grid
                     # Apply material attributes from fallback too
                     if attributes is not None and len(attributes) > 0:
-                        import numpy as np
                         mapped_attributes = self._map_region_ids_to_materials(attributes)
                         grid.cell_data['MaterialID'] = mapped_attributes
                         unique_materials = np.unique(mapped_attributes)
@@ -2141,52 +2197,73 @@ class TetrahedralMeshGenerator:
                 mesh_points = volume_mesh.points  # Existing mesh points
                 
                 for well_idx, well_info in self.well_data.items():
-                    well_pts = well_info.get('points')
-                    well_marker = well_info.get('marker', well_idx + 2)  # C++ style: markers start at 2
+                    well_marker = well_info.get('marker', well_idx + 2)
                     well_name = well_info.get('name', f'Well_{well_idx}')
-                    
-                    if well_pts is None or len(well_pts) < 2:
-                        continue
-                    
-                    # Convert points to array
-                    pts_arr = []
-                    for p in well_pts:
+                    well_edges = well_info.get('edges', [])
+
+                    # Build unique points and edge index pairs from the edges list.
+                    # This correctly handles non-contiguous segments and avoids
+                    # treating the flat 'points' list as a single polyline.
+                    def _extract_coord(p):
                         if hasattr(p, 'x'):
-                            pts_arr.append([p.x, p.y, p.z])
-                        elif len(p) >= 3:
-                            pts_arr.append([float(p[0]), float(p[1]), float(p[2])])
-                    
-                    if len(pts_arr) < 2:
+                            return (float(p.x), float(p.y), float(p.z))
+                        return (float(p[0]), float(p[1]), float(p[2]))
+
+                    if well_edges:
+                        unique_pts = []
+                        key_to_local = {}
+                        edge_pairs = []
+                        for edge_pts in well_edges:
+                            if len(edge_pts) < 2:
+                                continue
+                            local_idxs = []
+                            for p in (edge_pts[0], edge_pts[1]):
+                                c = _extract_coord(p)
+                                key = (round(c[0], 9), round(c[1], 9), round(c[2], 9))
+                                if key not in key_to_local:
+                                    key_to_local[key] = len(unique_pts)
+                                    unique_pts.append(list(c))
+                                local_idxs.append(key_to_local[key])
+                            if local_idxs[0] != local_idxs[1]:
+                                edge_pairs.append((local_idxs[0], local_idxs[1]))
+                    else:
+                        well_pts = well_info.get('points')
+                        if well_pts is None or len(well_pts) < 2:
+                            continue
+                        unique_pts = []
+                        for p in well_pts:
+                            unique_pts.append(list(_extract_coord(p)))
+                        edge_pairs = [(i, i + 1) for i in range(len(unique_pts) - 1)]
+
+                    if len(unique_pts) < 2 or not edge_pairs:
                         continue
-                    
-                    pts_arr = np.array(pts_arr)
-                    n_pts = len(pts_arr)
-                    n_edges = n_pts - 1
-                    
-                    # MAP well points to existing mesh node indices
+
+                    pts_arr = np.array(unique_pts, dtype=np.float64)
+
                     try:
                         mapped_indices = map_well_points_to_mesh_nodes(
                             mesh_points, pts_arr, tolerance=1e-5, precision=9
                         )
-                        logger.info(f"  Well '{well_name}': mapped {n_pts} points to existing mesh nodes")
+                        logger.info(f"  Well '{well_name}': mapped {len(pts_arr)} unique points to mesh nodes")
                     except ValueError as e:
                         logger.error(f"  Well '{well_name}' mapping failed: {e}")
-                        raise  # Re-raise - this is a critical error
-                    
-                    # Validate mapped indices are within bounds
+                        raise
+
                     max_node_idx = np.max(mapped_indices)
                     if max_node_idx >= volume_mesh.n_points:
-                        raise ValueError(f"Well '{well_name}' mapped to node {max_node_idx} but mesh only has {volume_mesh.n_points} nodes")
-                    
-                    # Create edge cells for VTK using MAPPED indices (format: [2, i1, i2, 2, i2, i3, ...])
-                    # Wells now reference existing mesh nodes - no duplicate points
+                        raise ValueError(
+                            f"Well '{well_name}' mapped to node {max_node_idx} "
+                            f"but mesh only has {volume_mesh.n_points} nodes"
+                        )
+
                     edge_cells = []
-                    for i in range(n_edges):
-                        edge_cells.extend([2, mapped_indices[i], mapped_indices[i + 1]])
-                    
+                    for a, b in edge_pairs:
+                        edge_cells.extend([2, mapped_indices[a], mapped_indices[b]])
+                    n_edges = len(edge_pairs)
+
                     all_well_cells.append(np.array(edge_cells, dtype=np.int64))
                     all_well_material_ids.append(np.full(n_edges, well_marker, dtype=np.int32))
-                    
+
                     well_edges_added += n_edges
                     logger.info(f"  Added well '{well_name}' (marker {well_marker}): {n_edges} edges (shared nodes with mesh)")
                 
