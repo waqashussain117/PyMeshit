@@ -3428,10 +3428,33 @@ class MeshItWorkflowGUI(QMainWindow):
         self.refine_select_intersection_constraints_only_btn.clicked.connect(self._refine_select_intersection_constraints_only)
         self.refine_select_hull_constraints_only_btn = QPushButton("Select Hull")
         self.refine_select_hull_constraints_only_btn.clicked.connect(self._refine_select_hull_constraints_only)
+        self.refine_select_well_constraints_only_btn = QPushButton("Select Wells")
+        self.refine_select_well_constraints_only_btn.clicked.connect(self._refine_select_well_constraints_only)
         btns.addWidget(self.refine_select_intersection_constraints_only_btn)
         btns.addWidget(self.refine_select_hull_constraints_only_btn)
+        btns.addWidget(self.refine_select_well_constraints_only_btn)
         btns.addStretch()
         cl.addLayout(btns)
+
+        filter_group = QGroupBox("Visibility Filters")
+        fl = QVBoxLayout(filter_group)
+        self.show_hull_constraints_checkbox = QCheckBox("Show Hull")
+        self.show_hull_constraints_checkbox.setChecked(True)
+        self.show_hull_constraints_checkbox.toggled.connect(self._update_refined_visualization)
+        fl.addWidget(self.show_hull_constraints_checkbox)
+        self.show_intersection_constraints_checkbox = QCheckBox("Show Intersections")
+        self.show_intersection_constraints_checkbox.setChecked(True)
+        self.show_intersection_constraints_checkbox.toggled.connect(self._update_refined_visualization)
+        fl.addWidget(self.show_intersection_constraints_checkbox)
+        self.show_well_constraints_checkbox = QCheckBox("Show Wells")
+        self.show_well_constraints_checkbox.setChecked(True)
+        self.show_well_constraints_checkbox.toggled.connect(self._update_refined_visualization)
+        fl.addWidget(self.show_well_constraints_checkbox)
+        self.show_selected_only_checkbox = QCheckBox("Selected Only")
+        self.show_selected_only_checkbox.setChecked(False)
+        self.show_selected_only_checkbox.toggled.connect(self._update_refined_visualization)
+        fl.addWidget(self.show_selected_only_checkbox)
+        cl.addWidget(filter_group)
 
         right_tabs.addTab(constraints_tab, "Constraints")
 
@@ -3797,10 +3820,12 @@ class MeshItWorkflowGUI(QMainWindow):
         # Get constraint type filters
         show_hull = getattr(self, 'show_hull_constraints_checkbox', None)
         show_intersections = getattr(self, 'show_intersection_constraints_checkbox', None)
+        show_wells = getattr(self, 'show_well_constraints_checkbox', None)
         show_selected_only = getattr(self, 'show_selected_only_checkbox', None)
         
         show_hull_constraints = show_hull.isChecked() if show_hull else True
         show_intersection_constraints = show_intersections.isChecked() if show_intersections else True
+        show_well_constraints = show_wells.isChecked() if show_wells else True
         show_selected_only_mode = show_selected_only.isChecked() if show_selected_only else False
 
         # Helper function to check if a surface should be shown
@@ -3823,17 +3848,19 @@ class MeshItWorkflowGUI(QMainWindow):
             # Track surface distribution
             surface_counts[surf_idx] = surface_counts.get(surf_idx, 0) + 1
             
-            # Check surface filter
-            should_show = should_show_surface(surf_idx)
+            seg_info = getattr(self, '_refine_segment_map', {}).get((surf_idx, seg_uid), {})
+            seg_type = str(seg_info.get("type", "")).lower()
+            
+            # Wells are not surface-filtered, but can be toggled via their own checkbox
+            if seg_type == "well":
+                should_show = show_well_constraints
+            else:
+                should_show = should_show_surface(surf_idx)
             
             if should_show:
-                seg_info = getattr(self, '_refine_segment_map', {}).get((surf_idx, seg_uid), {})
-                
-                # Check constraint type filters
-                seg_type = seg_info.get("type", "")
                 if seg_type == "hull" and not show_hull_constraints:
                     should_show = False
-                elif seg_type == "intersection" and not show_intersection_constraints:
+                elif seg_type in ("intersection", "int") and not show_intersection_constraints:
                     should_show = False
 
                 # Check if in selected-only mode
@@ -3884,16 +3911,18 @@ class MeshItWorkflowGUI(QMainWindow):
             # Re-add only the actors that should be visible
             actors_readded = 0
             for (surf_idx, seg_uid), actor in self.constraint_segment_actor_refs.items():
-                should_show = should_show_surface(surf_idx)
+                seg_info = getattr(self, '_refine_segment_map', {}).get((surf_idx, seg_uid), {})
+                seg_type = str(seg_info.get("type", "")).lower()
+
+                if seg_type == "well":
+                    should_show = show_well_constraints
+                else:
+                    should_show = should_show_surface(surf_idx)
                 
                 if should_show:
-                    seg_info = getattr(self, '_refine_segment_map', {}).get((surf_idx, seg_uid), {})
-                    
-                    # Check constraint type filters
-                    seg_type = seg_info.get("type", "")
                     if seg_type == "hull" and not show_hull_constraints:
                         should_show = False
-                    elif seg_type == "intersection" and not show_intersection_constraints:
+                    elif seg_type in ("intersection", "int") and not show_intersection_constraints:
                         should_show = False
 
                     # Check if in selected-only mode
@@ -12374,14 +12403,22 @@ class MeshItWorkflowGUI(QMainWindow):
 
         def walk(item):
             data = item.data(0, Qt.UserRole)
-            if data and data.get("type") == "constraint":
+            if not data:
+                pass
+            elif data.get("type") == "constraint":
                 surf_idx = data.get("surface_idx")
                 seg_uid = data.get("seg_uid")
                 key = (surf_idx, seg_uid)
                 if key in seg_map:
                     seg_map[key]["selected"] = (item.checkState(0) == Qt.Checked)
-                    # Column 4 is the holes checkbox
                     seg_map[key]["is_hole"] = (item.checkState(4) == Qt.Checked)
+            elif data.get("type") == "well_constraint":
+                w_idx = data.get("well_idx")
+                seg_uid = data.get("seg_uid")
+                if w_idx is not None:
+                    key = (-w_idx - 1, seg_uid)
+                    if key in seg_map:
+                        seg_map[key]["selected"] = (item.checkState(0) == Qt.Checked)
             for i in range(item.childCount()):
                 walk(item.child(i))
 
@@ -12394,12 +12431,14 @@ class MeshItWorkflowGUI(QMainWindow):
         show_hull_constraints: bool,
         show_intersection_constraints: bool,
         selected_only_mode: bool,
+        show_well_constraints: bool = True,
     ):
         """
-        Extremely fast Segments renderer: batches into at most 3 actors
+        Extremely fast Segments renderer: batches into at most 4 actors
         - selected NORMAL constraints  (green, thick)
         - selected HOLE constraints    (red,   thick)
         - unselected constraints       (grey,  thin)
+        - well constraints             (magenta, thick)
 
         Includes fallback: if no HULL segments exist in _refine_segment_map
         for a visible surface, draw its hull from dataset['hull_points'].
@@ -12455,7 +12494,8 @@ class MeshItWorkflowGUI(QMainWindow):
             
             # Handle wells separately (they use negative indices)
             if seg_type == "well":
-                # Wells are always visible (not filtered by surface)
+                if not show_well_constraints:
+                    continue
                 is_selected = bool(seg_info.get("selected", True))
                 if selected_only_mode and not is_selected:
                     continue
@@ -12611,7 +12651,9 @@ class MeshItWorkflowGUI(QMainWindow):
             if not hasattr(self, 'constraint_segment_actor_refs'):
                 self.constraint_segment_actor_refs = {}
             self._visualize_refined_intersections()
-            self._add_wells_to_intersection_plotter()
+            well_cb = getattr(self, 'show_well_constraints_checkbox', None)
+            if well_cb is None or well_cb.isChecked():
+                self._add_wells_to_intersection_plotter()
             return
 
         # --- 1: Meshes ---
@@ -12649,8 +12691,10 @@ class MeshItWorkflowGUI(QMainWindow):
                 )
                 self.conforming_mesh_actor_refs.append(actor)
 
-            # Add wells (1D polylines) to the mesh view
-            self._add_wells_polyline_to_plotter(plotter, show_intersection_points=True)
+            # Add wells (1D polylines) to the mesh view if filter allows
+            well_cb = getattr(self, 'show_well_constraints_checkbox', None)
+            if well_cb is None or well_cb.isChecked():
+                self._add_wells_polyline_to_plotter(plotter, show_intersection_points=True)
 
             plotter.add_axes()
             plotter.reset_camera()
@@ -12675,10 +12719,12 @@ class MeshItWorkflowGUI(QMainWindow):
 
         show_hull = getattr(self, 'show_hull_constraints_checkbox', None)
         show_intersections = getattr(self, 'show_intersection_constraints_checkbox', None)
+        show_wells = getattr(self, 'show_well_constraints_checkbox', None)
         show_selected_only = getattr(self, 'show_selected_only_checkbox', None)
 
         show_hull_constraints = show_hull.isChecked() if show_hull else True
         show_intersection_constraints = show_intersections.isChecked() if show_intersections else True
+        show_well_constraints = show_wells.isChecked() if show_wells else True
         selected_only_mode = show_selected_only.isChecked() if show_selected_only else False
 
         def surface_name(idx):
@@ -12703,13 +12749,14 @@ class MeshItWorkflowGUI(QMainWindow):
                 pass
 
         if self._segments_batched_mode:
-            # FAST path: draw everything in 1–3 actors
+            # FAST path: draw everything in 1–4 actors
             built = self._draw_segments_batched_fast(
                 plotter,
                 surface_is_visible_fn=surface_is_visible,
                 show_hull_constraints=show_hull_constraints,
                 show_intersection_constraints=show_intersection_constraints,
                 selected_only_mode=selected_only_mode,
+                show_well_constraints=show_well_constraints,
             )
         else:
             # PRECISE path (picking): one actor per segment (original behavior)
@@ -12732,10 +12779,13 @@ class MeshItWorkflowGUI(QMainWindow):
             built = 0
 
             for (surf_idx, seg_uid), seg_info in seg_map.items():
-                if not surface_is_visible(surf_idx):
+                seg_type = str(seg_info.get("type", seg_info.get("ctype", ""))).lower()
+                if seg_type == "well":
+                    if not show_well_constraints:
+                        continue
+                elif not surface_is_visible(surf_idx):
                     continue
 
-                seg_type = str(seg_info.get("type", seg_info.get("ctype", ""))).lower()
                 if seg_type == "hull" and not show_hull_constraints:
                     continue
                 if seg_type in ("int", "intersection") and not show_intersection_constraints:
@@ -13087,24 +13137,37 @@ class MeshItWorkflowGUI(QMainWindow):
                 for i in range(parent.childCount()):
                     child = parent.child(i)
                     child.setCheckState(0, state)
-                    # Update segment map for constraint items
                     child_data = child.data(0, Qt.UserRole)
-                    if child_data and child_data.get("type") == "constraint":
-                        surface_idx = child_data["surface_idx"]
-                        seg_uid = child_data["seg_uid"]
-                        if (surface_idx, seg_uid) in self._refine_segment_map:
-                            self._refine_segment_map[(surface_idx, seg_uid)]["selected"] = (state == Qt.Checked)
+                    if child_data:
+                        child_type = child_data.get("type")
+                        if child_type == "constraint":
+                            surface_idx = child_data["surface_idx"]
+                            seg_uid = child_data["seg_uid"]
+                            if (surface_idx, seg_uid) in self._refine_segment_map:
+                                self._refine_segment_map[(surface_idx, seg_uid)]["selected"] = (state == Qt.Checked)
+                        elif child_type == "well_constraint":
+                            w_idx = child_data.get("well_idx")
+                            seg_uid = child_data.get("seg_uid")
+                            if w_idx is not None and (-w_idx - 1, seg_uid) in self._refine_segment_map:
+                                self._refine_segment_map[(-w_idx - 1, seg_uid)]["selected"] = (state == Qt.Checked)
                     set_all_children_state(child, state)
 
             set_all_children_state(item, item.checkState(0))
             
-            # Also update the current item if it's a constraint
+            # Also update the current item if it's a constraint or well_constraint
             data = item.data(0, Qt.UserRole)
-            if data and data.get("type") == "constraint":
-                surface_idx = data["surface_idx"]
-                seg_uid = data["seg_uid"]
-                if (surface_idx, seg_uid) in self._refine_segment_map:
-                    self._refine_segment_map[(surface_idx, seg_uid)]["selected"] = (item.checkState(0) == Qt.Checked)
+            if data:
+                item_type = data.get("type")
+                if item_type == "constraint":
+                    surface_idx = data["surface_idx"]
+                    seg_uid = data["seg_uid"]
+                    if (surface_idx, seg_uid) in self._refine_segment_map:
+                        self._refine_segment_map[(surface_idx, seg_uid)]["selected"] = (item.checkState(0) == Qt.Checked)
+                elif item_type == "well_constraint":
+                    w_idx = data.get("well_idx")
+                    seg_uid = data.get("seg_uid")
+                    if w_idx is not None and (-w_idx - 1, seg_uid) in self._refine_segment_map:
+                        self._refine_segment_map[(-w_idx - 1, seg_uid)]["selected"] = (item.checkState(0) == Qt.Checked)
 
             # -------- propagate upwards (any unchecked → parent unchecked) ----
             def update_parent_state(child):
@@ -16472,50 +16535,81 @@ class MeshItWorkflowGUI(QMainWindow):
         """
         Collect selected well data for TetGen edge constraints (C++ MeshIt style).
         
-        In C++ MeshIt (geometry.cpp calculate_tets):
-        - Wells (polylines) are added to TetGen as edge constraints via edgelist
-        - Edge markers are stored in edgemarkerlist (marker = polyline_idx + 2)
-        - Wells are exported as 1D elements (VTK_LINE type 3 in VTU, T3D2 in ABAQUS)
+        Respects constraint tree selections from the Refine & Mesh tab:
+        only well segments that are checked in the tree are included.
+        Falls back to the tetra tab's material1d_list selection if no
+        constraint tree is available.
         
         Returns:
-            dict: {well_idx: {'points': [], 'marker': int, 'name': str}, ...}
+            dict: {well_idx: {'points': [], 'edges': [], 'marker': int, 'name': str}, ...}
         """
         well_data = {}
-        
-        # Get selected wells from the material1d_list checkboxes
+        seg_map = getattr(self, "_refine_segment_map", None)
+
+        if seg_map:
+            # Collect from constraint tree selections
+            for (key_idx, seg_uid), seg_info in seg_map.items():
+                if str(seg_info.get("type", "")).upper() != "WELL":
+                    continue
+                if not seg_info.get("selected", True):
+                    continue
+                w_idx = seg_info.get("well_idx")
+                if w_idx is None:
+                    continue
+
+                seg_pts = seg_info.get("points", [])
+                if not seg_pts or len(seg_pts) < 2:
+                    continue
+
+                if w_idx not in well_data:
+                    ds = self.datasets[w_idx] if w_idx < len(self.datasets) else {}
+                    well_data[w_idx] = {
+                        'points': [],
+                        'edges': [],
+                        'marker': w_idx + 2,
+                        'name': ds.get('name', f'Well_{w_idx}'),
+                    }
+
+                existing_pts = well_data[w_idx]['points']
+                existing_edges = well_data[w_idx]['edges']
+                for p in seg_pts:
+                    existing_pts.append(p)
+                for j in range(len(seg_pts) - 1):
+                    existing_edges.append((seg_pts[j], seg_pts[j + 1]))
+
+            if well_data:
+                for w_idx, wd in well_data.items():
+                    logger.info(f"  Well '{wd['name']}': {len(wd['points'])} pts, "
+                                f"{len(wd['edges'])} edges (constraint-tree), marker={wd['marker']}")
+                logger.info(f"Collected {len(well_data)} wells from constraint tree for TetGen")
+                return well_data
+
+        # Fallback: use tetra-tab material list
         selected_wells = self._get_selected_well_indices()
-        
         if not selected_wells:
             logger.info("No wells selected for TetGen edge constraints")
             return well_data
-        
-        logger.info(f"Collecting {len(selected_wells)} wells for TetGen edge constraints...")
-        
+
+        logger.info(f"Collecting {len(selected_wells)} wells for TetGen edge constraints (fallback)...")
         for well_idx in sorted(selected_wells):
             if well_idx >= len(self.datasets):
                 continue
-                
             ds = self.datasets[well_idx]
             if ds.get('type') != 'WELL':
                 continue
-            
-            # Use refined points if available, otherwise original points
+
             well_pts = ds.get('refined_well_points') or ds.get('points')
             if well_pts is None or len(well_pts) < 2:
                 continue
-            
-            well_name = ds.get('name', f'Well_{well_idx}')
-            # C++ style marker: polyline_idx + 2 (0,1 are reserved)
-            well_marker = well_idx + 2
-            
+
             well_data[well_idx] = {
-                'points': well_pts,
-                'marker': well_marker,
-                'name': well_name
+                'points': list(well_pts),
+                'edges': [],
+                'marker': well_idx + 2,
+                'name': ds.get('name', f'Well_{well_idx}'),
             }
-            
-            logger.info(f"  Well '{well_name}': {len(well_pts)} points, marker={well_marker}")
-        
+            logger.info(f"  Well '{ds.get('name', well_idx)}': {len(well_pts)} points, marker={well_idx + 2}")
+
         logger.info(f"Collected {len(well_data)} wells for TetGen export")
         return well_data
     
@@ -24031,7 +24125,36 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.info("Tab 6: Selected hull constraints only")
         finally:
             self._refine_updating_constraint_tree = False
-    
+
+    def _refine_select_well_constraints_only(self):
+        """Select only well constraints in Tab 6, deselect hull and intersection constraints."""
+        if not hasattr(self, 'refine_constraint_tree'):
+            return
+
+        self._refine_updating_constraint_tree = True
+        try:
+            root = self.refine_constraint_tree.invisibleRootItem()
+            for i in range(root.childCount()):
+                top_item = root.child(i)
+                top_data = top_item.data(0, Qt.UserRole) or {}
+                top_type = top_data.get("type")
+
+                if top_type == "well":
+                    top_item.setCheckState(0, Qt.Checked)
+                    for j in range(top_item.childCount()):
+                        top_item.child(j).setCheckState(0, Qt.Checked)
+                elif top_type == "surface":
+                    top_item.setCheckState(0, Qt.Unchecked)
+                    for j in range(top_item.childCount()):
+                        group = top_item.child(j)
+                        group.setCheckState(0, Qt.Unchecked)
+                        for k in range(group.childCount()):
+                            group.child(k).setCheckState(0, Qt.Unchecked)
+
+            logger.info("Tab 6: Selected well constraints only")
+        finally:
+            self._refine_updating_constraint_tree = False
+
     def _sync_intersection_selection_across_surfaces(self, changed_item):
         """
         Synchronize intersection line selections across surfaces.
