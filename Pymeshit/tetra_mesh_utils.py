@@ -1429,45 +1429,60 @@ class TetrahedralMeshGenerator:
             
             if hasattr(self, 'well_data') and self.well_data:
                 logger.info(f"Processing wells as {'Node Sets' if export_wells_as_nodesets else 'Element Blocks'} (mapping to existing mesh nodes)...")
-                
+
+                def _extract_coord_nc(p):
+                    if hasattr(p, 'x'):
+                        return (float(p.x), float(p.y), float(p.z))
+                    return (float(p[0]), float(p[1]), float(p[2]))
+
                 for well_idx, well_info in self.well_data.items():
-                    well_pts = well_info.get('points')
                     well_marker = well_info.get('marker', well_idx + 2)
                     well_name = well_info.get('name', f'Well_{well_idx}')
-                    
-                    if well_pts is None or len(well_pts) < 2:
-                        continue
-                    
-                    # Get custom name if provided
+                    well_edges = well_info.get('edges', [])
+
                     if hasattr(self, '_custom_well_names') and well_marker in self._custom_well_names:
                         well_name = self._custom_well_names[well_marker]
-                    
-                    # Convert points to array
-                    pts_arr = []
-                    for p in well_pts:
-                        if hasattr(p, 'x'):
-                            pts_arr.append([p.x, p.y, p.z])
-                        elif len(p) >= 3:
-                            pts_arr.append([float(p[0]), float(p[1]), float(p[2])])
-                    
-                    if len(pts_arr) < 2:
+
+                    if well_edges:
+                        unique_pts = []
+                        key_to_local = {}
+                        edge_pairs = []
+                        for edge_pts in well_edges:
+                            if len(edge_pts) < 2:
+                                continue
+                            local_idxs = []
+                            for p in (edge_pts[0], edge_pts[1]):
+                                c = _extract_coord_nc(p)
+                                key = (round(c[0], 9), round(c[1], 9), round(c[2], 9))
+                                if key not in key_to_local:
+                                    key_to_local[key] = len(unique_pts)
+                                    unique_pts.append(list(c))
+                                local_idxs.append(key_to_local[key])
+                            if local_idxs[0] != local_idxs[1]:
+                                edge_pairs.append((local_idxs[0], local_idxs[1]))
+                    else:
+                        well_pts = well_info.get('points')
+                        if well_pts is None or len(well_pts) < 2:
+                            continue
+                        unique_pts = [list(_extract_coord_nc(p)) for p in well_pts]
+                        edge_pairs = [(i, i + 1) for i in range(len(unique_pts) - 1)]
+
+                    if len(unique_pts) < 2 or not edge_pairs:
                         continue
-                    
-                    pts_arr = np.array(pts_arr)
+
+                    pts_arr = np.array(unique_pts, dtype=np.float64)
                     n_pts = len(pts_arr)
-                    n_edges = n_pts - 1
-                    
-                    # MAP well points to existing mesh node indices
+                    n_edges = len(edge_pairs)
+
                     try:
                         mapped_indices = map_well_points_to_mesh_nodes(
                             points, pts_arr, tolerance=1e-5, precision=9
                         )
-                        logger.info(f"  Well '{well_name}': mapped {n_pts} points to existing mesh nodes")
+                        logger.info(f"  Well '{well_name}': mapped {n_pts} unique points to existing mesh nodes")
                     except ValueError as e:
                         logger.error(f"  Well '{well_name}' mapping failed: {e}")
-                        raise  # Re-raise - this is a critical error
-                    
-                    # Validate that mapped nodes are used by tetra elements
+                        raise
+
                     unused_nodes = validate_well_node_usage(mapped_indices, cells, cell_types)
                     if unused_nodes:
                         logger.warning(
@@ -1475,9 +1490,8 @@ class TetrahedralMeshGenerator:
                             f"tetrahedral element. This may indicate incomplete PLC integration. "
                             f"Unused node indices: {unused_nodes[:5]}{'...' if len(unused_nodes) > 5 else ''}"
                         )
-                    
+
                     if export_wells_as_nodesets:
-                        # Store MAPPED INDICES for node set export (no duplicate points)
                         well_node_sets[well_marker] = {
                             'mapped_indices': mapped_indices,
                             'n_nodes': n_pts,
@@ -1486,9 +1500,9 @@ class TetrahedralMeshGenerator:
                         total_well_nodes += n_pts
                         logger.info(f"  Well node set '{well_name}' (marker {well_marker}): {n_pts} nodes (shared with mesh)")
                     else:
-                        # Store MAPPED INDICES for element block export (BAR2)
                         well_blocks[well_marker] = {
                             'mapped_indices': mapped_indices,
+                            'edge_pairs': edge_pairs,
                             'n_edges': n_edges,
                             'name': well_name
                         }
@@ -1644,11 +1658,11 @@ class TetrahedralMeshGenerator:
                         )
                         connect.setncattr('elem_type', 'BAR2')  # EXODUS BAR2 element type
                         
-                        # Write well edge connectivity using MAPPED mesh node indices (1-based)
-                        # Wells now share nodes with tetra mesh - no duplicate points
-                        for edge_idx in range(n_edges):
-                            connect[edge_idx, 0] = mapped_indices[edge_idx] + 1      # First node (1-based)
-                            connect[edge_idx, 1] = mapped_indices[edge_idx + 1] + 1  # Second node (1-based)
+                        # Write well edge connectivity using edge_pairs and MAPPED mesh node indices (1-based)
+                        edge_pairs = well_blk['edge_pairs']
+                        for edge_idx, (a, b) in enumerate(edge_pairs):
+                            connect[edge_idx, 0] = mapped_indices[a] + 1   # First node (1-based)
+                            connect[edge_idx, 1] = mapped_indices[b] + 1   # Second node (1-based)
                         
                         # Validate connectivity references valid nodes
                         max_node_ref = max(mapped_indices) + 1  # 1-based

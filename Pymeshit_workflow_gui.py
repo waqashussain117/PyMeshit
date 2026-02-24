@@ -5923,42 +5923,39 @@ class MeshItWorkflowGUI(QMainWindow):
         Populate the conforming surface tree with available conforming meshes.
         This creates a simple selection interface for choosing which surfaces to include in tetgen.
         """
-        self.conforming_surface_tree.clear()
-        
-        if not self.conforming_mesh_data:
-            logger.warning("No conforming mesh data to populate tree")
-            return
-        
-        # Add header info
-        header_item = QTreeWidgetItem(self.conforming_surface_tree)
-        header_item.setText(0, f"{len(self.conforming_mesh_data)} Conforming Surfaces Available")
-        header_item.setText(1, "Select")
-        header_item.setText(2, "for")  
-        header_item.setText(3, "TetGen")
-        header_item.setFlags(header_item.flags() & ~Qt.ItemIsUserCheckable)
-        
-        # Add each conforming surface
-        for surface_idx, mesh_data in self.conforming_mesh_data.items():
-            surface_item = QTreeWidgetItem(self.conforming_surface_tree)
-            surface_item.setText(0, f"{mesh_data['name']}")
-            surface_item.setText(1, str(len(mesh_data['vertices'])))
-            surface_item.setText(2, str(len(mesh_data['triangles'])))
-            surface_item.setText(3, "Ready")
-            
-            # Make surface selectable with checkbox
-            surface_item.setFlags(surface_item.flags() | Qt.ItemIsUserCheckable)
-            surface_item.setCheckState(0, Qt.Checked)  # Default to selected
-            
-            # Store surface index for retrieval
-            surface_item.setData(0, Qt.UserRole, surface_idx)
-            
-            # Add to selected surfaces
-            self.selected_conforming_surfaces.add(surface_idx)
-        
-        # Expand all items
-        self.conforming_surface_tree.expandAll()
-        
-        logger.info(f"Populated conforming surface tree with {len(self.conforming_mesh_data)} surfaces")
+        self.conforming_surface_tree.blockSignals(True)
+        try:
+            self.conforming_surface_tree.clear()
+
+            if not self.conforming_mesh_data:
+                logger.warning("No conforming mesh data to populate tree")
+                return
+
+            header_item = QTreeWidgetItem(self.conforming_surface_tree)
+            header_item.setText(0, f"{len(self.conforming_mesh_data)} Conforming Surfaces Available")
+            header_item.setText(1, "Select")
+            header_item.setText(2, "for")
+            header_item.setText(3, "TetGen")
+            header_item.setFlags(header_item.flags() & ~Qt.ItemIsUserCheckable)
+
+            for surface_idx, mesh_data in self.conforming_mesh_data.items():
+                surface_item = QTreeWidgetItem(self.conforming_surface_tree)
+                surface_item.setText(0, f"{mesh_data['name']}")
+                surface_item.setText(1, str(len(mesh_data['vertices'])))
+                surface_item.setText(2, str(len(mesh_data['triangles'])))
+                surface_item.setText(3, "Ready")
+
+                surface_item.setFlags(surface_item.flags() | Qt.ItemIsUserCheckable)
+                surface_item.setCheckState(0, Qt.Checked)
+
+                surface_item.setData(0, Qt.UserRole, surface_idx)
+
+                self.selected_conforming_surfaces.add(surface_idx)
+
+            self.conforming_surface_tree.expandAll()
+            logger.info(f"Populated conforming surface tree with {len(self.conforming_mesh_data)} surfaces")
+        finally:
+            self.conforming_surface_tree.blockSignals(False)
 
     def _on_conforming_surface_tree_item_changed(self, item, column):
         """Handle changes in the conforming surface tree selection - C++ style: simple state update"""
@@ -5987,23 +5984,37 @@ class MeshItWorkflowGUI(QMainWindow):
 
     def _select_all_conforming_surfaces(self):
         """Select all conforming surfaces in the tree"""
-        for i in range(self.conforming_surface_tree.topLevelItemCount()):
-            item = self.conforming_surface_tree.topLevelItem(i)
-            surface_idx = item.data(0, Qt.UserRole)
-            if surface_idx is not None:  # Skip header items
-                item.setCheckState(0, Qt.Checked)
-        
+        self.conforming_surface_tree.blockSignals(True)
+        try:
+            for i in range(self.conforming_surface_tree.topLevelItemCount()):
+                item = self.conforming_surface_tree.topLevelItem(i)
+                surface_idx = item.data(0, Qt.UserRole)
+                if surface_idx is not None:
+                    item.setCheckState(0, Qt.Checked)
+                    self.selected_conforming_surfaces.add(surface_idx)
+                    item.setText(3, "Selected")
+        finally:
+            self.conforming_surface_tree.blockSignals(False)
+
+        self._update_conforming_surface_visualization()
         self.statusBar().showMessage(f"Selected all {len(self.conforming_mesh_data)} conforming surfaces")
 
     def _deselect_all_conforming_surfaces(self):
         """Deselect all conforming surfaces in the tree"""
-        for i in range(self.conforming_surface_tree.topLevelItemCount()):
-            item = self.conforming_surface_tree.topLevelItem(i)
-            surface_idx = item.data(0, Qt.UserRole)
-            if surface_idx is not None:  # Skip header items
-                item.setCheckState(0, Qt.Unchecked)
-        
-                self.statusBar().showMessage("Deselected all conforming surfaces")
+        self.conforming_surface_tree.blockSignals(True)
+        try:
+            for i in range(self.conforming_surface_tree.topLevelItemCount()):
+                item = self.conforming_surface_tree.topLevelItem(i)
+                surface_idx = item.data(0, Qt.UserRole)
+                if surface_idx is not None:
+                    item.setCheckState(0, Qt.Unchecked)
+                    self.selected_conforming_surfaces.discard(surface_idx)
+                    item.setText(3, "Deselected")
+        finally:
+            self.conforming_surface_tree.blockSignals(False)
+
+        self._update_conforming_surface_visualization()
+        self.statusBar().showMessage("Deselected all conforming surfaces")
 
 
 
