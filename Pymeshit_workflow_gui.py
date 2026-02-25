@@ -11635,18 +11635,24 @@ class MeshItWorkflowGUI(QMainWindow):
         
         try:
             logger.info(f"Saving project to: {file_path}")
+
+            refine_constraint_snapshot = self._get_refine_constraint_state_for_persistence()
             
             # Prepare project data
             project_data = {
-                'version': '1.1',  # Project file version for future compatibility (1.1 adds tetra_materials)
+                'version': '1.2',  # 1.2 adds refine-constraint persistence and refine visualization state
                 'datasets': self.datasets,
                 'current_dataset_index': self.current_dataset_index,
                 'current_tab_index': self.notebook.currentIndex(),
                 'datasets_intersections': getattr(self, 'datasets_intersections', {}),
+                'refined_intersections_for_visualization': getattr(self, 'refined_intersections_for_visualization', {}),
+                'original_intersections_backup': getattr(self, 'original_intersections_backup', {}),
+                'triple_points': getattr(self, 'triple_points', []),
                 'seg_length_by_surface': getattr(self, 'seg_length_by_surface', {}),
                 'mesh_size_by_surface': getattr(self, 'mesh_size_by_surface', {}),
                 'tetra_mesh_data': getattr(self, 'tetra_mesh_data', None),
-                'tetra_materials': getattr(self, 'tetra_materials', [])  # Save material seed locations
+                'tetra_materials': getattr(self, 'tetra_materials', []),  # Save material seed locations
+                'refine_constraint_state_snapshot': refine_constraint_snapshot,
             }
             
             # Save to file using pickle
@@ -11718,6 +11724,15 @@ class MeshItWorkflowGUI(QMainWindow):
             # Step 1: Clear all visualizations first to prevent plotter crashes
             logger.info("Clearing visualizations before loading project")
             self._clear_visualizations()
+
+            # Clear refine constraint UI state so old project selections do not bleed into new data.
+            if hasattr(self, 'refine_constraint_tree') and self.refine_constraint_tree:
+                self.refine_constraint_tree.blockSignals(True)
+                self.refine_constraint_tree.clear()
+                self.refine_constraint_tree.blockSignals(False)
+            self._refine_segment_map = {}
+            self._pending_refine_constraint_state_snapshot = self._empty_refine_constraint_state_snapshot()
+            self._saved_refine_constraint_state_snapshot = self._empty_refine_constraint_state_snapshot()
             
             # Step 2: Clear plotter references safely
             if hasattr(self, 'plotters'):
@@ -11746,6 +11761,21 @@ class MeshItWorkflowGUI(QMainWindow):
             
             # Restore intersection data
             self.datasets_intersections = project_data.get('datasets_intersections', {})
+            self.refined_intersections_for_visualization = project_data.get('refined_intersections_for_visualization', {})
+            if not isinstance(self.refined_intersections_for_visualization, dict) or not self.refined_intersections_for_visualization:
+                self.refined_intersections_for_visualization = self._build_refined_intersections_visualization_map(
+                    self.datasets_intersections
+                )
+            self.original_intersections_backup = project_data.get('original_intersections_backup', {})
+            self.triple_points = project_data.get('triple_points', [])
+
+            saved_refine_snapshot = project_data.get('refine_constraint_state_snapshot')
+            self._pending_refine_constraint_state_snapshot = self._normalize_refine_constraint_state_snapshot(
+                saved_refine_snapshot
+            )
+            self._saved_refine_constraint_state_snapshot = self._normalize_refine_constraint_state_snapshot(
+                saved_refine_snapshot
+            )
             
             # Restore refinement data
             self.seg_length_by_surface = project_data.get('seg_length_by_surface', {})
@@ -11776,6 +11806,9 @@ class MeshItWorkflowGUI(QMainWindow):
                 self._refresh_well_refine_table()
             if hasattr(self, '_refresh_mesh_well_refine_table'):
                 self._refresh_mesh_well_refine_table()
+
+            # Restore Refine & Mesh constraint tree selections from saved state, independent of current tab.
+            self._restore_refine_constraints_after_project_load()
             
             # Step 6: Switch to the saved tab WITHOUT triggering visualization callbacks
             # Block signals temporarily to prevent tab change from triggering visualizations
@@ -11847,6 +11880,164 @@ class MeshItWorkflowGUI(QMainWindow):
                 self.new_project()
             except Exception as recovery_error:
                 logger.error(f"Error during recovery: {recovery_error}")
+
+    def _empty_refine_constraint_state_snapshot(self) -> Dict[str, Dict]:
+        """Return an empty refine-constraint snapshot with the expected schema."""
+        return {
+            "surface": {},
+            "hull_group": {},
+            "hull_segments": {},
+            "intersection_groups": {},
+            "intersection_segments": {},
+            "well": {},
+            "well_segments": {},
+        }
+
+    def _normalize_refine_constraint_state_snapshot(self, snapshot: Any) -> Dict[str, Dict]:
+        """Normalize persisted refine-constraint state into a safe dict structure."""
+        base = self._empty_refine_constraint_state_snapshot()
+        if not isinstance(snapshot, dict):
+            return base
+
+        for key in base.keys():
+            value = snapshot.get(key, {})
+            if isinstance(value, dict):
+                base[key] = value
+            else:
+                base[key] = {}
+        return base
+
+    def _has_refine_constraint_snapshot_content(self, snapshot: Dict[str, Dict]) -> bool:
+        """Return True when a refine-constraint snapshot actually stores any state."""
+        if not isinstance(snapshot, dict):
+            return False
+        return any(bool(snapshot.get(key, {})) for key in self._empty_refine_constraint_state_snapshot().keys())
+
+    def _get_refine_constraint_state_for_persistence(self) -> Dict[str, Dict]:
+        """
+        Collect refine-constraint selections for save/load persistence.
+        If the tree is not currently populated, fallback to the last loaded snapshot.
+        """
+        tree = getattr(self, "refine_constraint_tree", None)
+        if tree and tree.topLevelItemCount() > 0:
+            snapshot = self._capture_refine_constraint_state_snapshot()
+        else:
+            snapshot = self._normalize_refine_constraint_state_snapshot(
+                getattr(self, "_pending_refine_constraint_state_snapshot", None)
+            )
+            if not self._has_refine_constraint_snapshot_content(snapshot):
+                snapshot = self._normalize_refine_constraint_state_snapshot(
+                    getattr(self, "_saved_refine_constraint_state_snapshot", None)
+                )
+
+        self._saved_refine_constraint_state_snapshot = snapshot
+        return snapshot
+
+    def _build_refined_intersections_visualization_map(self, intersections_map: Dict[Any, List[Dict]]) -> Dict[int, List[Dict]]:
+        """
+        Build refined_intersections_for_visualization from datasets_intersections.
+        Used when loading older projects that do not store visualization intersection mapping.
+        """
+        rebuilt: Dict[int, List[Dict]] = {}
+        if not isinstance(intersections_map, dict):
+            return rebuilt
+
+        for intersections_list in intersections_map.values():
+            if not isinstance(intersections_list, list):
+                continue
+
+            for inter in intersections_list:
+                if not isinstance(inter, dict):
+                    continue
+
+                raw_id1 = inter.get("dataset_id1")
+                raw_id2 = inter.get("dataset_id2")
+                try:
+                    dataset_id1 = int(raw_id1)
+                except Exception:
+                    dataset_id1 = raw_id1
+                try:
+                    dataset_id2 = int(raw_id2)
+                except Exception:
+                    dataset_id2 = raw_id2
+
+                points = inter.get("points", [])
+                copied_points = []
+                if isinstance(points, list):
+                    for p in points:
+                        if isinstance(p, (list, tuple)):
+                            copied_points.append(list(p))
+                        else:
+                            copied_points.append(p)
+                else:
+                    copied_points = points
+
+                entry = {
+                    "dataset_id1": dataset_id1,
+                    "dataset_id2": dataset_id2,
+                    "is_polyline_mesh": bool(inter.get("is_polyline_mesh", False)),
+                    "points": copied_points,
+                }
+
+                for vis_key in (dataset_id1, dataset_id2):
+                    try:
+                        vis_idx = int(vis_key)
+                    except Exception:
+                        continue
+
+                    if vis_idx not in rebuilt:
+                        rebuilt[vis_idx] = []
+
+                    duplicate = False
+                    for existing in rebuilt[vis_idx]:
+                        if (
+                            existing.get("dataset_id1") == entry["dataset_id1"]
+                            and existing.get("dataset_id2") == entry["dataset_id2"]
+                            and existing.get("is_polyline_mesh") == entry["is_polyline_mesh"]
+                            and existing.get("points") == entry["points"]
+                        ):
+                            duplicate = True
+                            break
+                    if not duplicate:
+                        rebuilt[vis_idx].append(entry.copy())
+
+        return rebuilt
+
+    def _restore_refine_constraints_after_project_load(self):
+        """
+        Rebuild Step 6 constraint tree from loaded data and re-apply saved selections.
+        This allows loading from any tab without rerunning refinement.
+        """
+        tree = getattr(self, "refine_constraint_tree", None)
+        if not tree:
+            return
+
+        has_intersections = bool(getattr(self, "refined_intersections_for_visualization", {}))
+        has_hulls = any(
+            ds.get("type") not in ("WELL", "POLYLINE")
+            and ds.get("hull_points") is not None
+            and len(ds.get("hull_points")) >= 3
+            for ds in getattr(self, "datasets", [])
+        )
+        has_wells = any(
+            ds.get("type") == "WELL"
+            and ((ds.get("refined_well_points") is not None and len(ds.get("refined_well_points")) >= 2)
+                 or (ds.get("points") is not None and len(ds.get("points")) >= 2))
+            for ds in getattr(self, "datasets", [])
+        )
+
+        if not (has_intersections or has_hulls or has_wells):
+            logger.info("Skipping refine constraint tree restore: no compatible refined data found")
+            return
+
+        try:
+            self._populate_refine_constraint_tree()
+            self._refresh_segment_map_from_tree()
+            self._populate_surface_selector()
+            self._saved_refine_constraint_state_snapshot = self._capture_refine_constraint_state_snapshot()
+            logger.info("Restored refine constraint tree state from project file")
+        except Exception as e:
+            logger.warning(f"Failed to restore refine constraint tree state: {e}", exc_info=True)
     
     def _clear_visualizations(self):
         """Clear all visualizations"""
@@ -23583,7 +23774,11 @@ class MeshItWorkflowGUI(QMainWindow):
             return
 
         tree: QTreeWidget = self.refine_constraint_tree
-        state_snapshot = self._capture_refine_constraint_state_snapshot()
+        pending_snapshot = self._normalize_refine_constraint_state_snapshot(
+            getattr(self, "_pending_refine_constraint_state_snapshot", None)
+        )
+        use_pending_snapshot = self._has_refine_constraint_snapshot_content(pending_snapshot)
+        state_snapshot = pending_snapshot if use_pending_snapshot else self._capture_refine_constraint_state_snapshot()
         tree.clear()
         tree.blockSignals(True)
 
@@ -24053,6 +24248,9 @@ class MeshItWorkflowGUI(QMainWindow):
         self._sync_refine_tree_parent_states_from_children()
         tree.expandAll()
         tree.blockSignals(False)
+        if use_pending_snapshot:
+            self._pending_refine_constraint_state_snapshot = self._empty_refine_constraint_state_snapshot()
+        self._saved_refine_constraint_state_snapshot = self._capture_refine_constraint_state_snapshot()
         logger.info("Segment-level constraint tree populated (intersection segments between TRIPLE_POINTs and endpoints, wells included).")
 
     def _has_custom_refine_constraint_selection(self) -> bool:
@@ -24084,15 +24282,7 @@ class MeshItWorkflowGUI(QMainWindow):
         Capture current Step 6 tree states so they can be restored after rebuild.
         Uses stable structural keys (surface/line/segment order).
         """
-        snapshot = {
-            "surface": {},
-            "hull_group": {},
-            "hull_segments": {},
-            "intersection_groups": {},
-            "intersection_segments": {},
-            "well": {},
-            "well_segments": {},
-        }
+        snapshot = self._empty_refine_constraint_state_snapshot()
         tree = getattr(self, "refine_constraint_tree", None)
         if not tree:
             return snapshot
