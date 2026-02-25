@@ -19504,6 +19504,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 'mesh_center': self.tetrahedral_mesh.center
             }
         self._add_fault_surfaces_to_plotter(plotter, render_style, cmap, clip_info, line_width)
+        self._add_wells_to_export_plotter(plotter, render_style, clip_info, line_width)
         
         # Camera view
         view_preset = self.fig_view_preset.currentText()
@@ -19734,6 +19735,125 @@ class MeshItWorkflowGUI(QMainWindow):
             except Exception as e:
                 logger.warning(f"Failed to create fault mesh for marker {marker}: {e}")
                 continue
+
+    def _add_wells_to_export_plotter(self, plotter, render_style, clip_info=None, line_width=2.0):
+        """Add well polylines to publication/export plotter using final PLC edges."""
+        import pyvista as pv
+
+        # Source priority: final PLC edges -> persisted TetGen input -> current tree selection.
+        well_data = self._build_well_data_from_plc_edges()
+        if not well_data:
+            well_data = self._build_well_data_from_last_tetgen_input()
+        if not well_data:
+            well_data = self._get_selected_well_viz_data()
+        if not well_data:
+            logger.debug("No well data available for figure export")
+            return
+
+        selected_well_idx = None
+        try:
+            material_name = self.tetra_material_combo.currentText() if hasattr(self, 'tetra_material_combo') else ""
+            if "Well ID" in material_name:
+                match = re.search(r'Well ID (\d+)', material_name)
+                if match:
+                    selected_well_idx = int(match.group(1)) - 2
+        except Exception:
+            selected_well_idx = None
+
+        def _coord(pt):
+            if hasattr(pt, 'x'):
+                return [float(pt.x), float(pt.y), float(pt.z)]
+            return [float(pt[0]), float(pt[1]), float(pt[2])]
+
+        # Consistent, high-contrast palette for wells in exported figures.
+        well_colors = [
+            (1.0, 0.0, 1.0),  # magenta
+            (0.0, 1.0, 1.0),  # cyan
+            (1.0, 0.55, 0.0), # orange
+            (0.5, 1.0, 0.0),  # lime
+            (1.0, 0.2, 0.6),  # pink
+            (1.0, 1.0, 0.0),  # yellow
+        ]
+
+        wells_drawn = 0
+        for color_i, (w_idx, info) in enumerate(sorted(well_data.items())):
+            if selected_well_idx is not None and w_idx != selected_well_idx:
+                continue
+
+            edges = info.get("edges", []) or []
+            if not edges:
+                continue
+
+            pts_coords = []
+            pts_key_map = {}
+            lines_list = []
+
+            for edge in edges:
+                if edge is None or len(edge) < 2:
+                    continue
+                idxs = []
+                for ep in edge[:2]:
+                    try:
+                        c = _coord(ep)
+                    except Exception:
+                        c = None
+                    if c is None:
+                        continue
+                    k = (round(c[0], 7), round(c[1], 7), round(c[2], 7))
+                    if k not in pts_key_map:
+                        pts_key_map[k] = len(pts_coords)
+                        pts_coords.append(c)
+                    idxs.append(pts_key_map[k])
+                if len(idxs) == 2 and idxs[0] != idxs[1]:
+                    lines_list.append([2, idxs[0], idxs[1]])
+
+            if not pts_coords or not lines_list:
+                continue
+
+            pts_arr = np.asarray(pts_coords, dtype=np.float64)
+            lines_arr = np.hstack(lines_list).astype(np.int64)
+            poly = pv.PolyData(pts_arr)
+            poly.lines = lines_arr
+
+            # Apply clipping consistently with volume/fault export.
+            if clip_info is not None:
+                axis = clip_info['axis']
+                value = clip_info['value']
+                mesh_center = clip_info['mesh_center']
+                normal = {'x': [1, 0, 0], 'y': [0, 1, 0], 'z': [0, 0, 1]}[axis]
+                origin = [
+                    value if axis == 'x' else mesh_center[0],
+                    value if axis == 'y' else mesh_center[1],
+                    value if axis == 'z' else mesh_center[2]
+                ]
+                try:
+                    poly = poly.clip(normal=normal, origin=origin)
+                except Exception as e:
+                    logger.debug(f"Well clipping failed for export (well {w_idx}): {e}")
+
+            if poly is None or poly.n_points < 2:
+                continue
+            n_lines = getattr(poly, "n_lines", 0)
+            if n_lines == 0 and poly.n_cells == 0:
+                continue
+
+            well_name = info.get('name', f'Well_{w_idx}')
+            well_color = well_colors[color_i % len(well_colors)]
+            tube_width = max(float(line_width) * 1.8, 4.0)
+
+            # Keep wells as strong line overlays regardless of surface render style.
+            plotter.add_mesh(
+                poly,
+                color=well_color,
+                line_width=tube_width,
+                opacity=0.98,
+                render_lines_as_tubes=True,
+                label=well_name,
+            )
+            wells_drawn += 1
+
+        if wells_drawn > 0:
+            logger.info(f"Added {wells_drawn} well polyline(s) to figure export")
     
     def _add_material_labels_to_plotter(self, plotter, mesh, text_color):
         """Add material/surface labels to the plotter."""
