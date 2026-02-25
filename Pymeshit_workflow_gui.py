@@ -2514,11 +2514,45 @@ class MeshItWorkflowGUI(QMainWindow):
         clear_all_action.setStatusTip("Remove all loaded datasets")
         clear_all_action.triggered.connect(self.clear_all_datasets)
 
+        # --- Tools Menu ---
+        tools_menu = menu_bar.addMenu("&Tools")
+        compact_2d_action = QAction("2D Mesh (&Compact)...", self)
+        compact_2d_action.setStatusTip("Open the compact one-click 2D meshing window")
+        compact_2d_action.triggered.connect(self._open_compact_2d_mesh_window)
+        tools_menu.addAction(compact_2d_action)
+
         # --- Help Menu ---
         help_menu = menu_bar.addMenu("&Help")
         about_action = help_menu.addAction("&About")
         about_action.setStatusTip("Show information about the application")
         about_action.triggered.connect(self._show_about)
+    def _open_compact_2d_mesh_window(self):
+        """Open/reuse the compact one-click 2D meshing popup window."""
+        try:
+            from Pymeshit_2d_compact_gui import TwoDCompactMeshWindow
+        except Exception as e:
+            logger.error(f"Failed to import compact 2D GUI: {e}", exc_info=True)
+            QMessageBox.critical(
+                self,
+                "2D Compact Window Error",
+                f"Could not open compact 2D mesh window:\n{e}",
+            )
+            return
+
+        try:
+            window = getattr(self, "_compact_2d_window", None)
+            if window is None:
+                window = TwoDCompactMeshWindow(self)
+                self._compact_2d_window = window
+            window.show()
+            window.raise_()
+            window.activateWindow()
+        except RuntimeError:
+            window = TwoDCompactMeshWindow(self)
+            self._compact_2d_window = window
+            window.show()
+            window.raise_()
+            window.activateWindow()
     def load_well_file(self):
         """Load a single well (polyline) file. Wells are 1D and not triangulated."""
         self.statusBar().showMessage("Loading well file...")

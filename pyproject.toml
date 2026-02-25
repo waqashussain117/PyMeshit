@@ -33,6 +33,7 @@ dependencies = [
     "numpy>=1.20.0",
     "scipy>=1.7.0",
     "triangle",
+    "shapely>=2.0.0",
     "matplotlib>=3.3.0",
     "PySide6>=6.0.0",
     "pyvista>=0.30.0",
@@ -50,4 +51,4 @@ meshit-gui = "Pymeshit:main_wrapper"
 [tool.setuptools]
 packages = ["Pymeshit"]
 include-package-data = true
-py-modules = ["main", "Pymeshit_workflow_gui"]
+py-modules = ["main", "Pymeshit_workflow_gui", "Pymeshit_2d_compact_gui"]
