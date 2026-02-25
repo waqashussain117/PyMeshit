@@ -745,6 +745,7 @@ class MeshItWorkflowGUI(QMainWindow):
         self.refine_mesh_plotter = None
         self.refine_mesh_viz_frame = None # Add this line for consistency
         self.tetra_materials: list[dict] = []     # [{name:str, locations:[[x,y,z]…], attribute:int}, …]
+        self._last_tetgen_well_data: Dict[int, Dict[str, Any]] = {}
 
         # Create menu bar
         self._create_menu_bar()
@@ -6586,6 +6587,12 @@ class MeshItWorkflowGUI(QMainWindow):
         including segments that are checked (selected) in the tree. Returns
         an empty dict if no constraint tree exists yet.
         """
+        # Keep map selection flags aligned with the current tree checkboxes.
+        try:
+            self._refresh_segment_map_from_tree()
+        except Exception:
+            pass
+
         seg_map = getattr(self, "_refine_segment_map", None)
         if not seg_map:
             return {}
@@ -16337,6 +16344,109 @@ class MeshItWorkflowGUI(QMainWindow):
 
         except Exception as e:
             logger.error(f"Error refreshing tetrahedral visualization: {e}")
+
+    def _build_well_data_from_last_tetgen_input(self) -> dict:
+        """
+        Build normalized well-edge data from the exact payload used for TetGen.
+        Returns {well_idx: {'edges': [(p1, p2), ...], 'name': str, 'marker': int}}.
+        """
+        raw_data = getattr(self, "_last_tetgen_well_data", None) or {}
+        if not raw_data:
+            return {}
+
+        normalized = {}
+        for raw_idx, info in raw_data.items():
+            try:
+                w_idx = int(raw_idx)
+            except Exception:
+                continue
+
+            edges = []
+            for edge_pts in info.get("edges", []) or []:
+                if edge_pts is None or len(edge_pts) < 2:
+                    continue
+                edges.append((edge_pts[0], edge_pts[1]))
+
+            if not edges:
+                pts = info.get("points", []) or []
+                for i in range(len(pts) - 1):
+                    edges.append((pts[i], pts[i + 1]))
+
+            if not edges:
+                continue
+
+            ds_name = self.datasets[w_idx].get("name", f"Well_{w_idx}") if 0 <= w_idx < len(self.datasets) else f"Well_{w_idx}"
+            normalized[w_idx] = {
+                "edges": edges,
+                "name": info.get("name", ds_name),
+                "marker": int(info.get("marker", w_idx + 2)),
+            }
+
+        return normalized
+
+    def _build_well_data_from_plc_edges(self) -> dict:
+        """
+        Build well-edge data from the final PLC passed to TetGen.
+        This is the exact post-constraint, post-snapping geometry.
+        """
+        gen = getattr(self, "tetra_mesh_generator", None)
+        if gen is None:
+            return {}
+
+        edges = getattr(gen, "plc_edge_constraints", None)
+        markers = getattr(gen, "plc_edge_markers", None)
+        vertices = getattr(gen, "plc_vertices", None)
+        if edges is None or markers is None or vertices is None:
+            return {}
+
+        try:
+            edge_arr = np.asarray(edges, dtype=np.int64)
+            marker_arr = np.asarray(markers, dtype=np.int64).reshape(-1)
+            vert_arr = np.asarray(vertices, dtype=np.float64)
+        except Exception:
+            return {}
+
+        if edge_arr.ndim != 2 or edge_arr.shape[1] != 2 or len(edge_arr) == 0:
+            return {}
+        if marker_arr.shape[0] != edge_arr.shape[0]:
+            return {}
+        if vert_arr.ndim != 2 or vert_arr.shape[1] < 3 or len(vert_arr) == 0:
+            return {}
+
+        marker_name_map = {}
+        for raw_idx, info in (getattr(self, "_last_tetgen_well_data", None) or {}).items():
+            try:
+                fallback_widx = int(raw_idx)
+                mk = int(info.get("marker", fallback_widx + 2))
+            except Exception:
+                continue
+            marker_name_map[mk] = info.get("name", f"Well_{fallback_widx}")
+
+        well_data = {}
+        for i, (edge, marker) in enumerate(zip(edge_arr, marker_arr)):
+            marker = int(marker)
+            # C++ convention: wells start from marker 2; ignore non-well markers.
+            if marker < 2 or marker >= 1000:
+                continue
+
+            a, b = int(edge[0]), int(edge[1])
+            if a < 0 or b < 0 or a >= len(vert_arr) or b >= len(vert_arr) or a == b:
+                continue
+
+            w_idx = marker - 2
+            if w_idx not in well_data:
+                ds_name = self.datasets[w_idx].get("name", f"Well_{w_idx}") if 0 <= w_idx < len(self.datasets) else f"Well_{w_idx}"
+                well_data[w_idx] = {
+                    "edges": [],
+                    "name": marker_name_map.get(marker, ds_name),
+                    "marker": marker,
+                }
+
+            p1 = vert_arr[a, :3].tolist()
+            p2 = vert_arr[b, :3].tolist()
+            well_data[w_idx]["edges"].append((p1, p2))
+
+        return well_data
     
     def _add_wells_to_tetra_visualization(self):
         """
@@ -16364,7 +16474,12 @@ class MeshItWorkflowGUI(QMainWindow):
                     selected_well_marker = int(match.group(1))
                     selected_well_idx = selected_well_marker - 2
 
-            sel_wd = self._get_selected_well_viz_data()
+            # Prefer the final PLC edges (exact TetGen input), then UI selections.
+            sel_wd = self._build_well_data_from_plc_edges()
+            if not sel_wd:
+                sel_wd = self._get_selected_well_viz_data()
+            if not sel_wd:
+                sel_wd = self._build_well_data_from_last_tetgen_input()
             if not sel_wd:
                 return
 
@@ -16525,7 +16640,10 @@ class MeshItWorkflowGUI(QMainWindow):
             holes = self._collect_holes_from_constraint_tree()
 
             _progress_step(2, "Collecting well edge constraints...")
+            self._last_tetgen_well_data = {}
             well_data = self._collect_well_data_for_tetgen()
+            if well_data:
+                self._last_tetgen_well_data = well_data
 
             _progress_step(3, "Building TetGen input model...")
             self.tetra_mesh_generator = TetrahedralMeshGenerator(
@@ -16693,6 +16811,12 @@ class MeshItWorkflowGUI(QMainWindow):
         Returns:
             dict: {well_idx: {'points': [], 'edges': [], 'marker': int, 'name': str}, ...}
         """
+        # Ensure latest checkbox selections are reflected in segment map.
+        try:
+            self._refresh_segment_map_from_tree()
+        except Exception:
+            pass
+
         well_data = {}
         seg_map = getattr(self, "_refine_segment_map", None)
 
@@ -17515,11 +17639,16 @@ class MeshItWorkflowGUI(QMainWindow):
             
             general_stats = [
                 ("Number of Points", f"{stats['n_points']:,}"),
-                ("Number of Elements (Total)", f"{stats['n_cells']:,}"),
-                ("0D Elements (Points)", f"{stats['n_0d']:,}" if stats['n_0d'] > 0 else "-"),
-                ("1D Elements (Lines)", f"{stats['n_1d']:,}" if stats['n_1d'] > 0 else "-"),
-                ("2D Elements (Triangles)", f"{stats['n_2d']:,}" if stats['n_2d'] > 0 else "-"),
-                ("3D Elements (Tetrahedra)", f"{stats['n_3d']:,}" if stats['n_3d'] > 0 else "-"),
+                ("3D Cells in Grid", f"{stats['n_cells']:,}"),
+                ("0D Entities (Points)", f"{stats['n_0d']:,}"),
+                ("1D Entities (Well Edges)", f"{stats['n_1d']:,}"),
+                ("2D Entities (Fault Triangles)", f"{stats['n_2d']:,}"),
+                ("3D Elements (Tetrahedra)", f"{stats['n_3d']:,}"),
+                ("Wells (Count)", f"{stats.get('n_wells', 0):,}"),
+                ("Fault Surfaces (Count)", f"{stats.get('n_faults', 0):,}"),
+                ("Quality Avg (Radius-Edge)", f"{stats['quality_avg']:.6g}" if stats.get('quality_avg') is not None else "-"),
+                ("Quality Min (Radius-Edge)", f"{stats['quality_min']:.6g}" if stats.get('quality_min') is not None else "-"),
+                ("Quality Max (Radius-Edge)", f"{stats['quality_max']:.6g}" if stats.get('quality_max') is not None else "-"),
             ]
             
             general_table.setRowCount(len(general_stats))
@@ -17529,7 +17658,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 general_table.setItem(row, 1, item)
             
-            general_table.setMaximumHeight(200)
+            general_table.setMaximumHeight(320)
             general_layout.addWidget(general_table)
             main_layout.addWidget(general_group)
             
@@ -17597,115 +17726,330 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.error(f"Failed to show mesh statistics: {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Failed to generate mesh statistics:\n{str(e)}")
     
-    def _calculate_mesh_statistics(self, mesh) -> dict:
-        """Calculate detailed statistics from the tetrahedral mesh."""
-        import numpy as np
-        
-        stats = {
-            'n_points': mesh.n_points,
-            'n_cells': mesh.n_cells,
-            'n_0d': 0,
-            'n_1d': 0,
-            'n_2d': 0,
-            'n_3d': 0,
-            'material_stats': []
+    def _coord_key_for_stats(self, point, precision: int = 9):
+        """Convert a point-like object to a rounded coordinate key."""
+        try:
+            if hasattr(point, "x"):
+                x, y, z = float(point.x), float(point.y), float(point.z)
+            elif isinstance(point, (list, tuple, np.ndarray)) and len(point) >= 3:
+                x, y, z = float(point[0]), float(point[1]), float(point[2])
+            else:
+                return None
+            return (round(x, precision), round(y, precision), round(z, precision))
+        except Exception:
+            return None
+
+    def _collect_well_statistics(self) -> List[Dict[str, Any]]:
+        """
+        Collect per-well 1D statistics.
+        Uses the exact TetGen input wells when available.
+        """
+        source_data = self._build_well_data_from_plc_edges()
+        if not source_data:
+            source_data = self._build_well_data_from_last_tetgen_input()
+        if not source_data:
+            source_data = self._get_selected_well_viz_data()
+
+        if not source_data:
+            source_data = {}
+            selected_wells = self._get_selected_well_indices() if hasattr(self, "_get_selected_well_indices") else set()
+            for well_idx in sorted(selected_wells):
+                if well_idx < 0 or well_idx >= len(self.datasets):
+                    continue
+                ds = self.datasets[well_idx]
+                if ds.get("type") != "WELL":
+                    continue
+                pts = ds.get("refined_well_points") or ds.get("points") or []
+                if len(pts) < 2:
+                    continue
+                source_data[well_idx] = {
+                    "name": ds.get("name", f"Well_{well_idx}"),
+                    "marker": well_idx + 2,
+                    "edges": [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)],
+                }
+
+        well_stats = []
+        for w_idx, info in sorted(source_data.items()):
+            try:
+                w_idx_int = int(w_idx)
+            except Exception:
+                continue
+
+            edge_keys = set()
+            point_keys = set()
+            edges = info.get("edges", []) or []
+
+            for edge_pts in edges:
+                if edge_pts is None or len(edge_pts) < 2:
+                    continue
+                p1 = self._coord_key_for_stats(edge_pts[0])
+                p2 = self._coord_key_for_stats(edge_pts[1])
+                if p1 is None or p2 is None:
+                    continue
+                point_keys.add(p1)
+                point_keys.add(p2)
+                if p1 != p2:
+                    edge_keys.add(tuple(sorted((p1, p2))))
+
+            if not edge_keys:
+                continue
+
+            well_stats.append({
+                "well_idx": w_idx_int,
+                "marker": int(info.get("marker", w_idx_int + 2)),
+                "name": info.get("name", f"Well_{w_idx_int}"),
+                "n_edges": int(len(edge_keys)),
+                "n_points": int(len(point_keys)),
+            })
+
+        return well_stats
+
+    def _collect_fault_statistics(self) -> List[Dict[str, Any]]:
+        """Collect per-fault 2D face statistics from TetGen markers."""
+        fault_stats = []
+        fault_materials = [m for m in getattr(self, "tetra_materials", []) if str(m.get("type", "")).upper() == "FAULT"]
+        mat_by_marker = {
+            int(m.get("marker")): m
+            for m in fault_materials
+            if m.get("marker") is not None
         }
-        
-        # Count elements by type
-        cell_types = mesh.celltypes
-        
-        # VTK cell types:
-        # 1 = VTK_VERTEX (0D)
-        # 2 = VTK_POLY_VERTEX (0D)
-        # 3 = VTK_LINE (1D)
-        # 4 = VTK_POLY_LINE (1D)
-        # 5 = VTK_TRIANGLE (2D)
-        # 9 = VTK_QUAD (2D)
-        # 10 = VTK_TETRA (3D)
-        # 12 = VTK_HEXAHEDRON (3D)
-        
-        stats['n_0d'] = np.sum((cell_types == 1) | (cell_types == 2))
-        stats['n_1d'] = np.sum((cell_types == 3) | (cell_types == 4))
-        stats['n_2d'] = np.sum((cell_types == 5) | (cell_types == 9) | (cell_types == 7))  # triangle, quad, polygon
-        stats['n_3d'] = np.sum((cell_types == 10) | (cell_types == 12) | (cell_types == 13) | (cell_types == 14))  # tetra, hex, wedge, pyramid
-        
-        # Material statistics
-        if 'MaterialID' in mesh.cell_data:
-            material_ids = mesh.cell_data['MaterialID']
-            unique_materials = np.unique(material_ids)
-            
-            # Get material names from tetra_materials if available
-            material_names = {}
-            material_types = {}
-            if hasattr(self, 'tetra_materials'):
-                for mat in self.tetra_materials:
-                    mat_id = mat.get('attribute', -1)
-                    material_names[mat_id] = mat.get('name', f'Material_{mat_id}')
-                    material_types[mat_id] = mat.get('type', 'FORMATION')
-            
-            for mat_id in sorted(unique_materials):
-                count = np.sum(material_ids == mat_id)
-                
-                # Determine element type for this material
-                mat_mask = material_ids == mat_id
-                mat_cell_types = cell_types[mat_mask]
-                
-                # Check if mostly 2D (fault) or 3D (formation)
-                n_2d_mat = np.sum((mat_cell_types == 5) | (mat_cell_types == 9))
-                n_3d_mat = np.sum((mat_cell_types == 10) | (mat_cell_types == 12))
-                
-                if n_2d_mat > n_3d_mat:
-                    elem_type = "2D (Fault)"
-                elif n_3d_mat > 0:
-                    elem_type = "3D (Formation)"
+
+        tet = getattr(getattr(self, "tetra_mesh_generator", None), "tetgen_object", None)
+        triface_markers = getattr(tet, "triface_markers", None) if tet is not None else None
+        seen_markers = set()
+
+        if triface_markers is not None and len(triface_markers) > 0:
+            marker_arr = np.asarray(triface_markers).reshape(-1)
+            for marker in sorted(int(m) for m in np.unique(marker_arr) if int(m) >= 1000):
+                face_count = int(np.sum(marker_arr == marker))
+                surface_idx = marker - 1000
+                mat = mat_by_marker.get(marker, {})
+                if mat:
+                    fault_name = mat.get("name", f"Fault_{surface_idx}")
+                    mat_id = mat.get("attribute")
+                elif 0 <= surface_idx < len(self.datasets):
+                    fault_name = f"Fault_{self.datasets[surface_idx].get('name', f'Surface_{surface_idx}')}"
+                    mat_id = None
                 else:
-                    elem_type = "Mixed"
-                
-                stats['material_stats'].append({
-                    'id': int(mat_id),
-                    'name': material_names.get(int(mat_id), f'Material_{mat_id}'),
-                    'type': material_types.get(int(mat_id), elem_type),
-                    'count': int(count),
-                    'n_2d': int(n_2d_mat),
-                    'n_3d': int(n_3d_mat)
+                    fault_name = f"Fault_{surface_idx}"
+                    mat_id = None
+
+                fault_stats.append({
+                    "marker": marker,
+                    "surface_idx": surface_idx,
+                    "material_id": int(mat_id) if mat_id is not None else None,
+                    "name": fault_name,
+                    "n_faces": face_count,
                 })
-        
+                seen_markers.add(marker)
+
+        if not fault_stats:
+            for mat in fault_materials:
+                marker = mat.get("marker")
+                if marker is None:
+                    continue
+                marker = int(marker)
+                if marker in seen_markers:
+                    continue
+                fault_stats.append({
+                    "marker": marker,
+                    "surface_idx": int(mat.get("surface_idx", marker - 1000)),
+                    "material_id": int(mat.get("attribute")) if mat.get("attribute") is not None else None,
+                    "name": mat.get("name", f"Fault_{marker - 1000}"),
+                    "n_faces": int(mat.get("face_count", 0)),
+                })
+                seen_markers.add(marker)
+
+        return fault_stats
+
+    def _compute_radius_edge_quality_stats(self, mesh) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """Compute average/min/max tetra quality using radius-edge ratio."""
+        try:
+            cell_types = np.asarray(getattr(mesh, "celltypes", []))
+            tetra_mask = (cell_types == 10) if cell_types.size == mesh.n_cells else None
+
+            if tetra_mask is not None and np.any(tetra_mask):
+                tetra_indices = np.where(tetra_mask)[0]
+                tetra_mesh = mesh.extract_cells(tetra_indices) if len(tetra_indices) < mesh.n_cells else mesh
+            elif mesh.n_cells > 0:
+                tetra_mesh = mesh
+            else:
+                return None, None, None
+
+            quality_mesh = tetra_mesh.compute_cell_quality(quality_measure="radius_ratio")
+            qvals = np.asarray(quality_mesh.cell_data.get("CellQuality", []), dtype=np.float64)
+            qvals = qvals[np.isfinite(qvals)]
+            qvals = qvals[qvals >= 0.0]
+
+            if qvals.size == 0:
+                return None, None, None
+
+            return float(np.mean(qvals)), float(np.min(qvals)), float(np.max(qvals))
+        except Exception as e:
+            logger.warning(f"Radius-edge quality computation failed: {e}")
+            return None, None, None
+
+    def _calculate_mesh_statistics(self, mesh) -> dict:
+        """Calculate detailed statistics for tetra mesh, wells, faults, and quality."""
+        import numpy as np
+
+        if isinstance(mesh, dict):
+            mesh = mesh.get("pyvista_grid")
+        if mesh is None:
+            return {
+                "n_points": 0,
+                "n_cells": 0,
+                "n_0d": 0,
+                "n_1d": 0,
+                "n_2d": 0,
+                "n_3d": 0,
+                "n_wells": 0,
+                "n_faults": 0,
+                "quality_avg": None,
+                "quality_min": None,
+                "quality_max": None,
+                "well_stats": [],
+                "fault_stats": [],
+                "material_stats": [],
+            }
+
+        stats = {
+            "n_points": int(mesh.n_points),
+            "n_cells": int(mesh.n_cells),
+            "n_0d": int(mesh.n_points),  # 0D = points
+            "n_1d": 0,                   # 1D = wells
+            "n_2d": 0,                   # 2D = faults
+            "n_3d": 0,                   # 3D = tetrahedra
+            "n_wells": 0,
+            "n_faults": 0,
+            "quality_avg": None,
+            "quality_min": None,
+            "quality_max": None,
+            "well_stats": [],
+            "fault_stats": [],
+            "material_stats": [],
+        }
+
+        cell_types = np.asarray(getattr(mesh, "celltypes", []))
+        if cell_types.size == mesh.n_cells:
+            stats["n_3d"] = int(np.sum(np.isin(cell_types, (10, 12, 13, 14))))
+        else:
+            stats["n_3d"] = int(mesh.n_cells)
+
+        well_stats = self._collect_well_statistics()
+        stats["well_stats"] = well_stats
+        stats["n_wells"] = len(well_stats)
+        stats["n_1d"] = int(sum(w.get("n_edges", 0) for w in well_stats))
+
+        fault_stats = self._collect_fault_statistics()
+        stats["fault_stats"] = fault_stats
+        stats["n_faults"] = len(fault_stats)
+        stats["n_2d"] = int(sum(f.get("n_faces", 0) for f in fault_stats))
+
+        qavg, qmin, qmax = self._compute_radius_edge_quality_stats(mesh)
+        stats["quality_avg"] = qavg
+        stats["quality_min"] = qmin
+        stats["quality_max"] = qmax
+
+        material_names = {}
+        material_types = {}
+        for mat in getattr(self, "tetra_materials", []):
+            mat_id = mat.get("attribute")
+            if mat_id is None:
+                continue
+            mat_id = int(mat_id)
+            material_names[mat_id] = mat.get("name", f"Material_{mat_id}")
+            material_types[mat_id] = mat.get("type", "FORMATION")
+
+        if hasattr(mesh, "cell_data") and "MaterialID" in mesh.cell_data:
+            material_ids = np.asarray(mesh.cell_data["MaterialID"])
+            for mat_id in sorted(int(v) for v in np.unique(material_ids)):
+                mat_mask = material_ids == mat_id
+                count = int(np.sum(mat_mask))
+                mat_cell_types = cell_types[mat_mask] if cell_types.size == material_ids.size else np.asarray([])
+                n_1d_mat = int(np.sum(np.isin(mat_cell_types, (3, 4)))) if mat_cell_types.size else 0
+                n_2d_mat = int(np.sum(np.isin(mat_cell_types, (5, 7, 9)))) if mat_cell_types.size else 0
+                n_3d_mat = int(np.sum(np.isin(mat_cell_types, (10, 12, 13, 14)))) if mat_cell_types.size else count
+
+                inferred_type = "FORMATION"
+                if n_2d_mat > n_3d_mat:
+                    inferred_type = "FAULT"
+                elif n_1d_mat > 0 and n_3d_mat == 0 and n_2d_mat == 0:
+                    inferred_type = "WELL"
+
+                stats["material_stats"].append({
+                    "id": mat_id,
+                    "name": material_names.get(mat_id, f"Material_{mat_id}"),
+                    "type": material_types.get(mat_id, inferred_type),
+                    "count": count,
+                    "n_1d": n_1d_mat,
+                    "n_2d": n_2d_mat,
+                    "n_3d": n_3d_mat,
+                })
+
+        existing_fault_rows = {(str(m.get("id")), str(m.get("type", "")).upper()) for m in stats["material_stats"]}
+        for fault in fault_stats:
+            fault_id = fault["material_id"] if fault["material_id"] is not None else f"F{fault['marker']}"
+            key = (str(fault_id), "FAULT (2D)")
+            if key in existing_fault_rows:
+                continue
+            stats["material_stats"].append({
+                "id": fault_id,
+                "name": fault["name"],
+                "type": "FAULT (2D)",
+                "count": int(fault["n_faces"]),
+                "n_1d": 0,
+                "n_2d": int(fault["n_faces"]),
+                "n_3d": 0,
+            })
+            existing_fault_rows.add(key)
+
+        for well in well_stats:
+            stats["material_stats"].append({
+                "id": f"W{well['marker']}",
+                "name": well["name"],
+                "type": "WELL (1D)",
+                "count": int(well["n_edges"]),
+                "n_1d": int(well["n_edges"]),
+                "n_2d": 0,
+                "n_3d": 0,
+            })
+
+        stats["material_stats"].sort(key=lambda m: (str(m.get("type", "")), str(m.get("name", ""))))
         return stats
-    
+
     def _generate_mesh_summary(self, stats: dict) -> str:
         """Generate a human-readable summary of the mesh statistics."""
         lines = []
-        
-        lines.append(f"The mesh consists of approximately {stats['n_cells']:,} elements.")
-        lines.append("")
-        
-        # Breakdown by element type
-        if stats['n_2d'] > 0:
-            lines.append(f"• {stats['n_2d']:,} triangles represent fault surfaces")
-        if stats['n_3d'] > 0:
-            lines.append(f"• {stats['n_3d']:,} tetrahedra represent volumetric regions")
-        
-        lines.append("")
-        
-        # Breakdown by material
-        material_stats = stats.get('material_stats', [])
-        
-        # Separate faults and formations
-        faults = [m for m in material_stats if 'FAULT' in m.get('type', '').upper() or m.get('n_2d', 0) > m.get('n_3d', 0)]
-        formations = [m for m in material_stats if m not in faults]
-        
-        if faults:
-            fault_total = sum(f['count'] for f in faults)
-            lines.append(f"Fault surfaces ({len(faults)} faults): {fault_total:,} elements")
-            for f in faults:
-                lines.append(f"  - {f['name']}: {f['count']:,} triangles")
-        
-        if formations:
-            form_total = sum(f['count'] for f in formations)
-            lines.append(f"Geological units ({len(formations)} formations): {form_total:,} elements")
-            for f in formations:
-                lines.append(f"  - {f['name']}: {f['count']:,} tetrahedra")
-        
+        lines.append(f"3D tetrahedra: {stats.get('n_3d', 0):,}")
+        lines.append(f"2D fault triangles: {stats.get('n_2d', 0):,} across {stats.get('n_faults', 0)} fault surfaces")
+        lines.append(f"1D well edges: {stats.get('n_1d', 0):,} across {stats.get('n_wells', 0)} wells")
+        lines.append(f"0D points: {stats.get('n_0d', 0):,}")
+
+        qavg = stats.get("quality_avg")
+        qmin = stats.get("quality_min")
+        qmax = stats.get("quality_max")
+        if qavg is not None and qmin is not None and qmax is not None:
+            lines.append("")
+            lines.append("Radius-edge ratio quality (tetrahedra):")
+            lines.append(f"  Avg: {qavg:.6g}")
+            lines.append(f"  Min: {qmin:.6g}")
+            lines.append(f"  Max: {qmax:.6g}")
+
+        fault_stats = stats.get("fault_stats", [])
+        if fault_stats:
+            lines.append("")
+            lines.append("Fault breakdown:")
+            for fault in fault_stats:
+                lines.append(f"  - {fault['name']}: {fault['n_faces']:,} triangles (marker {fault['marker']})")
+
+        well_stats = stats.get("well_stats", [])
+        if well_stats:
+            lines.append("")
+            lines.append("Well breakdown:")
+            for well in well_stats:
+                lines.append(f"  - {well['name']}: {well['n_edges']:,} edges, {well['n_points']:,} points (marker {well['marker']})")
+
         return "\n".join(lines)
     
     def _save_mesh_statistics(self, stats: dict, summary: str):
@@ -17748,16 +18092,21 @@ class MeshItWorkflowGUI(QMainWindow):
             writer.writerow(["=== General Statistics ==="])
             writer.writerow(["Property", "Value"])
             writer.writerow(["Number of Points", stats['n_points']])
-            writer.writerow(["Number of Elements (Total)", stats['n_cells']])
-            writer.writerow(["0D Elements", stats['n_0d'] if stats['n_0d'] > 0 else "-"])
-            writer.writerow(["1D Elements", stats['n_1d'] if stats['n_1d'] > 0 else "-"])
-            writer.writerow(["2D Elements (Triangles)", stats['n_2d'] if stats['n_2d'] > 0 else "-"])
-            writer.writerow(["3D Elements (Tetrahedra)", stats['n_3d'] if stats['n_3d'] > 0 else "-"])
+            writer.writerow(["3D Cells in Grid", stats['n_cells']])
+            writer.writerow(["0D Entities (Points)", stats['n_0d']])
+            writer.writerow(["1D Entities (Well Edges)", stats['n_1d']])
+            writer.writerow(["2D Entities (Fault Triangles)", stats['n_2d']])
+            writer.writerow(["3D Elements (Tetrahedra)", stats['n_3d']])
+            writer.writerow(["Wells (Count)", stats.get('n_wells', 0)])
+            writer.writerow(["Fault Surfaces (Count)", stats.get('n_faults', 0)])
+            writer.writerow(["Quality Avg (Radius-Edge)", stats['quality_avg'] if stats.get('quality_avg') is not None else "-"])
+            writer.writerow(["Quality Min (Radius-Edge)", stats['quality_min'] if stats.get('quality_min') is not None else "-"])
+            writer.writerow(["Quality Max (Radius-Edge)", stats['quality_max'] if stats.get('quality_max') is not None else "-"])
             writer.writerow([])
             
             # Material statistics
             writer.writerow(["=== Material Statistics ==="])
-            writer.writerow(["Material ID", "Material Name", "Type", "Elements", "2D Elements", "3D Elements"])
+            writer.writerow(["Material ID", "Material Name", "Type", "Elements", "1D Elements", "2D Elements", "3D Elements"])
             
             for mat in stats.get('material_stats', []):
                 writer.writerow([
@@ -17765,9 +18114,22 @@ class MeshItWorkflowGUI(QMainWindow):
                     mat['name'],
                     mat['type'],
                     mat['count'],
+                    mat.get('n_1d', 0),
                     mat.get('n_2d', 0),
                     mat.get('n_3d', 0)
                 ])
+
+            writer.writerow([])
+            writer.writerow(["=== Fault Statistics ==="])
+            writer.writerow(["Marker", "Fault Name", "Triangles"])
+            for fault in stats.get('fault_stats', []):
+                writer.writerow([fault.get('marker'), fault.get('name'), fault.get('n_faces', 0)])
+
+            writer.writerow([])
+            writer.writerow(["=== Well Statistics ==="])
+            writer.writerow(["Marker", "Well Name", "Edges", "Points"])
+            for well in stats.get('well_stats', []):
+                writer.writerow([well.get('marker'), well.get('name'), well.get('n_edges', 0), well.get('n_points', 0)])
     
     def _save_statistics_txt(self, file_path: str, stats: dict, summary: str):
         """Save statistics in text format."""
@@ -17779,20 +18141,38 @@ class MeshItWorkflowGUI(QMainWindow):
             f.write("GENERAL STATISTICS\n")
             f.write("-" * 40 + "\n")
             f.write(f"Number of Points:           {stats['n_points']:>15,}\n")
-            f.write(f"Number of Elements (Total): {stats['n_cells']:>15,}\n")
-            f.write(f"0D Elements:                {stats['n_0d']:>15,}\n" if stats['n_0d'] > 0 else "0D Elements:                              -\n")
-            f.write(f"1D Elements:                {stats['n_1d']:>15,}\n" if stats['n_1d'] > 0 else "1D Elements:                              -\n")
-            f.write(f"2D Elements (Triangles):    {stats['n_2d']:>15,}\n" if stats['n_2d'] > 0 else "2D Elements (Triangles):                  -\n")
-            f.write(f"3D Elements (Tetrahedra):   {stats['n_3d']:>15,}\n" if stats['n_3d'] > 0 else "3D Elements (Tetrahedra):                 -\n")
+            f.write(f"3D Cells in Grid:           {stats['n_cells']:>15,}\n")
+            f.write(f"0D Entities (Points):       {stats['n_0d']:>15,}\n")
+            f.write(f"1D Entities (Well Edges):   {stats['n_1d']:>15,}\n")
+            f.write(f"2D Entities (Fault Tri):    {stats['n_2d']:>15,}\n")
+            f.write(f"3D Elements (Tetrahedra):   {stats['n_3d']:>15,}\n")
+            f.write(f"Wells (Count):              {stats.get('n_wells', 0):>15,}\n")
+            f.write(f"Fault Surfaces (Count):     {stats.get('n_faults', 0):>15,}\n")
+            if stats.get('quality_avg') is not None:
+                f.write(f"Quality Avg (Radius-Edge):  {stats['quality_avg']:>15.6g}\n")
+                f.write(f"Quality Min (Radius-Edge):  {stats['quality_min']:>15.6g}\n")
+                f.write(f"Quality Max (Radius-Edge):  {stats['quality_max']:>15.6g}\n")
             f.write("\n")
             
             f.write("MATERIAL STATISTICS\n")
             f.write("-" * 40 + "\n")
-            f.write(f"{'ID':<6} {'Name':<25} {'Type':<15} {'Elements':>12}\n")
-            f.write("-" * 60 + "\n")
+            f.write(f"{'ID':<10} {'Name':<25} {'Type':<15} {'Elements':>12}\n")
+            f.write("-" * 70 + "\n")
             
             for mat in stats.get('material_stats', []):
-                f.write(f"{mat['id']:<6} {mat['name']:<25} {mat['type']:<15} {mat['count']:>12,}\n")
+                f.write(f"{str(mat['id']):<10} {mat['name']:<25} {mat['type']:<15} {mat['count']:>12,}\n")
+
+            if stats.get('fault_stats'):
+                f.write("\nFAULT STATISTICS\n")
+                f.write("-" * 40 + "\n")
+                for fault in stats['fault_stats']:
+                    f.write(f"  {fault['name']}: {fault['n_faces']:,} triangles (marker {fault['marker']})\n")
+
+            if stats.get('well_stats'):
+                f.write("\nWELL STATISTICS\n")
+                f.write("-" * 40 + "\n")
+                for well in stats['well_stats']:
+                    f.write(f"  {well['name']}: {well['n_edges']:,} edges, {well['n_points']:,} points (marker {well['marker']})\n")
             
             f.write("\n")
             f.write("SUMMARY\n")
@@ -17809,16 +18189,34 @@ class MeshItWorkflowGUI(QMainWindow):
         text_lines.append("=" * 40)
         text_lines.append("")
         text_lines.append(f"Number of Points:           {stats['n_points']:,}")
-        text_lines.append(f"Number of Elements (Total): {stats['n_cells']:,}")
-        text_lines.append(f"0D Elements:                {stats['n_0d']:,}" if stats['n_0d'] > 0 else "0D Elements:                -")
-        text_lines.append(f"1D Elements:                {stats['n_1d']:,}" if stats['n_1d'] > 0 else "1D Elements:                -")
-        text_lines.append(f"2D Elements (Triangles):    {stats['n_2d']:,}" if stats['n_2d'] > 0 else "2D Elements (Triangles):    -")
-        text_lines.append(f"3D Elements (Tetrahedra):   {stats['n_3d']:,}" if stats['n_3d'] > 0 else "3D Elements (Tetrahedra):   -")
+        text_lines.append(f"3D Cells in Grid:           {stats['n_cells']:,}")
+        text_lines.append(f"0D Entities (Points):       {stats['n_0d']:,}")
+        text_lines.append(f"1D Entities (Well Edges):   {stats['n_1d']:,}")
+        text_lines.append(f"2D Entities (Fault Tri):    {stats['n_2d']:,}")
+        text_lines.append(f"3D Elements (Tetrahedra):   {stats['n_3d']:,}")
+        text_lines.append(f"Wells (Count):              {stats.get('n_wells', 0):,}")
+        text_lines.append(f"Fault Surfaces (Count):     {stats.get('n_faults', 0):,}")
+        if stats.get('quality_avg') is not None:
+            text_lines.append(f"Quality Avg (Radius-Edge):  {stats['quality_avg']:.6g}")
+            text_lines.append(f"Quality Min (Radius-Edge):  {stats['quality_min']:.6g}")
+            text_lines.append(f"Quality Max (Radius-Edge):  {stats['quality_max']:.6g}")
         text_lines.append("")
         text_lines.append("MATERIALS:")
         
         for mat in stats.get('material_stats', []):
             text_lines.append(f"  {mat['name']} (ID {mat['id']}): {mat['count']:,} elements ({mat['type']})")
+
+        if stats.get('fault_stats'):
+            text_lines.append("")
+            text_lines.append("FAULTS:")
+            for fault in stats['fault_stats']:
+                text_lines.append(f"  {fault['name']}: {fault['n_faces']:,} triangles (marker {fault['marker']})")
+
+        if stats.get('well_stats'):
+            text_lines.append("")
+            text_lines.append("WELLS:")
+            for well in stats['well_stats']:
+                text_lines.append(f"  {well['name']}: {well['n_edges']:,} edges, {well['n_points']:,} points (marker {well['marker']})")
         
         text_lines.append("")
         text_lines.append("SUMMARY:")
@@ -20498,17 +20896,27 @@ class MeshItWorkflowGUI(QMainWindow):
                         logger.debug(f"Added material from mesh MaterialID: {material_name}")
             
             # *** Add 1D Materials (Wells) - C++ style edgemarkerlist ***
-            selected_wells = self._get_selected_well_indices() if hasattr(self, '_get_selected_well_indices') else set()
+            selected_wells = set()
+            plc_wells = self._build_well_data_from_plc_edges()
+            if plc_wells:
+                selected_wells.update(plc_wells.keys())
+            persisted_wells = self._build_well_data_from_last_tetgen_input()
+            if persisted_wells:
+                selected_wells.update(persisted_wells.keys())
+            if hasattr(self, '_get_selected_well_indices'):
+                selected_wells.update(self._get_selected_well_indices())
+
             if selected_wells:
                 for well_idx in sorted(selected_wells):
-                    if well_idx < len(self.datasets):
-                        ds = self.datasets[well_idx]
-                        well_name = ds.get('name', f'Well_{well_idx}')
-                        # Well marker = well_idx + 2 (C++ style: 0,1 reserved, polylines start at 2)
-                        well_marker = well_idx + 2
-                        dropdown_name = f"{well_name} (Well ID {well_marker})"
-                        self.tetra_material_combo.addItem(dropdown_name)
-                        logger.debug(f"Added well to dropdown: {dropdown_name}")
+                    ds = self.datasets[well_idx] if 0 <= well_idx < len(self.datasets) else {}
+                    plc_info = plc_wells.get(well_idx, {})
+                    persisted_info = persisted_wells.get(well_idx, {})
+                    well_name = plc_info.get('name') or persisted_info.get('name') or ds.get('name', f'Well_{well_idx}')
+                    # Well marker = well_idx + 2 (C++ style: 0,1 reserved, polylines start at 2)
+                    well_marker = int(plc_info.get('marker', persisted_info.get('marker', well_idx + 2)))
+                    dropdown_name = f"{well_name} (Well ID {well_marker})"
+                    self.tetra_material_combo.addItem(dropdown_name)
+                    logger.debug(f"Added well to dropdown: {dropdown_name}")
                         
             self.tetra_material_combo.blockSignals(False)
             logger.info(f"Updated material dropdown with {self.tetra_material_combo.count()} options (incl. {len(selected_wells)} wells)")
@@ -22241,6 +22649,7 @@ class MeshItWorkflowGUI(QMainWindow):
         
         # Reset mesh data
         self.tetrahedral_mesh = None
+        self._last_tetgen_well_data = {}
         
         # Reset statistics
         if hasattr(self, 'tetra_stats_label'):
