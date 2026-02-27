@@ -465,19 +465,26 @@ class DirectTriangleWrapper:
             use_cpp_switches = getattr(self, 'use_cpp_switches', False)
             
             if use_cpp_switches:
-                # C++ MeshIt compatible switches with better area control
-                # Use "pzY" (no boundary insertion) with area constraint
-                # The C++ version actually uses "pzYYu" but 'u' needs external callback
-                area_constraint = self.base_size * self.base_size * 0.5
-                tri_options = f'pzYYa{area_constraint:.8f}'
-                self.logger.info(f"Using C++ MeshIt compatible Triangle options: '{tri_options}'")
+                # C++ MeshIt compatible Triangle options:
+                # - p: Planar Straight Line Graph (PSLG) - uses segments as constraints
+                # - z: Zero-indexed (Python convention)
+                # - Y: Prohibit Steiner points on mesh boundary  
+                # - Y: Prohibit Steiner points on all input segments (preserve segmentation)
+                # - q{angle}: Minimum angle constraint for triangle quality (default 20)
+                # - a{area}: Maximum triangle area constraint
+                #
+                # Area constraint for equilateral triangle with edge = base_size:
+                # Area = (sqrt(3)/4) * edge^2 ≈ 0.433 * edge^2
+                # Using 0.5 * edge^2 allows slightly larger triangles
+                area_constraint = self.base_size * self.base_size * 0.433  # sqrt(3)/4
+                min_angle = max(20.0, min(33.0, self.min_angle))  # Clamp to reasonable range
+                tri_options = f'pzYYq{min_angle:.1f}a{area_constraint:.8f}'
+                self.logger.info(f"C++ MeshIt Triangle: '{tri_options}' (base_size={self.base_size:.2f}, area={area_constraint:.2f})")
             else:
-                # Original fast approach
-                effective_min_angle = self.min_angle
-                area_constraint = self.base_size * self.base_size * 0.5
-                
-                # Simplified options - no expensive callbacks or complex features
-                tri_options = f'pzYYa{area_constraint:.8f}'
+                # Original fast approach with area constraint
+                area_constraint = self.base_size * self.base_size * 0.433
+                min_angle = max(20.0, min(33.0, self.min_angle))
+                tri_options = f'pzYYq{min_angle:.1f}a{area_constraint:.8f}'
         else:
             # Non-uniform approach for complex cases
             hull_points = self._get_hull_points_fast(points)

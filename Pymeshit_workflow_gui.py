@@ -906,15 +906,28 @@ class MeshItWorkflowGUI(QMainWindow):
     def _init_seg_refine_table(self):
         # Table for Segmentation per-surface RefineByLength
         # Uses dataset index as stable key; stores it in Qt.UserRole per row
+        # 
+        # C++ MeshIt Compatibility Note:
+        # The "Length" value here is the LOCAL refinement size at boundary constraints.
+        # This corresponds to C++ MeshIt's 'refinesize' variable.
+        # The global 'meshsize' is calculated automatically from the surface diagonal.
+        # The gradient parameter controls the smooth transition between refinesize and meshsize.
 
         if not hasattr(self, 'seg_length_by_surface'):
             self.seg_length_by_surface = {}
         self._seg_table_updating = False
 
-        self.seg_refine_group = QGroupBox("Per-Surface RefineByLength (Segmentation)")
+        self.seg_refine_group = QGroupBox("Per-Surface RefineByLength (C++ Compatible)")
+        self.seg_refine_group.setToolTip(
+            "Set the local refinement size at boundary constraints.\n"
+            "This corresponds to C++ MeshIt's 'refinesize' parameter.\n"
+            "Smaller values = finer mesh at boundaries.\n"
+            "Interior mesh automatically transitions to coarser elements.\n"
+            "Default: diagonal / 16 (matches C++ MeshIt)"
+        )
         lay = QVBoxLayout(self.seg_refine_group)
         self.seg_refine_table = QTableWidget(0, 2, self.seg_refine_group)
-        self.seg_refine_table.setHorizontalHeaderLabels(["Surface", "Length"])
+        self.seg_refine_table.setHorizontalHeaderLabels(["Surface", "RefineSize"])
         self.seg_refine_table.horizontalHeader().setStretchLastSection(True)
         self.seg_refine_table.verticalHeader().setVisible(False)
         self.seg_refine_table.setEditTriggers(
@@ -1080,6 +1093,101 @@ class MeshItWorkflowGUI(QMainWindow):
         except Exception as e:
             logger.warning(f"Failed to calculate default size for dataset {dataset_index}: {e}")
             return 15.0
+    
+    def _calculate_cpp_mesh_sizes(self, dataset_index: int, user_refine_size: float = None, 
+                                    uniform: bool = True) -> dict:
+        """
+        Calculate C++ MeshIt compatible mesh sizes for triangulation.
+        
+        In C++ MeshIt:
+        - For UNIFORM triangulation (default): meshsize = refinesize
+          This creates triangles that all respect the segment edge length.
+        - For GRADIENT triangulation: meshsize can be larger than refinesize
+          This allows coarser triangles away from constraints.
+        
+        The triunsuitable callback in C++ checks:
+          if (sq_meanlen > sq_meshsize) return 1;  // refine if triangle too big
+        
+        This ensures ALL triangles have edges <= meshsize.
+        
+        Args:
+            dataset_index: Index of the dataset
+            user_refine_size: User-specified refinement size (local constraint size).
+                              If None, uses the value from the segmentation table.
+            uniform: If True (default), mesh_size = refine_size for uniform triangulation.
+                     If False, allows gradient transition to coarser interior.
+        
+        Returns:
+            dict with keys:
+                - 'refine_size': Local refinement size at constraints (user's value)
+                - 'mesh_size': Global maximum mesh size for triangles
+                - 'diagonal': Bounding box diagonal for reference
+        """
+        try:
+            if dataset_index < 0 or dataset_index >= len(self.datasets):
+                return {'refine_size': 15.0, 'mesh_size': 15.0, 'diagonal': 240.0}
+            
+            ds = self.datasets[dataset_index]
+            
+            # Calculate the surface diagonal
+            diagonal = None
+            mesh_data = ds.get('mesh')
+            if mesh_data is not None:
+                bounds = mesh_data.bounds
+                dx = bounds[1] - bounds[0]
+                dy = bounds[3] - bounds[2]
+                dz = bounds[5] - bounds[4]
+                diagonal = np.sqrt(dx**2 + dy**2 + dz**2)
+            
+            if diagonal is None:
+                points = ds.get('points')
+                if points is not None and len(points) > 0:
+                    points_array = np.array(points)
+                    bounds = [
+                        points_array[:, 0].min(), points_array[:, 0].max(),
+                        points_array[:, 1].min(), points_array[:, 1].max(),
+                        points_array[:, 2].min(), points_array[:, 2].max()
+                    ]
+                    dx = bounds[1] - bounds[0]
+                    dy = bounds[3] - bounds[2]
+                    dz = bounds[5] - bounds[4]
+                    diagonal = np.sqrt(dx**2 + dy**2 + dz**2)
+            
+            if diagonal is None or diagonal < 1e-6:
+                diagonal = 240.0  # Fallback
+            
+            # Get user's refinement size (from segmentation table)
+            if user_refine_size is not None:
+                refine_size = float(user_refine_size)
+            else:
+                refine_size = float(self._get_seg_target_length_for_dataset(dataset_index))
+            
+            if refine_size <= 1e-6:
+                refine_size = diagonal / 16.0
+            
+            # C++ MeshIt uniform behavior: meshsize = refinesize
+            # This ensures ALL triangles respect the segment length
+            if uniform:
+                mesh_size = refine_size
+            else:
+                # Gradient mode: allow coarser interior (not typically used in C++ MeshIt)
+                cpp_default_meshsize = diagonal / 16.0
+                mesh_size = max(cpp_default_meshsize, refine_size * 2.5)
+                mesh_size = min(mesh_size, diagonal / 4.0)
+            
+            logger.debug(f"C++ mesh sizes for '{ds.get('name')}': "
+                        f"refine={refine_size:.3f}, mesh={mesh_size:.3f}, "
+                        f"uniform={uniform}, diagonal={diagonal:.3f}")
+            
+            return {
+                'refine_size': refine_size,
+                'mesh_size': mesh_size,
+                'diagonal': diagonal
+            }
+            
+        except Exception as e:
+            logger.warning(f"Failed to calculate C++ mesh sizes for dataset {dataset_index}: {e}")
+            return {'refine_size': 15.0, 'mesh_size': 60.0, 'diagonal': 240.0}
     
     def _calculate_default_size_for_polyline(self, dataset_index: int) -> float:
         """
@@ -9929,14 +10037,37 @@ class MeshItWorkflowGUI(QMainWindow):
             boundary_rot = (R @ boundary_xyz.T).T
             provided_xy = boundary_rot[:, :2]
 
+            # Get C++ compatible mesh sizes
+            # For uniform=True (default): mesh_size = refine_size -> all triangles same size
+            # This matches C++ MeshIt behavior where triunsuitable ensures all triangles
+            # have edges <= meshsize (which equals the segmentation RefineByLength)
             try:
-                base_size = float(self._get_seg_target_length_for_dataset(dataset_index))
-                if base_size <= 1e-6: base_size = 1.0
-            except Exception:
-                base_size = 1.0
+                cpp_sizes = self._calculate_cpp_mesh_sizes(dataset_index, uniform=uniform)
+                refine_size = cpp_sizes['refine_size']
+                mesh_size = cpp_sizes['mesh_size']  # = refine_size when uniform=True
+                logger.info(f"Using C++ sizes: refine={refine_size:.2f}, mesh={mesh_size:.2f}, uniform={uniform}")
+            except Exception as e:
+                logger.warning(f"Could not calculate C++ sizes: {e}, using fallback")
+                refine_size = float(self._get_seg_target_length_for_dataset(dataset_index))
+                if refine_size <= 1e-6: refine_size = 1.0
+                mesh_size = refine_size  # Uniform by default
 
-            # Triangulation (no hull snapping for non-legacy)
-            triangulator = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=base_size)
+            # Triangulation using C++ MeshIt compatible approach:
+            # - base_size = mesh_size (which = refine_size for uniform triangulation)
+            # - Area constraint = 0.5 * mesh_size^2 ensures all triangles respect segment length
+            triangulator = DirectTriangleWrapper(gradient=gradient, min_angle=min_angle, base_size=mesh_size)
+            
+            # Enable C++ compatible switches for triunsuitable-like behavior
+            triangulator.use_cpp_switches = True
+            
+            # For uniform triangulation, we set boundary points as feature points
+            # with the same size as mesh_size - this ensures uniform distribution
+            if len(provided_xy) > 0:
+                boundary_feature_pts = provided_xy.copy()
+                # Use mesh_size (= refine_size for uniform) at all boundary points
+                boundary_feature_sizes = np.full(len(boundary_feature_pts), mesh_size, dtype=np.float64)
+                triangulator.set_feature_points(boundary_feature_pts, boundary_feature_sizes)
+            
             tri_res = triangulator.triangulate(points=provided_xy, segments=boundary_segs, uniform=uniform, create_transition=True)
             if tri_res is None or 'vertices' not in tri_res or 'triangles' not in tri_res:
                 raise ValueError("Triangulation failed.")
