@@ -112,7 +112,48 @@ Typical workflow:
 
 ## Programmatic Usage
 
+PyMeshIt also exposes an experimental headless API for simple batch workflows.
+This is intended for scripted geometry variations where the GUI constraint tree
+would normally be set to "select intersections".
 
+A full notebook-style walkthrough is available in
+[`examples/headless_batch_workflow.ipynb`](examples/headless_batch_workflow.ipynb).
+It includes file upload/path setup, surface role assignment, material seed setup,
+workflow execution, mesh export, and a batch-loop template.
+
+```python
+from Pymeshit import MeshCase, MeshOptions, SurfaceSpec, MaterialSpec, run_mesh_case
+
+case = MeshCase(
+    surfaces=[
+        SurfaceSpec("bottom", bottom_points, role="border", target_size=50.0),
+        SurfaceSpec("top", top_points, role="border", target_size=50.0),
+        SurfaceSpec("fault", fault_points, role="fault", target_size=25.0),
+    ],
+    materials=[
+        MaterialSpec("lower", [0.0, 0.0, -500.0], attribute=1),
+        MaterialSpec("upper", [0.0, 0.0, 500.0], attribute=2),
+    ],
+    options=MeshOptions(
+        constraint_mode="intersections",
+        preserve_boundary_hulls=True,
+        include_hull_fallback_faults_in_volume=False,
+        target_size=50.0,
+        tetgen_switches="pq1.414aAY",
+    ),
+)
+
+result = run_mesh_case(case, output_path="case_001.vtu")
+```
+
+For parameter studies, build one `MeshCase` per geometry configuration and call
+`run_mesh_case()` in a loop. `constraint_mode="intersections"` selects only
+intersection constraints for conforming surface meshing, while
+`preserve_boundary_hulls=True` keeps each surface hull as the outer PLC boundary.
+This matches the GUI "select intersections" workflow used by the benchmark
+cases. If a non-benchmark case still cannot be triangulated from hull plus
+intersections, PyMeshIt keeps a hull-fallback fault surface for inspection but
+leaves it out of TetGen volume constraints by default.
 
 ## Troubleshooting
 

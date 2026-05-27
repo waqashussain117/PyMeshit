@@ -113,7 +113,30 @@ except ImportError:
     HAS_DIRECT_TRIANGLE = False
 
 # Define version
-__version__ = '0.2.0'
+__version__ = '0.8.3'
+
+_HEADLESS_EXPORTS = {
+    'SurfaceSpec',
+    'WellSpec',
+    'MaterialSpec',
+    'MeshOptions',
+    'MeshCase',
+    'MeshResult',
+    'read_points',
+    'run_mesh_case',
+    'generate_tetrahedral_mesh_from_surfaces',
+}
+
+
+def __getattr__(name):
+    """Lazily expose the headless API without making GUI imports heavier."""
+    if name in _HEADLESS_EXPORTS:
+        from . import headless as _headless
+
+        value = getattr(_headless, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Helper functions for adding geometries to a model
 def add_surface_to_model(model, surface):
@@ -224,5 +247,14 @@ __all__ = [
     'get_intersections',
     'get_triple_points',
     'compute_convex_hull',
-    'main_wrapper'
+    'main_wrapper',
+    'SurfaceSpec',
+    'WellSpec',
+    'MaterialSpec',
+    'MeshOptions',
+    'MeshCase',
+    'MeshResult',
+    'read_points',
+    'run_mesh_case',
+    'generate_tetrahedral_mesh_from_surfaces',
 ]
