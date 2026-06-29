@@ -18,9 +18,7 @@ try:
         GradientControl
     )
 except ImportError as e:
-    import sys
-    print(f"Warning: C++ extensions not available: {e}", file=sys.stderr)
-    print("Using Python fallback implementations", file=sys.stderr)
+    _CPP_IMPORT_ERROR = e
 
     # Provide dummy classes when C++ extensions are not available
     class Vector3D:

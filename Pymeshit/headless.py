@@ -140,11 +140,44 @@ class MeshResult:
     def ok(self) -> bool:
         return self.tetra_mesh is not None if self.tetra_generator is not None else not self.failures
 
+    def export_mesh(
+        self,
+        file_path: Union[str, os.PathLike],
+        *,
+        custom_block_names: Optional[Dict[int, str]] = None,
+        custom_sideset_names: Optional[Dict[int, str]] = None,
+        custom_well_names: Optional[Dict[int, str]] = None,
+        well_export_type: str = "Node Sets",
+    ) -> bool:
+        """
+        Export the generated tetrahedral mesh using the same exporter as the GUI.
+
+        EXODUS/NetCDF paths (``.exo``, ``.e``, ``.nc``, ``.nc4``, ``.cdf``) are
+        written with material element blocks, boundary/fault sidesets, and well
+        node sets when that metadata is available from TetGen.
+        """
+        if self.tetra_mesh is None:
+            raise ValueError("No tetrahedral mesh is available to export")
+
+        return _export_tetra_mesh(
+            file_path,
+            self.tetra_mesh,
+            tetra_generator=self.tetra_generator,
+            custom_block_names=custom_block_names,
+            custom_sideset_names=custom_sideset_names,
+            custom_well_names=custom_well_names,
+            well_export_type=well_export_type,
+        )
+
 
 def run_mesh_case(
     mesh_case: MeshCase,
     *,
     output_path: Optional[Union[str, os.PathLike]] = None,
+    custom_block_names: Optional[Dict[int, str]] = None,
+    custom_sideset_names: Optional[Dict[int, str]] = None,
+    custom_well_names: Optional[Dict[int, str]] = None,
+    well_export_type: str = "Node Sets",
 ) -> MeshResult:
     """
     Run a simple headless PyMeshIt workflow.
@@ -154,7 +187,9 @@ def run_mesh_case(
     mesh_case:
         Surfaces, wells, materials, and meshing options.
     output_path:
-        Optional path where the generated tetrahedral mesh should be saved.
+        Optional path where the generated tetrahedral mesh should be saved. The
+        GUI exporter is used when available, so EXODUS/NetCDF outputs include
+        material blocks, sidesets, and well node sets.
 
     Returns
     -------
@@ -267,9 +302,19 @@ def run_mesh_case(
         if tetra_mesh is None:
             failures.append(("tetgen", "TetGen did not produce a mesh"))
         elif output_path is not None:
-            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            tetra_mesh.save(str(output_path))
-            logger.info("Saved headless tetrahedral mesh to %s", output_path)
+            saved = _export_tetra_mesh(
+                output_path,
+                tetra_mesh,
+                tetra_generator=tetra_generator,
+                custom_block_names=custom_block_names,
+                custom_sideset_names=custom_sideset_names,
+                custom_well_names=custom_well_names,
+                well_export_type=well_export_type,
+            )
+            if saved:
+                logger.info("Saved headless tetrahedral mesh to %s", output_path)
+            else:
+                failures.append(("export", f"Failed to export mesh to {output_path}"))
 
     return MeshResult(
         datasets=datasets if options.keep_intermediate else [],
@@ -326,6 +371,40 @@ def generate_tetrahedral_mesh_from_surfaces(
         surface_data=surface_meshes,
     )
     return generator.generate_tetrahedral_mesh(tetgen_switches)
+
+
+def _export_tetra_mesh(
+    file_path: Union[str, os.PathLike],
+    tetra_mesh: Any,
+    *,
+    tetra_generator: Optional[Any] = None,
+    custom_block_names: Optional[Dict[int, str]] = None,
+    custom_sideset_names: Optional[Dict[int, str]] = None,
+    custom_well_names: Optional[Dict[int, str]] = None,
+    well_export_type: str = "Node Sets",
+) -> bool:
+    output = Path(file_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    if tetra_generator is not None and hasattr(tetra_generator, "export_mesh"):
+        return bool(
+            tetra_generator.export_mesh(
+                str(output),
+                tetra_mesh,
+                custom_block_names=custom_block_names,
+                custom_sideset_names=custom_sideset_names,
+                custom_well_names=custom_well_names,
+                well_export_type=well_export_type,
+            )
+        )
+
+    exodus_like = output.suffix.lower() in {".exo", ".e", ".nc", ".nc4", ".cdf"}
+    if exodus_like:
+        logger.error("EXODUS/NetCDF export requires the TetGen generator metadata")
+        return False
+
+    tetra_mesh.save(str(output))
+    return True
 
 
 def read_points(path: Union[str, os.PathLike]) -> np.ndarray:

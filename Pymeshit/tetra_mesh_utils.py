@@ -1523,6 +1523,13 @@ class TetrahedralMeshGenerator:
             num_side_sets = len(sidesets)
             logger.info(f"EXODUS export: {num_side_sets} sidesets for boundary surfaces")
 
+            boundary_node_sets = self._build_boundary_nodesets_from_sidesets(sidesets, tetra_cells)
+            num_boundary_nodesets = len(boundary_node_sets)
+            total_boundary_nodes = sum(ns['n_nodes'] for ns in boundary_node_sets.values())
+            if num_boundary_nodesets > 0:
+                logger.info(f"EXODUS export: {num_boundary_nodesets} boundary node sets derived from sidesets")
+            num_node_sets = num_well_nodesets + num_boundary_nodesets
+
             # Extract connectivity for tetrahedra only
             connectivity = []
             for tetra_cell in tetra_cells:
@@ -1560,7 +1567,7 @@ class TetrahedralMeshGenerator:
                 rootgrp.createDimension('num_nodes', total_points)
                 rootgrp.createDimension('num_elem', total_elements)
                 rootgrp.createDimension('num_el_blk', num_elem_blk)
-                rootgrp.createDimension('num_node_sets', num_well_nodesets)  # Well node sets for GOLEM
+                rootgrp.createDimension('num_node_sets', num_node_sets)
                 rootgrp.createDimension('num_side_sets', num_side_sets)
                 rootgrp.createDimension('num_qa_rec', 1)
                 rootgrp.createDimension('time_step', 1)  # Fixed size for NETCDF3 compatibility
@@ -1671,15 +1678,18 @@ class TetrahedralMeshGenerator:
                         
                         logger.info(f"  Well Block {blk_num}: '{well_name}' - {n_edges} BAR2 elements (shared nodes with mesh)")
                 
-                # ========== WELL NODE SETS (for GOLEM DiracKernels) ==========
-                # CRITICAL FIX: Use mapped_indices to reference existing mesh nodes
-                if export_wells_as_nodesets and num_well_nodesets > 0:
+                # ========== NODE SETS ==========
+                # Well node sets are used for GOLEM DiracKernels. Boundary node
+                # sets mirror sidesets and provide node-based BC handles.
+                if num_node_sets > 0:
                     ns_status = rootgrp.createVariable('ns_status', 'i4', ('num_node_sets',))
                     ns_prop1 = rootgrp.createVariable('ns_prop1', 'i4', ('num_node_sets',))
                     ns_prop1.setncattr('name', 'ID')
                     ns_names = rootgrp.createVariable('ns_names', 'S1', ('num_node_sets', 'len_name'))
-                    
-                    for ns_idx, (well_marker, well_ns) in enumerate(well_node_sets.items()):
+
+                    ns_idx = 0
+
+                    for well_marker, well_ns in well_node_sets.items():
                         well_name = well_ns['name']
                         n_nodes = well_ns['n_nodes']
                         mapped_indices = well_ns['mapped_indices']  # 0-based mesh node indices
@@ -1708,6 +1718,33 @@ class TetrahedralMeshGenerator:
                         dist_fact_ns[:] = np.ones(n_nodes, dtype=np.float64)
                         
                         logger.info(f"  Well Node Set {ns_num}: '{well_name}' - {n_nodes} nodes (shared with mesh, for DiracKernels)")
+                        ns_idx += 1
+
+                    for surface_marker, boundary_ns in boundary_node_sets.items():
+                        ns_name = boundary_ns['name']
+                        n_nodes = boundary_ns['n_nodes']
+                        mapped_indices = boundary_ns['mapped_indices']  # 0-based mesh node indices
+
+                        ns_num = ns_idx + 1
+                        ns_prop1[ns_idx] = int(surface_marker) + 200000
+                        ns_status[ns_idx] = 1
+                        self._write_exodus_string_v2(ns_names, ns_idx, ns_name, 33)
+
+                        rootgrp.createDimension(f'num_nod_ns{ns_num}', n_nodes)
+
+                        node_ns = rootgrp.createVariable(f'node_ns{ns_num}', 'i4', (f'num_nod_ns{ns_num}',))
+                        node_indices = mapped_indices + 1  # Convert 0-based to 1-based
+                        node_ns[:] = node_indices
+
+                        max_node_ref = np.max(node_indices)
+                        if max_node_ref > total_points:
+                            raise ValueError(f"Node set '{ns_name}' references node {max_node_ref} but only {total_points} nodes exist")
+
+                        dist_fact_ns = rootgrp.createVariable(f'dist_fact_ns{ns_num}', 'f8', (f'num_nod_ns{ns_num}',))
+                        dist_fact_ns[:] = np.ones(n_nodes, dtype=np.float64)
+
+                        logger.info(f"  Boundary Node Set {ns_num}: '{ns_name}' - {n_nodes} nodes")
+                        ns_idx += 1
 
                 # ========== SIDESETS ==========
                 if num_side_sets > 0:
@@ -1761,6 +1798,8 @@ class TetrahedralMeshGenerator:
                 logger.info(f"  {total_well_nodes} well nodes in {num_well_nodesets} node sets (shared with mesh, for GOLEM DiracKernels)")
             elif num_well_blk > 0:
                 logger.info(f"  {total_well_edges} well edges in {num_well_blk} BAR2 element blocks (shared nodes with mesh)")
+            if num_boundary_nodesets > 0:
+                logger.info(f"  {total_boundary_nodes} boundary nodes across {num_boundary_nodesets} node sets")
             
             # Clean up custom names after successful export
             self._custom_block_names = {}
@@ -1872,6 +1911,38 @@ class TetrahedralMeshGenerator:
                     bounding_surfaces.append(surface_name)
         
         return bounding_surfaces[:2]  # Return at most 2 surfaces
+
+    def _build_boundary_nodesets_from_sidesets(self, sidesets: Dict, tetra_cells: np.ndarray) -> Dict:
+        """Build node sets from EXODUS sidesets using the same tetra side numbering."""
+        boundary_node_sets = {}
+        side_nodes = {
+            1: (0, 1, 3),  # opposite to c3
+            2: (1, 2, 3),  # opposite to c1
+            3: (0, 2, 3),  # opposite to c2
+            4: (0, 1, 2),  # opposite to c4
+        }
+
+        for surface_marker, sideset_data in sidesets.items():
+            nodes = set()
+            for tetra_idx, side_num in zip(sideset_data.get('elem_list', []), sideset_data.get('side_list', [])):
+                if tetra_idx < 0 or tetra_idx >= len(tetra_cells):
+                    continue
+                local_nodes = side_nodes.get(int(side_num))
+                if local_nodes is None:
+                    continue
+                tet_nodes = tetra_cells[tetra_idx][1:5]
+                for local_idx in local_nodes:
+                    nodes.add(int(tet_nodes[local_idx]))
+
+            if nodes:
+                surface_name = sideset_data.get('name', f'surface_{surface_marker}')
+                boundary_node_sets[int(surface_marker)] = {
+                    'mapped_indices': np.asarray(sorted(nodes), dtype=np.int32),
+                    'n_nodes': len(nodes),
+                    'name': self._sanitize_surface_name(f"nodes_{surface_name}"),
+                }
+
+        return boundary_node_sets
 
     def _build_exodus_sidesets(self, mesh_data: pv.UnstructuredGrid, 
                                tetra_cells: np.ndarray, 
@@ -2044,7 +2115,7 @@ class TetrahedralMeshGenerator:
                 # Check file extension to determine export format
                 file_ext = file_path.lower().split('.')[-1]
 
-                if file_ext in ['nc', 'nc4', 'cdf', 'exo']:
+                if file_ext in ['nc', 'nc4', 'cdf', 'exo', 'e']:
                     # Use NetCDF/EXODUS export with optional custom names
                     return self._export_netcdf(file_path, mesh_data, 
                                                custom_block_names=custom_block_names,
