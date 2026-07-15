@@ -191,6 +191,14 @@ def build_exe(
         "--hidden-import=pyvistaqt.plotting",
         "--hidden-import=pyvistaqt.QtInteractor",
         "--hidden-import=pyvistaqt.background_plotter",
+        # PyVista imports pooch while registering readers. Keep pooch and its
+        # lightweight runtime dependencies in the frozen application.
+        "--hidden-import=pooch",
+        "--hidden-import=platformdirs",
+        "--hidden-import=requests",
+        "--hidden-import=urllib3",
+        "--hidden-import=charset_normalizer",
+        "--hidden-import=idna",
         "--hidden-import=vtkmodules",
         "--hidden-import=vtkmodules.qt",
         "--hidden-import=vtkmodules.qt.QVTKRenderWindowInteractor",
@@ -244,7 +252,6 @@ def build_exe(
         "--exclude-module=parso",
         "--exclude-module=tornado",
         "--exclude-module=zmq",
-        "--exclude-module=pooch",
         "--exclude-module=pyvista.examples",
         "--exclude-module=torch",
         "--exclude-module=PyQt5",
@@ -267,9 +274,6 @@ def build_exe(
         "--exclude-module=ipython",
         "--exclude-module=flask",
         "--exclude-module=django",
-        "--exclude-module=requests",
-        "--exclude-module=urllib3",
-        "--exclude-module=chardet",
         # Note: certifi is needed by netCDF4, don't exclude it
         "--exclude-module=pip",
         "--exclude-module=setuptools",

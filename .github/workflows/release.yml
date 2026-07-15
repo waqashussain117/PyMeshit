@@ -84,9 +84,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install pyinstaller
-          # Install core dependencies
-          python -m pip install numpy scipy matplotlib PySide6 pyvista tetgen triangle netCDF4
-          python -m pip install pyvistaqt
+          # Use the tested dependency versions, including PyVista's pooch stack.
+          python -m pip install -r requirements.txt
           python -m pip install -e .
 
       - name: Build Executable
@@ -94,6 +93,11 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: |
           python build_exe.py --no-clean
+
+      - name: Smoke-test frozen executable
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: timeout 60s ./release/PyMeshIt/PyMeshIt --smoke-test
 
       - name: Get version
         id: get_version
@@ -144,11 +148,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install pyinstaller
-          # Install core dependencies first
-          python -m pip install numpy scipy matplotlib PySide6 pyvista tetgen triangle netCDF4
-          # Install pyvistaqt separately (it has special installation requirements)
-          python -m pip install pyvistaqt
-          # Install from requirements.txt (excluding problematic packages)
+          # Use the tested dependency versions, including PyVista's pooch stack.
+          python -m pip install -r requirements.txt
           python -m pip install -e .
 
       - name: Verify dependencies
@@ -217,6 +218,18 @@ jobs:
             Get-ChildItem release -ErrorAction SilentlyContinue
             exit 1
           }
+
+      - name: Smoke-test frozen executable
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $process = Start-Process -FilePath "release/PyMeshIt/PyMeshIt.exe" -ArgumentList "--smoke-test" -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) {
+            Write-Host "Frozen executable smoke test failed with exit code $($process.ExitCode)"
+            exit $process.ExitCode
+          }
+          Write-Host "Frozen executable smoke test passed"
 
       - name: Get version
         id: get_version
@@ -289,14 +302,12 @@ jobs:
           if [ "${{ matrix.arch }}" = "x86_64" ]; then
             arch -x86_64 python -m pip install --upgrade pip
             arch -x86_64 python -m pip install pyinstaller
-            arch -x86_64 python -m pip install numpy scipy matplotlib PySide6 pyvista tetgen triangle netCDF4
-            arch -x86_64 python -m pip install pyvistaqt
+            arch -x86_64 python -m pip install -r requirements.txt
             arch -x86_64 python -m pip install -e .
           else
             python -m pip install --upgrade pip
             python -m pip install pyinstaller
-            python -m pip install numpy scipy matplotlib PySide6 pyvista tetgen triangle netCDF4
-            python -m pip install pyvistaqt
+            python -m pip install -r requirements.txt
             python -m pip install -e .
           fi
 
@@ -307,9 +318,9 @@ jobs:
         run: |
           APP_NAME="PyMeshIt-macOS-${{ matrix.arch }}"
           if [ "${{ matrix.arch }}" = "x86_64" ]; then
-            arch -x86_64 python build_exe.py --no-clean --target-arch "${{ matrix.arch }}" --name "$APP_NAME" --entry-script Pymeshit_workflow_gui.py
+            arch -x86_64 python build_exe.py --no-clean --target-arch "${{ matrix.arch }}" --name "$APP_NAME"
           else
-            python build_exe.py --no-clean --target-arch "${{ matrix.arch }}" --name "$APP_NAME" --entry-script Pymeshit_workflow_gui.py
+            python build_exe.py --no-clean --target-arch "${{ matrix.arch }}" --name "$APP_NAME"
           fi
 
       - name: Check build output
@@ -325,6 +336,25 @@ jobs:
             echo "No macOS output found in release/"
             ls -la release || true
             exit 1
+          fi
+
+      - name: Smoke-test frozen executable
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          APP_NAME="PyMeshIt-macOS-${{ matrix.arch }}"
+          if [ -x "release/${APP_NAME}.app/Contents/MacOS/${APP_NAME}" ]; then
+            BINARY="release/${APP_NAME}.app/Contents/MacOS/${APP_NAME}"
+          elif [ -x "release/${APP_NAME}/${APP_NAME}" ]; then
+            BINARY="release/${APP_NAME}/${APP_NAME}"
+          else
+            echo "Could not locate the frozen executable for smoke testing"
+            exit 1
+          fi
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            arch -x86_64 "$BINARY" --smoke-test
+          else
+            "$BINARY" --smoke-test
           fi
 
       - name: Get version

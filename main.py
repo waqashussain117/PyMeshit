@@ -7,7 +7,33 @@ from PySide6.QtWidgets import QSplashScreen
 from PySide6.QtGui import QPixmap
 from PySide6.QtCore import Qt
 
+
+def run_smoke_test():
+    """Import the frozen application's critical runtime dependencies."""
+    import netCDF4
+    import platformdirs
+    import pooch
+    import pyvista
+    import pyvistaqt
+    import requests
+    import tetgen
+
+    from Pymeshit_workflow_gui import MeshItWorkflowGUI
+
+    # Referencing the class ensures the GUI module completed its import.
+    assert MeshItWorkflowGUI is not None
+    print(
+        "PyMeshIt binary smoke test passed: "
+        f"PyVista {pyvista.__version__}, Pooch {pooch.__version__}, "
+        f"NetCDF4 {netCDF4.__version__}"
+    )
+
+
 def main():
+    if "--smoke-test" in sys.argv:
+        run_smoke_test()
+        return
+
     try:
         from Pymeshit_workflow_gui import MeshItWorkflowGUI
     except Exception as e:
