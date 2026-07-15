@@ -117,7 +117,7 @@ This is intended for scripted geometry variations where the GUI constraint tree
 would normally be set to "select intersections".
 
 A full notebook-style walkthrough is available in
-[`examples/headless_batch_workflow.ipynb`](examples/headless_batch_workflow.ipynb).
+[`examples/headless_batch_workflow.ipynb`](https://github.com/waqashussain117/PyMeshit/blob/main/examples/headless_batch_workflow.ipynb).
 It includes file upload/path setup, surface role assignment, material seed setup,
 workflow execution, mesh export, and a batch-loop template.
 

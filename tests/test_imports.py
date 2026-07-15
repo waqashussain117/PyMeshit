@@ -5,9 +5,12 @@ def test_package_imports():
 
 
 def test_version_string():
+    from importlib.metadata import version
     import Pymeshit
+
     assert isinstance(Pymeshit.__version__, str)
     assert Pymeshit.__version__ != "0.0.0"
+    assert Pymeshit.__version__ == version("Pymeshit")
 
 
 def test_headless_api_is_exposed():

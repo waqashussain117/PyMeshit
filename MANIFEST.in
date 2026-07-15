@@ -4,6 +4,7 @@ include Pymeshit_workflow_gui.py
 recursive-include resources *
 recursive-include Pymeshit *.py
 recursive-include examples *.ipynb
+recursive-include examples/data *.dat *.txt
 
 exclude bin/*
 exclude debug_plc/*
