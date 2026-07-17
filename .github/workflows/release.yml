@@ -9,6 +9,7 @@ on:
 jobs:
   publish-pypi:
     name: Build and publish to PyPI
+    needs: [build-linux-exe, build-windows-exe, build-macos-exe]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -114,6 +115,7 @@ jobs:
           cd ..
 
       - name: Upload ZIP to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -261,6 +263,7 @@ jobs:
           Write-Host "Looking for: PyMeshit-${{ steps.get_version.outputs.version }}-win64.zip"
 
       - name: Upload ZIP to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -378,6 +381,7 @@ jobs:
           fi
 
       - name: Upload ZIP to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
