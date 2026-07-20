@@ -31,7 +31,7 @@ python -c "import Pymeshit; print(Pymeshit.__version__)"
 Pin a version when reproducibility matters:
 
 ```bash
-python -m pip install "pymeshit==0.8.7"
+python -m pip install "pymeshit==0.8.8"
 ```
 
 ## Linux system libraries
