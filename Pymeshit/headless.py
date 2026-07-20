@@ -52,7 +52,34 @@ SurfaceRole = Literal["border", "unit", "fault"]
 
 @dataclass
 class SurfaceSpec:
-    """A surface input for headless meshing."""
+    """Describe one geological surface supplied to the headless workflow.
+
+    Parameters
+    ----------
+    name : str
+        Human-readable surface name. The name is propagated to intermediate
+        data and is used as the default Exodus sideset name.
+    points : path-like or array-like
+        Point-cloud coordinates. Pass a path accepted by :func:`read_points`
+        or an ``(N, 2)``/``(N, 3+)`` array-like object. Two-dimensional input
+        receives ``z=0``; columns after the first three are ignored.
+    role : {"border", "unit", "fault"}, default="unit"
+        ``"border"`` identifies an outer domain boundary, ``"unit"`` an
+        internal stratigraphic surface, and ``"fault"`` an internal fault
+        constraint. Roles also determine surface marker conventions.
+    target_size : float, optional
+        Surface-specific target edge length in the same units as ``points``.
+        A missing or non-positive value falls back to
+        :attr:`MeshOptions.target_size`.
+    metadata : dict, optional
+        User metadata copied into the corresponding intermediate dataset. The
+        workflow does not interpret these values.
+
+    Notes
+    -----
+    Surface order is significant. Non-fault surface ``i`` receives marker
+    ``i + 1``; fault surface ``i`` receives marker ``1000 + i``.
+    """
 
     name: str
     points: Union[str, os.PathLike, Sequence[Sequence[float]], np.ndarray]
@@ -63,7 +90,27 @@ class SurfaceSpec:
 
 @dataclass
 class WellSpec:
-    """A 1D well/polyline input used as a TetGen edge constraint."""
+    """Describe one well or polyline used as a TetGen edge constraint.
+
+    Parameters
+    ----------
+    name : str
+        Human-readable well name used by default during export.
+    points : path-like or array-like
+        Ordered well coordinates. Pass a path accepted by :func:`read_points`
+        or an ``(N, 2)``/``(N, 3+)`` array-like object. Consecutive points
+        define the well segments.
+    target_size : float, optional
+        Desired spacing along the refined well in coordinate units. If
+        omitted, the workflow derives a value from the well extent and the
+        global target size.
+    marker : int, optional
+        Exodus node-set or BAR2 block identifier. Set this explicitly when IDs
+        must remain stable across cases; otherwise PyMeshIt assigns an ID from
+        dataset order.
+    metadata : dict, optional
+        User metadata copied into the intermediate well dataset.
+    """
 
     name: str
     points: Union[str, os.PathLike, Sequence[Sequence[float]], np.ndarray]
@@ -74,7 +121,31 @@ class WellSpec:
 
 @dataclass
 class MaterialSpec:
-    """A TetGen region material seed."""
+    """Describe a material and its TetGen region seed locations.
+
+    Parameters
+    ----------
+    name : str
+        Material name used as the default Exodus element-block name.
+    locations : array-like
+        One ``(x, y, z)`` location or an ``(N, 3+)`` collection. Formation
+        seeds must lie inside the volume region they label.
+    attribute : int, default=0
+        Geological material ID written to the volume mesh ``MaterialID`` cell
+        array and used as the key for ``custom_block_names``.
+    type : {"FORMATION", "FAULT"}, default="FORMATION"
+        Formations create volumetric TetGen regions. Fault materials describe
+        surface-only material metadata and do not create volume region seeds.
+    max_volume : float, default=0.0
+        Reserved per-material maximum volume value. The current headless
+        workflow stores it in TetGen material metadata; global TetGen switches
+        remain responsible for volume constraints.
+
+    Raises
+    ------
+    ValueError
+        If ``locations`` cannot be interpreted as three-dimensional points.
+    """
 
     name: str
     locations: Union[Sequence[float], Sequence[Sequence[float]]]
@@ -83,6 +154,14 @@ class MaterialSpec:
     max_volume: float = 0.0
 
     def to_tetra_dict(self) -> Dict[str, Any]:
+        """Convert this specification to the dictionary used by TetGen.
+
+        Returns
+        -------
+        dict
+            Normalized material metadata containing ``name``, ``locations``,
+            ``attribute``, ``type``, and ``max_volume``.
+        """
         locs = _normalize_locations(self.locations)
         return {
             "name": self.name,
@@ -95,7 +174,61 @@ class MaterialSpec:
 
 @dataclass
 class MeshOptions:
-    """Headless workflow options."""
+    """Control surface processing, constraint selection, and volume meshing.
+
+    Parameters
+    ----------
+    target_size : float, default=1.0
+        Global target edge length in the same units as the input coordinates.
+        Must be positive. Per-surface and per-well values override it.
+    min_angle : float, default=20.0
+        Requested minimum surface-triangle angle in degrees. Very large values
+        can make constrained triangulation impossible.
+    gradient : float, default=2.0
+        Mesh-size transition factor used during triangulation and intersection
+        processing. Smaller values generally request a gentler transition.
+    uniform : bool, default=True
+        Use approximately uniform spacing when refining hulls and intersection
+        lines.
+    interpolation : str, default="Thin Plate Spline (TPS)"
+        Surface elevation interpolation method. Strings containing
+        ``"Thin Plate"`` select TPS; strings containing ``"IDW"`` or
+        ``"Legacy"`` select inverse-distance weighting. Unknown strings fall
+        back to IDW for initial triangulation.
+    smoothing : float, default=0.0
+        Smoothing passed to thin-plate-spline interpolation. Zero interpolates
+        the supplied samples as closely as the solver permits.
+    hull_method : {"delaunay", "alpha"}, default="delaunay"
+        Method used to find the projected boundary of non-horizontal point
+        clouds. Alpha-shape extraction falls back to Delaunay/convex-hull
+        processing when it cannot form a usable boundary.
+    hull_alpha_factor : float, default=1.0
+        Scale controlling alpha-shape boundary extraction. It is used only
+        when ``hull_method="alpha"``.
+    constraint_mode : {"all", "intersections", "hulls"}, default="intersections"
+        Select constraints for conforming surface triangulation. ``"all"``
+        uses hulls and intersections, ``"intersections"`` uses intersections
+        plus boundary hulls when requested, and ``"hulls"`` uses hulls only.
+    preserve_boundary_hulls : bool, default=True
+        Retain hull constraints while using intersection mode so each surface
+        still has an outer PLC boundary.
+    tetgen_switches : str, default="pq1.414aAY"
+        Switch string forwarded to TetGen. Invalid or overly restrictive
+        switches can prevent volume generation.
+    generate_volume : bool, default=True
+        Run TetGen after conforming surface generation. Set to ``False`` to
+        inspect or export intermediate surface information only.
+    include_hull_fallback_faults_in_volume : bool, default=False
+        Force fault surfaces that required hull fallback into the volume PLC.
+        The safer default retains them as surface outputs but excludes them
+        from TetGen constraints.
+    intersection_tolerance : float, default=1e-5
+        Geometric tolerance in coordinate units for intersection and triple
+        point matching.
+    keep_intermediate : bool, default=True
+        Retain ``datasets`` and ``conforming_surface_data`` in
+        :class:`MeshResult`. Disable it to reduce retained Python-side data.
+    """
 
     target_size: float = 1.0
     min_angle: float = 20.0
@@ -116,7 +249,22 @@ class MeshOptions:
 
 @dataclass
 class MeshCase:
-    """Complete input for one headless mesh generation run."""
+    """Collect all inputs for one headless mesh generation run.
+
+    Parameters
+    ----------
+    surfaces : sequence of SurfaceSpec
+        Ordered surface definitions. At least one surface is required.
+    materials : sequence of MaterialSpec, optional
+        Formation and fault material metadata. If no formation material is
+        provided, the TetGen wrapper creates one default region near the PLC
+        centre.
+    wells : sequence of WellSpec, optional
+        Ordered well/polyline constraints.
+    options : MeshOptions, optional
+        Workflow settings. A default :class:`MeshOptions` instance is created
+        for each case.
+    """
 
     surfaces: Sequence[SurfaceSpec]
     materials: Sequence[MaterialSpec] = field(default_factory=list)
@@ -126,7 +274,41 @@ class MeshCase:
 
 @dataclass
 class MeshResult:
-    """Outputs from a headless run."""
+    """Store final and intermediate outputs from a headless run.
+
+    Parameters
+    ----------
+    datasets : list of dict
+        Normalized surface datasets followed by well datasets. When
+        ``keep_intermediate=True``, entries may also contain hulls, initial
+        triangulations, refined well points, and conforming meshes.
+    conforming_surface_data : dict of int to dict
+        Surface-indexed meshes. Each value contains ``name``, ``vertices``,
+        ``triangles``, ``facet_markers``, ``original_dataset_index``,
+        ``conforming_mesh_source``, ``constraint_source``, and
+        ``mesh_metadata``.
+    tetra_mesh : object, optional
+        Final PyVista ``UnstructuredGrid`` returned by TetGen, or ``None`` when
+        volume generation is disabled or fails.
+    intersections : dict of int to list of dict, optional
+        Intersection records grouped by the lower participating dataset index.
+        Records contain ``dataset_id1``, ``dataset_id2``,
+        ``is_polyline_mesh``, and ordered ``points``.
+    triple_points : list of dict, optional
+        Records with a three-coordinate ``point`` and the participating
+        ``intersection_ids``.
+    tetra_generator : object, optional
+        Internal ``TetrahedralMeshGenerator`` retaining metadata needed for
+        Exodus export.
+    failures : list of tuple[str, str], optional
+        Recoverable stage or surface failures as ``(name, message)`` tuples.
+
+    Notes
+    -----
+    In volume cases, :attr:`ok` reports whether a tetrahedral mesh exists.
+    Always inspect ``failures`` as well, because a mesh can exist even when a
+    requested export failed.
+    """
 
     datasets: List[Dict[str, Any]]
     conforming_surface_data: Dict[int, Dict[str, Any]]
@@ -138,6 +320,12 @@ class MeshResult:
 
     @property
     def ok(self) -> bool:
+        """Whether the requested meshing stage produced its primary result.
+
+        For a volume case this is ``True`` when ``tetra_mesh`` exists. For a
+        surface-only case it is ``True`` when no recoverable failures were
+        recorded. Export errors remain available separately in ``failures``.
+        """
         return self.tetra_mesh is not None if self.tetra_generator is not None else not self.failures
 
     def export_mesh(
@@ -155,6 +343,34 @@ class MeshResult:
         EXODUS/NetCDF paths (``.exo``, ``.e``, ``.nc``, ``.nc4``, ``.cdf``) are
         written with material element blocks, boundary/fault sidesets, and well
         node sets when that metadata is available from TetGen.
+
+        Parameters
+        ----------
+        file_path : path-like
+            Destination mesh path. Parent directories are created.
+        custom_block_names : dict of int to str, optional
+            Map material attributes to Exodus element-block names.
+        custom_sideset_names : dict of int to str, optional
+            Map surface markers to Exodus sideset names.
+        custom_well_names : dict of int to str, optional
+            Map well markers to Exodus node-set or BAR2 block names.
+        well_export_type : {"Node Sets", "Element Blocks"}, default="Node Sets"
+            Write wells as shared mesh-node sets or as BAR2 element blocks.
+
+        Returns
+        -------
+        bool
+            ``True`` when the exporter reports success.
+
+        Raises
+        ------
+        ValueError
+            If no tetrahedral mesh is available.
+
+        Notes
+        -----
+        Exodus export requires ``tetra_generator`` metadata produced by
+        :func:`run_mesh_case` or the GUI workflow.
         """
         if self.tetra_mesh is None:
             raise ValueError("No tetrahedral mesh is available to export")
@@ -180,22 +396,47 @@ def run_mesh_case(
     well_export_type: str = "Node Sets",
 ) -> MeshResult:
     """
-    Run a simple headless PyMeshIt workflow.
+    Run the complete headless PyMeshIt workflow for one case.
 
     Parameters
     ----------
-    mesh_case:
+    mesh_case : MeshCase
         Surfaces, wells, materials, and meshing options.
-    output_path:
+    output_path : path-like, optional
         Optional path where the generated tetrahedral mesh should be saved. The
         GUI exporter is used when available, so EXODUS/NetCDF outputs include
-        material blocks, sidesets, and well node sets.
+        material blocks, sidesets, and well node sets. It is used only when
+        ``mesh_case.options.generate_volume`` is ``True``.
+    custom_block_names : dict of int to str, optional
+        Map material attributes to Exodus element-block names.
+    custom_sideset_names : dict of int to str, optional
+        Map surface markers to Exodus sideset names.
+    custom_well_names : dict of int to str, optional
+        Map well markers to Exodus node-set or BAR2 block names.
+    well_export_type : {"Node Sets", "Element Blocks"}, default="Node Sets"
+        Select the Exodus representation for wells.
 
     Returns
     -------
     MeshResult
         Contains the intermediate datasets, conforming surface meshes, and the
         final PyVista/TetGen volume mesh when ``generate_volume`` is enabled.
+
+    Raises
+    ------
+    ValueError
+        If there are no surfaces, the global target size is non-positive, a
+        constraint mode or surface role is invalid, or point data is malformed.
+    RuntimeError
+        If volume generation is requested but no conforming surface mesh can be
+        generated. Lower-level geometry errors may also propagate from hull or
+        initial triangulation stages.
+
+    Notes
+    -----
+    Conforming triangulation errors for individual surfaces are recorded in
+    ``MeshResult.failures`` so other surfaces can still be inspected. A TetGen
+    failure is also recorded and returns ``tetra_mesh=None``.
     """
     if not mesh_case.surfaces:
         raise ValueError("MeshCase requires at least one surface")
@@ -343,6 +584,40 @@ def generate_tetrahedral_mesh_from_surfaces(
 
     This is useful when geometry is generated externally and users only need
     PyMeshIt's PLC assembly and TetGen/material handling.
+
+    Parameters
+    ----------
+    surface_meshes : dict of int to dict
+        Surface-indexed conforming meshes. Each entry must provide ``vertices``
+        and ``triangles``; ``facet_markers`` and ``name`` should be supplied
+        when boundary identification matters.
+    datasets : list of dict, optional
+        Dataset metadata aligned with the integer surface indices. Minimal
+        placeholder names are generated when omitted.
+    selected_surfaces : iterable of int, optional
+        Surface indices included in the PLC. All supplied surfaces are selected
+        by default.
+    border_surface_indices : iterable of int, optional
+        Selected indices treated as external boundaries. Defaults to all
+        selected surfaces.
+    unit_surface_indices : iterable of int, optional
+        Selected internal stratigraphic surface indices.
+    fault_surface_indices : iterable of int, optional
+        Selected internal fault surface indices.
+    materials : sequence of MaterialSpec or dict, optional
+        Formation/fault material metadata and region seeds.
+    tetgen_switches : str, default="pq1.414aAY"
+        Switch string forwarded to TetGen.
+
+    Returns
+    -------
+    object or None
+        A PyVista ``UnstructuredGrid`` when TetGen succeeds, otherwise ``None``.
+
+    Raises
+    ------
+    ValueError
+        If ``surface_meshes`` is empty.
     """
     if not surface_meshes:
         raise ValueError("surface_meshes cannot be empty")
@@ -408,7 +683,36 @@ def _export_tetra_mesh(
 
 
 def read_points(path: Union[str, os.PathLike]) -> np.ndarray:
-    """Read a text/CSV/VTU point file into an ``(N, 3)`` float array."""
+    """Read a text, CSV, or VTK point file into an ``(N, 3)`` array.
+
+    Parameters
+    ----------
+    path : path-like
+        Input file. ``.vtu``, ``.vtk``, and ``.vtp`` are read with PyVista.
+        Other files are treated as UTF-8 text with whitespace, comma, semicolon,
+        or tab separators. Blank lines and lines beginning with ``#`` are
+        ignored.
+
+    Returns
+    -------
+    numpy.ndarray
+        Floating-point coordinates with shape ``(N, 3)``. Two-column text data
+        receives ``z=0`` and extra columns are ignored.
+
+    Raises
+    ------
+    FileNotFoundError
+        If ``path`` does not exist.
+    ValueError
+        If no usable coordinates are found or the loaded array has fewer than
+        two coordinate columns.
+
+    Notes
+    -----
+    Text lines that cannot be parsed as numeric coordinates are skipped. A line
+    beginning with ``Bounds:`` is expanded into the corners encoded by its
+    ``X[...]``, ``Y[...]``, and optional ``Z[...]`` ranges.
+    """
     file_path = Path(path)
     ext = file_path.suffix.lower()
     if ext in {".vtu", ".vtk", ".vtp"}:

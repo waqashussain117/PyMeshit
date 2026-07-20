@@ -17,7 +17,7 @@ for case_index, case in enumerate(cases):
         case,
         output_path=output_dir / f"case_{case_index:03d}.exo",
     )
-    if not result.ok:
+    if not result.ok or result.failures:
         raise RuntimeError(f"Case {case_index} failed: {result.failures}")
 ```
 
@@ -54,6 +54,6 @@ and mesh quality over forced node correspondence.
 - Record all `MeshOptions` values and TetGen switches.
 - Keep input geometry files for every case.
 - Use deterministic case and surface names.
-- Check `MeshResult.ok` and preserve `MeshResult.failures`.
+- Check `MeshResult.ok` and `MeshResult.failures`; an export can fail after a
+  volume mesh was created successfully.
 - Record the common-grid coordinates, mask, and interpolation method.
-

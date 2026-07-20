@@ -24,7 +24,7 @@ release = project_version()
 version = ".".join(release.split(".")[:2])
 
 extensions = [
-    "myst_parser",
+    "myst_nb",
     "numpydoc",
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
@@ -32,10 +32,6 @@ extensions = [
     "sphinx_copybutton",
 ]
 
-source_suffix = {
-    ".rst": "restructuredtext",
-    ".md": "markdown",
-}
 master_doc = "index"
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
@@ -58,6 +54,8 @@ autosummary_generate = True
 numpydoc_show_class_members = False
 
 myst_enable_extensions = ["colon_fence", "deflist"]
+nb_execution_mode = "off"
+nb_merge_streams = True
 
 html_theme = "furo"
 html_title = f"PyMeshIt {release}"
@@ -66,4 +64,3 @@ html_theme_options = {
     "source_branch": "main",
     "source_directory": "docs/",
 }
-

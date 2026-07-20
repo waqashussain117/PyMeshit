@@ -19,6 +19,7 @@ upgrading.
 
 - Follow the [installation guide](installation.md).
 - Run the [surface-meshing quickstart](quickstart.md).
+- Work through the [complete batch-workflow notebook](examples/headless_batch_workflow.ipynb).
 - Read the [batch and POD guidance](user-guide/batch-and-pod.md) before
   comparing results from varying geometries.
 - Consult the [headless API reference](api/index.rst) for exact signatures and
@@ -36,8 +37,20 @@ quickstart
 :maxdepth: 2
 :caption: User guide
 
+user-guide/input-data
+user-guide/geometry-and-materials
+user-guide/meshing-options
+user-guide/results
+user-guide/exodus-export
 user-guide/batch-and-pod
 troubleshooting
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Tutorials
+
+examples/headless_batch_workflow
 ```
 
 ```{toctree}
@@ -52,5 +65,4 @@ api/index
 - [Source code](https://github.com/waqashussain117/PyMeshit)
 - [PyPI package](https://pypi.org/project/Pymeshit/)
 - [Issue tracker](https://github.com/waqashussain117/PyMeshit/issues)
-- [Full batch-workflow notebook](https://github.com/waqashussain117/PyMeshit/blob/main/examples/headless_batch_workflow.ipynb)
-
+- [Download the original batch-workflow notebook](https://github.com/waqashussain117/PyMeshit/blob/main/examples/headless_batch_workflow.ipynb)

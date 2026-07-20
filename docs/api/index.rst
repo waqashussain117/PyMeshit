@@ -2,41 +2,15 @@ Headless API reference
 ======================
 
 The supported headless interface is available from both :mod:`Pymeshit` and
-:mod:`Pymeshit.headless`. Importing from :mod:`Pymeshit` is recommended for
-normal use.
+:mod:`Pymeshit.headless`. Importing public names from :mod:`Pymeshit` is
+recommended for normal use. Names beginning with an underscore are internal
+implementation details and are not part of the compatibility contract.
 
-Inputs
-------
+.. toctree::
+   :maxdepth: 2
 
-.. currentmodule:: Pymeshit.headless
-
-.. autoclass:: SurfaceSpec
-   :members:
-
-.. autoclass:: WellSpec
-   :members:
-
-.. autoclass:: MaterialSpec
-   :members:
-
-.. autoclass:: MeshOptions
-   :members:
-
-.. autoclass:: MeshCase
-   :members:
-
-Execution
----------
-
-.. autofunction:: read_points
-
-.. autofunction:: run_mesh_case
-
-.. autofunction:: generate_tetrahedral_mesh_from_surfaces
-
-Results
--------
-
-.. autoclass:: MeshResult
-   :members:
+   inputs
+   options
+   execution
+   results
 

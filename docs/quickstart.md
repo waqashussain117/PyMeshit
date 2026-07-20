@@ -68,6 +68,5 @@ A volume case normally contains enough boundary surfaces to form a closed,
 watertight domain. Add internal unit or fault surfaces, define material seed
 points with `MaterialSpec`, and leave `generate_volume=True`.
 
-See the [complete batch-workflow notebook](https://github.com/waqashussain117/PyMeshit/blob/main/examples/headless_batch_workflow.ipynb)
+See the [complete batch-workflow notebook](examples/headless_batch_workflow.ipynb)
 for surfaces, wells, material seeds, TetGen options, and Exodus export.
-
