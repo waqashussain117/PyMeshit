@@ -82,6 +82,9 @@ The package will automatically install all required dependencies:
 sudo apt-get install libxcb-cursor0 libxkbcommon-x11-0 libegl1 libopengl0 libgl1
 ```
 
+## Documentation 
+
+Go to the [Documentation Page](https://pymeshit.readthedocs.io/) for further information about the API and detailed instructions on Tutorials. 
 
 ## Quick start (GUI)
 
