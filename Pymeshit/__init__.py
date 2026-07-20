@@ -113,7 +113,7 @@ except ImportError:
     HAS_DIRECT_TRIANGLE = False
 
 # Define version
-__version__ = '0.8.6'
+__version__ = '0.8.7'
 
 _HEADLESS_EXPORTS = {
     'SurfaceSpec',
