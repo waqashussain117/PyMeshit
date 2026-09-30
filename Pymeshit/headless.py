@@ -1616,13 +1616,19 @@ def _generate_conforming_surface_meshes(
                 hull_entries = _hull_constraint_entries(datasets[s_idx], target)
                 if not hull_entries:
                     raise
+                # The fallback replaces surface boundary constraints, but the
+                # well cut points still belong in the PLC and must retain their
+                # local refinement sizes.
+                fallback_entries = hull_entries + [
+                    entry for entry in entries if entry.get("is_well_intersection", False)
+                ]
                 logger.warning(
                     "Conforming mesh for %s failed with intersection-only constraints (%s). "
                     "Retrying with hull constraints for this surface.",
                     name,
                     selected_exc,
                 )
-                vertices, triangles, holes = triangulate_entries(hull_entries, "hull fallback")
+                vertices, triangles, holes = triangulate_entries(fallback_entries, "hull fallback")
                 constraint_source = "hull_fallback"
 
             dataset["conforming_mesh"] = {
