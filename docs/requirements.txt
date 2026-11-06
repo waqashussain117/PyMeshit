@@ -4,3 +4,4 @@ myst-parser==5.1.0
 myst-nb==1.4.0
 numpydoc==1.10.0
 sphinx-copybutton==0.5.2
+setuptools-scm>=8

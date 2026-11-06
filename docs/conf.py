@@ -1,8 +1,10 @@
 """Sphinx configuration for the PyMeshIt documentation."""
 
 from pathlib import Path
-import re
 import sys
+import tomllib
+
+from setuptools_scm import get_version
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,12 +12,10 @@ sys.path.insert(0, str(ROOT))
 
 
 def project_version() -> str:
-    """Read the package version without importing the GUI or build backend."""
-    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, flags=re.MULTILINE)
-    if match is None:
-        raise RuntimeError("Could not determine the PyMeshIt version")
-    return match.group(1)
+    """Resolve the tag-based package version without importing the GUI."""
+    with (ROOT / "pyproject.toml").open("rb") as source:
+        fallback = tomllib.load(source)["tool"]["setuptools_scm"]["fallback_version"]
+    return get_version(root=str(ROOT), fallback_root=str(ROOT), fallback_version=fallback)
 
 
 project = "PyMeshIt"
