@@ -112,8 +112,13 @@ try:
 except ImportError:
     HAS_DIRECT_TRIANGLE = False
 
-# Define version
-__version__ = '0.9.2'
+# The installed package version is derived from its Git release tag.
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("Pymeshit")
+except PackageNotFoundError:
+    __version__ = "1.0.0"
 
 _HEADLESS_EXPORTS = {
     'SurfaceSpec',

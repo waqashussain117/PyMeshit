@@ -1,21 +1,63 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch: {}
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+# Queue successful main pushes so each gets its own patch version.
+concurrency:
+  group: automatic-release-main
+  queue: max
 
 jobs:
+  prepare:
+    name: Tag the tested main commit
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Checkout the commit tested by CI
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Create or reuse the release tag
+        id: tag
+        run: |
+          tag=$(python tools/next_release.py)
+          if ! git show-ref --verify --quiet "refs/tags/$tag"; then
+            git tag "$tag"
+            git push origin "refs/tags/$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
   publish-pypi:
     name: Build and publish to PyPI
-    needs: [build-linux-exe, build-windows-exe, build-macos-exe]
+    needs: [prepare, publish-github-release]
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -26,16 +68,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install build numpy twine
-
-      - name: Verify tag matches package version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          PACKAGE_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if [ "$PACKAGE_VERSION" != "$TAG_VERSION" ]; then
-            echo "Tag version $TAG_VERSION does not match package version $PACKAGE_VERSION"
-            exit 1
-          fi
 
       - name: Build sdist and wheel
         run: python -m build
@@ -56,13 +88,13 @@ jobs:
           path: dist/*
 
       - name: Publish to PyPI
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
 
   build-linux-exe:
+    needs: prepare
     name: Build Linux Executable
     runs-on: ubuntu-latest
     permissions:
@@ -70,6 +102,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -103,8 +138,7 @@ jobs:
       - name: Get version
         id: get_version
         run: |
-          VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=${{ needs.prepare.outputs.version }}" >> "$GITHUB_OUTPUT"
 
       - name: Create ZIP archive
         run: |
@@ -114,17 +148,15 @@ jobs:
           zip -r PyMeshit-$VER-linux.zip PyMeshIt
           cd ..
 
-      - name: Upload ZIP to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+      - name: Save release archive
+        uses: actions/upload-artifact@v7
         with:
-          files: |
-            release/PyMeshit-${{ steps.get_version.outputs.version }}-linux.zip
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: release-linux
+          path: release/PyMeshit-${{ steps.get_version.outputs.version }}-linux.zip
+          if-no-files-found: error
 
   build-windows-exe:
+    needs: prepare
     name: Build Windows EXE and attach to Release
     runs-on: windows-latest
     permissions:
@@ -132,6 +164,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -237,8 +272,7 @@ jobs:
         id: get_version
         shell: pwsh
         run: |
-          $version = python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
-          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "version=${{ needs.prepare.outputs.version }}" >> $env:GITHUB_OUTPUT
 
       - name: Create ZIP archive
         shell: pwsh
@@ -262,17 +296,15 @@ jobs:
           Get-ChildItem release -ErrorAction SilentlyContinue
           Write-Host "Looking for: PyMeshit-${{ steps.get_version.outputs.version }}-win64.zip"
 
-      - name: Upload ZIP to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+      - name: Save release archive
+        uses: actions/upload-artifact@v7
         with:
-          files: |
-            release/PyMeshit-${{ steps.get_version.outputs.version }}-win64.zip
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: release-windows
+          path: release/PyMeshit-${{ steps.get_version.outputs.version }}-win64.zip
+          if-no-files-found: error
 
   build-macos-exe:
+    needs: prepare
     name: Build macOS App (${{ matrix.arch }}) and attach to Release
     runs-on: ${{ matrix.os }}
     permissions:
@@ -281,13 +313,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15-intel
             arch: x86_64
           - os: macos-latest
             arch: arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -363,8 +398,7 @@ jobs:
       - name: Get version
         id: get_version
         run: |
-          VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=${{ needs.prepare.outputs.version }}" >> "$GITHUB_OUTPUT"
 
       - name: Create ZIP archive
         run: |
@@ -380,14 +414,47 @@ jobs:
             cd ..
           fi
 
-      - name: Upload ZIP to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Save release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-macos-${{ matrix.arch }}
+          path: release/PyMeshit-${{ steps.get_version.outputs.version }}-macOS-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+
+
+  publish-github-release:
+    name: Publish GitHub release
+    needs: [prepare, build-linux-exe, build-windows-exe, build-macos-exe]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Find version-specific notes
+        id: notes
+        run: |
+          notes=".github/release-notes/${{ needs.prepare.outputs.version }}.md"
+          if [ -f "$notes" ]; then
+            echo "path=$notes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all platform archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish the release and all archives
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            release/PyMeshit-${{ steps.get_version.outputs.version }}-macOS-${{ matrix.arch }}.zip
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          files: release-assets/*.zip
+          body_path: ${{ steps.notes.outputs.path }}
+          fail_on_unmatched_files: true
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-

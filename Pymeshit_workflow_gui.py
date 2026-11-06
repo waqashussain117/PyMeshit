@@ -23,14 +23,14 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QTabWidget,
     QFileDialog, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox,
     QCheckBox, QGroupBox, QRadioButton, QSlider, QLineEdit,
-    QSplitter, QDialog, QFormLayout, QButtonGroup, QMenu,
+    QSplitter, QDialog, QFormLayout, QLayout, QButtonGroup, QMenu,
     QListWidget, QListWidgetItem, QProgressDialog,
     QSpacerItem, QTableWidget, QTableWidgetItem,
     QTreeWidget, QTreeWidgetItem, QScrollArea, QDockWidget,
     QAbstractItemView, QHeaderView, QSizePolicy, QInputDialog
 )
 from PySide6.QtGui import QFont, QIcon, QColor, QPalette, QPixmap, QAction, QActionGroup
-from PySide6.QtCore import Qt, QSize, Signal, QObject, QThread, QTimer, QSettings, Slot, QMetaObject
+from PySide6.QtCore import Qt, QSize, Signal, QObject, QThread, QTimer, QSettings, Slot, QMetaObject, QEvent
 
 # PyMeshIt Imports
 import tetgen
@@ -81,6 +81,50 @@ except ImportError as e:
 
 # Add Scipy import for interpolation
 from scipy.interpolate import griddata
+
+class _RefineConstraintClickFilter(QObject):
+    """Observe clicks without interfering with the viewer's camera controls."""
+
+    def __init__(self, gui, widget):
+        super().__init__(widget)
+        self.gui = gui
+        self.widget = widget
+        self.start = None
+        self.dragged = False
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            self.start = event.position()
+            self.dragged = False
+        elif event.type() == QEvent.MouseMove and self.start is not None:
+            delta = event.position() - self.start
+            if delta.x() ** 2 + delta.y() ** 2 > 16:
+                self.dragged = True
+        elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            if self.start is not None:
+                delta = event.position() - self.start
+                if not self.dragged and delta.x() ** 2 + delta.y() ** 2 <= 16:
+                    pos = event.position()
+                    scale = self.widget._getPixelRatio()
+                    x = int(round(pos.x() * scale))
+                    y = int(round((self.widget.height() - pos.y() - 1) * scale))
+                    # Finish the VTK interaction before changing actors or the tree.
+                    QTimer.singleShot(0, lambda: self.gui._refine_pick_at(x, y))
+            self.start = None
+        return False
+
+
+def _configure_refine_constraint_tree(tree):
+    """Keep the constraint and hole checkboxes accessible at small sizes."""
+    header = tree.header()
+    header.setStretchLastSection(False)
+    for column in range(4):
+        header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+    header.setSectionResizeMode(4, QHeaderView.Fixed)
+    tree.setColumnWidth(4, 60)
+    tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    tree.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+
 
 # Worker class for background computations
 class ComputationWorker(QObject):
@@ -741,6 +785,8 @@ class MeshItWorkflowGUI(QMainWindow):
         self.notebook.addTab(self.tetra_mesh_tab, "8. Tetra Mesh")
         self._setup_tetra_mesh_tab()
 
+        self._make_workflow_tabs_scrollable()
+
         # Placeholder for the refine_mesh_tab plotter
         self.refine_mesh_plotter = None
         self.refine_mesh_viz_frame = None # Add this line for consistency
@@ -771,6 +817,43 @@ class MeshItWorkflowGUI(QMainWindow):
         self._create_main_layout()
         self.show()
         self._update_statistics() # Initial update
+
+    def _make_workflow_tabs_scrollable(self):
+        """Keep each tab's controls usable when the window is small."""
+        current_index = self.notebook.currentIndex()
+        for index in range(self.notebook.count()):
+            page = self.notebook.widget(index)
+            title = self.notebook.tabText(index)
+            icon = self.notebook.tabIcon(index)
+            tooltip = self.notebook.tabToolTip(index)
+            page.layout().setSizeConstraint(QLayout.SetMinimumSize)
+            for splitter in page.findChildren(QSplitter):
+                splitter.setChildrenCollapsible(False)
+                for child_index in range(splitter.count()):
+                    layout = splitter.widget(child_index).layout()
+                    if layout is not None:
+                        layout.setSizeConstraint(QLayout.SetMinimumSize)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            self.notebook.removeTab(index)
+            scroll.setWidget(page)
+            self.notebook.insertTab(index, scroll, icon, title)
+            self.notebook.setTabToolTip(index, tooltip)
+        self.notebook.setCurrentIndex(current_index)
+
+    def _workflow_tab_at(self, index):
+        widget = self.notebook.widget(index)
+        return widget.widget() if isinstance(widget, QScrollArea) else widget
+
+    def _new_hsplitter(self):
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
+        return splitter
+
     def _init_material_selection_ui(self) -> QGroupBox:
         """
         Builds the 'Materials' group-box and returns it so the caller
@@ -2604,11 +2687,14 @@ class MeshItWorkflowGUI(QMainWindow):
     def _setup_file_tab(self):
         """Sets up the file loading tab with controls and visualization area"""
         # Main layout for the tab
-        tab_layout = QHBoxLayout(self.file_tab)
+        tab_layout = QVBoxLayout(self.file_tab)
+        splitter = self._new_hsplitter()
+        tab_layout.addWidget(splitter)
         
         # --- Control panel (left side) ---
         control_panel = QWidget()
-        control_panel.setMaximumWidth(350) # Limit width
+        control_panel.setMinimumWidth(260)
+        control_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         control_layout = QVBoxLayout(control_panel)
         
         # -- File Loading Controls --
@@ -2670,7 +2756,7 @@ class MeshItWorkflowGUI(QMainWindow):
         control_layout.addWidget(stats_group)
         control_layout.addStretch()
         
-        tab_layout.addWidget(control_panel)
+        splitter.addWidget(control_panel)
         
         # --- Visualization Area (right side) ---
         viz_group = QGroupBox("Point Cloud Visualization")
@@ -2688,16 +2774,22 @@ class MeshItWorkflowGUI(QMainWindow):
         self.file_viz_layout.addWidget(self.file_viz_placeholder)
         
         viz_layout.addWidget(self.file_viz_frame)
-        tab_layout.addWidget(viz_group, 1)  # 1 = stretch factor
+        splitter.addWidget(viz_group)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 940])
     
     def _setup_hull_tab(self):
         """Sets up the convex hull tab with controls and visualization area"""
         # Main layout for the tab
-        tab_layout = QHBoxLayout(self.hull_tab)
+        tab_layout = QVBoxLayout(self.hull_tab)
+        splitter = self._new_hsplitter()
+        tab_layout.addWidget(splitter)
 
         # --- Control panel (left side) ---
         control_panel = QWidget()
-        control_panel.setMaximumWidth(300)
+        control_panel.setMinimumWidth(260)
+        control_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         control_layout = QVBoxLayout(control_panel)
 
         # -- Hull Controls --
@@ -2793,7 +2885,7 @@ class MeshItWorkflowGUI(QMainWindow):
         control_layout.addLayout(nav_layout)
         control_layout.addStretch()
         
-        tab_layout.addWidget(control_panel)
+        splitter.addWidget(control_panel)
         
         # --- Visualization Area (right side) ---
         viz_group = QGroupBox("Convex Hull Visualization")
@@ -2814,7 +2906,10 @@ class MeshItWorkflowGUI(QMainWindow):
         self.hull_viz_layout.addWidget(self.hull_viz_placeholder)
         
         viz_layout.addWidget(self.hull_viz_frame)
-        tab_layout.addWidget(viz_group, 1)  # 1 = stretch factor
+        splitter.addWidget(viz_group)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 940])
     
     def _on_hull_method_changed(self, index):
         """Handle hull method dropdown change - enable/disable alpha parameter."""
@@ -2825,11 +2920,14 @@ class MeshItWorkflowGUI(QMainWindow):
     def _setup_segment_tab(self):
         """Sets up the segmentation tab with controls and visualization area"""
         # Main layout for the tab
-        tab_layout = QHBoxLayout(self.segment_tab)
+        tab_layout = QVBoxLayout(self.segment_tab)
+        splitter = self._new_hsplitter()
+        tab_layout.addWidget(splitter)
 
         # --- Control panel (left side) ---
         control_panel = QWidget()
-        control_panel.setMaximumWidth(300)
+        control_panel.setMinimumWidth(260)
+        control_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         control_layout = QVBoxLayout(control_panel)
 
         # -- Segmentation Controls --
@@ -2908,7 +3006,7 @@ class MeshItWorkflowGUI(QMainWindow):
         control_layout.addLayout(nav_layout)
         control_layout.addStretch()
 
-        tab_layout.addWidget(control_panel)
+        splitter.addWidget(control_panel)
 
         # --- Visualization Area (right side) ---
         viz_group = QGroupBox("Segmentation Visualization")
@@ -2929,16 +3027,22 @@ class MeshItWorkflowGUI(QMainWindow):
         self.segment_viz_layout.addWidget(self.segment_viz_placeholder)
 
         viz_layout.addWidget(self.segment_viz_frame)
-        tab_layout.addWidget(viz_group, 1)  # 1 = stretch factor
+        splitter.addWidget(viz_group)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 940])
     
     def _setup_triangulation_tab(self):
         """Sets up the triangulation tab with controls and visualization area"""
         # Main layout for the tab
-        tab_layout = QHBoxLayout(self.triangulation_tab)
+        tab_layout = QVBoxLayout(self.triangulation_tab)
+        splitter = self._new_hsplitter()
+        tab_layout.addWidget(splitter)
 
         # --- Control panel (left side) ---
         control_panel = QWidget()
-        control_panel.setMaximumWidth(300)
+        control_panel.setMinimumWidth(260)
+        control_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         control_layout = QVBoxLayout(control_panel)
 
         # -- Triangulation Controls --
@@ -3048,7 +3152,7 @@ class MeshItWorkflowGUI(QMainWindow):
         control_layout.addLayout(nav_layout) # Added for completeness
         control_layout.addStretch() # Added for completeness
 
-        tab_layout.addWidget(control_panel)
+        splitter.addWidget(control_panel)
 
         # --- Visualization Area (right side) --- (remain the same)
         # ... (viz_group setup remains the same) ...
@@ -3064,7 +3168,10 @@ class MeshItWorkflowGUI(QMainWindow):
         self.tri_viz_placeholder.setAlignment(Qt.AlignCenter) # Added for completeness
         self.tri_viz_layout.addWidget(self.tri_viz_placeholder) # Added for completeness
         viz_layout.addWidget(self.tri_viz_frame) # Added for completeness
-        tab_layout.addWidget(viz_group, 1)  # 1 = stretch factor # Added for completeness
+        splitter.addWidget(viz_group)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 940])
 
     def _setup_intersection_tab(self):
         """Create the intersection tab and its components with embedded PyVista view."""
@@ -3363,10 +3470,14 @@ class MeshItWorkflowGUI(QMainWindow):
         self.refine_surface_selector.currentTextChanged.connect(self._on_refine_surface_selection_changed)
         toolbar.addWidget(self.refine_surface_selector)
 
-        self.mouse_selection_enabled_btn = QPushButton("Mouse Selection")
-        self.mouse_selection_enabled_btn.setCheckable(True)
-        self.mouse_selection_enabled_btn.toggled.connect(self._on_mouse_selection_toggled)
-        toolbar.addWidget(self.mouse_selection_enabled_btn)
+        self.refine_pick_constraints_btn = QPushButton("Constraint selection with mouse")
+        self.refine_pick_constraints_btn.setCheckable(True)
+        self.refine_pick_constraints_btn.setToolTip(
+            "Turn on, then click a constraint in the Segments view to toggle it. "
+            "Use the surface filter to choose between overlapping constraints."
+        )
+        self.refine_pick_constraints_btn.toggled.connect(self._toggle_refine_constraint_picking)
+        toolbar.addWidget(self.refine_pick_constraints_btn)
         toolbar.addStretch()
         center_layout.addLayout(toolbar)
 
@@ -3418,8 +3529,7 @@ class MeshItWorkflowGUI(QMainWindow):
 
         self.refine_constraint_tree = QTreeWidget()
         self.refine_constraint_tree.setHeaderLabels(["Constraint", "Type", "Segments", "Status", "Hole"])
-        self.refine_constraint_tree.header().setSectionResizeMode(QHeaderView.Interactive)
-        self.refine_constraint_tree.header().setStretchLastSection(True)
+        _configure_refine_constraint_tree(self.refine_constraint_tree)
         self.refine_constraint_tree.itemChanged.connect(self._on_refine_constraint_tree_item_changed)
         self.refine_constraint_tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         cl.addWidget(self.refine_constraint_tree, 1)
@@ -3537,13 +3647,10 @@ class MeshItWorkflowGUI(QMainWindow):
             self.refine_mesh_plotter = self.intersections_plotter
             self.plotters['refine_mesh'] = self.intersections_plotter
             
-            # Initialize constraint actor persistence system
-            self.constraint_segment_actor_refs = {}
-            self._constraint_actors_built = False
-            self._last_segment_count = 0
-            self._constraint_actors_persistent = True
+            self._refine_pick_actors = []
+            self._refine_segments_drawn = False
             
-            logger.info("Successfully created all refine mesh tab plotters and initialized constraint actor system")
+            logger.info("Successfully created all refine mesh tab plotters with batched constraint picking")
             
         except Exception as e:
             logger.error(f"Error initializing Refine/Mesh plotters: {e}", exc_info=True)
@@ -3584,23 +3691,14 @@ class MeshItWorkflowGUI(QMainWindow):
             logger.info(f"[REFINE] refine_mesh_plotter set to tab {index} ({'OK' if self.refine_mesh_plotter else 'None'})")
 
         if old_view != index:
-            self._ensure_constraint_actors_persistence()
-
-            # Disable mouse selection when leaving segments view
-            if old_view == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
-                if self.mouse_selection_enabled_btn.isChecked():
-                    self.mouse_selection_enabled_btn.setChecked(False)
-
-            logger.info("[REFINE] Calling _update_refined_visualization after tab change")
+            if index != 2 and getattr(self, "refine_pick_constraints_btn", None):
+                self.refine_pick_constraints_btn.setChecked(False)
             self._update_refined_visualization()
-
-            if index == 2 and hasattr(self, 'mouse_selection_enabled_btn'):
-                self.mouse_selection_enabled_btn.setEnabled(True)
-            elif hasattr(self, 'mouse_selection_enabled_btn'):
-                self.mouse_selection_enabled_btn.setEnabled(index == 2)
 
     def _clear_refine_tab_plotters(self):
         """Clear all refine tab plotters"""
+        self._refine_segments_drawn = False
+        self._refine_pick_actors = []
         for plotter_name in ['intersections_plotter', 'meshes_plotter', 'segments_plotter']:
             plotter = getattr(self, plotter_name, None)
             if plotter and hasattr(plotter, 'clear'):
@@ -3692,24 +3790,6 @@ class MeshItWorkflowGUI(QMainWindow):
         logger.warning(f"[REFINE] current plotter -> Unknown tab index {current_index}")
         return None
     
-    def _ensure_constraint_actors_persistence(self):
-        """
-        Ensure constraint actors persist across tab switches and surface filter changes.
-        This prevents unnecessary rebuilding and improves performance.
-        """
-        if not hasattr(self, 'constraint_segment_actor_refs'):
-            self.constraint_segment_actor_refs = {}
-            
-        if not hasattr(self, '_constraint_actors_built'):
-            self._constraint_actors_built = False
-            
-        # Mark constraint actors as persistent to avoid clearing during tab switches
-        if hasattr(self, 'constraint_segment_actor_refs') and self.constraint_segment_actor_refs:
-            setattr(self, '_constraint_actors_persistent', True)
-            
-        # Initialize segment count tracking for change detection
-        if not hasattr(self, '_last_segment_count'):
-            self._last_segment_count = 0
     
     # Event handlers - placeholder implementations
     # ─── Visibility helpers for the view selector ─────────────────────────
@@ -3743,22 +3823,7 @@ class MeshItWorkflowGUI(QMainWindow):
         elif self.refine_mesh_plotter:  # Fallback
             self.refine_mesh_plotter.render()
 
-    def _show_constraint_segment_actors(self, visible: bool):
-        if not hasattr(self, "constraint_segment_actor_refs"):
-            return
-        for a in self.constraint_segment_actor_refs:
-            try:
-                a.SetVisibility(visible)
-            except Exception:
-                pass
-        # Render on the current active plotter
-        current_plotter = self._get_current_refine_plotter()
-        if current_plotter:
-            current_plotter.render()
-        elif self.refine_mesh_plotter:  # Fallback
-            self.refine_mesh_plotter.render()
 
-    
     def _on_refine_surface_selection_changed(self, surface_name):
         """
         Called when the user changes the surface selection in the dropdown.
@@ -3767,1835 +3832,123 @@ class MeshItWorkflowGUI(QMainWindow):
         """
         logger.info(f"Surface selection changed to: {surface_name}")
 
-        current_view = getattr(self, 'current_refine_view', 0)
+        current_view = getattr(self, "current_refine_view", 0)
         if current_view != 2:
-            logger.info(f"Surface selection noted for view {current_view} (constraint visibility not applicable)")
+            logger.info(
+                f"Surface selection noted for view {current_view} (constraint visibility not applicable)"
+            )
             if current_view == 0:
-                logger.info(f"Refreshing intersections visualization for surface filter: {surface_name}")
+                logger.info(
+                    f"Refreshing intersections visualization for surface filter: {surface_name}"
+                )
                 self._visualize_refined_intersections()
             elif current_view == 1:
-                logger.info(f"Refreshing meshes visualization for surface filter: {surface_name}")
+                logger.info(
+                    f"Refreshing meshes visualization for surface filter: {surface_name}"
+                )
                 self._update_refined_visualization()
             self._highlight_surface_in_constraint_tree(surface_name)
             return
 
-        # Segments view
-        batched = bool(getattr(self, "_segments_batched_mode", False))
-        has_segment_actors = bool(getattr(self, 'constraint_segment_actor_refs', {}))
-
-        # In batched mode (mouse selection OFF) or when no actors exist → rebuild once (fast path)
-        if batched or not has_segment_actors:
-            logger.info("[SEGMENTS] Surface filter change: rebuilding batched view")
-            self._update_refined_visualization()
-        else:
-            # Per‑segment actors exist → fast toggle
-            if hasattr(self, 'constraint_segment_actor_refs') and self.constraint_segment_actor_refs:
-                logger.info(f"Updating constraint visibility for surface filter in Segments view (view={current_view})")
-                self._update_segment_visibility_for_surface_selection(surface_name)
-            else:
-                logger.warning("No constraint actors available for visibility update")
-
+        # Rebuild the batched constraint view after changing the surface filter.
+        self._update_refined_visualization()
         self._highlight_surface_in_constraint_tree(surface_name)
 
-    def _update_segment_visibility_for_surface_selection(self, selected_surface):
-        """
-        Fast visibility update for segment actors when surface selection changes.
-        No rebuilding - just toggle visibility.
-        """
-        if not hasattr(self, 'constraint_segment_actor_refs'):
-            logger.warning("No constraint_segment_actor_refs available for visibility update")
+
+
+    def _toggle_refine_constraint_picking(self, enabled):
+        """Enable click selection on the Segments viewer."""
+        if not enabled:
+            self._remove_refine_pick_observers()
+            self.statusBar().showMessage("Constraint selection mode off", 3000)
             return
-            
-        # Get the current active plotter
-        plotter = self._get_current_refine_plotter()
-        if not plotter:
-            # Fallback to old method
-            plotter = self.plotters.get("refine_mesh")
-            if not plotter:
-                logger.warning("No refine_mesh plotter available for visibility update")
-                return
-
-        logger.info(f"Updating visibility for surface filter: '{selected_surface}'")
-        logger.info(f"Total constraint actors available: {len(self.constraint_segment_actor_refs)}")
-
-        # Get constraint type filters
-        show_hull = getattr(self, 'show_hull_constraints_checkbox', None)
-        show_intersections = getattr(self, 'show_intersection_constraints_checkbox', None)
-        show_wells = getattr(self, 'show_well_constraints_checkbox', None)
-        show_selected_only = getattr(self, 'show_selected_only_checkbox', None)
-        
-        show_hull_constraints = show_hull.isChecked() if show_hull else True
-        show_intersection_constraints = show_intersections.isChecked() if show_intersections else True
-        show_well_constraints = show_wells.isChecked() if show_wells else True
-        show_selected_only_mode = show_selected_only.isChecked() if show_selected_only else False
-
-        # Helper function to check if a surface should be shown
-        def should_show_surface(dataset_idx):
-            if selected_surface == "All Surfaces":
-                return True
-            if dataset_idx < len(self.datasets):
-                dataset_name = self.datasets[dataset_idx].get("name", f"Surface_{dataset_idx}")
-                should_show = dataset_name == selected_surface
-                logger.debug(f"Surface check: idx={dataset_idx}, name='{dataset_name}', filter='{selected_surface}', show={should_show}")
-                return should_show
-            logger.debug(f"Surface check: idx={dataset_idx} out of range ({len(self.datasets)} datasets)")
-            return False
-
-        visible_count = 0
-        hidden_count = 0
-        surface_counts = {}  # Track how many segments per surface
-        
-        for (surf_idx, seg_uid), actor in self.constraint_segment_actor_refs.items():
-            # Track surface distribution
-            surface_counts[surf_idx] = surface_counts.get(surf_idx, 0) + 1
-            
-            seg_info = getattr(self, '_refine_segment_map', {}).get((surf_idx, seg_uid), {})
-            seg_type = str(seg_info.get("type", "")).lower()
-            
-            if seg_type == "well":
-                should_show = show_well_constraints
-                if should_show and selected_surface != "All Surfaces":
-                    w_idx = seg_info.get("well_idx")
-                    if w_idx is not None and w_idx < len(self.datasets):
-                        should_show = self.datasets[w_idx].get("name", f"Well_{w_idx}") == selected_surface
-            else:
-                should_show = should_show_surface(surf_idx)
-            
-            if should_show:
-                if seg_type == "hull" and not show_hull_constraints:
-                    should_show = False
-                elif seg_type in ("intersection", "int") and not show_intersection_constraints:
-                    should_show = False
-
-                # Check if in selected-only mode
-                if should_show and show_selected_only_mode:
-                    is_selected = seg_info.get("selected", False)
-                    if not is_selected:
-                        should_show = False
-
-            # Apply visibility instantly
-            try:
-                actor.SetVisibility(should_show)
-                # Force the actor to update its visibility immediately
-                if hasattr(actor, 'Modified'):
-                    actor.Modified()
-                    
-                # NUCLEAR OPTION: If SetVisibility doesn't work, remove/add actor from plotter
-                if not should_show:
-                    # Try to remove actor from plotter entirely
-                    try:
-                        if hasattr(plotter, 'remove_actor') and actor in plotter.renderer.actors:
-                            plotter.remove_actor(actor)
-                            logger.debug(f"Removed actor ({surf_idx}, {seg_uid}) from plotter")
-                    except:
-                        pass
-                else:
-                    # Ensure actor is in plotter
-                    try:
-                        if hasattr(plotter, 'add_actor') and actor not in plotter.renderer.actors:
-                            plotter.add_actor(actor)
-                            logger.debug(f"Added actor ({surf_idx}, {seg_uid}) to plotter")
-                    except:
-                        pass
-                        
-                if should_show:
-                    visible_count += 1
-                else:
-                    hidden_count += 1
-            except Exception as e:
-                logger.warning(f"Failed to set visibility for actor ({surf_idx}, {seg_uid}): {e}")
-                continue
-        
-        # Force complete render and refresh
+        self.refine_view_tabs.setCurrentIndex(2)
+        plotter = self._ensure_segments_plotter()
         try:
-            # NUCLEAR APPROACH: Since SetVisibility() doesn't work,
-            # physically remove all non-visible actors from the plotter
-            plotter.clear_actors()  # Remove ALL actors first
-            
-            # Re-add only the actors that should be visible
-            actors_readded = 0
-            for (surf_idx, seg_uid), actor in self.constraint_segment_actor_refs.items():
-                seg_info = getattr(self, '_refine_segment_map', {}).get((surf_idx, seg_uid), {})
-                seg_type = str(seg_info.get("type", "")).lower()
+            widget = plotter.interactor
+            self._refine_click_filter = _RefineConstraintClickFilter(self, widget)
+            widget.installEventFilter(self._refine_click_filter)
+            self.statusBar().showMessage(
+                "Click a constraint to toggle it; drag to rotate. Filter by surface to disambiguate overlaps."
+            )
+        except Exception as exc:
+            logger.warning("Could not enable constraint picking: %s", exc, exc_info=True)
+            self._remove_refine_pick_observers()
+            self.refine_pick_constraints_btn.setChecked(False)
+            self.statusBar().showMessage("Could not enable constraint selection", 5000)
 
-                if seg_type == "well":
-                    should_show = show_well_constraints
-                    if should_show and selected_surface != "All Surfaces":
-                        w_idx = seg_info.get("well_idx")
-                        if w_idx is not None and w_idx < len(self.datasets):
-                            should_show = self.datasets[w_idx].get("name", f"Well_{w_idx}") == selected_surface
-                else:
-                    should_show = should_show_surface(surf_idx)
-                
-                if should_show:
-                    if seg_type == "hull" and not show_hull_constraints:
-                        should_show = False
-                    elif seg_type in ("intersection", "int") and not show_intersection_constraints:
-                        should_show = False
-
-                    # Check if in selected-only mode
-                    if should_show and show_selected_only_mode:
-                        is_selected = seg_info.get("selected", False)
-                        if not is_selected:
-                            should_show = False
-                
-                # Only add actors that should be visible
-                if should_show:
-                    try:
-                        plotter.add_actor(actor)
-                        actors_readded += 1
-                        logger.debug(f"Re-added actor ({surf_idx}, {seg_uid}) to plotter")
-                    except Exception as e:
-                        logger.warning(f"Failed to re-add actor ({surf_idx}, {seg_uid}): {e}")
-            
-            logger.info(f"NUCLEAR FIX: Removed all actors, re-added {actors_readded} visible actors")
-            
-            # Standard rendering
-            plotter.render()
-            if hasattr(plotter, 'update'):
-                plotter.update()
-            if hasattr(plotter, 'ren_win') and plotter.ren_win:
-                plotter.ren_win.Render()
-                
-        except Exception as e:
-            logger.warning(f"Error during nuclear render fix: {e}")
-            # Fallback to standard render
+    def _remove_refine_pick_observers(self):
+        click_filter = getattr(self, "_refine_click_filter", None)
+        if click_filter is not None:
             try:
-                plotter.render()
-            except:
+                click_filter.widget.removeEventFilter(click_filter)
+                click_filter.deleteLater()
+            except RuntimeError:
                 pass
-        
-        # Detailed logging
-        logger.info(f"Visibility update complete: {visible_count} visible, {hidden_count} hidden")
-        logger.info(f"Surface distribution: {surface_counts}")
-        
-        # Specific info about the selected surface
-        if selected_surface != "All Surfaces":
-            # Find which surface index corresponds to the selected surface name
-            target_surface_idx = None
-            for idx, dataset in enumerate(self.datasets):
-                if dataset.get("name", f"Surface_{idx}") == selected_surface:
-                    target_surface_idx = idx
-                    break
-            
-            if target_surface_idx is not None:
-                visible_for_selected = surface_counts.get(target_surface_idx, 0)
-                logger.info(f"Selected surface '{selected_surface}' (idx={target_surface_idx}) has {visible_for_selected} total segments")
-                
-                # VERIFY THE FIX: Check if the visibility was actually applied
-                visible_actors_for_surface = 0
-                for (surf_idx, seg_uid), actor in self.constraint_segment_actor_refs.items():
-                    if surf_idx == target_surface_idx and actor.GetVisibility():
-                        visible_actors_for_surface += 1
-                
-                logger.info(f"VERIFICATION: {visible_actors_for_surface} actors are actually visible for surface {target_surface_idx}")
-                
-                if visible_actors_for_surface != visible_count:
-                    logger.error(f"VISIBILITY MISMATCH: Expected {visible_count} visible, but {visible_actors_for_surface} actors are actually visible!")
-                else:
-                    logger.info(f"VISIBILITY CONFIRMED: All {visible_count} actors are properly visible")
-                    
-            else:
-                logger.warning(f"Could not find surface index for '{selected_surface}'")
-        
-        logger.info(f"Final result: {visible_count} segments visible for '{selected_surface}'")
+        self._refine_click_filter = None
 
-    def _on_constraint_filter_changed(self):
-        """
-        Fast constraint filter update when checkboxes change.
-        If batched mode: rebuild once. If per‑segment mode: visibility toggle.
-        """
-        if getattr(self, "current_refine_view", 0) != 2:
-            self._update_refined_visualization()
+    def _refine_pick_at(self, x, y):
+        if (not self.refine_pick_constraints_btn.isChecked()
+                or getattr(self, "current_refine_view", 0) != 2):
             return
+        from vtkmodules.vtkRenderingCore import vtkCellPicker
 
-        batched = bool(getattr(self, "_segments_batched_mode", False))
-        if batched:
-            logger.info("[SEGMENTS] Constraint filter changed → rebuilding batched view")
-            self._update_refined_visualization()
+        picker = vtkCellPicker()
+        picker.SetTolerance(0.008)
+        picker.PickFromListOn()
+        actors = getattr(self, "_refine_pick_actors", [])
+        for actor, _ in actors:
+            picker.AddPickList(actor)
+        if not picker.Pick(x, y, 0, self.segments_plotter.renderer):
+            self.statusBar().showMessage("No constraint at this position", 2000)
             return
-
-        # Per‑segment actors exist, toggle visibility without rebuild
-        selected_surface = "All Surfaces"
-        if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
-            selected_surface = self.refine_surface_selector.currentText()
-        self._update_segment_visibility_for_surface_selection(selected_surface)
-
-    def _on_mouse_selection_toggled(self, enabled):
-        """
-        Toggle mouse-based constraint selection on/off.
-        When enabled we rebuild per-segment actors and enable picking.
-        When disabled we rebuild the fast batched view.
-        """
-        logger.info(f"Mouse selection {'enabled' if enabled else 'disabled'}")
-
-        # Show/hide selection mode buttons
-        if hasattr(self, 'selection_mode_btn') and hasattr(self, 'deselection_mode_btn'):
-            self.selection_mode_btn.setVisible(enabled)
-            self.deselection_mode_btn.setVisible(enabled)
-
-        if not hasattr(self, 'current_selection_mode'):
-            self.current_selection_mode = "select"
-
-        if not hasattr(self, 'highlight_timer'):
-            self.highlight_timer = QTimer()
-            self.highlight_timer.setSingleShot(True)
-            self.highlight_timer.timeout.connect(self._clear_selection_highlight)
-            self.highlight_timer.setInterval(500)
-
-        # Ensure we are on Segments tab
-        current_view = getattr(self, 'current_refine_view', 0)
-        if current_view != 2 and enabled:
-            if hasattr(self, 'refine_view_tabs'):
-                self.refine_view_tabs.setCurrentIndex(2)
-            else:
-                if hasattr(self, 'view_btn_grp'):
-                    self.view_btn_grp.button(2).setChecked(True)
-
-        plotter = self._get_current_refine_plotter() or self.plotters.get("refine_mesh")
-        if not plotter:
-            logger.warning("No refine_mesh plotter available for mouse selection")
-            return
-
-        # Rebuild visualization for the new mode
-        # - enabled: per-segment actors for picking
-        # - disabled: batched fast drawing
-        try:
-            self._update_refined_visualization()
-        except Exception as e:
-            logger.warning(f"Redraw after toggling mouse selection failed: {e}")
-
-        if enabled:
-            # Require per-segment actors
-            if not hasattr(self, 'constraint_segment_actor_refs'):
-                self.constraint_segment_actor_refs = {}
-            if not getattr(self, '_constraint_actors_built', False) or not self.constraint_segment_actor_refs:
-                logger.warning("No constraint actors available for mouse selection after rebuild")
+        picked_actor = picker.GetActor()
+        cell_id = picker.GetCellId()
+        for actor, keys in actors:
+            if actor == picked_actor and 0 <= cell_id < len(keys):
+                key = keys[cell_id]
+                if key is not None:
+                    self._toggle_refine_constraint_item(key)
                 return
 
-            try:
-                plotter.enable_cell_picking(
-                    callback=self._on_constraint_cell_clicked,
-                    show_message=False,
-                    font_size=12,
-                    color='yellow',
-                    through=True,
-                    start=True,
-                    show=True
-                )
-                self.mouse_selection_enabled_btn.setText("Mouse ON")
-                logger.info("Constraint mouse selection enabled")
-            except Exception as cell_error:
-                logger.warning(f"Cell picking failed: {cell_error}")
-                try:
-                    from pyvista.plotting.opts import ElementType
-                    plotter.enable_element_picking(
-                        mode=ElementType.EDGE,
-                        callback=self._on_constraint_edge_clicked,
-                        show_message=False,
-                        font_size=10,
-                        color='yellow'
-                    )
-                    self.mouse_selection_enabled_btn.setText("Mouse ON")
-                    logger.info("Constraint mouse selection enabled (edge picking fallback)")
-                except Exception as edge_error:
-                    logger.warning(f"Edge picking failed: {edge_error}")
-                    try:
-                        plotter.enable_mesh_picking(
-                            callback=self._on_constraint_clicked_single,
-                            show_message=False,
-                            font_size=10,
-                            color='yellow'
-                        )
-                        self.mouse_selection_enabled_btn.setText("Mouse ON")
-                        logger.info("Constraint mouse selection enabled (mesh picking fallback)")
-                    except Exception as mesh_error:
-                        logger.error(f"All picking methods failed: {mesh_error}")
-                        return
-        else:
-            # Disable picking and rebuild fast view
-            try:
-                plotter.disable_picking()
-            except Exception:
-                pass
-            self.mouse_selection_enabled_btn.setText("Mouse Selection")
-            try:
-                self._update_refined_visualization()
-            except Exception:
-                pass
-            logger.info("Constraint mouse selection disabled")
-
-    def _on_selection_mode_changed(self, button, checked):
-        """
-        Called when user switches between Select Mode and Deselect Mode.
-        Updates the behavior of rectangle selection.
-        """
-        if not checked:
-            return  # Only respond to button being checked, not unchecked
-            
-        mode_id = self.selection_mode_group.id(button)
-        if mode_id == 0:  # Select mode
-            self.current_selection_mode = "select"
-            logger.info("Selection mode: SELECT - Rectangle drag will select constraints")
-            # Update button styles to show active mode
-            self.selection_mode_btn.setText("Select Mode (Active)")
-            self.deselection_mode_btn.setText("Deselect Mode")
-        elif mode_id == 1:  # Deselect mode
-            self.current_selection_mode = "deselect"
-            logger.info("Selection mode: DESELECT - Rectangle drag will deselect constraints")
-            # Update button styles to show active mode
-            self.selection_mode_btn.setText("Select Mode")
-            self.deselection_mode_btn.setText("Deselect Mode (Active)")
-        
-        # Store the current mode for use in cell clicking callback
-        self.current_selection_mode = "select" if mode_id == 0 else "deselect"
-
-    def _clear_selection_highlight(self):
-        """
-        Clear the yellow selection highlight after a short delay.
-        This allows users to see the actual selection state of constraints.
-        """
-        try:
-            # Get the current active plotter
-            plotter = self._get_current_refine_plotter()
-            if not plotter:
-                # Fallback to old method
-                plotter = self.plotters.get("refine_mesh")
-            if plotter:
-                # Try multiple methods to clear PyVista highlighting
-                try:
-                    # Method 1: Clear pick selection if available
-                    if hasattr(plotter, 'clear_pick_selection'):
-                        plotter.clear_pick_selection()
-                        logger.debug("Cleared using clear_pick_selection()")
-                    
-                    # Method 2: Clear cell picking highlight
-                    elif hasattr(plotter, 'picked_cell') and plotter.picked_cell is not None:
-                        plotter.picked_cell = None
-                        logger.debug("Cleared picked_cell")
-                    
-                    # Method 3: Clear mesh picking highlight  
-                    elif hasattr(plotter, 'picked_mesh') and plotter.picked_mesh is not None:
-                        plotter.picked_mesh = None
-                        logger.debug("Cleared picked_mesh")
-                    
-                    # Method 4: Force render to clear any visual artifacts
-                    plotter.render()
-                    logger.debug("Cleared selection highlighting with render")
-                    
-                except AttributeError as ae:
-                    # Just render if specific clearing methods don't exist
-                    plotter.render()
-                    logger.debug(f"Used render fallback: {ae}")
-                    
-        except Exception as e:
-            logger.warning(f"Error clearing selection highlight: {e}")
-
-    def _update_constraint_visualization_colors(self):
-        """
-        Update the visual colors of constraint lines based on their selection state.
-        Green = selected, Gray = unselected (following the original constraint visualization system).
-        """
-        try:
-            # Get the current active plotter
-            plotter = self._get_current_refine_plotter()
-            if not plotter:
-                # Fallback to old method
-                plotter = self.plotters.get("refine_mesh")
-            if not plotter or not hasattr(self, 'constraint_segment_actor_refs'):
-                return
-                
-            # Get the tree for checking selection states
-            tree = getattr(self, 'refine_constraint_tree', None)
-            if not tree:
-                return
-                
-            logger.debug("Updating constraint visualization colors based on selection state")
-            
-            # Build a map of selection states for fast lookup
-            selection_states = {}  # {(surf_idx, seg_uid): is_selected}
-            
-            def collect_selection_states(item):
-                """Recursively collect selection states from tree"""
-                data = item.data(0, Qt.UserRole)
-                if data and data.get("type") == "constraint":
-                    surf_idx = data.get("surface_idx")
-                    seg_uid = data.get("seg_uid")
-                    is_selected = item.checkState(0) == Qt.Checked
-                    selection_states[(surf_idx, seg_uid)] = is_selected
-                
-                # Process child items
-                for i in range(item.childCount()):
-                    collect_selection_states(item.child(i))
-            
-            # Collect all selection states from tree
-            for i in range(tree.topLevelItemCount()):
-                collect_selection_states(tree.topLevelItem(i))
-            
-            # Update actor colors based on selection state
-            updated_count = 0
-            for (surf_idx, seg_uid), actor in self.constraint_segment_actor_refs.items():
-                is_selected = selection_states.get((surf_idx, seg_uid), False)
-                
-                # Set color: Green for selected, Gray for unselected
-                if is_selected:
-                    color = [0.0, 1.0, 0.0]  # Green
-                else:
-                    color = [0.5, 0.5, 0.5]  # Gray
-                
-                try:
-                    # Update actor color
-                    actor.GetProperty().SetColor(color)
-                    actor.Modified()  # Mark as modified to trigger render update
-                    updated_count += 1
-                except Exception as actor_error:
-                    logger.debug(f"Failed to update color for actor ({surf_idx}, {seg_uid}): {actor_error}")
-            
-            # Force render to show color changes
-            plotter.render()
-            logger.debug(f"Updated colors for {updated_count} constraint actors")
-            
-        except Exception as e:
-            logger.warning(f"Error updating constraint visualization colors: {e}")
-
-    def _synchronize_shared_intersection_segments(self, selected_segments):
-        """
-        Synchronize selection state for intersection segments that are shared across multiple surfaces.
-        When an intersection segment is selected/deselected on one surface, it should be 
-        selected/deselected on all other surfaces that share the same intersection.
-        """
-        try:
-            if not hasattr(self, 'refined_intersections_for_visualization') or not hasattr(self, 'refine_constraint_tree'):
-                return
-                
-            tree = self.refine_constraint_tree
-            if not tree:
-                return
-                
-            # Get current selection mode
-            mode = getattr(self, 'current_selection_mode', 'select')
-            
-            logger.debug(f"Synchronizing {len(selected_segments)} segments across surfaces (mode: {mode})")
-            
-            # Block signals to prevent recursion during synchronization
-            tree.blockSignals(True)
-            
-            try:
-                # For each segment that was just selected/deselected
-                for surf_idx, seg_uid in selected_segments:
-                    # Check if this is an intersection segment by finding its parent in the tree
-                    segment_item = self._find_tree_item_for_segment(surf_idx, seg_uid)
-                    if not segment_item:
-                        continue
-                        
-                    parent_item = segment_item.parent()
-                    if not parent_item:
-                        continue
-                        
-                    parent_data = parent_item.data(0, Qt.UserRole)
-                    if not parent_data or parent_data.get("type") != "intersection_group":
-                        continue  # Not an intersection segment, no sync needed
-                    
-                    # Get the intersection index
-                    try:
-                        intersection_idx = int(parent_item.text(0).split(" ")[-1])
-                    except (ValueError, IndexError):
-                        continue
-                    
-                    # Get the intersection data to find which surfaces are involved
-                    if surf_idx not in self.refined_intersections_for_visualization:
-                        continue
-                        
-                    if intersection_idx >= len(self.refined_intersections_for_visualization[surf_idx]):
-                        continue
-                        
-                    intersection_data = self.refined_intersections_for_visualization[surf_idx][intersection_idx]
-                    dataset_id1 = intersection_data.get('dataset_id1')
-                    dataset_id2 = intersection_data.get('dataset_id2')
-                    
-                    # Get the current selection state of the segment we just modified
-                    current_state = segment_item.checkState(0) == Qt.Checked
-                    
-                    logger.debug(f"Syncing intersection segment {seg_uid} from surface {surf_idx} to surfaces {dataset_id1}, {dataset_id2}")
-                    
-                    # Update the same segment on the other involved surfaces
-                    surfaces_to_sync = []
-                    if dataset_id1 is not None and dataset_id1 != surf_idx:
-                        surfaces_to_sync.append(dataset_id1)
-                    if dataset_id2 is not None and dataset_id2 != surf_idx:
-                        surfaces_to_sync.append(dataset_id2)
-                    
-                    for other_surface_idx in surfaces_to_sync:
-                        # Find the corresponding segment on the other surface
-                        other_segment_item = self._find_matching_intersection_segment(
-                            other_surface_idx, intersection_idx, seg_uid
-                        )
-                        
-                        if other_segment_item:
-                            # Set the same selection state
-                            new_state = Qt.Checked if current_state else Qt.Unchecked
-                            if other_segment_item.checkState(0) != new_state:
-                                other_segment_item.setCheckState(0, new_state)
-                                logger.debug(f"Synced segment {seg_uid} on surface {other_surface_idx} to {current_state}")
-                
-            finally:
-                # Re-enable signals and update visualization
-                tree.blockSignals(False)
-                tree.update()
-                tree.repaint()
-                
-                # Update colors again to reflect synchronized changes
-                self._update_constraint_visualization_colors()
-                
-            logger.debug("Cross-surface synchronization complete")
-            
-        except Exception as e:
-            logger.warning(f"Error synchronizing shared intersection segments: {e}")
-
-    def _synchronize_shared_intersection_segments_background(self, selected_segments):
-        """
-        Background synchronization for intersection segments that respects surface filtering.
-        Updates tree states without affecting visual display - the surface filter remains active.
-        """
-        try:
-            if not hasattr(self, 'refined_intersections_for_visualization') or not hasattr(self, 'refine_constraint_tree'):
-                return
-                
-            tree = self.refine_constraint_tree
-            if not tree:
-                return
-                
-            # Get current selection mode and surface filter
-            mode = getattr(self, 'current_selection_mode', 'select')
-            current_surface_filter = "All Surfaces"
-            if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
-                current_surface_filter = self.refine_surface_selector.currentText()
-                
-            logger.debug(f"Background sync: {len(selected_segments)} segments (mode: {mode}, filter: {current_surface_filter})")
-            
-            # Block signals to prevent visual updates during background sync
-            tree.blockSignals(True)
-            
-            try:
-                # For each segment that was just selected/deselected
-                for surf_idx, seg_uid in selected_segments:
-                    # Only sync if this segment was actually from the filtered surface
-                    if current_surface_filter != "All Surfaces":
-                        # Check if this segment belongs to the currently filtered surface
-                        if surf_idx < len(self.datasets):
-                            dataset_entry = self.datasets[surf_idx]
-                            # Robustly obtain surface name whether the datasets list stores dicts or paths
-                            if isinstance(dataset_entry, dict):
-                                surface_name = dataset_entry.get("name", f"Surface_{surf_idx}")
-                            else:
-                                surface_name = os.path.basename(str(dataset_entry))
-                            if surface_name != current_surface_filter:
-                                continue  # Skip segments not from current surface filter
-                    
-                    # Find and sync intersection segments
-                    segment_item = self._find_tree_item_for_segment(surf_idx, seg_uid)
-                    if not segment_item:
-                        continue
-                        
-                    parent_item = segment_item.parent()
-                    if not parent_item:
-                        continue
-                        
-                    parent_data = parent_item.data(0, Qt.UserRole)
-                    if not parent_data or parent_data.get("type") != "intersection_group":
-                        continue  # Not an intersection segment
-                    
-                    # Get intersection data and sync to other surfaces
-                    try:
-                        intersection_idx = int(parent_item.text(0).split(" ")[-1])
-                    except (ValueError, IndexError):
-                        continue
-                    
-                    if surf_idx not in self.refined_intersections_for_visualization:
-                        continue
-                        
-                    if intersection_idx >= len(self.refined_intersections_for_visualization[surf_idx]):
-                        continue
-                        
-                    intersection_data = self.refined_intersections_for_visualization[surf_idx][intersection_idx]
-                    dataset_id1 = intersection_data.get('dataset_id1')
-                    dataset_id2 = intersection_data.get('dataset_id2')
-                    
-                    # Get current selection state
-                    current_state = segment_item.checkState(0) == Qt.Checked
-                    
-                    # Update other surfaces (background tree updates only)
-                    surfaces_to_sync = []
-                    if dataset_id1 is not None and dataset_id1 != surf_idx:
-                        surfaces_to_sync.append(dataset_id1)
-                    if dataset_id2 is not None and dataset_id2 != surf_idx:
-                        surfaces_to_sync.append(dataset_id2)
-                    
-                    for other_surface_idx in surfaces_to_sync:
-                        other_segment_item = self._find_matching_intersection_segment(
-                            other_surface_idx, intersection_idx, seg_uid
-                        )
-                        
-                        if other_segment_item:
-                            # Update tree state without triggering visual updates
-                            new_state = Qt.Checked if current_state else Qt.Unchecked
-                            if other_segment_item.checkState(0) != new_state:
-                                other_segment_item.setCheckState(0, new_state)
-                                logger.debug(f"Background sync: segment {seg_uid} on surface {other_surface_idx} → {current_state}")
-                
-            finally:
-                # Re-enable signals but DON'T trigger visual updates
-                tree.blockSignals(False)
-                # NOTE: We deliberately don't call tree.update() or repaint() here
-                # NOTE: We deliberately don't call _update_constraint_visualization_colors() here
-                # This keeps the background sync invisible to the user interface
-                
-            logger.debug("Background synchronization complete (no visual changes)")
-            
-        except Exception as e:
-            logger.warning(f"Error in background synchronization: {e}")
-
-    def _find_tree_item_for_segment(self, surf_idx, seg_uid):
-        """
-        Find the tree item for a specific segment.
-        """
-        tree = getattr(self, 'refine_constraint_tree', None)
-        if not tree:
-            return None
-            
-        def search_item(item):
-            data = item.data(0, Qt.UserRole)
-            if data and data.get("type") == "constraint":
-                if data.get("surface_idx") == surf_idx and data.get("seg_uid") == seg_uid:
-                    return item
-            
-            # Search children
-            for i in range(item.childCount()):
-                result = search_item(item.child(i))
-                if result:
-                    return result
-            return None
-        
-        # Search all top-level items
-        for i in range(tree.topLevelItemCount()):
-            result = search_item(tree.topLevelItem(i))
-            if result:
-                return result
-        return None
-
-    def _find_matching_intersection_segment(self, surface_idx, intersection_idx, seg_uid):
-        """
-        Find the matching intersection segment on another surface.
-        """
-        tree = getattr(self, 'refine_constraint_tree', None)
-        if not tree:
-            return None
-            
-        # Find the surface item
-        for i in range(tree.topLevelItemCount()):
-            surface_item = tree.topLevelItem(i)
-            surface_data = surface_item.data(0, Qt.UserRole)
-            
-            if surface_data and surface_data.get("surface_idx") == surface_idx:
-                # Find the intersection group
-                for j in range(surface_item.childCount()):
-                    group_item = surface_item.child(j)
-                    group_data = group_item.data(0, Qt.UserRole)
-                    
-                    if (group_data and group_data.get("type") == "intersection_group"):
-                        try:
-                            item_intersection_idx = int(group_item.text(0).split(" ")[-1])
-                            if item_intersection_idx == intersection_idx:
-                                # Find the segment within this group
-                                for k in range(group_item.childCount()):
-                                    segment_item = group_item.child(k)
-                                    segment_data = segment_item.data(0, Qt.UserRole)
-                                    
-                                    if (segment_data and 
-                                        segment_data.get("type") == "constraint" and
-                                        segment_data.get("seg_uid") == seg_uid):
-                                        return segment_item
-                        except (ValueError, IndexError):
-                            continue
-        return None
-
-    def _on_constraint_edge_clicked(self, *args):
-        """
-        Called when user clicks on a constraint edge using element picking.
-        This is the most accurate method for selecting constraint lines since they are edges.
-        """
-        import traceback
-        try:
-            logger.info(f"=== EDGE CLICK DETECTED === Received {len(args)} arguments")
-            
-            # Edge picking typically provides: (mesh, cell_id, edge_id) or similar
-            if len(args) >= 1:
-                mesh = args[0]
-                logger.info(f"Clicked edge mesh type: {type(mesh)}")
-                
-                # Handle None mesh (edge picking sometimes fails)
-                if mesh is None:
-                    logger.warning("Edge picking returned None mesh - edge detection failed")
-                    return
-                
-                # Try to get edge info if available
-                if len(args) >= 2:
-                    cell_id = args[1]
-                    logger.info(f"Cell ID: {cell_id}")
-                    
-                if len(args) >= 3:
-                    edge_id = args[2]
-                    logger.info(f"Edge ID: {edge_id}")
-                
-                # Add mesh debugging
-                if hasattr(mesh, 'GetNumberOfPoints'):
-                    num_points = mesh.GetNumberOfPoints()
-                    logger.info(f"Clicked edge mesh has {num_points} points")
-                    
-                    if num_points >= 2:
-                        # Get first and last points for debugging
-                        first_point = mesh.GetPoint(0)
-                        last_point = mesh.GetPoint(num_points - 1)
-                        logger.info(f"Edge: start={first_point}, end={last_point}")
-                else:
-                    logger.warning("Edge mesh has no GetNumberOfPoints method")
-                    
-                # Use the standard method to find and select the segment
-                logger.info("Processing edge click through constraint clicked method...")
-                self._on_constraint_clicked(mesh)
-                
-            else:
-                logger.warning("No data received in edge picking callback")
-        except Exception as e:
-            logger.error(f"Error in edge picking callback: {e}")
-            traceback.print_exc()
-
-    def _on_constraint_cell_clicked(self, *args):
-        """
-        Called when user clicks on a constraint using cell picking.
-        This method gets the mesh from the picked cell and handles both single clicks and rectangle selections.
-        """
-        import traceback
-        try:
-            # Fast processing - reduced logging for speed
-            # logger.info(f"=== MOUSE CLICK DETECTED === Received {len(args)} arguments")
-            
-            # Cell picking can provide either a single mesh or a collection of picked cells
-            if len(args) >= 1:
-                picked_data = args[0]
-                logger.info(f"Picked data type: {type(picked_data)}")
-                
-                # Handle different types of picked data
-                meshes_to_process = []
-                
-                if hasattr(picked_data, 'n_blocks') and picked_data.n_blocks > 0:
-                    # MultiBlock - could be rectangle selection or single click
-                    total_points = sum(block.n_points for block in picked_data if block is not None and hasattr(block, 'n_points'))
-                    logger.info(f"MultiBlock with {picked_data.n_blocks} blocks, total points: {total_points}")
-                    
-                    # Extract all valid individual meshes from the MultiBlock
-                    for i in range(picked_data.n_blocks):
-                        block = picked_data[i]
-                        if block is not None and hasattr(block, 'n_points') and block.n_points >= 2:
-                            meshes_to_process.append(block)
-                    
-                    logger.info(f"Extracted {len(meshes_to_process)} valid meshes for processing")
-                    
-                elif hasattr(picked_data, 'n_points'):
-                    # Single mesh
-                    meshes_to_process = [picked_data]
-                    logger.info(f"Single mesh with {picked_data.n_points} points")
-                
-                # Get current surface filter FIRST to enable pre-filtering
-                selected_surface = "All Surfaces"
-                if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
-                    selected_surface = self.refine_surface_selector.currentText()
-                    # logger.info(f"Current surface filter: '{selected_surface}'")  # Removed for speed
-                
-                # CRITICAL FIX: Pre-filter meshes to only include those from visible actors
-                # This prevents PyVista from returning meshes from hidden constraint actors
-                filtered_meshes = []
-                skipped_count = 0
-                
-                for mesh in meshes_to_process:
-                    # Find the segment for this mesh
-                    clicked_segment = self._find_segment_by_mesh_comparison(mesh)
-                    
-                    if clicked_segment:
-                        surf_idx, seg_uid = clicked_segment
-                        
-                        # Check if this segment should be visible based on surface filter
-                        if self._is_surface_visible_in_filter(surf_idx, selected_surface):
-                            # Check if the actor is actually visible
-                            if self._is_constraint_actor_visible(surf_idx, seg_uid):
-                                filtered_meshes.append(mesh)
-                                logger.debug(f"Including mesh for segment ({surf_idx}, {seg_uid})")
-                            else:
-                                skipped_count += 1
-                                logger.debug(f"Skipping mesh for segment ({surf_idx}, {seg_uid}) - actor not visible")
-                        else:
-                            skipped_count += 1
-                            logger.debug(f"Skipping mesh for segment ({surf_idx}, {seg_uid}) - surface not selected")
-                    else:
-                        skipped_count += 1
-                        logger.debug("Skipping mesh - could not identify segment")
-                
-                logger.info(f"PRE-FILTER: {len(filtered_meshes)} valid, {skipped_count} skipped from {len(meshes_to_process)} total meshes")
-                
-                # Process only the filtered meshes
-                valid_segments = []
-                
-                for mesh in filtered_meshes:
-                    # Find the segment for this mesh (we know it exists since we pre-filtered)
-                    clicked_segment = self._find_segment_by_mesh_comparison(mesh)
-                    
-                    if clicked_segment:
-                        surf_idx, seg_uid = clicked_segment
-                        valid_segments.append((surf_idx, seg_uid))
-                        # logger.debug(f"Will toggle segment ({surf_idx}, {seg_uid})")  # Removed for speed
-                
-                # Report results
-                if valid_segments:
-                    # Fast operation - minimal logging
-                    if len(valid_segments) == 1:
-                        operation = "Single click"
-                    else:
-                        operation = "Rectangle selection"
-                    
-                    mode_text = "selected" if getattr(self, 'current_selection_mode', 'select') == "select" else "deselected"
-                    
-                    # ULTRA-FAST BATCH PROCESSING - disable all tree signals during batch update
-                    tree = getattr(self, 'refine_constraint_tree', None)
-                    if tree:
-                        tree.blockSignals(True)
-                    
-                    try:
-                        # Process all segments in a single batch
-                        success_count = 0
-                        for surf_idx, seg_uid in valid_segments:
-                            if self._apply_selection_mode_to_segment_fast(surf_idx, seg_uid):
-                                success_count += 1
-                        
-                        logger.info(f"{operation}: {mode_text} {success_count}/{len(valid_segments)} segments")
-                        
-                    finally:
-                        # Re-enable tree signals after batch operation - THIS TRIGGERS THE VISUAL UPDATE
-                        if tree:
-                            tree.blockSignals(False)
-                            # CRITICAL: Emit a signal to update the tree visualization
-                            tree.update()
-                            tree.repaint()
-                            
-                        # CRITICAL FIX: Update constraint visualization colors after selection changes
-                        # This ensures green (selected) and gray (unselected) lines are properly updated
-                        self._update_constraint_visualization_colors()
-                        
-                        # CROSS-SURFACE SYNCHRONIZATION: Update shared intersection segments in the background
-                        # This only updates tree states, not visual display (surface filter still applies)
-                        self._synchronize_shared_intersection_segments_background(valid_segments)
-
-                        # Immediately clear any yellow picking highlight so the user sees the final colors
-                        self._clear_selection_highlight()
-                    
-                    # Start timer to ensure any residual highlight is cleared after a short delay
-                    if hasattr(self, 'highlight_timer'):
-                        try:
-                            self.highlight_timer.start()  # This will clear highlighting after 500ms
-                        except Exception as timer_error:
-                            logger.debug(f"Highlight timer error (non-critical): {timer_error}")
-                            # If timer fails, just do immediate clear
-                            self._clear_selection_highlight()
-                    
-                else:
-                    logger.warning("No valid segments found for current surface filter")
-                    if skipped_count > 0:
-                        logger.info(f"All {skipped_count} picked meshes were filtered out due to surface selection")
-                        logger.info(f"Current filter: '{selected_surface}' - ensure you're clicking on visible constraints")
-                        logger.info(f"Switch to 'All Surfaces' to interact with all constraints")
-                
-            else:
-                logger.warning("No data received in cell picking callback")
-                
-        except Exception as e:
-            logger.error(f"Error in cell picking callback: {e}")
-            traceback.print_exc()
-
-    def _is_surface_visible_in_filter(self, surf_idx, selected_surface):
-        """
-        Helper function to check if a surface should be shown based on the current filter.
-        """
-        if selected_surface == "All Surfaces":
-            return True
-        if surf_idx < len(self.datasets):
-            dataset_entry = self.datasets[surf_idx]
-            if isinstance(dataset_entry, dict):
-                dataset_name = dataset_entry.get("name", f"Surface_{surf_idx}")
-            else:
-                dataset_name = os.path.basename(str(dataset_entry))
-            return dataset_name == selected_surface
-        return False
-
-    def _is_constraint_actor_visible(self, surf_idx, seg_uid):
-        """
-        Check if a constraint actor is currently visible in the plotter.
-        This ensures we only select constraints that are actually displayed.
-        """
-        try:
-            if not hasattr(self, 'constraint_segment_actor_refs'):
-                return False
-                
-            actor = self.constraint_segment_actor_refs.get((surf_idx, seg_uid))
-            if not actor:
-                return False
-                
-            # Check if actor has visibility property and is visible
-            if hasattr(actor, 'GetVisibility'):
-                is_visible = actor.GetVisibility()
-                logger.debug(f"Actor ({surf_idx}, {seg_uid}) visibility: {is_visible}")
-                return bool(is_visible)
-            else:
-                # If we can't check visibility, assume it's visible
-                logger.debug(f"Actor ({surf_idx}, {seg_uid}) has no visibility check - assuming visible")
-                return True
-                
-        except Exception as e:
-            logger.debug(f"Error checking actor visibility for ({surf_idx}, {seg_uid}): {e}")
-            return False
-
-    def _find_segment_by_direct_lookup(self, clicked_mesh):
-        """
-        Simplified direct lookup approach that tries to match the exact mesh objects.
-        """
-        try:
-            if not hasattr(clicked_mesh, 'GetNumberOfPoints') or clicked_mesh.GetNumberOfPoints() < 2:
-                logger.warning("Invalid clicked mesh for direct lookup")
-                return None
-                
-            num_points = clicked_mesh.GetNumberOfPoints()
-            logger.info(f"Direct lookup for mesh with {num_points} points")
-            
-            # Get clicked mesh endpoints for comparison
-            clicked_start = clicked_mesh.GetPoint(0)
-            clicked_end = clicked_mesh.GetPoint(num_points - 1)
-            
-            logger.info(f"Clicked mesh: start={clicked_start}, end={clicked_end}")
-            
-            # Check all stored constraint actors to find exact match
-            best_match = None
-            best_score = float('inf')
-            
-            for (surf_idx, seg_uid), actor in getattr(self, 'constraint_segment_actor_refs', {}).items():
-                try:
-                    # Get the mesh from the actor
-                    if hasattr(actor, 'GetMapper') and actor.GetMapper():
-                        actor_mesh = actor.GetMapper().GetInput()
-                        if (actor_mesh and 
-                            hasattr(actor_mesh, 'GetNumberOfPoints') and 
-                            actor_mesh.GetNumberOfPoints() == num_points):
-                            
-                            # Get actor mesh endpoints
-                            actor_start = actor_mesh.GetPoint(0)
-                            actor_end = actor_mesh.GetPoint(num_points - 1)
-                            
-                            # Calculate exact distance between endpoints
-                            start_dist = ((clicked_start[0] - actor_start[0])**2 + 
-                                        (clicked_start[1] - actor_start[1])**2 + 
-                                        (clicked_start[2] - actor_start[2])**2)**0.5
-                            
-                            end_dist = ((clicked_end[0] - actor_end[0])**2 + 
-                                      (clicked_end[1] - actor_end[1])**2 + 
-                                      (clicked_end[2] - actor_end[2])**2)**0.5
-                            
-                            total_dist = start_dist + end_dist
-                            
-                            logger.debug(f"Actor ({surf_idx}, {seg_uid}): start_dist={start_dist:.6f}, end_dist={end_dist:.6f}, total={total_dist:.6f}")
-                            
-                            # Check for very close match (should be exact for line segments)
-                            if total_dist < 1e-6:  # Very tight tolerance for exact match
-                                logger.info(f"EXACT MATCH found: surf={surf_idx}, seg={seg_uid}, dist={total_dist:.10f}")
-                                return (surf_idx, seg_uid)
-                            
-                            # Track best match as fallback
-                            if total_dist < best_score:
-                                best_score = total_dist
-                                best_match = (surf_idx, seg_uid)
-                                
-                except Exception as e:
-                    logger.debug(f"Error checking actor ({surf_idx}, {seg_uid}): {e}")
-                    continue
-            
-            # Return best match if it's close enough
-            if best_match and best_score < 1.0:  # 1 unit tolerance
-                logger.info(f"BEST MATCH found: {best_match}, score={best_score:.6f}")
-                return best_match
-            
-            logger.warning(f"No suitable direct match found. Best score: {best_score:.6f}")
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error in direct lookup: {e}")
-            return None
-
-    def _on_constraint_point_clicked(self, *args):
-        """
-        Called when user clicks on a constraint using point picking.
-        Uses the clicked point location to find the nearest segment.
-        """
-        # Handle different callback signatures
-        if len(args) >= 1:
-            point = args[0]
-        else:
-            logger.warning("No point data received in callback")
-            return
-            
-        if not point or len(point) < 3:
-            logger.warning("Invalid click point received")
-            return
-            
-        logger.debug(f"Point clicked at: {point}")
-        
-        # Find the closest segment to the clicked point
-        clicked_segment = self._find_segment_by_click_point(point)
-        
-        if not clicked_segment:
-            logger.warning("Could not identify clicked constraint segment from point")
-            return
-            
-        surf_idx, seg_uid = clicked_segment
-        logger.info(f"Mouse clicked constraint at point {point}: surface {surf_idx}, segment {seg_uid}")
-        
-        # Check if this segment is currently visible (respects surface filter)
-        selected_surface = "All Surfaces"
-        if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
-            selected_surface = self.refine_surface_selector.currentText()
-            
-        # Helper function to check if a surface should be shown
-        def should_show_surface(dataset_idx):
-            if selected_surface == "All Surfaces":
-                return True
-            if dataset_idx < len(self.datasets):
-                dataset_name = self.datasets[dataset_idx].get("name", f"Surface_{dataset_idx}")
-                return dataset_name == selected_surface
-            return False
-        
-        if not should_show_surface(surf_idx):
-            logger.info(f"Clicked segment not in current surface filter: {selected_surface}")
-            return
-            
-        # Find the corresponding tree item and toggle its selection
-        self._toggle_segment_selection_in_tree(surf_idx, seg_uid)
-
-    def _find_segment_by_click_point(self, click_point):
-        """
-        Find the segment closest to the clicked point coordinates.
-        This provides the most accurate selection based on actual click location.
-        """
-        try:
-            click_x, click_y, click_z = click_point[0], click_point[1], click_point[2]
-            logger.debug(f"Finding segment closest to click point: ({click_x:.6f}, {click_y:.6f}, {click_z:.6f})")
-            
-            best_match = None
-            best_distance = float('inf')
-            candidates = []
-            
-            # Check all stored segments
-            for (surf_idx, seg_uid), seg_info in getattr(self, "_refine_segment_map", {}).items():
-                if 'points' not in seg_info or len(seg_info['points']) < 2:
-                    continue
-                    
-                seg_points = seg_info['points']
-                
-                # Find the minimum distance from click point to this segment
-                min_dist_to_segment = float('inf')
-                closest_point_on_segment = None
-                
-                # Check distance to each segment of the line
-                for i in range(len(seg_points) - 1):
-                    p1 = seg_points[i]
-                    p2 = seg_points[i + 1]
-                    
-                    # Calculate distance from click point to line segment
-                    dist_to_segment, closest_on_seg = self._point_to_line_segment_distance(
-                        (click_x, click_y, click_z), p1, p2
-                    )
-                    
-                    if dist_to_segment < min_dist_to_segment:
-                        min_dist_to_segment = dist_to_segment
-                        closest_point_on_segment = closest_on_seg
-                
-                # Also check distance to endpoints for very short segments
-                start_dist = ((click_x - seg_points[0][0])**2 + 
-                            (click_y - seg_points[0][1])**2 + 
-                            (click_z - seg_points[0][2])**2)**0.5
-                            
-                end_dist = ((click_x - seg_points[-1][0])**2 + 
-                          (click_y - seg_points[-1][1])**2 + 
-                          (click_z - seg_points[-1][2])**2)**0.5
-                
-                final_distance = min(min_dist_to_segment, start_dist, end_dist)
-                
-                candidates.append(((surf_idx, seg_uid), final_distance, surf_idx, seg_uid))
-                
-                if final_distance < best_distance:
-                    best_distance = final_distance
-                    best_match = (surf_idx, seg_uid)
-                    
-                logger.debug(f"Distance to surf={surf_idx}, seg={seg_uid}: {final_distance:.6f}")
-            
-            # Return best match if it's close enough
-            if best_match and best_distance < 5.0:  # 5 unit tolerance for click accuracy
-                logger.info(f"Best click-point match found with distance {best_distance:.6f}: {best_match}")
-                return best_match
-            elif candidates:
-                # Show top candidates for debugging
-                candidates.sort(key=lambda x: x[1])
-                logger.warning(f"No close click-point match found. Top 3 candidates:")
-                for i, (seg_info, dist, surf_idx, seg_uid) in enumerate(candidates[:3]):
-                    logger.warning(f"  {i+1}. surf={surf_idx}, seg={seg_uid}, dist={dist:.6f}")
-            
-            logger.warning(f"No suitable click-point match found. Best distance: {best_distance:.6f}")
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error in click point matching: {e}")
-            return None
-    
-    def _point_to_line_segment_distance(self, point, line_start, line_end):
-        """
-        Calculate the minimum distance from a point to a line segment.
-        Returns (distance, closest_point_on_segment).
-        """
-        try:
-            px, py, pz = point
-            x1, y1, z1 = line_start
-            x2, y2, z2 = line_end
-            
-            # Vector from line start to end
-            dx = x2 - x1
-            dy = y2 - y1
-            dz = z2 - z1
-            
-            # If line is actually a point
-            if dx*dx + dy*dy + dz*dz < 1e-12:
-                dist = ((px - x1)**2 + (py - y1)**2 + (pz - z1)**2)**0.5
-                return dist, (x1, y1, z1)
-            
-            # Parameter t for closest point on line
-            t = ((px - x1)*dx + (py - y1)*dy + (pz - z1)*dz) / (dx*dx + dy*dy + dz*dz)
-            
-            # Clamp t to [0, 1] to stay on segment
-            t = max(0, min(1, t))
-            
-            # Closest point on segment
-            closest_x = x1 + t * dx
-            closest_y = y1 + t * dy
-            closest_z = z1 + t * dz
-            
-            # Distance from point to closest point on segment
-            distance = ((px - closest_x)**2 + (py - closest_y)**2 + (pz - closest_z)**2)**0.5
-            
-            return distance, (closest_x, closest_y, closest_z)
-            
-        except Exception as e:
-            logger.debug(f"Error calculating point to line distance: {e}")
-            return float('inf'), None
-
-    def _on_constraint_clicked(self, mesh):
-        """
-        Called when user clicks on a constraint line in the visualization.
-        Finds the corresponding segment and returns the segment info.
-        Surface filtering is now handled by the caller.
-        """
-        logger.debug("=== CONSTRAINT CLICKED METHOD CALLED ===")
-        
-        if not mesh:
-            logger.warning("No mesh provided to constraint click handler")
-            return None
-        
-        try:
-            num_points = mesh.GetNumberOfPoints() if hasattr(mesh, 'GetNumberOfPoints') else 0
-            logger.debug(f"Constraint clicked: mesh with {num_points} points")
-        except:
-            logger.warning("Could not get point count from clicked mesh")
-            return None
-            
-        # Find the segment by looking through all actors and comparing mesh data
-        logger.debug("Looking for segment by mesh comparison...")
-        clicked_segment = self._find_segment_by_mesh_comparison(mesh)
-        
-        if not clicked_segment:
-            logger.debug("Could not identify clicked constraint segment")
-            # Add debug info about available mappings
-            if hasattr(self, '_mesh_geometry_map'):
-                logger.debug(f"Available mesh signatures: {len(self._mesh_geometry_map)}")
-            if hasattr(self, 'constraint_segment_actor_refs'):
-                logger.debug(f"Available actor refs: {len(self.constraint_segment_actor_refs)}")
-            return None
-            
-        surf_idx, seg_uid = clicked_segment
-        logger.debug(f"Found segment: surface {surf_idx}, segment {seg_uid}")
-        
-        return clicked_segment
-
-    def _create_mesh_signature(self, mesh):
-        """
-        Create a unique geometric signature for a mesh that can be used as a dictionary key.
-        Simplified for better stability and matching.
-        """
-        try:
-            if not mesh or not hasattr(mesh, 'GetNumberOfPoints'):
-                return None
-                
-            num_points = mesh.GetNumberOfPoints()
-            if num_points < 2:
-                return None
-                
-            # Get all points with consistent precision
-            points = []
-            for i in range(num_points):
-                point = mesh.GetPoint(i)
-                # Use moderate precision for better matching stability
-                points.append((round(point[0], 8), round(point[1], 8), round(point[2], 8)))
-            
-            # Create signature from start point, end point, and length
-            start_point = points[0]
-            end_point = points[-1]
-            
-            # Calculate total length with consistent precision
-            total_length = 0.0
-            for i in range(1, len(points)):
-                dx = points[i][0] - points[i-1][0]
-                dy = points[i][1] - points[i-1][1] 
-                dz = points[i][2] - points[i-1][2]
-                total_length += (dx*dx + dy*dy + dz*dz)**0.5
-            
-            # Include midpoint if we have enough points  
-            if num_points >= 3:
-                mid_idx = num_points // 2
-                mid_point = points[mid_idx]
-            else:
-                mid_point = None
-            
-            # Build stable signature
-            signature = (start_point, end_point, mid_point, round(total_length, 8), num_points)
-                
-            return signature
-            
-        except Exception as e:
-            logger.debug(f"Error creating mesh signature: {e}")
-            return None
-
-    def _find_segment_by_mesh_comparison(self, clicked_mesh):
-        """
-        Find segment by comparing mesh properties with stored actors.
-        Enhanced with spatial proximity for better accuracy.
-        """
-        if not hasattr(clicked_mesh, 'GetNumberOfPoints') or clicked_mesh.GetNumberOfPoints() < 2:
-            logger.warning("Invalid clicked mesh - insufficient points")
-            return None
-        
-        logger.debug(f"Finding segment for mesh with {clicked_mesh.GetNumberOfPoints()} points")
-        
-        # Approach 1: Direct geometric signature lookup (fastest and most accurate)
-        clicked_signature = self._create_mesh_signature(clicked_mesh)
-        if clicked_signature and hasattr(self, '_mesh_geometry_map'):
-            direct_match = self._mesh_geometry_map.get(clicked_signature)
-            if direct_match:
-                logger.debug(f"Found direct signature match: {direct_match}")
-                return direct_match
-            else:
-                logger.debug(f"No direct signature match found for signature: {clicked_signature}")
-        
-        # Approach 2: Try with slightly different precision (handle floating point variations)
-        if clicked_signature:
-            # Try with reduced precision in case of minor floating point differences
-            reduced_precision_sig = self._create_reduced_precision_signature(clicked_mesh)
-            if reduced_precision_sig and hasattr(self, '_mesh_geometry_map_reduced'):
-                reduced_match = self._mesh_geometry_map_reduced.get(reduced_precision_sig)
-                if reduced_match:
-                    logger.debug(f"Found reduced precision match: {reduced_match}")
-                    return reduced_match
-        
-        # Approach 3: Spatial proximity matching (most reliable for click accuracy)
-        logger.debug("Falling back to spatial proximity matching")
-        return self._find_segment_by_spatial_proximity(clicked_mesh)
-    
-    def _find_segment_by_spatial_proximity(self, clicked_mesh):
-        """
-        Find the segment that is spatially closest to the clicked mesh.
-        This helps with click accuracy when mesh comparison fails.
-        """
-        try:
-            # Get clicked mesh center and bounds for comparison
-            clicked_points = []
-            num_points = clicked_mesh.GetNumberOfPoints()
-            for i in range(num_points):
-                point = clicked_mesh.GetPoint(i)
-                clicked_points.append(point)
-            
-            if len(clicked_points) < 2:
-                return None
-                
-            # Calculate clicked mesh center and start/end points
-            clicked_center = [
-                sum(p[0] for p in clicked_points) / len(clicked_points),
-                sum(p[1] for p in clicked_points) / len(clicked_points), 
-                sum(p[2] for p in clicked_points) / len(clicked_points)
-            ]
-            clicked_start = clicked_points[0]
-            clicked_end = clicked_points[-1]
-            
-            logger.debug(f"Clicked mesh center: {clicked_center}, start: {clicked_start}, end: {clicked_end}")
-            
-            best_match = None
-            best_distance = float('inf')
-            candidates = []
-            
-            for (surf_idx, seg_uid), actor in getattr(self, 'constraint_segment_actor_refs', {}).items():
-                try:
-                    # Get segment info from mapping
-                    actor_id = id(actor)
-                    segment_info = getattr(self, '_actor_id_to_segment_map', {}).get(actor_id)
-                    
-                    if not segment_info:
-                        continue
-                        
-                    # Get segment data from the stored constraint data
-                    if hasattr(self, '_refine_segment_map'):
-                        seg_data = self._refine_segment_map.get((surf_idx, seg_uid))
-                        if seg_data and 'points' in seg_data and len(seg_data['points']) >= 2:
-                            seg_points = seg_data['points']
-                            
-                            # Calculate segment center and endpoints
-                            seg_center = [
-                                sum(p[0] for p in seg_points) / len(seg_points),
-                                sum(p[1] for p in seg_points) / len(seg_points),
-                                sum(p[2] for p in seg_points) / len(seg_points)
-                            ]
-                            seg_start = seg_points[0]
-                            seg_end = seg_points[-1]
-                            
-                            # Calculate distance between centers
-                            center_dist = ((clicked_center[0] - seg_center[0])**2 + 
-                                         (clicked_center[1] - seg_center[1])**2 + 
-                                         (clicked_center[2] - seg_center[2])**2)**0.5
-                            
-                            # Also check start/end point distances for better matching
-                            start_dist = ((clicked_start[0] - seg_start[0])**2 + 
-                                        (clicked_start[1] - seg_start[1])**2 + 
-                                        (clicked_start[2] - seg_start[2])**2)**0.5
-                            
-                            end_dist = ((clicked_end[0] - seg_end[0])**2 + 
-                                      (clicked_end[1] - seg_end[1])**2 + 
-                                      (clicked_end[2] - seg_end[2])**2)**0.5
-                            
-                            # Combined distance score (center distance is most important)
-                            total_distance = center_dist + 0.1 * (start_dist + end_dist)
-                            
-                            candidates.append((segment_info, total_distance, surf_idx, seg_uid, center_dist))
-                            
-                            if total_distance < best_distance:
-                                best_distance = total_distance
-                                best_match = segment_info
-                                
-                            logger.debug(f"Spatial comparison surf={surf_idx}, seg={seg_uid}: "
-                                       f"center_dist={center_dist:.6f}, total_dist={total_distance:.6f}")
-                            
-                except Exception as e:
-                    logger.debug(f"Error in spatial comparison for segment ({surf_idx}, {seg_uid}): {e}")
-                    continue
-            
-            # Return best match if it's close enough
-            if best_match and best_distance < 10.0:  # Reasonable spatial tolerance
-                logger.info(f"Best spatial match found with distance {best_distance:.6f}: {best_match}")
-                return best_match
-            elif candidates:
-                # Show top candidates for debugging
-                candidates.sort(key=lambda x: x[1])
-                logger.warning(f"No close spatial match found. Top 3 candidates:")
-                for i, (seg_info, total_dist, surf_idx, seg_uid, center_dist) in enumerate(candidates[:3]):
-                    logger.warning(f"  {i+1}. surf={surf_idx}, seg={seg_uid}, "
-                                 f"center_dist={center_dist:.6f}, total_dist={total_dist:.6f}")
-            
-            logger.warning(f"No suitable spatial match found. Best distance: {best_distance:.6f}")
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error in spatial proximity matching: {e}")
-            return None
-    
-    def _create_reduced_precision_signature(self, mesh):
-        """
-        Create a mesh signature with reduced precision for fallback matching.
-        """
-        try:
-            if not mesh or not hasattr(mesh, 'GetNumberOfPoints'):
-                return None
-                
-            num_points = mesh.GetNumberOfPoints()
-            if num_points < 2:
-                return None
-                
-            # Get all points with reduced precision
-            points = []
-            for i in range(num_points):
-                point = mesh.GetPoint(i)
-                points.append((round(point[0], 6), round(point[1], 6), round(point[2], 6)))
-            
-            start_point = points[0]
-            end_point = points[-1]
-            
-            # Calculate total length
-            total_length = 0.0
-            for i in range(1, len(points)):
-                dx = points[i][0] - points[i-1][0]
-                dy = points[i][1] - points[i-1][1] 
-                dz = points[i][2] - points[i-1][2]
-                total_length += (dx*dx + dy*dy + dz*dz)**0.5
-            
-            # Include midpoint if we have enough points
-            if num_points >= 3:
-                mid_idx = num_points // 2
-                mid_point = points[mid_idx]
-            else:
-                mid_point = None
-                
-            return (start_point, end_point, mid_point, round(total_length, 6), num_points)
-            
-        except Exception as e:
-            logger.debug(f"Error creating reduced precision signature: {e}")
-            return None
-    
-    def _fallback_mesh_comparison(self, clicked_mesh):
-        """
-        Fallback mesh comparison using detailed geometric analysis.
-        """
-        if not hasattr(clicked_mesh, 'GetNumberOfPoints') or clicked_mesh.GetNumberOfPoints() < 2:
-            return None
-            
-    def _fallback_mesh_comparison(self, clicked_mesh):
-        """
-        Simplified and reliable mesh comparison using basic geometric properties.
-        """
-        if not hasattr(clicked_mesh, 'GetNumberOfPoints') or clicked_mesh.GetNumberOfPoints() < 2:
-            return None
-            
-        # Get the clicked mesh points for comparison
-        try:
-            clicked_points = []
-            num_points = clicked_mesh.GetNumberOfPoints()
-            for i in range(num_points):
-                point = clicked_mesh.GetPoint(i)
-                clicked_points.append(point)
-        except Exception:
-            return None
-            
-        if len(clicked_points) < 2:
-            return None
-            
-        # Create simple signature for the clicked mesh
-        clicked_start = clicked_points[0]
-        clicked_end = clicked_points[-1]
-        
-        # Calculate clicked mesh length
-        clicked_length = 0
-        for i in range(1, len(clicked_points)):
-            dx = clicked_points[i][0] - clicked_points[i-1][0]
-            dy = clicked_points[i][1] - clicked_points[i-1][1] 
-            dz = clicked_points[i][2] - clicked_points[i-1][2]
-            clicked_length += (dx*dx + dy*dy + dz*dz)**0.5
-        
-        logger.debug(f"Clicked mesh: {num_points} points, length={clicked_length:.6f}, start={clicked_start}, end={clicked_end}")
-        
-        # Find the best match by comparing with all stored segments
-        best_match = None
-        best_score = float('inf')
-        candidates = []
-        
-        for (surf_idx, seg_uid), actor in getattr(self, 'constraint_segment_actor_refs', {}).items():
-            try:
-                # Get actor ID and look up segment info
-                actor_id = id(actor)
-                segment_info = getattr(self, '_actor_id_to_segment_map', {}).get(actor_id)
-                
-                if segment_info and hasattr(actor, 'GetMapper') and actor.GetMapper():
-                    actor_mesh = actor.GetMapper().GetInput()
-                    if (actor_mesh and 
-                        hasattr(actor_mesh, 'GetNumberOfPoints') and 
-                        actor_mesh.GetNumberOfPoints() == num_points):
-                        
-                        # Get actor mesh points
-                        actor_points = []
-                        for i in range(num_points):
-                            actor_points.append(actor_mesh.GetPoint(i))
-                        
-                        if len(actor_points) < 2:
-                            continue
-                            
-                        # Simple geometric comparison
-                        actor_start = actor_points[0]
-                        actor_end = actor_points[-1]
-                        
-                        # Calculate actor mesh length
-                        actor_length = 0
-                        for i in range(1, len(actor_points)):
-                            dx = actor_points[i][0] - actor_points[i-1][0]
-                            dy = actor_points[i][1] - actor_points[i-1][1] 
-                            dz = actor_points[i][2] - actor_points[i-1][2]
-                            actor_length += (dx*dx + dy*dy + dz*dz)**0.5
-                        
-                        # Calculate differences
-                        start_dist = ((clicked_start[0] - actor_start[0])**2 + 
-                                    (clicked_start[1] - actor_start[1])**2 + 
-                                    (clicked_start[2] - actor_start[2])**2)**0.5
-                        
-                        end_dist = ((clicked_end[0] - actor_end[0])**2 + 
-                                  (clicked_end[1] - actor_end[1])**2 + 
-                                  (clicked_end[2] - actor_end[2])**2)**0.5
-                        
-                        length_diff = abs(clicked_length - actor_length)
-                        
-                        # Simple scoring
-                        score = start_dist + end_dist + length_diff
-                        
-                        candidates.append((segment_info, score, surf_idx, seg_uid))
-                        
-                        # Track best match
-                        if score < best_score:
-                            best_score = score
-                            best_match = segment_info
-                            
-                        logger.debug(f"Comparing surf={surf_idx}, seg={seg_uid}: "
-                                   f"score={score:.6f}, start_dist={start_dist:.6f}, "
-                                   f"end_dist={end_dist:.6f}, length_diff={length_diff:.6f}")
-                            
-            except Exception as e:
-                logger.debug(f"Error comparing mesh for segment ({surf_idx}, {seg_uid}): {e}")
-                continue
-        
-        # Return best match if it's good enough
-        if best_match and best_score < 10.0:  # More tolerant threshold
-            logger.info(f"Best match found with score {best_score:.6f}: {best_match}")
-            return best_match
-        elif candidates:
-            # Show top candidates for debugging
-            candidates.sort(key=lambda x: x[1])
-            logger.warning(f"No good match found. Top 3 candidates:")
-            for i, (seg_info, score, surf_idx, seg_uid) in enumerate(candidates[:3]):
-                logger.warning(f"  {i+1}. surf={surf_idx}, seg={seg_uid}, score={score:.6f}")
-            
-            # If we have candidates but none are very close, return the best one anyway
-            if candidates and candidates[0][1] < 50.0:  # Very generous fallback
-                best_candidate = candidates[0]
-                logger.info(f"Using best candidate as fallback: surf={best_candidate[2]}, seg={best_candidate[3]}, score={best_candidate[1]:.6f}")
-                return best_candidate[0]
-        
-        logger.warning(f"No suitable match found. Best score: {best_score:.6f}")
-        return None
-
-    def _apply_selection_mode_to_segment(self, surf_idx, seg_uid):
-        """
-        Apply the current selection mode (select or deselect) to a segment.
-        Unlike toggle, this respects the current selection mode.
-        Returns True if successful, False otherwise.
-        """
-        if not hasattr(self, 'current_selection_mode'):
-            self.current_selection_mode = "select"  # Default to select mode
-            
-        mode = self.current_selection_mode
-        
-        if not hasattr(self, 'refine_constraint_tree') or not self.refine_constraint_tree:
-            return False
-            
+    def _toggle_refine_constraint_item(self, key):
+        """Toggle the matching tree leaf so normal table synchronization runs."""
         tree = self.refine_constraint_tree
-        
-        # DISABLE tree signals during batch operations to prevent lag
-        tree.blockSignals(True)
-        
-        try:
-            def find_and_set_segment(item):
-                """Recursively search for the segment and set its selection state"""
-                data = item.data(0, Qt.UserRole)
-                if data and data.get("type") == "constraint":
-                    item_surf_idx = data.get("surface_idx")
-                    item_seg_uid = data.get("seg_uid")
-                    
-                    if item_surf_idx == surf_idx and item_seg_uid == seg_uid:
-                        current_state = item.checkState(0)
-                        
-                        if mode == "select":
-                            # Force selection
-                            if current_state != Qt.Checked:
-                                item.setCheckState(0, Qt.Checked)
-                                return True
-                            else:
-                                return True
-                        elif mode == "deselect":
-                            # Force deselection
-                            if current_state == Qt.Checked:
-                                item.setCheckState(0, Qt.Unchecked)
-                                return True
-                            else:
-                                return True
-                
-                # Search child items
-                for i in range(item.childCount()):
-                    if find_and_set_segment(item.child(i)):
-                        return True
-                return False
-            
-            # Search all top-level items
-            for i in range(tree.topLevelItemCount()):
-                if find_and_set_segment(tree.topLevelItem(i)):
-                    return True
-            
-            return False
-            
-        finally:
-            # RE-ENABLE tree signals after batch operations
-            tree.blockSignals(False)
-            
-        return False
 
-    def _apply_selection_mode_to_segment_fast(self, surf_idx, seg_uid):
-        """
-        Ultra-fast version that assumes tree signals are already blocked.
-        NO signal blocking/unblocking overhead per segment.
-        """
-        if not hasattr(self, 'current_selection_mode'):
-            self.current_selection_mode = "select"
-            
-        mode = self.current_selection_mode
-        tree = getattr(self, 'refine_constraint_tree', None)
-        if not tree:
-            return False
-        
-        def find_and_set_segment_fast(item):
-            """Fast recursive search without signal overhead"""
-            data = item.data(0, Qt.UserRole)
-            if data and data.get("type") == "constraint":
-                item_surf_idx = data.get("surface_idx")
-                item_seg_uid = data.get("seg_uid")
-                
-                if item_surf_idx == surf_idx and item_seg_uid == seg_uid:
-                    current_state = item.checkState(0)
-                    
-                    if mode == "select" and current_state != Qt.Checked:
-                        item.setCheckState(0, Qt.Checked)
-                        return True
-                    elif mode == "deselect" and current_state == Qt.Checked:
-                        item.setCheckState(0, Qt.Unchecked)
-                        return True
-                    else:
-                        return True  # Already in desired state
-            
-            # Search child items
-            for i in range(item.childCount()):
-                if find_and_set_segment_fast(item.child(i)):
-                    return True
-            return False
-        
-        # Search all top-level items
-        for i in range(tree.topLevelItemCount()):
-            if find_and_set_segment_fast(tree.topLevelItem(i)):
-                return True
-        
-        return False
-
-    def _toggle_segment_selection_in_tree(self, surf_idx, seg_uid):
-        """
-        Find the tree item corresponding to the segment and toggle its checkbox.
-        Optimized for fast mouse selection with minimal tree operations.
-        Returns True if successful, False otherwise.
-        """
-        if not hasattr(self, 'refine_constraint_tree') or not self.refine_constraint_tree:
-            logger.warning("No constraint tree available for toggling")
-            return False
-            
-        tree = self.refine_constraint_tree
-        logger.info(f"Searching tree for segment: surface {surf_idx}, segment {seg_uid}")
-        
-        def find_and_toggle_segment(item):
-            """Recursively search for the segment and toggle it"""
-            data = item.data(0, Qt.UserRole)
-            if data and data.get("type") == "constraint":
-                item_surf_idx = data.get("surface_idx")
-                item_seg_uid = data.get("seg_uid")
-                
-                if item_surf_idx == surf_idx and item_seg_uid == seg_uid:
-                    # Found the segment! Toggle its selection
-                    current_state = item.checkState(0)
-                    new_state = Qt.Unchecked if current_state == Qt.Checked else Qt.Checked
-                    
-                    logger.info(f"Found tree item! Toggling from {current_state} to {new_state}")
-                    
-                    # Set flag to indicate this is a mouse-triggered change
-                    self._mouse_triggered_change = True
-                    
-                    # Temporarily disable tree change handler to prevent recursive updates
-                    self._refine_updating_constraint_tree = True
-                    try:
-                        item.setCheckState(0, new_state)
-                        
-                        # Update segment data directly for fast tracking
-                        if hasattr(self, '_refine_segment_map') and (surf_idx, seg_uid) in self._refine_segment_map:
-                            self._refine_segment_map[(surf_idx, seg_uid)]["selected"] = (new_state == Qt.Checked)
-                        
-                        # Fast single actor update instead of batch update
-                        if hasattr(self, '_apply_segment_state'):
-                            self._apply_segment_state(surf_idx, seg_uid, new_state == Qt.Checked)
-                        
-                    finally:
-                        self._refine_updating_constraint_tree = False
-                        # Clear the mouse trigger flag
-                        self._mouse_triggered_change = False
-                    
-                    # Scroll to and highlight the item briefly
-                    tree.scrollToItem(item)
-                    tree.setCurrentItem(item)
-                    
-                    logger.info(f"Toggled segment {seg_uid} to {'selected' if new_state == Qt.Checked else 'deselected'}")
-                    return True
-                    
-            # Check children
-            for i in range(item.childCount()):
-                if find_and_toggle_segment(item.child(i)):
-                    return True
-            return False
-        
-        # Search through all top-level items
-        for i in range(tree.topLevelItemCount()):
-            if find_and_toggle_segment(tree.topLevelItem(i)):
-                return True
-        
-        logger.warning(f"Could not find tree item for segment: surface {surf_idx}, segment {seg_uid}")
-        return False
-
-    def _on_constraint_clicked_single(self, mesh):
-        """
-        Fallback method for single mesh selection (used by mesh picking).
-        Handles surface filtering and tree toggling for a single mesh.
-        """
-        clicked_segment = self._on_constraint_clicked(mesh)
-        if not clicked_segment:
-            return
-            
-        surf_idx, seg_uid = clicked_segment
-        
-        # Get current surface filter
-        selected_surface = "All Surfaces"
-        if hasattr(self, 'refine_surface_selector') and self.refine_surface_selector:
-            selected_surface = self.refine_surface_selector.currentText()
-        
-        # Check surface filter
-        if self._is_surface_visible_in_filter(surf_idx, selected_surface):
-            success = self._toggle_segment_selection_in_tree(surf_idx, seg_uid)
-            if success:
-                logger.info(f"Successfully toggled single constraint selection")
+        def visit(item):
+            data = item.data(0, Qt.UserRole) or {}
+            if data.get("type") == "constraint":
+                item_key = (data.get("surface_idx"), data.get("seg_uid"))
+            elif data.get("type") == "well_constraint":
+                item_key = (-data["well_idx"] - 1, data.get("seg_uid"))
             else:
-                logger.warning(f"Failed to toggle constraint in tree")
-        else:
-            logger.warning(f"Clicked segment not visible in current filter: '{selected_surface}'")
+                item_key = None
+            if item_key == key:
+                tree.setCurrentItem(item)
+                tree.scrollToItem(item)
+                state = Qt.Unchecked if item.checkState(0) == Qt.Checked else Qt.Checked
+                item.setCheckState(0, state)
+                return True
+            return any(visit(item.child(i)) for i in range(item.childCount()))
+
+        return any(visit(tree.topLevelItem(i)) for i in range(tree.topLevelItemCount()))
+
+    def _point_to_line_segment_distance(self, point, segment):
+        """Calculate minimum distance from point to any line segment in the constraint."""
+        import numpy as np
+
+        min_distance = float('inf')
+        point = np.array(point)
+
+        for i in range(len(segment) - 1):
+            seg_start = np.array(segment[i])
+            seg_end = np.array(segment[i + 1])
+
+            # Distance from point to line segment
+            distance = self._point_to_segment_distance(point, seg_start, seg_end)
+            min_distance = min(min_distance, distance)
+
+        return min_distance
 
     def _highlight_surface_in_constraint_tree(self, surface_name):
         """
@@ -5710,32 +4063,26 @@ class MeshItWorkflowGUI(QMainWindow):
     def _setup_pre_tetramesh_tab(self):
             """Sets up the Pre-Tetrahedral Mesh tab for surface selection and validation."""
             # Initialize the main layout for this specific tab
-            tab_layout = QHBoxLayout(self.pre_tetramesh_tab)
+            tab_layout = QVBoxLayout(self.pre_tetramesh_tab)
+            splitter = self._new_hsplitter()
+            tab_layout.addWidget(splitter)
 
             # --- Control panel (left side) ---
             control_panel = QWidget()
-            control_panel.setMaximumWidth(350)
+            control_panel.setMinimumWidth(260)
+            control_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
             control_layout = QVBoxLayout(control_panel) # This is the layout for the control_panel's content
             
             # -- Surface Selection Controls --
             surface_group = QGroupBox("Conforming Surface Selection")
             surface_layout = QVBoxLayout(surface_group)
 
-            self.load_conforming_meshes_btn = QPushButton("Load Conforming Meshes from Refine Tab")
-            self.load_conforming_meshes_btn.setToolTip(
-                "Load pre-computed conforming surface meshes from the refine mesh tab.\n"
-                "Follows C++ core.cpp workflow: surfaces → conforming meshes → selection → tetgen"
-            )
-            self.load_conforming_meshes_btn.clicked.connect(
-                    self._load_conforming_meshes_from_refine_tab)
-            surface_layout.addWidget(self.load_conforming_meshes_btn)
-
             # Status label showing loaded conforming meshes
             self.conforming_mesh_status_label = QLabel("No conforming meshes loaded")
             self.conforming_mesh_status_label.setWordWrap(True)
-            self.conforming_mesh_status_label.setStyleSheet(
-                "background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; border-radius: 3px;"
-            )
+            self.conforming_mesh_status_label.setTextFormat(Qt.PlainText)
+            self.conforming_mesh_status_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self.conforming_mesh_status_label.setStyleSheet("color: palette(text); padding: 4px 0;")
             surface_layout.addWidget(self.conforming_mesh_status_label)
             
             # Add tetgen validation button
@@ -5760,7 +4107,6 @@ class MeshItWorkflowGUI(QMainWindow):
             self.conforming_surface_tree = QTreeWidget()
             self.conforming_surface_tree.setHeaderLabels(["Surface", "Vertices", "Triangles", "Status"])
             self.conforming_surface_tree.itemChanged.connect(self._on_conforming_surface_tree_item_changed)
-            self.conforming_surface_tree.setMaximumHeight(250)
             selection_layout.addWidget(QLabel("Conforming Surface Selection:"))
             selection_layout.addWidget(self.conforming_surface_tree)
             
@@ -5796,7 +4142,7 @@ class MeshItWorkflowGUI(QMainWindow):
             control_layout.addLayout(nav_layout)
             
             # Add the control_panel to the main tab_layout
-            tab_layout.addWidget(control_panel)
+            splitter.addWidget(control_panel)
 
             # --- Visualization Area (right side) ---
             viz_group = QGroupBox("Conforming Surface Mesh Visualization")
@@ -5812,7 +4158,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 plotter = QtInteractor(self.pre_tetramesh_viz_frame)
                 self.pre_tetramesh_plot_layout.addWidget(plotter.interactor)
                 plotter.set_background([0.2, 0.2, 0.25]) # Darker background
-                plotter.add_text("Load conforming meshes from Refine tab to visualize.\nC++ core.cpp workflow: surfaces → conforming meshes → selection → tetgen", position='upper_edge', color='white')
+
                 self.plotters['pre_tetramesh'] = plotter 
                 self.pre_tetramesh_plotter = plotter
                 logger.info("Successfully created pre_tetramesh_plotter")
@@ -5825,18 +4171,16 @@ class MeshItWorkflowGUI(QMainWindow):
             viz_layout.addWidget(self.pre_tetramesh_viz_frame, 1) # Add the frame to viz_group's layout
             
             # Add the viz_group to the main tab_layout
-            tab_layout.addWidget(viz_group, 1)
+            splitter.addWidget(viz_group)
+            splitter.setStretchFactor(0, 0)
+            splitter.setStretchFactor(1, 1)
+            splitter.setSizes([360, 940])
 
     # Add a new clear method for this tab's plotter
     def _clear_pre_tetramesh_plot(self):
         plotter = self.plotters.get('pre_tetramesh')
         if plotter:
             plotter.clear()
-            plotter.add_text(
-                "Load conforming meshes from Refine tab to visualize.\nC++ core.cpp workflow: surfaces → conforming meshes → selection → tetgen",
-                position='upper_edge',
-                color='white'
-            )
             plotter.reset_camera()
         elif hasattr(self, 'pre_tetramesh_plot_layout'): # Fallback
             # ... (similar clearing logic as _clear_refine_mesh_plot if plotter is None)
@@ -5856,68 +4200,43 @@ class MeshItWorkflowGUI(QMainWindow):
             
     # Update _on_tab_changed
     def _load_conforming_meshes_from_refine_tab(self):
-        """
-        Load pre-computed conforming surface meshes from the Refine & Mesh tab.
-        This follows the C++ core.cpp workflow where surfaces are first processed
-        to conforming meshes, then selected for tetgen.
-        """
-        logger.info("Loading conforming meshes from Refine & Mesh tab...")
-        self.statusBar().showMessage("Loading conforming surface meshes...")
-        
-        if not hasattr(self, 'datasets') or not self.datasets:
-            QMessageBox.warning(self, "No Data", "Please load surfaces first.")
-            return
+        """Refresh available meshes while preserving existing surface choices."""
+        previous = self.conforming_mesh_data
+        selected = self.selected_conforming_surfaces
+        previous_ids = {id(data["original_dataset"]) for data in previous.values()}
+        selected_ids = {id(previous[index]["original_dataset"]) for index in selected if index in previous}
+        meshes = {}
+        new_selected = set()
+        for index, dataset in enumerate(getattr(self, "datasets", [])):
+            mesh = dataset.get("conforming_mesh")
+            if not isinstance(mesh, dict):
+                continue
+            vertices, triangles = mesh.get("vertices"), mesh.get("triangles")
+            if vertices is None or triangles is None or not len(vertices) or not len(triangles):
+                continue
+            meshes[index] = {
+                "name": dataset.get("name", f"Surface_{index}"),
+                "vertices": vertices,
+                "triangles": triangles,
+                "statistics": mesh.get("statistics", {}),
+                "original_dataset": dataset,
+            }
+            if id(dataset) not in previous_ids or id(dataset) in selected_ids:
+                new_selected.add(index)
 
-        # Check if conforming meshes exist from the refine tab
-        conforming_surfaces_found = 0
-        self.conforming_mesh_data.clear()
-        
-        for dataset_idx, dataset in enumerate(self.datasets):
-            if 'conforming_mesh' in dataset:
-                conforming_mesh = dataset['conforming_mesh']
-                
-                # Validate conforming mesh data
-                if ('vertices' in conforming_mesh and 'triangles' in conforming_mesh and 
-                    len(conforming_mesh['vertices']) > 0 and len(conforming_mesh['triangles']) > 0):
-                    
-                    self.conforming_mesh_data[dataset_idx] = {
-                        'name': dataset.get('name', f'Surface_{dataset_idx}'),
-                        'vertices': conforming_mesh['vertices'],
-                        'triangles': conforming_mesh['triangles'],
-                        'statistics': conforming_mesh.get('statistics', {}),
-                        'original_dataset': dataset
-                    }
-                    conforming_surfaces_found += 1
-                    logger.info(f"Loaded conforming mesh for surface {dataset_idx}: "
-                              f"{len(conforming_mesh['vertices'])} vertices, "
-                              f"{len(conforming_mesh['triangles'])} triangles")
-        
-        if conforming_surfaces_found == 0:
-            QMessageBox.warning(self, "No Conforming Meshes", 
-                               "No conforming surface meshes found.\n"
-                               "Please generate conforming meshes in the Refine & Mesh tab first.")
-            return
-
-        # Update status label
+        self.conforming_mesh_data = meshes
+        self.selected_conforming_surfaces = new_selected
+        count = len(meshes)
         self.conforming_mesh_status_label.setText(
-            f"<b>Loaded {conforming_surfaces_found} conforming surface meshes</b><br>"
-            f"Ready for selection and tetgen validation"
+            f"Loaded {count} conforming surface meshes" if count else "No conforming meshes available"
         )
-        self.conforming_mesh_status_label.setStyleSheet(
-            "background-color: #e8f5e8; padding: 5px; border: 1px solid #4CAF50; border-radius: 3px;"
-        )
-        
-        # Enable validation button
-        self.validate_for_tetgen_btn.setEnabled(True)
-        
-        # Populate the surface selection tree
+        self.validate_for_tetgen_btn.setEnabled(bool(count))
         self._populate_conforming_surface_tree()
-        
-        # Update visualization
         self._update_conforming_surface_visualization()
-        
-        self.statusBar().showMessage(f"Loaded {conforming_surfaces_found} conforming surface meshes")
-        logger.info(f"Successfully loaded {conforming_surfaces_found} conforming surface meshes")
+        self.statusBar().showMessage(
+            f"Loaded {count} conforming surface meshes" if count
+            else "Generate conforming meshes in Refine & Mesh first."
+        )
 
     def _populate_conforming_surface_tree(self):
         """
@@ -5944,14 +4263,13 @@ class MeshItWorkflowGUI(QMainWindow):
                 surface_item.setText(0, f"{mesh_data['name']}")
                 surface_item.setText(1, str(len(mesh_data['vertices'])))
                 surface_item.setText(2, str(len(mesh_data['triangles'])))
-                surface_item.setText(3, "Ready")
+                surface_item.setText(3, "Selected" if surface_idx in self.selected_conforming_surfaces else "Deselected")
 
                 surface_item.setFlags(surface_item.flags() | Qt.ItemIsUserCheckable)
-                surface_item.setCheckState(0, Qt.Checked)
+                surface_item.setCheckState(0, Qt.Checked if surface_idx in self.selected_conforming_surfaces else Qt.Unchecked)
 
                 surface_item.setData(0, Qt.UserRole, surface_idx)
 
-                self.selected_conforming_surfaces.add(surface_idx)
 
             self.conforming_surface_tree.expandAll()
             logger.info(f"Populated conforming surface tree with {len(self.conforming_mesh_data)} surfaces")
@@ -6036,13 +4354,9 @@ class MeshItWorkflowGUI(QMainWindow):
             self.pre_tetramesh_plotter.clear()
             
             if not self.selected_conforming_surfaces:
-                self.pre_tetramesh_plotter.add_text(
-                    "No conforming surfaces selected.\nSelect surfaces in the tree to visualize.",
-                    position='upper_edge',
-                    color='white'
-                )
+                self.pre_tetramesh_plotter.render()
                 return
-            
+
             # Visualize only selected conforming surfaces
             import pyvista as pv
 
@@ -6096,35 +4410,13 @@ class MeshItWorkflowGUI(QMainWindow):
                 self.pre_tetramesh_plotter, show_intersection_points=True,
                 selected_well_data=sel_wd if sel_wd else None)
             
-            # Count wells
-            well_count = sum(1 for ds in self.datasets if ds.get('type') == 'WELL')
-            
-            # Add simple legend
-            selected_count = len(self.selected_conforming_surfaces)
-            total_count = len(self.conforming_mesh_data)
-            
-            legend_text = f"Selected Conforming Surfaces: {selected_count}/{total_count}\n"
-            if well_count > 0:
-                legend_text += f"Wells (1D edge constraints): {well_count}\n"
-            legend_text += "Ready for TetGen tetrahedralization"
-            
-            self.pre_tetramesh_plotter.add_text(
-                legend_text,
-                position='upper_edge',
-                color='white',
-                font_size=12
-            )
-            
             # Reset camera and render
             self.pre_tetramesh_plotter.reset_camera()
+            self.pre_tetramesh_plotter.render()
             
         except Exception as e:
             logger.error(f"Error updating conforming surface visualization: {e}")
-            self.pre_tetramesh_plotter.add_text(
-                f"Visualization error: {str(e)}",
-                position='upper_edge',
-                color='red'
-            )
+            self.statusBar().showMessage(f"Visualization error: {e}")
 
     def _validate_conforming_meshes_for_tetgen(self):
         """
@@ -9759,7 +8051,7 @@ class MeshItWorkflowGUI(QMainWindow):
     def _refresh_seg_view_if_active(self):
         """If Segmentation tab is active, force a fresh 3D redraw from current dataset['segments']."""
         try:
-            if self.notebook.widget(self.notebook.currentIndex()) == self.segment_tab:
+            if self._workflow_tab_at(self.notebook.currentIndex()) == self.segment_tab:
                 self._clear_segment_plot()
                 # Prefer 3D always when available
                 self.view_3d_enabled = True
@@ -11819,7 +10111,7 @@ class MeshItWorkflowGUI(QMainWindow):
             
             # Step 7: Update visualizations ONCE for the restored data
             # Call the appropriate visualization for the current tab only
-            current_tab_widget = self.notebook.widget(saved_tab_index) if 0 <= saved_tab_index < self.notebook.count() else None
+            current_tab_widget = self._workflow_tab_at(saved_tab_index) if 0 <= saved_tab_index < self.notebook.count() else None
             
             if current_tab_widget == self.file_tab:
                 self._visualize_all_points()
@@ -11840,8 +10132,7 @@ class MeshItWorkflowGUI(QMainWindow):
                 if hasattr(self, 'datasets_intersections') and bool(self.datasets_intersections):
                     self._visualize_refined_intersections()
             elif hasattr(self, 'pre_tetramesh_tab') and current_tab_widget == self.pre_tetramesh_tab:
-                if any(d.get('constrained_triangulation_result') for d in self.datasets):
-                    self._visualize_constrained_meshes()
+                self._load_conforming_meshes_from_refine_tab()
             elif hasattr(self, 'tetra_mesh_tab') and current_tab_widget == self.tetra_mesh_tab:
                 if hasattr(self, 'tetrahedral_mesh') and self.tetrahedral_mesh:
                     self._visualize_tetrahedral_mesh()
@@ -12781,17 +11072,23 @@ class MeshItWorkflowGUI(QMainWindow):
         cats = {
             "sel_norm": {"pts": [], "lines": [], "idx": 0},
             "sel_hole": {"pts": [], "lines": [], "idx": 0},
-            "unsel":    {"pts": [], "lines": [], "idx": 0},
-            "well":     {"pts": [], "lines": [], "idx": 0},  # Wells get their own category (magenta)
+            "unsel": {"pts": [], "lines": [], "idx": 0},
+            "well": {
+                "pts": [],
+                "lines": [],
+                "idx": 0,
+            },  # Wells get their own category (magenta)
         }
 
-        def add_segment(cat_key, p1, p2):
+        def add_segment(cat_key, p1, p2, key=None):
             if p1 == p2:
                 return
             cat = cats[cat_key]
             i0 = cat["idx"]
-            cat["pts"].append(p1); cat["pts"].append(p2)
+            cat["pts"].append(p1)
+            cat["pts"].append(p2)
             cat["lines"].extend([2, i0, i0 + 1])
+            cat.setdefault("keys", []).append(key)
             cat["idx"] += 2
 
         def to_xyz(p):
@@ -12815,42 +11112,48 @@ class MeshItWorkflowGUI(QMainWindow):
         # 1) Use map data when present
         for (surf_idx, seg_uid), seg_info in seg_map.items():
             seg_type = str(seg_info.get("type", seg_info.get("ctype", ""))).lower()
-            
+
             # Handle wells separately (they use negative indices)
             if seg_type == "well":
                 if not show_well_constraints:
                     continue
                 w_idx = seg_info.get("well_idx")
-                if well_is_visible_fn and w_idx is not None and not well_is_visible_fn(w_idx):
+                if (
+                    well_is_visible_fn
+                    and w_idx is not None
+                    and not well_is_visible_fn(w_idx)
+                ):
                     continue
                 is_selected = bool(seg_info.get("selected", True))
                 if selected_only_mode and not is_selected:
                     continue
-                
+
                 pts = seg_info.get("points", [])
                 if not pts or len(pts) < 2:
                     continue
-                
+
                 # Use "well" category for wells (magenta color)
                 cat_key = "well" if is_selected else "unsel"
-                
+
                 if len(pts) == 2:
-                    p1 = to_xyz(pts[0]); p2 = to_xyz(pts[1])
+                    p1 = to_xyz(pts[0])
+                    p2 = to_xyz(pts[1])
                     if p1 is not None and p2 is not None and p1 != p2:
-                        add_segment(cat_key, p1, p2)
+                        add_segment(cat_key, p1, p2, (surf_idx, seg_uid))
                         built += 1
                 else:
                     local_pairs = 0
                     for j in range(len(pts) - 1):
-                        p1 = to_xyz(pts[j]); p2 = to_xyz(pts[j + 1])
+                        p1 = to_xyz(pts[j])
+                        p2 = to_xyz(pts[j + 1])
                         if p1 is None or p2 is None or p1 == p2:
                             continue
-                        add_segment(cat_key, p1, p2)
+                        add_segment(cat_key, p1, p2, (surf_idx, seg_uid))
                         local_pairs += 1
                     if local_pairs > 0:
                         built += 1
                 continue
-            
+
             # Regular surface constraints
             if not surface_is_visible_fn(surf_idx):
                 continue
@@ -12864,7 +11167,7 @@ class MeshItWorkflowGUI(QMainWindow):
                     continue
 
             is_selected = bool(seg_info.get("selected", True))
-            is_hole     = bool(seg_info.get("is_hole", False))
+            is_hole = bool(seg_info.get("is_hole", False))
             if selected_only_mode and not is_selected:
                 continue
 
@@ -12872,20 +11175,26 @@ class MeshItWorkflowGUI(QMainWindow):
             if not pts or len(pts) < 2:
                 continue
 
-            cat_key = "sel_hole" if (is_selected and is_hole) else ("sel_norm" if is_selected else "unsel")
+            cat_key = (
+                "sel_hole"
+                if (is_selected and is_hole)
+                else ("sel_norm" if is_selected else "unsel")
+            )
 
             if len(pts) == 2:
-                p1 = to_xyz(pts[0]); p2 = to_xyz(pts[1])
+                p1 = to_xyz(pts[0])
+                p2 = to_xyz(pts[1])
                 if p1 is not None and p2 is not None and p1 != p2:
-                    add_segment(cat_key, p1, p2)
+                    add_segment(cat_key, p1, p2, (surf_idx, seg_uid))
                     built += 1
             else:
                 local_pairs = 0
                 for j in range(len(pts) - 1):
-                    p1 = to_xyz(pts[j]); p2 = to_xyz(pts[j + 1])
+                    p1 = to_xyz(pts[j])
+                    p2 = to_xyz(pts[j + 1])
                     if p1 is None or p2 is None or p1 == p2:
                         continue
-                    add_segment(cat_key, p1, p2)
+                    add_segment(cat_key, p1, p2, (surf_idx, seg_uid))
                     local_pairs += 1
                 if local_pairs > 0:
                     built += 1
@@ -12910,7 +11219,9 @@ class MeshItWorkflowGUI(QMainWindow):
                     continue
 
                 n = len(points)
-                closed = (np.linalg.norm(np.array(points[0]) - np.array(points[-1])) < 1e-12)
+                closed = (
+                    np.linalg.norm(np.array(points[0]) - np.array(points[-1])) < 1e-12
+                )
                 last = n - 1  # wrap manually
 
                 local_pairs = 0
@@ -12923,6 +11234,8 @@ class MeshItWorkflowGUI(QMainWindow):
                 if local_pairs > 0:
                     built += 1
 
+        # Keep one identity per line cell, even when a constraint has many edges.
+        self._refine_pick_actors = []
         # build up to three actors
         def emit(cat_key, color, lw):
             cat = cats[cat_key]
@@ -12930,17 +11243,25 @@ class MeshItWorkflowGUI(QMainWindow):
                 return
             pts = np.asarray(cat["pts"], dtype=float)
             lines = np.asarray(cat["lines"], dtype=np.int64)
-            poly = pv.PolyData(pts); poly.lines = lines
-            plotter.add_mesh(poly, color=color, line_width=lw,
-                            render_lines_as_tubes=True, pickable=False, smooth_shading=False)
-
-        # Clear per-segment refs in batched mode
-        self.constraint_segment_actor_refs = {}
+            poly = pv.PolyData(pts)
+            # Point-only PolyData creates vertex cells; remove them so picker cell IDs
+            # correspond exactly to the line-cell identity list.
+            poly.verts = np.empty(0, dtype=np.int64)
+            poly.lines = lines
+            actor = plotter.add_mesh(
+                poly,
+                color=color,
+                line_width=lw,
+                render_lines_as_tubes=False,
+                pickable=True,
+                smooth_shading=False,
+            )
+            self._refine_pick_actors.append((actor, cat["keys"]))
 
         emit("sel_norm", (0.0, 1.0, 0.0), 4)
         emit("sel_hole", (1.0, 0.0, 0.0), 4)
-        emit("unsel",    (0.53, 0.53, 0.53), 2)
-        emit("well",     (1.0, 0.0, 1.0), 5)  # Magenta, thicker for wells (1D elements)
+        emit("unsel", (0.53, 0.53, 0.53), 2)
+        emit("well", (1.0, 0.0, 1.0), 5)  # Magenta, thicker for wells (1D elements)
 
         return built
     # ======================================================================
@@ -12952,8 +11273,7 @@ class MeshItWorkflowGUI(QMainWindow):
             view 1 – conforming surface meshes    (faces, 70 % opa)
             view 2 – constraint segments          (green ↔ dotted grey)
 
-        Restores reliable per-segment actors keyed by (surf_idx, seg_uid) and
-        guarantees the Segments plotter is cleared and repopulated each time.
+        Batches constraint lines and keeps one pick identity per line cell.
         """
         import numpy as np
         import pyvista as pv
@@ -12980,8 +11300,6 @@ class MeshItWorkflowGUI(QMainWindow):
         if view == 0:
             self.intersection_actor_refs = []
             self.conforming_mesh_actor_refs = []
-            if not hasattr(self, 'constraint_segment_actor_refs'):
-                self.constraint_segment_actor_refs = {}
             self._visualize_refined_intersections()
             well_cb = getattr(self, 'show_well_constraints_checkbox', None)
             if well_cb is None or well_cb.isChecked():
@@ -13000,8 +11318,6 @@ class MeshItWorkflowGUI(QMainWindow):
             plotter.clear()
             self.intersection_actor_refs = []
             self.conforming_mesh_actor_refs = []
-            if not hasattr(self, 'constraint_segment_actor_refs'):
-                self.constraint_segment_actor_refs = {}
 
             for ds in self.datasets:
                 if ds.get('type') == 'WELL':
@@ -13046,7 +11362,8 @@ class MeshItWorkflowGUI(QMainWindow):
         if not plotter:
             return
 
-        # Fully reset the Segments viewport so it never stays white
+        # Keep the viewpoint stable when a pick redraws the batched actors.
+        camera_position = plotter.camera_position if getattr(self, "_refine_segments_drawn", False) else None
         plotter.clear()
         plotter.set_background([0.318, 0.341, 0.431])
 
@@ -13080,139 +11397,21 @@ class MeshItWorkflowGUI(QMainWindow):
                 return True
             return _dataset_name(w_idx) == selected_surface_name
 
-        # Decide rendering mode: batched for speed when mouse selection is OFF
-        mouse_sel_on = bool(getattr(self, 'mouse_selection_enabled_btn', None) and self.mouse_selection_enabled_btn.isChecked())
-        self._segments_batched_mode = not mouse_sel_on
-
-        # Ensure the segment map is available
         if not hasattr(self, "_refine_segment_map") or not self._refine_segment_map:
             try:
                 self._populate_refine_constraint_tree()
             except Exception:
                 pass
 
-        if self._segments_batched_mode:
-            # FAST path: draw everything in 1–4 actors
-            built = self._draw_segments_batched_fast(
-                plotter,
-                surface_is_visible_fn=surface_is_visible,
-                show_hull_constraints=show_hull_constraints,
-                show_intersection_constraints=show_intersection_constraints,
-                selected_only_mode=selected_only_mode,
-                show_well_constraints=show_well_constraints,
-                well_is_visible_fn=well_is_visible,
-            )
-        else:
-            # PRECISE path (picking): one actor per segment (original behavior)
-            if not hasattr(self, 'constraint_segment_actor_refs'):
-                self.constraint_segment_actor_refs = {}
-            else:
-                for actor in list(self.constraint_segment_actor_refs.values()):
-                    try:
-                        plotter.remove_actor(actor)
-                    except Exception:
-                        pass
-                self.constraint_segment_actor_refs = {}
-
-            # initialize picking maps
-            self._actor_id_to_segment_map = {}
-            self._mesh_geometry_map = {}
-            self._mesh_geometry_map_reduced = {}
-
-            seg_map = getattr(self, "_refine_segment_map", {}) or {}
-            built = 0
-
-            for (surf_idx, seg_uid), seg_info in seg_map.items():
-                seg_type = str(seg_info.get("type", seg_info.get("ctype", ""))).lower()
-                if seg_type == "well":
-                    if not show_well_constraints:
-                        continue
-                    w_idx = seg_info.get("well_idx")
-                    if w_idx is not None and not well_is_visible(w_idx):
-                        continue
-                elif not surface_is_visible(surf_idx):
-                    continue
-
-                if seg_type == "hull" and not show_hull_constraints:
-                    continue
-                if seg_type in ("int", "intersection") and not show_intersection_constraints:
-                    continue
-                if selected_only_mode and not seg_info.get("selected", True):
-                    continue
-
-                pts = seg_info.get("points", [])
-                if not pts or len(pts) < 2:
-                    continue
-
-                def to_xyz(p):
-                    if isinstance(p, (list, tuple)) and len(p) >= 3:
-                        return float(p[0]), float(p[1]), float(p[2])
-                    if hasattr(p, "x") and hasattr(p, "y") and hasattr(p, "z"):
-                        return float(p.x), float(p.y), float(p.z)
-                    try:
-            
-                        if isinstance(p, np.ndarray) and p.size >= 3:
-                            return float(p[0]), float(p[1]), float(p[2])
-                    except Exception:
-                        pass
-                    return None
-
-                # Convert all points to xyz
-                xyz_pts = []
-                for p in pts:
-                    xyz = to_xyz(p)
-                    if xyz is not None:
-                        xyz_pts.append(xyz)
-                
-                if len(xyz_pts) < 2:
-                    continue
-
-
-                # Create polyline through all points
-                poly = pv.PolyData(np.array(xyz_pts, dtype=float))
-                # Create line connectivity for all points
-                n_pts = len(xyz_pts)
-                lines = np.zeros(n_pts + 1, dtype=np.int64)
-                lines[0] = n_pts  # Number of points in the line
-                lines[1:] = np.arange(n_pts)  # Point indices
-                poly.lines = lines
-
-                rgb, lw, pattern = self._segment_vis_props(surf_idx, seg_uid)
-                actor = plotter.add_mesh(
-                    poly, color=rgb, line_width=lw, pickable=True,
-                    render_lines_as_tubes=True, smooth_shading=False,
-                )
-                try:
-                    prop = actor.GetProperty()
-                    try:
-                        prop.SetLineStipplePattern(pattern)
-                        prop.SetLineStippleRepeatFactor(1)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-                # store refs and build picking maps
-                self.constraint_segment_actor_refs[(surf_idx, seg_uid)] = actor
-                actor_id = id(actor)
-                self._actor_id_to_segment_map[actor_id] = (surf_idx, seg_uid)
-                try:
-                    sig = self._create_mesh_signature(poly)
-                    if sig is not None:
-                        self._mesh_geometry_map[sig] = (surf_idx, seg_uid)
-                    rsig = self._create_reduced_precision_signature(poly)
-                    if rsig is not None:
-                        if not hasattr(self, '_mesh_geometry_map_reduced') or self._mesh_geometry_map_reduced is None:
-                            self._mesh_geometry_map_reduced = {}
-                        self._mesh_geometry_map_reduced[rsig] = (surf_idx, seg_uid)
-                except Exception:
-                    pass
-
-                built += 1
-
-            # flag for mouse toggler
-            self._constraint_actors_built = built > 0
-
+        built = self._draw_segments_batched_fast(
+            plotter,
+            surface_is_visible_fn=surface_is_visible,
+            show_hull_constraints=show_hull_constraints,
+            show_intersection_constraints=show_intersection_constraints,
+            selected_only_mode=selected_only_mode,
+            show_well_constraints=show_well_constraints,
+            well_is_visible_fn=well_is_visible,
+        )
         # Empty-state text if nothing passed the filters
         if built == 0:
             msg = "No segments to display."
@@ -13230,62 +11429,19 @@ class MeshItWorkflowGUI(QMainWindow):
             plotter.add_text(msg, position='upper_edge', color='white')
 
         plotter.add_axes()
-        plotter.reset_camera()
+        if camera_position is None:
+            plotter.reset_camera()
+        else:
+            plotter.camera_position = camera_position
+        self._refine_segments_drawn = True
         plotter.render()
         # =====================================
 
     # ======================================================================
     #  SEGMENT selection → drawing helpers
     # ======================================================================
-    def _segment_checked(self, surf_idx: int, seg_uid: int) -> bool:
-        """Return True if that segment’s checkbox is currently ticked."""
-        tree = getattr(self, "refine_constraint_tree", None)
-        if not tree:
-            return False
 
-        def walk(item):
-            data = item.data(0, Qt.UserRole)
-            if data and data.get("type") == "constraint" \
-               and data["surface_idx"] == surf_idx \
-               and data["seg_uid"]     == seg_uid:
-                return item.checkState(0) == Qt.Checked
-            for i in range(item.childCount()):
-                res = walk(item.child(i))
-                if res is not None:
-                    return res
-            return None
-
-        for i in range(tree.topLevelItemCount()):
-            res = walk(tree.topLevelItem(i))
-            if res is not None:
-                return res
-        return False
-
-    def _segment_vis_props(self, surf_idx: int, seg_uid: int):
-        """
-        Return a tuple   (rgb-tuple , line-width , stipple-pattern)
-        • If the segment is selected and is a hole  →  thick solid red
-        • If the segment is selected               →  thick solid green
-        • If not selected                         →  thin  dotted grey
-        """
-        checked = self._segment_checked(surf_idx, seg_uid)
-        is_hole = self._segment_is_hole(surf_idx, seg_uid)
         
-        if checked:
-            if is_hole:
-                return ((1.00, 0.00, 0.00), 4, 0xFFFF)      # solid red for holes
-            else:
-                return ((0.00, 1.00, 0.00), 4, 0xFFFF)      # solid green for normal constraints
-        else:
-            # 0xAAAA = dot-dot pattern; renders solid on old VTK builds
-            return ((0.53, 0.53, 0.53), 2, 0xAAAA)
-        
-    def _segment_is_hole(self, surf_idx: int, seg_uid: int) -> bool:
-        """Check if a segment is marked as a hole."""
-        seg_data = self._refine_segment_map.get((surf_idx, seg_uid))
-        if seg_data:
-            return seg_data.get("is_hole", False)
-        return False
         # ======================================================================
     #  SEGMENT-TREE → 3-D SYNC
     # ======================================================================
@@ -13293,85 +11449,11 @@ class MeshItWorkflowGUI(QMainWindow):
        # ======================================================================
     #  Update ONE segment actor when its checkbox changes
     # ======================================================================
-    def _apply_segment_state(self, surf_idx: int, seg_uid: int, checked: bool):
-        """
-        Update ONE segment actor when its checkbox changes.
-        Optimized for fast individual updates during mouse clicks.
-        """
-        actor = self.constraint_segment_actor_refs.get((surf_idx, seg_uid))
-        if not actor:
-            return
-
-        rgb, lw, pattern = self._segment_vis_props(surf_idx, seg_uid)
-
-        try:
-            prop = actor.GetProperty()
-            prop.SetColor(*rgb)
-            prop.SetLineWidth(lw)
-            prop.SetLineStipplePattern(pattern)
-            prop.SetLineStippleRepeatFactor(1)
-        except Exception:
-            # at least update colour if stipple unsupported
-            try:
-                actor.GetProperty().SetColor(*rgb)
-            except Exception:
-                pass
-
-        actor.SetVisibility(True)      # always draw – style encodes selection
-        
-        # Immediate render for instant feedback (only if in segments view)
-        if (getattr(self, "current_refine_view", 0) == 2):
-            current_plotter = self._get_current_refine_plotter()
-            if current_plotter:
-                current_plotter.render()
-            elif self.plotters.get("refine_mesh"):
-                self.plotters["refine_mesh"].render()
 
     def _update_all_segment_actors(self):
-        """
-        Refresh colours/styles after any tree tick change.
-        - If batched mode is ON (mouse selection OFF), just rebuild once.
-        - If per-segment mode (mouse selection ON), update actors in place.
-        """
-        if getattr(self, "current_refine_view", 0) != 2:
-            return
-
-        if getattr(self, "_segments_batched_mode", False):
-            # Rebuild the batched view in a single pass
+        """Refresh the batched constraint view after table selections change."""
+        if getattr(self, "current_refine_view", 0) == 2:
             self._update_refined_visualization()
-            return
-
-        # Per-segment path (original behavior)
-        needs_render = False
-        for (s_idx, uid), actor in getattr(self, 'constraint_segment_actor_refs', {}).items():
-            if not actor:
-                continue
-            is_checked = self._segment_checked(s_idx, uid)
-            is_hole = self._segment_is_hole(s_idx, uid)
-            if (s_idx, uid) in getattr(self, '_refine_segment_map', {}):
-                self._refine_segment_map[(s_idx, uid)]["selected"] = is_checked
-                self._refine_segment_map[(s_idx, uid)]["is_hole"] = is_hole
-            rgb, lw, pattern = self._segment_vis_props(s_idx, uid)
-            try:
-                prop = actor.GetProperty()
-                if (prop.GetColor() != rgb) or (prop.GetLineWidth() != lw):
-                    prop.SetColor(*rgb)
-                    prop.SetLineWidth(lw)
-                    needs_render = True
-                try:
-                    prop.SetLineStipplePattern(pattern)
-                    prop.SetLineStippleRepeatFactor(1)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        if needs_render:
-            current_plotter = self._get_current_refine_plotter()
-            if current_plotter:
-                current_plotter.render()
-            elif self.plotters.get("refine_mesh"):
-                self.plotters["refine_mesh"].render()
 
     # ----------------------------------------------------------------------
     def _on_refine_constraint_tree_item_changed(self, item, column):
@@ -13393,26 +11475,30 @@ class MeshItWorkflowGUI(QMainWindow):
                 if data and data.get("type") == "constraint":
                     surface_idx = data["surface_idx"]
                     seg_uid = data["seg_uid"]
-                    is_hole = (item.checkState(4) == Qt.Checked)
+                    is_hole = item.checkState(4) == Qt.Checked
                     # Update the segment map
                     if (surface_idx, seg_uid) in self._refine_segment_map:
-                        self._refine_segment_map[(surface_idx, seg_uid)]["is_hole"] = is_hole
+                        self._refine_segment_map[(surface_idx, seg_uid)][
+                            "is_hole"
+                        ] = is_hole
                         logger.info(f"Updated segment {seg_uid} hole status: {is_hole}")
-                        
+
                     # Synchronize hole marking across surfaces for shared intersection lines
                     self._sync_hole_selection_across_surfaces(item)
-                        
+
                     # Update visualization to show hole segments differently
                     self._update_all_segment_actors()
-                
+
                 # Handle hole checkbox changes for group items (intersection_group or hull_group)
                 elif data and data.get("type") in ["intersection_group", "hull_group"]:
-                    is_hole = (item.checkState(4) == Qt.Checked)
+                    is_hole = item.checkState(4) == Qt.Checked
                     group_type = data.get("type")
                     surface_idx = data.get("surface_idx")
-                    
-                    logger.info(f"Group {group_type} hole state changed to {is_hole} for surface {surface_idx}")
-                    
+
+                    logger.info(
+                        f"Group {group_type} hole state changed to {is_hole} for surface {surface_idx}"
+                    )
+
                     # Propagate hole state to all children segments
                     def set_all_children_hole_state(parent, state):
                         for i in range(parent.childCount()):
@@ -13423,42 +11509,59 @@ class MeshItWorkflowGUI(QMainWindow):
                                 # Update segment map
                                 child_surface_idx = child_data["surface_idx"]
                                 child_seg_uid = child_data["seg_uid"]
-                                if (child_surface_idx, child_seg_uid) in self._refine_segment_map:
-                                    self._refine_segment_map[(child_surface_idx, child_seg_uid)]["is_hole"] = (state == Qt.Checked)
-                                    logger.debug(f"Updated segment {child_seg_uid} hole status: {state == Qt.Checked}")
+                                if (
+                                    child_surface_idx,
+                                    child_seg_uid,
+                                ) in self._refine_segment_map:
+                                    self._refine_segment_map[
+                                        (child_surface_idx, child_seg_uid)
+                                    ]["is_hole"] = (state == Qt.Checked)
+                                    logger.debug(
+                                        f"Updated segment {child_seg_uid} hole status: {state == Qt.Checked}"
+                                    )
                             set_all_children_hole_state(child, state)
-                    
-                    set_all_children_hole_state(item, Qt.Checked if is_hole else Qt.Unchecked)
-                    
+
+                    set_all_children_hole_state(
+                        item, Qt.Checked if is_hole else Qt.Unchecked
+                    )
+
                     # Synchronize across surfaces if it's an intersection group
                     if data.get("type") == "intersection_group":
-                        logger.info(f"Synchronizing intersection group hole state across surfaces...")
+                        logger.info(
+                            f"Synchronizing intersection group hole state across surfaces..."
+                        )
                         self._sync_hole_selection_across_surfaces(item)
-                    
+
                     # Update visualization
                     self._update_all_segment_actors()
-                
+
                 # Handle parent state updates when children change
                 def update_parent_hole_state(child):
                     parent = child.parent()
                     if not parent:
                         return
-                    
+
                     parent_data = parent.data(0, Qt.UserRole)
-                    if parent_data and parent_data.get("type") in ["intersection_group", "hull_group"]:
+                    if parent_data and parent_data.get("type") in [
+                        "intersection_group",
+                        "hull_group",
+                    ]:
                         # Check if all children have the same hole state
                         all_hole = True
                         any_hole = False
                         for i in range(parent.childCount()):
                             child_item = parent.child(i)
                             child_item_data = child_item.data(0, Qt.UserRole)
-                            if child_item_data and child_item_data.get("type") == "constraint":
-                                child_is_hole = (child_item.checkState(4) == Qt.Checked)
+                            if (
+                                child_item_data
+                                and child_item_data.get("type") == "constraint"
+                            ):
+                                child_is_hole = child_item.checkState(4) == Qt.Checked
                                 if child_is_hole:
                                     any_hole = True
                                 else:
                                     all_hole = False
-                        
+
                         # Set parent state: checked if all children are holes, unchecked if none, partially checked if mixed
                         if all_hole and any_hole:
                             parent.setCheckState(4, Qt.Checked)
@@ -13466,13 +11569,13 @@ class MeshItWorkflowGUI(QMainWindow):
                             parent.setCheckState(4, Qt.PartiallyChecked)
                         else:
                             parent.setCheckState(4, Qt.Unchecked)
-                        
+
                         update_parent_hole_state(parent)
-                
+
                 # Update parent state if this was a constraint item
                 if data and data.get("type") == "constraint":
                     update_parent_hole_state(item)
-                
+
                 return
 
             # Handle selection checkbox changes (column 0)
@@ -13491,16 +11594,23 @@ class MeshItWorkflowGUI(QMainWindow):
                             surface_idx = child_data["surface_idx"]
                             seg_uid = child_data["seg_uid"]
                             if (surface_idx, seg_uid) in self._refine_segment_map:
-                                self._refine_segment_map[(surface_idx, seg_uid)]["selected"] = (state == Qt.Checked)
+                                self._refine_segment_map[(surface_idx, seg_uid)][
+                                    "selected"
+                                ] = (state == Qt.Checked)
                         elif child_type == "well_constraint":
                             w_idx = child_data.get("well_idx")
                             seg_uid = child_data.get("seg_uid")
-                            if w_idx is not None and (-w_idx - 1, seg_uid) in self._refine_segment_map:
-                                self._refine_segment_map[(-w_idx - 1, seg_uid)]["selected"] = (state == Qt.Checked)
+                            if (
+                                w_idx is not None
+                                and (-w_idx - 1, seg_uid) in self._refine_segment_map
+                            ):
+                                self._refine_segment_map[(-w_idx - 1, seg_uid)][
+                                    "selected"
+                                ] = (state == Qt.Checked)
                     set_all_children_state(child, state)
 
             set_all_children_state(item, item.checkState(0))
-            
+
             # Also update the current item if it's a constraint or well_constraint
             data = item.data(0, Qt.UserRole)
             if data:
@@ -13509,12 +11619,19 @@ class MeshItWorkflowGUI(QMainWindow):
                     surface_idx = data["surface_idx"]
                     seg_uid = data["seg_uid"]
                     if (surface_idx, seg_uid) in self._refine_segment_map:
-                        self._refine_segment_map[(surface_idx, seg_uid)]["selected"] = (item.checkState(0) == Qt.Checked)
+                        self._refine_segment_map[(surface_idx, seg_uid)]["selected"] = (
+                            item.checkState(0) == Qt.Checked
+                        )
                 elif item_type == "well_constraint":
                     w_idx = data.get("well_idx")
                     seg_uid = data.get("seg_uid")
-                    if w_idx is not None and (-w_idx - 1, seg_uid) in self._refine_segment_map:
-                        self._refine_segment_map[(-w_idx - 1, seg_uid)]["selected"] = (item.checkState(0) == Qt.Checked)
+                    if (
+                        w_idx is not None
+                        and (-w_idx - 1, seg_uid) in self._refine_segment_map
+                    ):
+                        self._refine_segment_map[(-w_idx - 1, seg_uid)]["selected"] = (
+                            item.checkState(0) == Qt.Checked
+                        )
 
             # -------- propagate upwards (any unchecked → parent unchecked) ----
             def update_parent_state(child):
@@ -13535,11 +11652,12 @@ class MeshItWorkflowGUI(QMainWindow):
             data = item.data(0, Qt.UserRole)
             if data:
                 # If it's an intersection group or a constraint within an intersection group
-                if data.get('type') == 'intersection_group' or (
-                    data.get('type') == 'constraint' and 
-                    item.parent() and 
-                    item.parent().data(0, Qt.UserRole) and 
-                    item.parent().data(0, Qt.UserRole).get('type') == 'intersection_group'
+                if data.get("type") == "intersection_group" or (
+                    data.get("type") == "constraint"
+                    and item.parent()
+                    and item.parent().data(0, Qt.UserRole)
+                    and item.parent().data(0, Qt.UserRole).get("type")
+                    == "intersection_group"
                 ):
                     # Synchronize this intersection line selection across surfaces
                     self._sync_intersection_selection_across_surfaces(item)
@@ -13547,10 +11665,9 @@ class MeshItWorkflowGUI(QMainWindow):
         finally:
             self._refine_updating_constraint_tree = False
 
-        # -------- refresh 3-D actors (only for non-mouse triggered changes) ----
-        # Skip batch update if this was triggered by mouse selection (already handled individually)
-        if not getattr(self, '_mouse_triggered_change', False):
-            self._update_all_segment_actors()
+        # Refresh geometry after synchronizing constraint-table selections.
+        self._refresh_segment_map_from_tree()
+        self._update_all_segment_actors()
     def consolidate_points_for_triangulation(self):
         """
         Consolidate all refined points following C++ MeshIt logic for tetrahedral meshing:
@@ -13873,7 +11990,11 @@ class MeshItWorkflowGUI(QMainWindow):
         """Handle tab changes to update visualizations as needed"""
         logger.debug(f"Tab changed to index {index}")
         # Get the widget associated with the current index
-        current_tab_widget = self.notebook.widget(index)
+        current_tab_widget = self._workflow_tab_at(index)
+
+        if current_tab_widget == self.pre_tetramesh_tab:
+            self._load_conforming_meshes_from_refine_tab()
+            return
 
         if not self.datasets:
             logger.debug("No datasets loaded, clearing visualizations.")
@@ -13927,11 +12048,6 @@ class MeshItWorkflowGUI(QMainWindow):
                 self._visualize_refined_intersections()
             else:
                 self._clear_refine_mesh_plot(); self.statusBar().showMessage("No intersections to refine or display.")
-        elif current_tab_widget == self.pre_tetramesh_tab:
-            if any(d.get('constrained_triangulation_result') for d in self.datasets):
-                self._visualize_constrained_meshes()
-            else:
-                self._clear_pre_tetramesh_plot(); self.statusBar().showMessage("No constrained surface meshes computed yet.")
         elif hasattr(self, 'tetra_mesh_tab') and current_tab_widget == self.tetra_mesh_tab:
             if hasattr(self, 'tetrahedral_mesh') and self.tetrahedral_mesh:
                 self._visualize_tetrahedral_mesh_in_tetra_tab()
@@ -15537,12 +13653,13 @@ class MeshItWorkflowGUI(QMainWindow):
         self.tetra_surface_data = {}  # Store transferred surface data
         
         # Create main layout
-        tab_layout = QHBoxLayout(self.tetra_mesh_tab)
+        tab_layout = QVBoxLayout(self.tetra_mesh_tab)
+        splitter = self._new_hsplitter()
+        tab_layout.addWidget(splitter)
         tab_layout.setSpacing(6)
         
         # === Control Panel (Left) ===
         control_panel = QWidget()
-        control_panel.setMaximumWidth(280)
         control_panel.setMinimumWidth(250)
         control_layout = QVBoxLayout(control_panel)
         control_layout.setContentsMargins(4, 4, 4, 4)
@@ -15674,16 +13791,21 @@ class MeshItWorkflowGUI(QMainWindow):
         control_layout.addStretch()  # Push everything to the top
         
         # Add control panel to layout first (left side)
-        tab_layout.addWidget(control_panel)
+        splitter.addWidget(control_panel)
         
         # === 3D Visualization Panel (Center) ===
-        self._setup_tetra_3d_viewer(tab_layout)
+        self._setup_tetra_3d_viewer(splitter)
         
         # === Materials Panel (Right) ===
         materials_group = self._init_material_selection_ui()
-        tab_layout.addWidget(materials_group)
+        splitter.addWidget(materials_group)
         
         logger.info("Enhanced tetra mesh tab with 3D viewer and surface transfer initialized")
+
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([320, 800, 250])
 
     def _setup_tetra_3d_viewer(self, parent_layout):
         """Setup the 3D visualization panel for the tetra mesh tab"""
@@ -15861,7 +13983,7 @@ class MeshItWorkflowGUI(QMainWindow):
             self.tetra_plotter = None
         
         # Add to main layout with stretch factor
-        parent_layout.addWidget(viz_panel, 1)  # stretch=1 to take remaining space
+        parent_layout.addWidget(viz_panel)
 
     def _load_conforming_meshes_for_tetgen(self):
         """Load conforming meshes from Tab 6 (Refine & Mesh) following C++ approach"""
@@ -25301,8 +23423,6 @@ class MeshItWorkflowGUI(QMainWindow):
                                         # Update parent state if needed
                                         self._update_parent_state_after_segment_change(segment_item)
                                         
-                                        # Force visual update
-                                        self._apply_segment_state(surface_idx, seg_uid, is_checked)
                                         
                                     # We found a match, but continue searching for more potential matches
                                     # instead of returning immediately

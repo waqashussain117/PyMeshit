@@ -233,6 +233,7 @@ def build_exe(
         "--collect-binaries=netCDF4",
         # Pymeshit specific imports
         "--hidden-import=Pymeshit",
+        "--copy-metadata=Pymeshit",
         "--hidden-import=Pymeshit.intersection_utils",
         "--hidden-import=Pymeshit.tetra_mesh_utils",
         "--hidden-import=Pymeshit.core",

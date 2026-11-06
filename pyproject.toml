@@ -1,6 +1,7 @@
 [build-system]
 requires = [
-    "setuptools>=42",
+    "setuptools>=61",
+    "setuptools-scm>=8",
     "wheel",
     "numpy>=1.20.0",
 ]
@@ -8,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Pymeshit"
-version = "0.9.2"
+dynamic = ["version"]
 authors = [
     {name = "Waqas Hussain", email = "waqas.hussain117@gmail.com"},
 ]
@@ -51,3 +52,6 @@ meshit-gui = "Pymeshit:main_wrapper"
 packages = ["Pymeshit", "Pymeshit.core"]
 include-package-data = true
 py-modules = ["main", "Pymeshit_workflow_gui"]
+
+[tool.setuptools_scm]
+fallback_version = "1.0.0"
